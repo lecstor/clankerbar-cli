@@ -35,19 +35,20 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 	// exit that would otherwise stop the daemon is itself part of the silent
 	// death, not a verdict.
 	//
-	// The retry is scoped to the FIRST phase (`i == 0`), the one that claimed
-	// its own task: a retry cannot re-seed a resumed phase — invocationFor
-	// only substitutes the task/run placeholders and sets ResumeClaim when the
-	// predecessor claim is present, which the dead handback cleared — so
-	// retrying a dead RESUMED phase would spawn a session whose brief still
-	// carries the literal {{taskId}}/{{runId}} and whose handback, salvage and
-	// delivery checks are all switched off. A resumed phase's dead signature
-	// still vetoes its checkpoint below (the false-premise guard applies to
-	// every phase); it just is not retried or parked here — the drain ends and
-	// the task returns to the queue, where a fresh claiming session retries it
-	// with a valid seed (review finding). The operator decision's "retry the
-	// implement phase N times, then park" is exactly `i == 0` in the shipped
-	// [implement, review] sequence.
+	// The retry is scoped to the phase the walk STARTED at (`i == start`): a
+	// retry cannot re-seed a resumed phase — invocationFor only substitutes the
+	// task/run placeholders and sets ResumeClaim when the predecessor claim is
+	// present, which the dead handback cleared — so retrying a dead RESUMED
+	// phase would spawn a session whose brief still carries the literal
+	// {{taskId}}/{{runId}} and whose handback, salvage and delivery checks are
+	// all switched off. A session-claimed start re-claims in its own session; a
+	// runner-claimed start is re-claimed by the runner before the retry. A
+	// resumed phase's dead signature still vetoes its checkpoint below (the
+	// false-premise guard applies to every phase); it just is not retried or
+	// parked here — the drain ends and the task returns to the queue, where a
+	// fresh claiming session retries it with a valid seed (review finding). The
+	// operator decision's "retry the implement phase N times, then park" is
+	// exactly `i == start` in the shipped [implement, review] sequence.
 	//
 	// CLA-396: a dead phase feeds BOTH counters, but the per-task park is
 	// checked and taken FIRST — before the fleet counter's trip is even
@@ -72,7 +73,7 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			taskID = st.end.claim.Claim.TaskID
 		}
 
-		if !st.last && s.i == 0 && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
+		if !st.last && s.i == s.start && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
 			if st.end.toolLoop != "" {
 				how = "was killed (" + st.end.toolLoop + "), dead"
@@ -97,7 +98,20 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			return seqBreak
 		}
 
-		if !st.last && s.i == 0 {
+		if !st.last && s.i == s.start {
+			// A runner-claimed start must re-claim before the respawn: the dead
+			// phase handed the task back. The reclaim can land a DIFFERENT task
+			// when this one is gone, so the counters below follow what is
+			// actually held now, not what died.
+			if s.runnerClaimed {
+				if taskID == "" {
+					taskID = s.seen.TaskID
+				}
+				if !s.reclaimForRetry(ctx, taskID) {
+					return seqBreak
+				}
+				taskID = s.seen.TaskID
+			}
 			// Either the first dead phase this task produced, or a dead phase
 			// on a task other than the one counted above: that task has died
 			// once, and earns its own retry ladder rather than being parked

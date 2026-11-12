@@ -61,8 +61,20 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way
 	// it ends — hence the defer, and hence state the deferred record reads.
 	defer s.recordIteration()
+	// The runner takes the claim before the walk so every phase, including the
+	// first, resumes a task the driver holds. claimSessionPath keeps the old
+	// path; only claimNothing ends the drain here.
+	if _, ok := s.runnerClaimEligible(); ok {
+		if s.claimForDrain(ctx) == claimNothing {
+			// Wired mode loops straight back to the poll, and a zero-spend drain
+			// never trips the quiet breaker: idle here, or a poll that says
+			// "spawnable" while next_task offers nothing spins against the plane.
+			s.stop = d.waitOrStop(ctx, d.cfg.IdlePollInterval.OrDefault(60*time.Second))
+			return s.tokens, s.cost, s.handoffs, s.stop, s.err
+		}
+	}
 walk:
-	for s.i = 0; s.i < len(phases); {
+	for s.i = s.start; s.i < len(phases); {
 		st := &seqStep{}
 		st.ph = phases[s.i]
 		// CLA-639: whether this position is one reviewer of a review panel. The
@@ -184,8 +196,20 @@ walk:
 		// shape returns to the queue for the next drain — the tally measures it
 		// without tripping the park or fleet machinery, which is how a fleet-wide
 		// silent EOT shows up in the rate the operator watches.
+		//
+		// A runner-claimed retry re-claims first: the empty exit handed the
+		// task back, so nothing is held to resume.
 		if st.end.empty {
-			if !st.last && s.i == 0 && s.emptyRetries < 1 && st.end.releasedToQueue {
+			if !st.last && s.i == s.start && s.emptyRetries < 1 && st.end.releasedToQueue {
+				if s.runnerClaimed {
+					taskID := s.seen.TaskID
+					if st.end.claim != nil {
+						taskID = st.end.claim.Claim.TaskID
+					}
+					if !s.reclaimForRetry(ctx, taskID) {
+						break
+					}
+				}
 				s.emptyRetries++
 				continue
 			}

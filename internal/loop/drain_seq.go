@@ -8,6 +8,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
 // drainSeq is one drain's walk through its phase sequence: what drainPhases
@@ -28,6 +29,15 @@ type drainSeq struct {
 	// i is the index of the phase being run. The walk has no post statement:
 	// a stage that moves past a phase says so by writing it.
 	i int
+	// start is the index the walk begins at. 0 until the start-phase wiring
+	// chooses one; a retry is scoped to the phase the walk STARTED at.
+	start int
+	// runnerClaimed reports that the RUNNER, not a session, holds this drain's
+	// claim, so a retry must re-claim before it respawns.
+	runnerClaimed bool
+	// claimedTask is the brief behind a runner-claimed drain's claim, kept for
+	// the start-phase wiring.
+	claimedTask plane.TaskBrief
 
 	// What the drain returns.
 	tokens   int
