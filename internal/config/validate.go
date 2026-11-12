@@ -784,6 +784,7 @@ func (c *Config) resolveTopMCPConfig() error {
 	// file can pass this gate and still fail the origin one.
 	if c.MCPConfigPath == "" {
 		c.MCPConfigPath = discoverMCPConfig(c.WorkDir)
+		c.mcpDiscovered = c.MCPConfigPath != ""
 		if err := c.checkDiscoveredMCPConfig(c.MCPConfigPath, "mcp_config_path", c.AllowLocalMCPServers); err != nil {
 			return err
 		}
@@ -956,6 +957,7 @@ func (c *Config) validateProject(i int, seen map[string]bool) error {
 	p.MCPConfigPath = mcpUnderWorkDir(p.MCPConfigPath, effectiveWorkDir)
 	if p.MCPConfigPath == "" {
 		p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
+		p.mcpDiscovered = p.MCPConfigPath != ""
 		// Discovered, not named, exactly like the top-level default above —
 		// same rule, labelled with THIS field so the remedy names the line
 		// the operator actually adds, and allowlisted per THIS project
