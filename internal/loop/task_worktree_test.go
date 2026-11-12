@@ -1,8 +1,8 @@
 package loop
 
 // task_worktree_test.go — task_worktree.go over REAL repositories: a bare
-// "origin", a clone as the checkout, and a `<checkout>-wt` directory so
-// panelWorktreeRoot picks the beside-the-checkout area.
+// "origin", a clone as the checkout, and a `<checkout>-wt` directory so the
+// fleet root is the beside-the-checkout area.
 //
 // The tests pin the behaviour the runner depends on: the branch and path are
 // deterministic, a resumed branch is merged (or reported conflicted and left
@@ -56,7 +56,7 @@ func newTaskWorktreeRepo(t *testing.T) *taskWorktreeRepo {
 	gitRun(t, r.checkout, "config", "user.name", "Driver Test")
 	gitRun(t, r.checkout, "config", "user.email", "driver@example.test")
 	gitRun(t, r.checkout, "config", "commit.gpgsign", "false")
-	// panelWorktreeRoot prefers <project>/worktrees, then <checkout>-wt; only
+	// fleetWorktreeRoot prefers <project>/worktrees, then <checkout>-wt; only
 	// the latter exists here.
 	if err := os.MkdirAll(r.checkout+"-wt", 0o755); err != nil {
 		t.Fatal(err)
@@ -66,6 +66,15 @@ func newTaskWorktreeRepo(t *testing.T) *taskWorktreeRepo {
 
 func (r *taskWorktreeRepo) request() worktreeRequest {
 	return worktreeRequest{Checkout: r.checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "staging"}
+}
+
+// withoutFleetRoot removes the only fleet worktree area this fixture has, so a
+// prepare has to pick a fallback root.
+func (r *taskWorktreeRepo) withoutFleetRoot(t *testing.T) {
+	t.Helper()
+	if err := os.RemoveAll(r.checkout + "-wt"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // commitOn (re)cuts branch at from ("" means its current origin tip), commits
@@ -483,24 +492,270 @@ func TestTaskWorktree_AdoptsWorktreeInFleetRoot(t *testing.T) {
 	}
 }
 
-// Any other tree on the branch may be another drain instance's checkout, so it
-// is refused by path rather than shared.
-func TestTaskWorktree_ForeignWorktreeOnBranchRefused(t *testing.T) {
+// A tree outside the task-worktree roots is still adopted when it carries
+// nothing origin does not: a clean tree at origin's tip holds no unpushed work,
+// and refusing it would burn the task's claim for a tree the next session could
+// safely use.
+func TestTaskWorktree_AdoptsCleanWorktreeOutsideTheRoots(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
-	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
+	branchTip := f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
 	gitRun(t, f.checkout, "fetch", "origin")
 	elsewhere := filepath.Join(f.root, "session-wt")
 	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, elsewhere, "origin/"+taskWorktreeBranch)
 	req := f.request()
 	req.Resume = true
 
+	prep, err := f.prepare(t, req)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !taskWorktreeSamePath(prep.Dir, elsewhere) {
+		t.Errorf("Dir = %q, want the existing worktree %q", prep.Dir, elsewhere)
+	}
+	if !prep.AdoptedOutside || prep.Created {
+		t.Errorf("AdoptedOutside/Created = %v/%v, want true/false", prep.AdoptedOutside, prep.Created)
+	}
+	if prep.Tip != branchTip {
+		t.Errorf("Tip = %s, want %s", prep.Tip, branchTip)
+	}
+}
+
+// A task worktree outlives the session and holds installed dependencies, so
+// with no fleet area it belongs in the main checkout's own .worktrees — never
+// the OS temp dir, which is a tmpfs on many hosts.
+func TestTaskWorktree_CreatesUnderMainWorktreesDir(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.withoutFleetRoot(t)
+	dotWorktrees := filepath.Join(f.checkout, ".worktrees")
+	if err := os.MkdirAll(dotWorktrees, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prep, err := f.prepare(t, f.request())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	// git spells the main worktree symlink-resolved (/private/tmp), so compare
+	// the way the rest of this file does.
+	if want := filepath.Join(dotWorktrees, taskWorktreeID[:8]); !taskWorktreeSamePath(prep.Dir, want) {
+		t.Errorf("Dir = %q, want %q", prep.Dir, want)
+	}
+}
+
+// With neither a fleet area nor a .worktrees directory, the older -wt sibling
+// outside the repo is used: still durable, unlike the temp dir.
+func TestTaskWorktree_CreatesBesideCheckoutWithoutFleetArea(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.withoutFleetRoot(t)
+
+	prep, err := f.prepare(t, f.request())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	// The exact path, not a temp-dir prefix: t.TempDir() is itself under the OS
+	// temp dir, so only the exact expectation proves the root rule.
+	if want := filepath.Join(f.checkout+"-wt", taskWorktreeID[:8]); prep.Dir != want {
+		t.Errorf("Dir = %q, want %q", prep.Dir, want)
+	}
+}
+
+// The fleet's area wins over the checkout's .worktrees: it is the layout the
+// panel and the doctor already agree on.
+func TestTaskWorktree_FleetRootWinsOverMainWorktreesDir(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	if err := os.MkdirAll(filepath.Join(f.checkout, ".worktrees"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prep, err := f.prepare(t, f.request())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if want := filepath.Join(f.checkout+"-wt", taskWorktreeID[:8]); prep.Dir != want {
+		t.Errorf("Dir = %q, want the fleet root's %q", prep.Dir, want)
+	}
+}
+
+// A session in the repo cuts `<main>/.claNNN` worktrees. A clean one at origin's
+// tip is the task's tree and is adopted rather than refused.
+func TestTaskWorktree_AdoptsCleanSiblingWorktree(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	branchTip := f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
+	gitRun(t, f.checkout, "fetch", "origin")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/"+taskWorktreeBranch)
+	req := f.request()
+	req.Resume = true
+
+	prep, err := f.prepare(t, req)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !taskWorktreeSamePath(prep.Dir, sibling) {
+		t.Errorf("Dir = %q, want the existing worktree %q", prep.Dir, sibling)
+	}
+	if !prep.AdoptedOutside || prep.Created {
+		t.Errorf("AdoptedOutside/Created = %v/%v, want true/false", prep.AdoptedOutside, prep.Created)
+	}
+	if prep.Tip != branchTip {
+		t.Errorf("Tip = %s, want %s", prep.Tip, branchTip)
+	}
+}
+
+// A sibling tree behind origin holds nothing unpushed, so it is adopted and the
+// resumed branch fast-forwards to origin's tip.
+func TestTaskWorktree_AdoptsSiblingWorktreeBehindOrigin(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
+	gitRun(t, f.checkout, "fetch", "origin")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/"+taskWorktreeBranch)
+	originTip := f.commitOn(t, taskWorktreeBranch, "", "more.txt", "more work", "more work")
+	req := f.request()
+	req.Resume = true
+
+	prep, err := f.prepare(t, req)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !prep.AdoptedOutside {
+		t.Errorf("AdoptedOutside = false, want true for %s", prep.Dir)
+	}
+	if prep.Tip != originTip {
+		t.Errorf("Tip = %s, want the fast-forwarded origin tip %s", prep.Tip, originTip)
+	}
+}
+
+// An untracked file in the sibling is work: adopting would hide it, so it is
+// refused with the reason.
+func TestTaskWorktree_DirtySiblingWorktreeRefused(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
+	gitRun(t, f.checkout, "fetch", "origin")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/"+taskWorktreeBranch)
+	writeTestFile(t, filepath.Join(sibling, "stray.txt"), "work in progress")
+	req := f.request()
+	req.Resume = true
+
 	_, err := f.prepare(t, req)
 	if err == nil {
-		t.Fatalf("a worktree outside the task-worktree roots must be refused, not adopted")
+		t.Fatalf("a dirty sibling worktree must be refused, not adopted")
 	}
-	// The basename: git may report the path symlink-resolved.
-	if !strings.Contains(err.Error(), "session-wt") || !strings.Contains(err.Error(), "not a task worktree") {
-		t.Errorf("error %q does not name %s as unadoptable", err, elsewhere)
+	if !strings.Contains(err.Error(), ".cla848") || !strings.Contains(err.Error(), "uncommitted") {
+		t.Errorf("error %q does not name the sibling and its dirty state", err)
+	}
+}
+
+// A sibling holding a commit origin never got is refused: adopting it would make
+// that work look like the task's own.
+func TestTaskWorktree_SiblingWorktreeAheadOfOriginRefused(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
+	gitRun(t, f.checkout, "fetch", "origin")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/"+taskWorktreeBranch)
+	writeTestFile(t, filepath.Join(sibling, "local.txt"), "local commit")
+	gitRun(t, sibling, "add", "-A")
+	gitRun(t, sibling, "commit", "-m", "unpushed work")
+	req := f.request()
+	req.Resume = true
+
+	_, err := f.prepare(t, req)
+	if err == nil {
+		t.Fatalf("a sibling ahead of origin must be refused, not adopted")
+	}
+	if !strings.Contains(err.Error(), "does not have") {
+		t.Errorf("error %q does not say the tree holds commits origin lacks", err)
+	}
+}
+
+// A fresh task that has pushed nothing yet: its branch is not on origin, but a
+// clean sibling at the PR base holds exactly what the runner would cut, so it is
+// adopted rather than refused and parked.
+func TestTaskWorktree_AdoptsFreshSiblingAtBaseNotOnOrigin(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	gitRun(t, f.checkout, "fetch", "origin")
+	baseTip := gitOut(t, f.checkout, "rev-parse", "origin/staging")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/staging")
+
+	prep, err := f.prepare(t, f.request())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !taskWorktreeSamePath(prep.Dir, sibling) {
+		t.Errorf("Dir = %q, want the existing worktree %q", prep.Dir, sibling)
+	}
+	if !prep.AdoptedOutside || prep.Created {
+		t.Errorf("AdoptedOutside/Created = %v/%v, want true/false", prep.AdoptedOutside, prep.Created)
+	}
+	if prep.Tip != baseTip {
+		t.Errorf("Tip = %s, want the base tip %s", prep.Tip, baseTip)
+	}
+	if prep.OriginTip != "" || prep.Ahead != 0 {
+		t.Errorf("OriginTip/Ahead = %q/%d, want empty/0: the branch was never pushed", prep.OriginTip, prep.Ahead)
+	}
+}
+
+// The same fresh shape, but the sibling holds a commit the base does not: that
+// is unpushed work, so it is refused and left untouched.
+func TestTaskWorktree_FreshSiblingWithLocalCommitRefused(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	gitRun(t, f.checkout, "fetch", "origin")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/staging")
+	writeTestFile(t, filepath.Join(sibling, "local.txt"), "local commit")
+	gitRun(t, sibling, "add", "-A")
+	gitRun(t, sibling, "commit", "-m", "unpushed work")
+	localTip := gitOut(t, sibling, "rev-parse", "HEAD")
+
+	_, err := f.prepare(t, f.request())
+	if err == nil {
+		t.Fatalf("a sibling with commits the base does not have must be refused, not adopted")
+	}
+	if !strings.Contains(err.Error(), "holds commits origin/") {
+		t.Errorf("error %q does not say the tree holds commits origin lacks", err)
+	}
+	if got := gitOut(t, sibling, "rev-parse", "HEAD"); got != localTip {
+		t.Errorf("HEAD = %s, want the local commit %s to survive the refusal", got, localTip)
+	}
+}
+
+// The fresh-tree relaxation is for a start, never a resume: a resumed branch
+// that is not on origin still has nothing to prove it was published.
+func TestTaskWorktree_ResumeRefusesBranchNotOnOriginOutsideTheRoots(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	gitRun(t, f.checkout, "fetch", "origin")
+	sibling := filepath.Join(f.checkout, ".cla848")
+	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/staging")
+	req := f.request()
+	req.Resume = true
+
+	_, err := f.prepare(t, req)
+	if err == nil {
+		t.Fatalf("a resumed branch that is not on origin must be refused, not adopted")
+	}
+	if !strings.Contains(err.Error(), "not on origin") {
+		t.Errorf("error %q does not say the branch is not on origin", err)
+	}
+}
+
+// The panel's root rule is unchanged: a throwaway member tree falls back to the
+// OS temp dir when no known layout exists.
+func TestPanelWorktreeRootFallsBackToTempDir(t *testing.T) {
+	checkout := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := panelWorktreeRoot(checkout); got != os.TempDir() {
+		t.Errorf("panelWorktreeRoot = %q, want the temp dir %q", got, os.TempDir())
+	}
+	if err := os.MkdirAll(checkout+"-wt", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := panelWorktreeRoot(checkout); got != checkout+"-wt" {
+		t.Errorf("panelWorktreeRoot = %q, want %q", got, checkout+"-wt")
 	}
 }
 

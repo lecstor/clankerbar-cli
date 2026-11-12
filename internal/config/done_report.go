@@ -78,7 +78,7 @@ func ParseDone(final string) (rep DoneReport, found bool, err error) {
 	if !ok {
 		return DoneReport{}, false, nil
 	}
-	body = stripDoneFence(body)
+	body = stripDoneFence(stripTrailingModelArtifacts(body))
 	if body == "" {
 		return DoneReport{}, true, errors.New("the done marker line carries no done report")
 	}
@@ -146,9 +146,10 @@ func stripDoneFence(body string) string {
 }
 
 // ValidateReview holds a review-shaped done report to the record the runner
-// writes: the verdict and its findings agree, the reviewed tip is a commit, and
-// a verify report's findingUpdates are shippable. tip is the checkpoint tip the
-// runner verified, "" when it had none to verify against.
+// writes: the verdict and its findings agree, the reviewed tip is a commit, no
+// finding string is over the plane's bound, and a verify report's findingUpdates
+// are shippable. tip is the checkpoint tip the runner verified, "" when it had
+// none to verify against.
 //
 // The errors name the offending field or finding index because they go to the
 // log, where "invalid report" is worth nothing to whoever reads it.
@@ -183,14 +184,26 @@ func (r DoneReport) ValidateReview(tip string) error {
 		if strings.TrimSpace(f.Summary) == "" {
 			return fmt.Errorf("findings[%d] (%s): summary is empty", i, f.Severity)
 		}
+		// The plane refuses an over-bound record whole, so the same refusal
+		// here is the difference between a re-report and a lost review.
+		if err := checkBounds(fmt.Sprintf("findings[%d]", i), []boundedField{
+			{"summary", f.Summary, boundFindingSummary},
+			{"evidence", f.Evidence, boundFindingEvidence},
+			{"evidenceKind", f.EvidenceKind, boundFindingEvidenceKind},
+			{"file", f.File, boundFindingFile},
+			{"kind", f.Kind, boundFindingKind},
+			{"requiredFix", f.RequiredFix, boundFindingRequiredFix},
+		}); err != nil {
+			return err
+		}
 	}
 	return ValidateFindingUpdates(r.FindingUpdates)
 }
 
 // ValidateFindingUpdates holds the durable record's findingUpdates batch to the
-// shape the plane accepts. Each status requires the field that carries its
-// evidence, and a batch is all-or-nothing, so a duplicate id is refused here
-// rather than discovered by the plane's refusal.
+// shape the plane accepts, bounds included. Each status requires the field that
+// carries its evidence, and a batch is all-or-nothing, so a duplicate id is
+// refused here rather than discovered by the plane's refusal.
 func ValidateFindingUpdates(us []DoneFindingUpdate) error {
 	seen := make(map[string]bool, len(us))
 	for i, u := range us {
@@ -201,6 +214,15 @@ func ValidateFindingUpdates(us []DoneFindingUpdate) error {
 			return fmt.Errorf("findingUpdates[%d]: duplicate findingId %q", i, u.FindingID)
 		}
 		seen[u.FindingID] = true
+		// Bounds first, so an over-limit field is named as the plane names it
+		// rather than as a shape violation.
+		if err := checkBounds(fmt.Sprintf("findingUpdates[%d]", i), []boundedField{
+			{"refutedReason", u.RefutedReason, boundFindingRefutedReason},
+			{"fixCommit", u.FixCommit, boundFindingFixCommit},
+			{"filedTaskRef", u.FiledTaskRef, boundFindingFiledTaskRef},
+		}); err != nil {
+			return err
+		}
 		switch u.Status {
 		case "fixed":
 			if !validLowerHex(u.FixCommit, 7, 64) {
