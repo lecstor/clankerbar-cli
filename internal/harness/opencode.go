@@ -508,6 +508,12 @@ func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string)
 	}
 	// Code Mode, denied by name: see the function doc.
 	perm["execute"] = "deny"
+	// opencode 2.2 built-ins are named like MCP tools, so `*_*` would allow them,
+	// and worktree_create wrote outside the workdir. Deny the family; keep the MCP
+	// resource reads (see the function doc). Shadows an MCP server named "opencode".
+	perm["opencode_*"] = "deny"
+	perm["opencode_list_mcp_resources"] = "allow"
+	perm["opencode_read_mcp_resource"] = "allow"
 	if readOnly {
 		perm["edit"] = "deny"
 		perm["shell"] = "deny"
@@ -1433,8 +1439,8 @@ func opencodeErrorText(res Result) string {
 // retryable is how a delivered phase got classified as a failed attempt (both
 // 2026-10-19 incidents). So an error event with any typed event after it is
 // recovery and contributes nothing here; only a stream that stops on the error
-// is a failure. The distinction is pinned by the conformance suite's
-// recovered-provider-error case, which execs the real binary.
+// is a failure. The conformance suite's recovered-provider-error case pins the
+// recovery against the real binary (2.0.x error event; 2.2.x retry event).
 //
 // stderr is scanned unconditionally: it is the harness's own diagnostic channel,
 // written as the process winds down, and the fallback for the untyped failures

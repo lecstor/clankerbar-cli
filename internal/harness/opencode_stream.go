@@ -462,7 +462,8 @@ type opencodeParse struct {
 	// conformance suite. Classification itself reads the event text.
 	errorType string
 
-	// recoveredErrors counts the typed error events the stream did NOT end on:
+	// recoveredErrors counts the typed error (or 2.2.x retry) events the stream
+	// did NOT end on:
 	// an event that is followed by any later typed event is one the session
 	// recovered from, because 2.x retries a provider failure itself and carries
 	// on (CLA-700). lastEventWasError is whether the most recent typed event was
@@ -555,7 +556,9 @@ func (p *opencodeParse) line(line []byte) {
 			// recovered from (whether or not this event is also an error).
 			p.recoveredErrors++
 		}
-		p.lastEventWasError = ev.Type == "error"
+		// 2.2.x reports a recovery it retries as a `retry` event carrying the
+		// error; it counts as recovered once something follows it.
+		p.lastEventWasError = ev.Type == "error" || (ev.Type == "retry" && ev.Error != nil)
 	}
 	if ev.Part == nil {
 		return

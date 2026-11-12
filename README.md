@@ -2625,7 +2625,10 @@ checkout - otherwise overrides the top-level policy. `shell` is
 allowed tool-level (its permission patterns match parsed commands, not paths).
 Everything else - `lsp`, `subagent`, `skill`, `question`, the network tools
 (`webfetch`, `websearch`) and `execute` - is denied by a `*` catch-all or by
-name, and denied tools are hidden from the session's catalog entirely. `grep`,
+name, and denied tools are hidden from the session's catalog, except that
+opencode 2.2.x still offers `skill` (refused when called) and
+`opencode_worktree_remove` (which only removes worktrees opencode created; the
+other `opencode_*` built-ins are denied by name, see docs/opencode-build.md). `grep`,
 `glob` and `list` are allowed (CLA-390): their asks carry the search pattern,
 not a path, so their boundary is the `external_directory` gate. `*_*` allows the
 MCP tools (`<server>_<tool>`: `clankerbar_get_backlog_summary`,

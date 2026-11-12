@@ -463,6 +463,13 @@ func TestOpencodeConformance_stop(t *testing.T) {
 func TestOpencodeConformance_permissions(t *testing.T) {
 	requireOpencodeConformance(t)
 	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(victim, "keep"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	calls := func() [][]fakeCall {
 		return [][]fakeCall{{
 			{"write", map[string]any{"path": "w1.txt", "content": "in"}},
@@ -471,6 +478,8 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 			{"shell", map[string]any{"command": "echo b2 > " + filepath.Join(outside, "b2.txt"), "description": "out"}},
 			{"read", map[string]any{"path": "/etc/hosts"}},
 			{"webfetch", map[string]any{"url": "http://127.0.0.1:1/"}},
+			{"skill", map[string]any{"id": "probe"}},
+			{"opencode_worktree_remove", map[string]any{"directory": victim}},
 		}}
 	}
 	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
@@ -481,6 +490,14 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 		defer srv.Close()
 		iso := isolate(t)
 		work := t.TempDir()
+		// A real skill, so the skill call is refused by the policy, not by lookup.
+		skillDir := filepath.Join(work, ".opencode", "skills", "probe")
+		if err := os.MkdirAll(skillDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: probe\ndescription: probe\n---\nbody\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		res := invokeConformance(t, iso.invocation("work", work, writeJSON(t, fakeConfigDoc(srv.URL))))
 		requireHit(t, fake)
 		requireV2Record(t, iso, res)
@@ -493,10 +510,37 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 			}
 		}
 		t.Logf("tools offered under the drain policy: %v", offered)
-		for _, denied := range []string{"webfetch", "websearch", "execute", "question", "skill", "subagent"} {
+		for _, denied := range []string{"webfetch", "websearch", "execute", "question", "subagent",
+			"opencode_worktree_create", "opencode_worktree_list", "opencode_session_move", "opencode_session_rename", "opencode_models"} {
 			if indexOfTool(offered, denied) >= 0 {
 				t.Errorf("%s was offered; a tool-level deny must remove it", denied)
 			}
+		}
+		// The MCP resource reads the policy keeps; a rename upstream goes red here.
+		for _, kept := range []string{"opencode_list_mcp_resources", "opencode_read_mcp_resource"} {
+			if indexOfTool(offered, kept) < 0 {
+				t.Errorf("%s was not offered; the policy allows MCP resource reads", kept)
+			}
+		}
+		// 2.2.x offers skill and opencode_worktree_remove whatever the policy says.
+		// skill must be refused when called; worktree_remove must not delete a
+		// directory opencode did not create.
+		for _, tool := range []string{"skill", "opencode_worktree_remove"} {
+			if indexOfTool(offered, tool) >= 0 {
+				t.Logf("%s is offered under the drain policy (2.2.x does not filter it by permission)", tool)
+			}
+		}
+		if !exists(filepath.Join(victim, "keep")) {
+			t.Errorf("opencode_worktree_remove deleted a directory opencode did not create; events %s", describeTools(res))
+		}
+		skillRefused := false
+		for _, p := range toolEvents(res) {
+			if p.Tool == "skill" && p.State != nil && p.State.Status == "error" && strings.Contains(p.State.Error, "Permission denied: skill") {
+				skillRefused = true
+			}
+		}
+		if indexOfTool(offered, "skill") >= 0 && !skillRefused {
+			t.Errorf("the skill call was not refused by the policy; events %s", describeTools(res))
 		}
 		for _, allowed := range []string{"read", "write", "edit", "shell", "glob", "grep"} {
 			if indexOfTool(offered, allowed) < 0 {
@@ -584,7 +628,7 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 			res := invokeConformance(t, iso.invocation("work", work, writeJSON(t, fakeConfigDoc(srv.URL))))
 			requireHit(t, fake)
 			for _, r := range fake.requests() {
-				for _, gone := range []string{"webfetch", "websearch", "execute", "subagent", "question"} {
+				for _, gone := range []string{"webfetch", "websearch", "execute", "subagent", "question", "opencode_worktree_create"} {
 					if indexOfTool(r.Tools, gone) >= 0 {
 						t.Errorf("%s offered despite the pinned policy", gone)
 					}
@@ -938,9 +982,9 @@ func TestOpencodeConformance_errors(t *testing.T) {
 //     indistinguishable from a genuine failure at the process level, which is
 //     exactly how two delivered phases were stranded on 2026-10-19.
 //
-// The assertions below pin all three facts, so an upstream fix (or a new
-// regression) fails here loudly instead of silently changing how the driver
-// reads a session.
+// 2.2.x reports the same recovery as a `retry` event carrying the error and
+// exits 0. Both shapes are accepted, and both must be recorded as recovered, so
+// a later non-zero exit still reads as a recovery.
 func TestOpencodeConformance_recoveredProviderError(t *testing.T) {
 	requireOpencodeConformance(t)
 	fake := &fakeOpenAI{malformedTurns: 1}
@@ -957,34 +1001,35 @@ func TestOpencodeConformance_recoveredProviderError(t *testing.T) {
 		t.Fatalf("the session sent %d tool-bearing request(s), want at least 2 — opencode did not retry the malformed stream, so this fixture is not exercising the recovery", got)
 	}
 
-	// The exit status (CLA-700's open question, now answered): non-zero.
-	if res.ExitCode != 1 {
-		t.Errorf("ExitCode = %d, want 1 — opencode 2.x exits NON-ZERO after recovering from a provider error (stderr %.300s); if upstream changed this, the driver's recovery handling can be revisited", res.ExitCode, res.Stderr)
+	// The exit status: 1 on 2.0.32 (error event), 0 on 2.2.x (retry event).
+	if res.ExitCode != 0 && res.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 0 or 1 after a recovered provider error (stderr %.300s)", res.ExitCode, res.Stderr)
 	}
 
-	// The event sequence: the typed error event, and typed events AFTER it.
+	// The event sequence: the typed error (an error or retry event), and typed
+	// events AFTER it.
 	lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
-	errAt := -1
+	errAt, errKind := -1, ""
 	for i, line := range lines {
 		var ev opencodeEvent
 		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type == "" {
 			continue
 		}
-		if ev.Type == "error" {
-			errAt = i
+		if ev.Type == "error" || ev.Type == "retry" {
+			errAt, errKind = i, ev.Type
 			if ev.Error == nil || ev.Error.Type != "provider.invalid-output" {
-				t.Errorf("line %d: error event = %+v, want type provider.invalid-output (the #43622 shape)", i, ev.Error)
+				t.Errorf("line %d: %s event error = %+v, want type provider.invalid-output (the #43622 shape)", i, ev.Type, ev.Error)
 			}
 		}
 	}
 	if errAt < 0 {
-		t.Fatalf("the stream carries no error event; the fixture did not reproduce #43622:\n%s", res.Stdout)
+		t.Fatalf("the stream carries no error or retry event; the fixture did not reproduce #43622:\n%s", res.Stdout)
 	}
 	if errAt == len(lines)-1 {
-		t.Fatalf("the error event is the LAST event on the stream — the session did not recover, so this fixture is not #43622:\n%s", res.Stdout)
+		t.Fatalf("the %s event is the LAST event on the stream — the session did not recover, so this fixture is not #43622:\n%s", errKind, res.Stdout)
 	}
-	if got := RecoveredErrors(res); got == 0 {
-		t.Errorf("the adapter recorded no recovered error events for a stream whose error is followed by %d event(s)", len(lines)-errAt-1)
+	if RecoveredErrors(res) == 0 {
+		t.Errorf("exit %d with a %s event followed by %d event(s), but the adapter recorded no recovered errors", res.ExitCode, errKind, len(lines)-errAt-1)
 	}
 	if res.FinalMessage != "OK" {
 		t.Errorf("FinalMessage = %q, want OK — the retried turn's answer is the session's final message", res.FinalMessage)
@@ -997,7 +1042,7 @@ func TestOpencodeConformance_recoveredProviderError(t *testing.T) {
 	if (opencode{}).DetectLimit(res).Limited {
 		t.Error("DetectLimit fired on a recovered provider.invalid-output event")
 	}
-	t.Logf("exit=%d recovered=%d final=%q usage_reported=%v tokens=%d", res.ExitCode, RecoveredErrors(res), res.FinalMessage, res.UsageReported, res.Tokens)
+	t.Logf("exit=%d %s-event recovered=%d final=%q usage_reported=%v tokens=%d", res.ExitCode, errKind, RecoveredErrors(res), res.FinalMessage, res.UsageReported, res.Tokens)
 }
 
 // The content layer is merged after OPENCODE_CONFIG. The adapter's permission
