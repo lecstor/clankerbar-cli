@@ -8,15 +8,22 @@ import (
 // runnerBriefs lists every runner-claimed brief by name, with the prohibition
 // block it carries. Each is started by a runner that holds the claim and owns
 // the lifecycle around it - so the prohibitions and the removed plumbing are the
-// same for all of them, except that the close-out may inspect and repair CI.
-func runnerBriefs() []struct{ name, brief, forbidden string } {
-	return []struct{ name, brief, forbidden string }{
-		{"implement", RunnerImplementBrief(), runnerForbidden},
-		{"close-out", RunnerCloseOutBrief(), runnerCloseOutForbidden},
-		{"review-only", RunnerReviewOnlyBrief(), runnerForbidden},
-		{"fix", RunnerFixBrief(), runnerForbidden},
-		{"fix-verify", RunnerFixVerifyBrief(), runnerForbidden},
-		{"verify", RunnerVerifyBrief(), runnerForbidden},
+// same for all of them, except that the close-out may inspect and repair CI and
+// still writes its own close-out record.
+func runnerBriefs() []struct {
+	name, brief, forbidden string
+	doneReport             bool
+} {
+	return []struct {
+		name, brief, forbidden string
+		doneReport             bool
+	}{
+		{"implement", RunnerImplementBrief(), runnerForbidden, true},
+		{"close-out", RunnerCloseOutBrief(), runnerCloseOutForbidden, false},
+		{"review-only", RunnerReviewOnlyBrief(), runnerForbidden, true},
+		{"fix", RunnerFixBrief(), runnerForbidden, true},
+		{"fix-verify", RunnerFixVerifyBrief(), runnerForbidden, true},
+		{"verify", RunnerVerifyBrief(), runnerForbidden, true},
 	}
 }
 
@@ -46,6 +53,69 @@ func TestRunnerBriefsForbidTheRunnersMechanics(t *testing.T) {
 	}
 }
 
+// Every runner phase but the close-out records nothing: it ends with the done
+// report and the runner writes the records from it. The close-out keeps its own
+// release_task hand-back, so it is the one brief that may still instruct a
+// write.
+func TestRunnerBriefsEndWithADoneReportAndNoWrites(t *testing.T) {
+	for _, tc := range runnerBriefs() {
+		if !tc.doneReport {
+			if strings.Contains(tc.brief, DoneMarker) {
+				t.Errorf("the %s brief carries a done report; that phase still writes its own record", tc.name)
+			}
+			continue
+		}
+		if !strings.Contains(tc.brief, DoneMarker) {
+			t.Errorf("the %s brief never names the done marker %q", tc.name, DoneMarker)
+		}
+		if !strings.Contains(tc.brief, runnerNoWrites) {
+			t.Errorf("the %s brief does not carry the runner's write ban", tc.name)
+		}
+		// The ban itself names the calls it forbids, so it is removed before the
+		// scan: what must not survive is a brief INSTRUCTING one of them.
+		body := strings.Replace(tc.brief, runnerNoWrites, "", 1)
+		for _, banned := range []string{
+			"record_progress(taskId",
+			"record_review(taskId",
+			"settle_task(taskId",
+			"submit_for_review(taskId",
+			"record_decision",
+		} {
+			if strings.Contains(body, banned) {
+				t.Errorf("the %s brief still instructs %q; the runner writes that record from the done report", tc.name, banned)
+			}
+		}
+		// The only write a fix session keeps is the follow-up task it files.
+		if strings.Contains(body, runnerFixCreateTask) && tc.name != "fix" && tc.name != "fix-verify" {
+			t.Errorf("the %s brief allows create_task; only a fix phase files a follow-up", tc.name)
+		}
+	}
+}
+
+// The close-out is the exception: it repairs a red check and hands the task back
+// itself, so it must keep release_task and checkGreen.
+func TestRunnerCloseOutBriefKeepsItsHandBack(t *testing.T) {
+	brief := RunnerCloseOutBrief()
+	for _, want := range []string{"`release_task`", "`checkGreen`"} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner close-out brief no longer says %s:\n%s", want, brief)
+		}
+	}
+	if strings.Contains(brief, runnerNoWrites) {
+		t.Error("the runner close-out brief carries the write ban it must not: it writes its own close-out record")
+	}
+}
+
+// Every brief still ends at handoffGuidance: a declared handoff is the one way a
+// session ends without the phase's own ending.
+func TestRunnerBriefsEndAtHandoffGuidance(t *testing.T) {
+	for _, tc := range runnerBriefs() {
+		if !strings.HasSuffix(tc.brief, handoffGuidance) {
+			t.Errorf("the %s brief does not end with the handoff guidance", tc.name)
+		}
+	}
+}
+
 func TestRunnerPhaseBriefsStartAtAPreparedTip(t *testing.T) {
 	want := "You were started in the task worktree at tip " + ReviewedTipPlaceholder
 	for _, tc := range []struct{ name, brief string }{
@@ -60,49 +130,151 @@ func TestRunnerPhaseBriefsStartAtAPreparedTip(t *testing.T) {
 	}
 }
 
-// The record, PR and hand-over steps stay in the fix and verify briefs until the
-// runner owns the close-out (B7/B8): the runner variants must not quietly drop
-// the phase's own contract.
-func TestRunnerBriefsKeepTheirTerminalSteps(t *testing.T) {
-	for _, tc := range []struct{ name, brief, step string }{
-		{"review-only", RunnerReviewOnlyBrief(), reviewOnlyTerminalStep},
-		{"fix", RunnerFixBrief(), reviewTerminalStep},
-		{"fix", RunnerFixBrief(), fixTerminalRecord},
-		{"fix-verify", RunnerFixVerifyBrief(), fixOnlyTerminalStep},
-		{"fix-verify", RunnerFixVerifyBrief(), fixVerifyRecord},
-		{"verify", RunnerVerifyBrief(), verifyTerminalStep},
+// The review's findings are the deliverable, but the session no longer renders
+// the block or seals the record: it reports, and the runner writes both.
+func TestRunnerReviewOnlyBriefReportsInsteadOfRecording(t *testing.T) {
+	brief := RunnerReviewOnlyBrief()
+	for _, want := range []string{
+		"verdict",
+		"reviewedTip",
+		"findings",
+		"omitted",
+		reviewMUSTBarGrades,
+		"do NOT write the `" + ReviewRecordHeading + "` block",
+		"do NOT call record_review",
+		"CHECKPOINT: keep holding, do NOT commit, push or open a PR",
+		"report it as a MUST finding of kind failure",
+		DoneMarker,
 	} {
-		if !strings.Contains(tc.brief, tc.step) {
-			t.Errorf("the %s brief lost its terminal/record step", tc.name)
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner review-only brief never says %q:\n%s", want, brief)
+		}
+	}
+	if strings.Contains(brief, reviewOnlyRecordShape) || strings.Contains(brief, reviewOnlyTerminalStep) {
+		t.Error("the runner review-only brief still carries the shipped record shape or terminal step")
+	}
+}
+
+// The fix phase's per-finding updates and its follow-up tasks leave in the
+// report; the runner sends them and appends the outcome itself.
+func TestRunnerFixBriefsReportTheirFindingUpdates(t *testing.T) {
+	for _, tc := range []struct{ name, brief string }{
+		{"fix", RunnerFixBrief()},
+		{"fix-verify", RunnerFixVerifyBrief()},
+	} {
+		for _, want := range []string{
+			"create_task",
+			"findingUpdates",
+			"findingId",
+			"fixCommit",
+			"refutedReason",
+			"filedTaskRef",
+			"### Fixes",
+			DoneMarker,
+		} {
+			if !strings.Contains(tc.brief, want) {
+				t.Errorf("the runner %s brief never says %q:\n%s", tc.name, want, tc.brief)
+			}
+		}
+	}
+	if strings.Contains(runnerFixCore, "settle_task(") || strings.Contains(runnerFixCore, "record_review(") {
+		t.Errorf("runnerFixCore still writes its own records:\n%s", runnerFixCore)
+	}
+}
+
+// The last fix phase opens the PR, and its report must carry the risk the runner
+// hands the task over with.
+func TestRunnerFixBriefDeclaresRiskAndOpensThePR(t *testing.T) {
+	brief := RunnerFixBrief()
+	for _, want := range []string{
+		"open a PR targeting the repo's PR base branch",
+		"risk { touches: [...] }",
+		"risk_vocabulary",
+		"The runner hands the task over with submit_for_review itself",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner fix brief never says %q:\n%s", want, brief)
+		}
+	}
+	// The served `finishing` page is a skill page, and those are forbidden here.
+	if strings.Contains(brief, "`finishing`") {
+		t.Errorf("the runner fix brief points at the served finishing reference:\n%s", brief)
+	}
+}
+
+// A verification round follows the fix-verify phase, so the PR stays the
+// verifier's: the fixer commits, pushes and reports.
+func TestRunnerFixVerifyBriefLeavesThePRToTheVerifier(t *testing.T) {
+	brief := RunnerFixVerifyBrief()
+	for _, want := range []string{
+		"Do NOT open a PR",
+		"do NOT move the task to in_review",
+		"the VERIFICATION round after you carries that terminal step",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner fix-verify brief never says %q:\n%s", want, brief)
 		}
 	}
 }
 
-func TestRunnerImplementBriefEndsAtAPushedRecordedBranch(t *testing.T) {
+// The verification round adjudicates through the report's findingUpdates, and
+// only its no-open-MUST arm hands the task over.
+func TestRunnerVerifyBriefReportsTheRound(t *testing.T) {
+	brief := RunnerVerifyBrief()
+	for _, want := range []string{
+		"findingUpdates",
+		"verdict",
+		"reviewedTip",
+		"findings",
+		"omitted",
+		"notes",
+		"risk { touches: [...] }",
+		"The runner records the round and hands the task to in_review",
+		"Never decide to run another round yourself",
+		verifyStoppingRule,
+		verifyDriverBounds,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner verify brief never says %q:\n%s", want, brief)
+		}
+	}
+}
+
+func TestRunnerImplementBriefEndsAtAPushedBranch(t *testing.T) {
 	brief := RunnerImplementBrief()
 	for _, want := range []string{
 		"PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder,
 		"implementation ONLY",
 		"no review gate and no in_review",
 		runnerTaskPrepared,
-		"record_decision",
-		"settle_task(taskId, runId, disposition: \"parked\", outcome: ...)",
+		"The runner records the branch on the task itself once it is on origin",
 		"Never rebase and never force-push",
 		"PUSH to origin " + PhaseBranchPlaceholder,
-		"record_progress(taskId, runId, branch)",
-		"STOP and end the session",
+		"Then end the session with the done report",
+		"do NOT move the task to in_review",
+		DoneMarker,
 		runnerRerunGuidance,
 	} {
 		if !strings.Contains(brief, want) {
 			t.Errorf("the runner implement brief never says %q:\n%s", want, brief)
 		}
 	}
-	// The runner does the merge (or reports its conflicts in the context block),
-	// so the brief must not send the session to merge or claim anything itself.
-	for _, banned := range []string{"merge the repo's PR base branch", "git merge origin/", "hasWip"} {
+	// Supersession is a park in the report, not a decision the session writes; the
+	// runner does the merge or reports its conflicts in the context block.
+	for _, banned := range []string{
+		"record_progress(taskId",
+		"settle_task(taskId",
+		"merge the repo's PR base branch",
+		"git merge origin/",
+		"hasWip",
+	} {
 		if strings.Contains(brief, banned) {
 			t.Errorf("the runner implement brief still says %q:\n%s", banned, brief)
 		}
+	}
+	// The park is named as a report field, never as a call.
+	if !strings.Contains(brief, "`park`") {
+		t.Errorf("the runner implement brief never names the report's park field:\n%s", brief)
 	}
 }
 
@@ -158,16 +330,18 @@ func TestRunnerCloseOutBriefMayWaitOnCI(t *testing.T) {
 	}
 }
 
-// phaseDone is the runner's phase marker: the plane does not check who writes
-// it, so every runner brief must keep the session off it.
+// phaseDone is the runner's phase marker, and it rides on record_progress: the
+// phase briefs ban that write outright, so only the close-out needs the marker
+// named.
 func TestRunnerBriefsForbidThePhaseMarker(t *testing.T) {
-	for _, tc := range []struct{ name, block string }{
-		{"runner", runnerForbidden},
-		{"close-out", runnerCloseOutForbidden},
-	} {
-		if !strings.Contains(tc.block, "do NOT pass phaseDone to record_progress") {
-			t.Errorf("the %s prohibition does not keep the session off the runner's phase marker:\n%s", tc.name, tc.block)
-		}
+	if !strings.Contains(runnerForbidden, runnerNoWrites) {
+		t.Errorf("runnerForbidden does not carry the write ban that removes the phase marker:\n%s", runnerForbidden)
+	}
+	if !strings.Contains(runnerNoWrites, "phaseDone") {
+		t.Errorf("the write ban does not name the phase marker among the record_progress writes:\n%s", runnerNoWrites)
+	}
+	if !strings.Contains(runnerCloseOutForbidden, "do NOT pass phaseDone to record_progress") {
+		t.Errorf("the close-out prohibition does not keep the session off the runner's phase marker:\n%s", runnerCloseOutForbidden)
 	}
 }
 
@@ -227,16 +401,36 @@ func TestRunnerHandoffContinuationDropsTheServedSkillPointer(t *testing.T) {
 	if !strings.Contains(got, runnerForbidden) {
 		t.Errorf("the runner continuation does not carry the runner's prohibition:\n%s", got)
 	}
+	if !strings.Contains(got, runnerNoWrites) {
+		t.Errorf("the runner continuation does not carry the write ban:\n%s", got)
+	}
 	if got := RunnerHandoffContinuation(""); got != "" {
 		t.Errorf("RunnerHandoffContinuation(\"\") = %q, want empty", got)
 	}
 }
 
-func TestRunnerFixCoreReplacesTheWorktreeHunt(t *testing.T) {
-	if strings.Contains(runnerFixCore, fixWorktreeClause) {
-		t.Fatal("runnerFixCore still carries fixCore's worktree sentence: the substitution did not apply")
-	}
+// runnerFixCore is written for the runner rather than derived from fixCore, so
+// the worktree and the records are pinned here: the runner's prepared tree, and
+// no write of its own.
+func TestRunnerFixCoreStatesThePreparedWorktree(t *testing.T) {
 	if !strings.Contains(runnerFixCore, runnerWorktreeAtTip) {
 		t.Errorf("runnerFixCore does not state the prepared worktree and tip:\n%s", runnerFixCore)
+	}
+	if strings.Contains(runnerFixCore, "Work in the worktree for branch") {
+		t.Errorf("runnerFixCore carries a worktree hunt:\n%s", runnerFixCore)
+	}
+	if strings.Contains(runnerFixCore, "record_progress(taskId") {
+		t.Errorf("runnerFixCore still writes the task itself:\n%s", runnerFixCore)
+	}
+}
+
+func TestRunnerFixGradingRulePointsAtTheReport(t *testing.T) {
+	if runnerFixGradingRule == fixGradingRule {
+		t.Fatal("runnerFixGradingRule is unchanged: a shipped fixGradingRule edit broke the replacements")
+	}
+	for _, b := range []string{runnerFixBrief, runnerFixVerifyBrief} {
+		if strings.Contains(b, "in your outcome") {
+			t.Errorf("runner fix brief still tells the session to write its outcome")
+		}
 	}
 }
