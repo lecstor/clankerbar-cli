@@ -26,6 +26,10 @@ var (
 	// container, human-only work, a `someday` lane, approved work the operator
 	// integrates, or a task at its reclaim bound.
 	ErrNotClaimable = errors.New("the task is not claimable")
+
+	// ErrRunLost means a heartbeat was refused because this run no longer holds
+	// its task: taken over, reclaimed, released or withheld.
+	ErrRunLost = errors.New("the run no longer holds its task")
 )
 
 // TaskBrief is one task as the runner briefs it: the words to work to, where
@@ -181,6 +185,21 @@ func classifyRefusal(err error) error {
 		return fmt.Errorf("%w: %s", ErrClaimLost, refusalText(code, message))
 	case "not_claimable", "human_only", "is_container", "reclaim_bound_exhausted":
 		return fmt.Errorf("%w: %s", ErrNotClaimable, refusalText(code, message))
+	}
+	return err
+}
+
+// classifyHeartbeatRefusal wraps a refusal in ErrRunLost when the plane says this
+// run no longer holds the task. A session whose lease cannot be renewed is
+// working someone else's task, so the renewer ends it rather than retrying.
+func classifyHeartbeatRefusal(err error) error {
+	code, message, ok := refusalCode(err)
+	if !ok {
+		return err
+	}
+	switch code {
+	case "not_your_run", "run_superseded", "is_container", "human_only", "not_claimable", "run_secret_required", "run_secret_invalid":
+		return fmt.Errorf("%w: %s", ErrRunLost, refusalText(code, message))
 	}
 	return err
 }

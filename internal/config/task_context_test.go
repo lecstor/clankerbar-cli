@@ -61,6 +61,35 @@ func TestTaskContextBlockOmitsEmptySections(t *testing.T) {
 	}
 }
 
+// The runner-claimed session never claimed, so the ids it must sign every
+// write with are only in this block.
+func TestTaskContextBlockRendersTheTaskAndRunIDs(t *testing.T) {
+	block := TaskContextBlock(TaskContext{
+		Ref: "CLA-9", TaskID: "1a2b3c4d-0000", RunID: "run-7",
+		PhaseNumber: 1, PhaseTotal: 2, PhaseName: "implement", Worktree: "/tmp/wt/cla-9",
+	})
+	for _, want := range []string{
+		"Phase: 1 of 2 (implement)",
+		"Task id: 1a2b3c4d-0000",
+		"Run id: run-7 (sign every task write - record_progress, record_review, settle_task, release_task - with this taskId and runId)",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("the context block never says %q:\n%s", want, block)
+		}
+	}
+	phaseAt, taskAt, worktreeAt := strings.Index(block, "Phase:"), strings.Index(block, "Task id:"), strings.Index(block, "Worktree:")
+	if !(phaseAt < taskAt && taskAt < worktreeAt) {
+		t.Errorf("the ids do not sit between the phase and the worktree facts:\n%s", block)
+	}
+
+	withoutIDs := TaskContextBlock(TaskContext{Ref: "CLA-9"})
+	for _, absent := range []string{"Task id:", "Run id:"} {
+		if strings.Contains(withoutIDs, absent) {
+			t.Errorf("an empty id rendered %q:\n%s", absent, withoutIDs)
+		}
+	}
+}
+
 func TestTaskContextBlockStatesTheAbortedMerge(t *testing.T) {
 	block := TaskContextBlock(TaskContext{Ref: "CLA-3", Branch: "cla-3", PRBase: "staging", Merge: "merged", Conflicts: []string{"internal/config/phases.go", "docs/runner-owned-mechanics.md"}})
 	for _, want := range []string{

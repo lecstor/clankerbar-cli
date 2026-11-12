@@ -16,9 +16,7 @@ import (
 // session exiting: a cancelled context stops the run, a failed MCP preflight is
 // retried once, anything else is an error.
 func (r *phaseRun) endOnInvokeError(ctx context.Context, at *phaseAttempt) attemptVerdict {
-	d := r.d
 	t := r.t
-	tc := r.tc
 	drainNum := r.drainNum
 	phaseIdx := r.phaseIdx
 	ph := r.ph
@@ -38,11 +36,7 @@ func (r *phaseRun) endOnInvokeError(ctx context.Context, at *phaseAttempt) attem
 		// untrusted branch below and endUntrustedDrain (CLA-262) - counted
 		// nowhere, so no breaker ever acts on a figure that cannot be known.
 		if at.res.Untrusted == "" {
-			r.tokens += at.res.Tokens
-			r.cost += at.res.CostUSD
-			r.publishSpend()
-			recordPassSpend(r.end.session, a, &r.pass, &at.res)
-			d.charge(tc.HarnessFor(ph), at.res.Tokens, at.res.CostUSD)
+			r.countTrustedSpend(at)
 		}
 		// CLA-703: an MCP preflight failure is infrastructure, not a verdict
 		// on the phase. The session never reached its first turn, so the
@@ -76,7 +70,6 @@ func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) atte
 	tc := r.tc
 	drainNum := r.drainNum
 	ph := r.ph
-	a := r.a
 	// A session whose stream could not be read whole (CLA-262). Everything below
 	// this line reads a figure parsed out of that stream, so counting the spend,
 	// classifying the exit or retrying on the strength of it are three ways to
@@ -99,16 +92,23 @@ func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) atte
 	// real spend, not under-counting it. Each attempt is a distinct session, so
 	// summing per attempt (and returning the accumulator, not the final res)
 	// counts every session exactly once.
+	r.countTrustedSpend(at)
+
+	return attemptVerdict{}
+}
+
+// countTrustedSpend counts one attempt's spend toward the budget breaker and the
+// pass's session entry. Callers hold the guard that the stream was read whole: an
+// untrusted stream carries a floor, not a total, and is counted nowhere.
+func (r *phaseRun) countTrustedSpend(at *phaseAttempt) {
 	r.tokens += at.res.Tokens
 	r.cost += at.res.CostUSD
 	r.publishSpend()
 	// The pass's own session entry takes the same figures, in the same breath
 	// (CLA-691): every attempt the loop counts is money the record attributes
 	// to the pass, and none it refuses is.
-	recordPassSpend(r.end.session, a, &r.pass, &at.res)
-	d.charge(tc.HarnessFor(ph), at.res.Tokens, at.res.CostUSD)
-
-	return attemptVerdict{}
+	recordPassSpend(r.end.session, r.a, &r.pass, &at.res)
+	r.d.charge(r.tc.HarnessFor(r.ph), at.res.Tokens, at.res.CostUSD)
 }
 
 // handleUsageLimit waits out a rolling usage limit and re-runs the session, or

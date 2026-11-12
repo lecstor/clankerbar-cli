@@ -58,6 +58,10 @@ type phaseEnd struct {
 	// whatever came next.
 	released bool
 
+	// runLost reports that the phase ended because the plane said the run no
+	// longer holds the task; the drain ends and nothing is salvaged or handed back.
+	runLost bool
+
 	// checkpoint reports an orderly end still holding the task, with the sequence
 	// meant to continue into the next phase.
 	checkpoint bool
@@ -165,10 +169,11 @@ type phaseEnd struct {
 	noMCP bool
 
 	// toolLoop is the cause when the adapter killed this pass's session for
-	// repeating a failing tool call (CLA-739), "" otherwise. The pass is also
-	// dead (when !last and held); this carries the NAME of the death, so the
-	// panel handler records the member as failed with the cause rather than
-	// with "died producing nothing".
+	// repeating a failing tool call (CLA-739), "" otherwise. It is also
+	// `idle: <IdleKilled>` when the adapter killed the session for silence. Both
+	// are driver kills: the pass is also dead (when !last and held), and this
+	// carries the NAME of the death, so the panel handler records the member as
+	// failed with the cause rather than with "died producing nothing".
 	toolLoop string
 
 	// reviewCloseFailed reports that this pass's review seam gate passed far

@@ -45,6 +45,11 @@ var builtinPhasePrompts = map[string]string{
 	VerifyPhaseName: verifyBrief,
 }
 
+// BuiltinImplementBrief returns the shipped implement brief, so the driver can
+// tell a phase running it (and so swap in the runner-claimed variant) from one
+// carrying an operator's custom prompt.
+func BuiltinImplementBrief() string { return builtinPhasePrompts[ImplementPhaseName] }
+
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
 // tell whether a phase runs the built-in brief (vs an operator's custom prompt)
 // when it must choose a variant (CLA-497): a checkpoint evidenced by the
@@ -68,7 +73,9 @@ func ReviewShaped(prompt string) bool {
 	switch prompt {
 	case reviewOnlyBrief, unverifiedReviewOnlyBrief, noCodeReviewOnlyBrief,
 		panelMemberReviewOnlyBrief, panelMemberUnverifiedReviewOnlyBrief,
-		verifyBrief, noCodeVerifyBrief:
+		// Callers pass captured config prompts today, so these two arms only
+		// matter if a resolved runner prompt is ever checked.
+		runnerReviewOnlyBrief, verifyBrief, noCodeVerifyBrief, runnerVerifyBrief:
 		return true
 	}
 	return false
@@ -81,7 +88,9 @@ func ReviewShaped(prompt string) bool {
 // the driver must not mistake an ordinary review for it.
 func VerifyShaped(prompt string) bool {
 	switch prompt {
-	case verifyBrief, noCodeVerifyBrief:
+	case verifyBrief, noCodeVerifyBrief,
+		// As in ReviewShaped: only reachable if a resolved runner prompt is checked.
+		runnerVerifyBrief:
 		return true
 	}
 	return false

@@ -355,12 +355,13 @@ type Invocation struct {
 
 	// MaxSessionIdle bounds how long a session may go without ANY stream output
 	// before the adapter kills it as a silent hang: the adapter kills the
-	// process mid-session and records the cause on Result.IdleKilled; how the
-	// driver classifies that end is the loop's call. While a tool call is open the idle
-	// clock is paused (a build or an MCP call can legitimately emit nothing) and
-	// MaxToolCallDuration bounds that call instead. 0 disables the watchdog for
-	// this invocation, which is the default until the loop resolves it from
-	// config; probes never arm it.
+	// process mid-session and records the cause on Result.IdleKilled. While a
+	// tool call is open the idle clock is paused (a build or an MCP call can
+	// legitimately emit nothing) and MaxToolCallDuration bounds that call
+	// instead. 0 disables the watchdog for this invocation; probes never arm it.
+	//
+	// The loop resolves it per harness from Config.SessionIdleFor and classifies
+	// an IdleKilled end as dead, like a tool-loop kill.
 	MaxSessionIdle time.Duration
 
 	// MaxToolCallDuration bounds one tool call while MaxSessionIdle's watchdog

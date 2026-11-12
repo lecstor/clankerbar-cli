@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/logfile"
@@ -84,7 +85,7 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 	// refuses an existing path either way; this stops it turning into a denial
 	// of the log itself.
-	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases)
+	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner)
 	if at.ierr != nil {
 		// The session env refused to resolve (a failing or empty-output
 		// fromCommand, an unreadable @path file — the error names the
@@ -112,7 +113,35 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	if opts.worktree != "" {
 		at.inv.Prompt = panelWorktreeNote + at.inv.Prompt
 	}
+	// A runner-claimed session's task context goes outermost: it is the frame
+	// the brief was written to assume, and it is prepended here for the same
+	// reason as the grades above - plane text quoting `{{model}}` stays a quote.
+	if opts.runner != nil {
+		at.inv.Prompt = r.runnerContextBlock(at) + "\n\n---\n\n" + at.inv.Prompt
+	}
 	return attemptVerdict{}
+}
+
+// runnerContextBlock fills the context block from the attempt's resolved
+// invocation: the worktree is where the session actually starts, and the tip is
+// the checkpoint's when a predecessor recorded one, else what the runner's own
+// prep left in the tree.
+func (r *phaseRun) runnerContextBlock(at *phaseAttempt) string {
+	tip := ""
+	if r.prev != nil {
+		tip = r.prev.CheckpointTip
+	}
+	if tip == "" {
+		tip = r.opts.runner.prep.Tip
+	}
+	branch := ""
+	if r.prev != nil {
+		branch = verifiedBranch(r.prev)
+	}
+	if branch == "" {
+		branch = r.opts.runner.task.Branch
+	}
+	return config.TaskContextBlock(runnerTaskContext(r.opts.runner, r.phases, r.phaseIdx, at.inv.WorkDir, branch, r.prBase, tip))
 }
 
 // openAttemptLog opens this attempt's iteration log, points the invocation's
@@ -211,15 +240,32 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	// across supervised waits, after exit. Inside the window the adapter may
 	// run its own resurrection machinery (opencode CLA-406): those processes
 	// continue the SAME session on the SAME claim, so renewal spans them.
-	renewer := d.startLeaseRenewal(ctx, ti, t, &at.inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
+	//
+	// The child runs on its own cancellable context so the renewer can end it
+	// the moment the plane says the run no longer holds the task. The renewer
+	// itself stays on the parent context: it still has its log line to write,
+	// and a cancelled parent is the operator stopping the whole run, not a lost
+	// claim.
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	loss := &leaseLoss{}
+	renewer := d.startLeaseRenewal(ctx, ti, t, &at.inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum), func(err error) {
+		loss.record(err)
+		cancel(err)
+	})
 	// The launch boundary itself (CLA-738 review 3.2): a panel member releases
 	// its successor here, so nothing this member did before its adapter call
 	// (worktree, brief, budget check) can be overtaken by a later member's.
 	if opts.onSessionLaunch != nil {
 		opts.onSessionLaunch()
 	}
-	at.res, at.ierr = a.Invoke(ctx, at.inv)
-	renewer.stop()
+	at.res, at.ierr = a.Invoke(sctx, at.inv)
+	joined := renewer.stop()
+	// Only a session this run ended counts as lost: a cancelled parent is the
+	// operator stopping the whole run.
+	if ctx.Err() == nil {
+		at.runLost = renewalCause(sctx, joined, loss.cause())
+	}
 	// CLA-782: record the routes this session was denied and write each SWITCH
 	// to both logs before the iteration log is closed. Runs before every
 	// classification below, because a transient retry must already start on the
@@ -251,6 +297,10 @@ func (r *phaseRun) classifyEnd(at *phaseAttempt) {
 	// panel's failed-member path and the fleet record. Not a cap: a cap is an
 	// orderly end of a session doing its job, and this one had stopped.
 	at.toolLoop = at.res.ToolLoop
+	if at.toolLoop == "" && at.res.IdleKilled != "" {
+		// A silence kill is a driver kill like a tool loop: dead, never a checkpoint, retried by the dead-phase ladder.
+		at.toolLoop = "idle: " + at.res.IdleKilled
+	}
 	at.producedNothing = at.res.Untrusted == "" && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
 }
 

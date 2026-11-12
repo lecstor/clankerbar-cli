@@ -105,6 +105,13 @@ type panelParallelAdapter struct {
 	// reports for killing it on a repeated failing tool call (CLA-739),
 	// still holding the claim it resumed.
 	failToolLoop string
+	// lostLabel, when set, is a member whose session blocks until its context is
+	// cancelled and then returns that cancellation as an invocation error — the
+	// shape the renewer's run-lost kill produces. onLostBlocked, when non-nil,
+	// is called once that member is blocked, so a test can arm the refusing
+	// heartbeat at the moment the session is live.
+	lostLabel     string
+	onLostBlocked func()
 
 	mu          sync.Mutex
 	calls       int
@@ -175,7 +182,7 @@ func (a *panelParallelAdapter) Invoke(ctx context.Context, in harness.Invocation
 
 	switch {
 	case strings.Contains(in.Prompt, "REVIEW-ONLY gate"):
-		return a.review(in)
+		return a.review(ctx, in)
 	case strings.Contains(in.Prompt, "the FIX phase"):
 		a.mu.Lock()
 		a.fixCalls++
@@ -227,7 +234,7 @@ func (a *panelParallelAdapter) fails(label string) bool {
 	return false
 }
 
-func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, error) {
+func (a *panelParallelAdapter) review(ctx context.Context, in harness.Invocation) (harness.Result, error) {
 	label := reviewRoleFromPrompt(in.Prompt)
 	if label == "" {
 		a.recordErr("a review brief carried no reviewerRole: %s", in.Prompt)
@@ -261,6 +268,21 @@ func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, er
 		close(a.allStarted)
 	}
 	a.mu.Unlock()
+
+	if label == a.lostLabel {
+		// The run is taken away mid-session: hold the session open until the
+		// renewer's onLost cancels it, then report the cancellation the way any
+		// killed session does.
+		a.waitBarrier(label)
+		if a.onLostBlocked != nil {
+			a.onLostBlocked()
+		}
+		<-ctx.Done()
+		a.mu.Lock()
+		a.inFlight--
+		a.mu.Unlock()
+		return harness.Result{}, ctx.Err()
+	}
 
 	if a.fails(label) {
 		// The barrier still counts it as started — the panel's other members must
@@ -340,7 +362,7 @@ func panelGitOutput(dir string, args ...string) (string, error) {
 // the config's default (the whole panel). The fakeFleet is on the target so the
 // iteration RECORD is observable: free text in its Outcome is what the plane
 // refused in CLA-738, and the parallel path is the shipped default.
-func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, members []config.ReviewPanelMember, workdir, tip string, concurrency int) (*Driver, *fakeFleet) {
+func panelParallelDriver(t *testing.T, h harness.Adapter, rel plane.Releaser, members []config.ReviewPanelMember, workdir, tip string, concurrency int) (*Driver, *fakeFleet) {
 	t.Helper()
 	cfg := fastCfg()
 	cfg.Prompt = ""
@@ -991,6 +1013,90 @@ func TestDrainPhases_ParallelPanelOnlyOptionalSeatsRecordedSpawnsNoFix(t *testin
 	}
 	if out := logs.String(); !strings.Contains(out, "no REQUIRED member of the review panel recorded") {
 		t.Errorf("the daemon log does not say why no fix spawned:\n%s", out)
+	}
+	requireOneFleetRecord(t, ff)
+}
+
+// --- a panel member losing its run ------------------------------------------
+
+// panelBeat is the lease renewal the panel's members beat on. Once armed it
+// refuses every beat with plane.ErrRunLost, which is what the renewer ends a
+// session on; before that it answers normally, so the implement phase is not
+// disturbed.
+type panelBeat struct {
+	mu    sync.Mutex
+	armed bool
+	beats int
+}
+
+func (b *panelBeat) Heartbeat(context.Context, string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.beats++
+	if b.armed {
+		return fmt.Errorf("%w: run_superseded", plane.ErrRunLost)
+	}
+	return nil
+}
+
+func (b *panelBeat) arm() {
+	b.mu.Lock()
+	b.armed = true
+	b.mu.Unlock()
+}
+
+// panelLostReleaser is the panel's plane fake plus that heartbeat, so the
+// driver's renewer starts for the panel's members.
+type panelLostReleaser struct {
+	*reviewReleaser
+	beat *panelBeat
+}
+
+func (r *panelLostReleaser) Heartbeat(ctx context.Context, runID string) error {
+	return r.beat.Heartbeat(ctx, runID)
+}
+
+// TestDrainPhases_ParallelPanelMemberLosingItsRunEndsTheDrain: a member whose
+// run the plane refuses is working a task that is no longer this run's, so the
+// walk must end there — no fix against findings nobody owns, and no handback of
+// someone else's claim.
+func TestDrainPhases_ParallelPanelMemberLosingItsRunEndsTheDrain(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	beat := &panelBeat{}
+	members := panelMembers()
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	a.lostLabel = "review-2"
+	a.onLostBlocked = beat.arm
+	d, ff := panelParallelDriver(t, a, &panelLostReleaser{reviewReleaser: rel, beat: beat}, members, repo, tip, 0)
+	// The production cadence is a third of a 30-minute lease; the refusal must
+	// land while the member's session is still running.
+	d.leaseRenewalInterval = time.Millisecond
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — a lost run ends the drain, it does not fail it", err, stop)
+	}
+	a.mu.Lock()
+	fixCalls := a.fixCalls
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if fixCalls != 0 {
+		t.Errorf("fix sessions = %d, want 0 — the panel's findings are not this run's to apply", fixCalls)
+	}
+	// Nothing is owed a handback: the claim belongs to whoever took the task.
+	rel.mu.Lock()
+	releases := len(rel.calls)
+	expires := len(rel.expireCalls)
+	rel.mu.Unlock()
+	if releases != 0 || expires != 0 {
+		t.Errorf("handback calls = %d release(s), %d expire(s); want none after a lost run", releases, expires)
+	}
+	if out := logs.String(); !strings.Contains(out, "the task is no longer this run's") {
+		t.Errorf("the daemon log does not say why the drain ended:\n%s", out)
 	}
 	requireOneFleetRecord(t, ff)
 }

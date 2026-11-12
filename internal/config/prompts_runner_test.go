@@ -201,6 +201,37 @@ func TestRunnerRerunGuidanceInlinesTheWaitingRule(t *testing.T) {
 	}
 }
 
+// A runner-claimed handoff respawn gets the runner's own preamble: no heartbeat,
+// no claim, no skill page - and adapting a shipped continuation rewrites the
+// waiting pointer without dropping the bound.
+func TestRunnerHandoffPreambleLeavesTheLeaseAlone(t *testing.T) {
+	if strings.Contains(RunnerHandoffPreamble, `heartbeat("`) {
+		t.Errorf("RunnerHandoffPreamble still tells the successor to resume the run itself:\n%s", RunnerHandoffPreamble)
+	}
+	if !strings.Contains(RunnerHandoffPreamble, PhaseRunPlaceholder) || !strings.Contains(RunnerHandoffPreamble, PhaseTaskPlaceholder) {
+		t.Errorf("RunnerHandoffPreamble does not name the run and task placeholders:\n%s", RunnerHandoffPreamble)
+	}
+}
+
+func TestRunnerHandoffContinuationDropsTheServedSkillPointer(t *testing.T) {
+	got := RunnerHandoffContinuation(HandoffContinuation(ImplementPhaseName))
+	if got == "" {
+		t.Fatal("RunnerHandoffContinuation dropped a shipped continuation")
+	}
+	if strings.Contains(got, "waiting.md") {
+		t.Errorf("the runner continuation still points at a served skill page:\n%s", got)
+	}
+	if !strings.Contains(got, runnerWaitRule) {
+		t.Errorf("the runner continuation does not carry the inline waiting rule:\n%s", got)
+	}
+	if !strings.Contains(got, runnerForbidden) {
+		t.Errorf("the runner continuation does not carry the runner's prohibition:\n%s", got)
+	}
+	if got := RunnerHandoffContinuation(""); got != "" {
+		t.Errorf("RunnerHandoffContinuation(\"\") = %q, want empty", got)
+	}
+}
+
 func TestRunnerFixCoreReplacesTheWorktreeHunt(t *testing.T) {
 	if strings.Contains(runnerFixCore, fixWorktreeClause) {
 		t.Fatal("runnerFixCore still carries fixCore's worktree sentence: the substitution did not apply")

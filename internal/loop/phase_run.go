@@ -140,11 +140,13 @@ type attemptVerdict struct {
 // phaseAttempt is one pass through the ladder: the session it spawned, how that
 // session ended, and the seam's verdict on it. A fresh one is made per attempt.
 // res is shared by pointer with phaseEnd.claim, so it lives here rather than
-// being passed by value between stages.
+// being passed by value between stages. runLost is non-nil when the renewer
+// ended the session because the plane says the run no longer holds the task.
 type phaseAttempt struct {
 	inv                harness.Invocation
 	res                harness.Result
 	ierr               error
+	runLost            error
 	logPath            string
 	logFile            *os.File
 	capped             bool

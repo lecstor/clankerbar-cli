@@ -651,11 +651,18 @@ func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
 // Heartbeat renews a live claim's lease. It is the driver-side renewal (CLA-358):
 // the loop calls it periodically while a session lives, so a >30-minute session
 // does not have its lease expire and become a stale take-over offer.
+//
+// A refusal that says this run no longer holds the task is classified as
+// ErrRunLost, because it is the one answer the caller must act on at once.
 func (r *mcpReleaser) Heartbeat(ctx context.Context, runID string) error {
 	if runID == "" {
 		return errors.New("heartbeat: runId is required")
 	}
-	return r.call(ctx, "heartbeat", map[string]any{
+	err := r.call(ctx, "heartbeat", map[string]any{
 		"runId": runID,
 	})
+	if err != nil {
+		return classifyHeartbeatRefusal(err)
+	}
+	return nil
 }

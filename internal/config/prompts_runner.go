@@ -237,6 +237,24 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	verifyStoppingRule + verifyDriverBounds + verifyTerminalStep + runnerRerunGuidance + runnerForbidden +
 	handoffGuidance
 
+// RunnerHandoffPreamble is HandoffPreamble for a runner-claimed session: the
+// runner holds the lease, so no heartbeat, and the work stays in the worktree the
+// runner started it in.
+const RunnerHandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on task " + PhaseTaskPlaceholder +
+	", handed to you by the previous session on this task via a self-chosen handoff. The runner claimed the task " +
+	"and holds its lease: do NOT call next_task, claim_task or heartbeat, and stay within this phase's scope and " +
+	"in the worktree you were started in. What follows is the previous session's own continuation prompt:\n\n"
+
+// RunnerHandoffContinuation adapts a shipped handoff continuation for a
+// runner-claimed session: the waiting reference becomes the brief's own rule and
+// the runner's prohibition is appended.
+func RunnerHandoffContinuation(continuation string) string {
+	if continuation == "" {
+		return ""
+	}
+	return strings.Replace(continuation, rerunGuidance, runnerRerunGuidance, -1) + runnerForbidden
+}
+
 // RunnerImplementBrief returns the implement phase's brief for a runner-claimed
 // session.
 func RunnerImplementBrief() string { return runnerImplementBrief }

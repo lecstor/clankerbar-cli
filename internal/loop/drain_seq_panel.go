@@ -143,6 +143,12 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 				// lapse into a takeover, never released); no record at all means
 				// no fix.
 				switch {
+				case out.runLost:
+					// The task is no longer this run's: nothing is owed a handback and no later
+					// phase runs. First, so a failed close cannot leave the claim to be released.
+					s.carried = nil
+					log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
+					return seqBreak
 				case out.closeFailed:
 					if s.limitWait == nil && out.sequenceEnded && out.limitWait == nil {
 						s.transientKey = out.transientKey

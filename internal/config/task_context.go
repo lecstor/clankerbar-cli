@@ -32,9 +32,16 @@ const taskContextTruncationNote = "(truncated — the full text is on the task: 
 // Questions and Decisions are newest-first except for the blocking questions,
 // which the plane appends at the END. RunnerNext is one sentence naming what
 // the runner does after this session ends.
+//
+// TaskID and RunID are the ids every task write must be signed with. A
+// runner-claimed session never claimed, so these are the only place it learns
+// them: the runner briefs name record_progress(taskId, runId) but carry no
+// placeholder for either.
 type TaskContext struct {
 	Ref         string
 	Title       string
+	TaskID      string
+	RunID       string
 	Detail      string
 	DoneWhen    string
 	PhaseNumber int
@@ -218,6 +225,15 @@ func taskContextHeader(c TaskContext) string {
 	}
 	if phase := taskContextPhase(c); phase != "" {
 		lines = append(lines, phase)
+	}
+	// The ids come right after the phase so they are read before the work, and
+	// the run line states what to do with them: a session that never claimed
+	// has nowhere else to learn them.
+	if id := strings.TrimSpace(c.TaskID); id != "" {
+		lines = append(lines, "Task id: "+id)
+	}
+	if id := strings.TrimSpace(c.RunID); id != "" {
+		lines = append(lines, "Run id: "+id+" (sign every task write - record_progress, record_review, settle_task, release_task - with this taskId and runId)")
 	}
 	for _, field := range []struct{ label, value string }{
 		{"Worktree", c.Worktree},

@@ -133,6 +133,10 @@ walk:
 		case seqBreak:
 			break walk
 		}
+		if st.end.runLost {
+			log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(t), drainNum)
+			break
+		}
 		switch s.judgeSequenceEnd(st) {
 		case seqContinue:
 			continue
@@ -330,6 +334,11 @@ type phaseRunOpts struct {
 	// (CLA-738 review 3.2). Idempotent on the panel side, so a retry's repeat
 	// call is harmless. Nil for every other caller.
 	onSessionLaunch func()
+
+	// runner, when non-nil, briefs this phase as a session of a drain the RUNNER
+	// claimed: the runner-claimed briefs and the task context block. Nil is the
+	// session-claim path, which runs the shipped briefs.
+	runner *runnerBriefing
 }
 
 // panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).

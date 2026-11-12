@@ -47,12 +47,16 @@ import (
 // brief — phase 1, claim-free at spawn time — is itself one of the carriers, in
 // its resumed-work rule. Empty leaves the placeholder standing, like the rest.
 //
+// runner is the runner-claimed briefing, nil for the session-claim path: it
+// swaps the shipped briefs for the ones that assume the runner already holds the
+// claim, and names the branch a fresh claim has not recorded yet.
+//
 // phases is the sequence as CAPTURED when the drain started, and supplies every
 // positional/attribution fact here — the "PHASE i of N" total and the previous
 // phase's harness/model. A RELOAD applied inside a wait swaps the live config
 // under an in-flight sequence (CLA-664), and the sequence must keep its own
 // shape and attribution until the next drain.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase) (harness.Invocation, error) {
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing) (harness.Invocation, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
@@ -82,6 +86,8 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	inv.MaxSessionWallClock = ph.MaxWallClock.Duration()
 	// CLA-739: the repeated-failing-tool-call kill. Default on (5), 0 off.
 	inv.MaxRepeatedToolFailures = tc.RepeatedToolFailureBound()
+	// The no-output watchdog, armed per harness: its adapter enforces the bounds, the loop only resolves them.
+	inv.MaxSessionIdle, inv.MaxToolCallDuration = tc.SessionIdleFor(tc.HarnessFor(ph))
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the
@@ -237,6 +243,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 			// to re-review; its brief adjudicates the record's findings.
 			prompt = config.NoCodeVerifyBrief()
 		}
+		prompt = runnerPrompt(prompt, runner, panelMember)
 		inv.Prompt = prompt
 		// Seed the claim as well as the prompt. The session is told not to claim,
 		// so the adapter would observe none — and Result.Claim.Held() is what gates
@@ -291,10 +298,16 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		repl = append(repl, config.PhasePRBasePlaceholder, prBase)
 	}
 	if prev != nil && prev.Claim.Held() {
+		branch := verifiedBranch(prev)
+		if branch == "" && runner != nil && (inv.Prompt == config.RunnerImplementBrief() || inv.Prompt == config.RunnerCloseOutBrief()) {
+			// A fresh claim has no recorded branch yet; the runner created the
+			// worktree on the plane's name.
+			branch = runner.task.Branch
+		}
 		repl = append(repl,
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
-			config.PhaseBranchPlaceholder, verifiedBranch(prev),
+			config.PhaseBranchPlaceholder, branch,
 		)
 		// CLA-637: the durable review record's identity. The role is the
 		// driver's assignment for THIS phase, and the tip is the origin commit

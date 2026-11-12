@@ -1812,6 +1812,7 @@ instance the supervisor reads.
   "retry_cap": "5m",
   "max_zero_spend_attempts": 3,
   "max_repeated_tool_failures": 5,
+  "session_idle": {"opencode": {"max_idle": "15m"}, "claude": {"max_idle": "10m", "max_tool_call": "30m"}},
   "echo_sessions": false,
   "budget": {
     "max_tokens": 0,
@@ -2387,6 +2388,16 @@ with that cause. It is never retried as a transient failure and never stops the
 run. `0` turns the check off; unset is the default; a negative is refused.
 Enforced by the `claude` and `opencode` adapters, which see tool results as they
 stream; inert under `codex`.
+
+**A session that goes silent is killed.** `session_idle` is the no-output
+watchdog: a session silent for `max_idle` is ended by the driver. Under `claude`
+the clock pauses while a tool call is open, and `max_tool_call` caps that single
+call; `opencode` emits nothing while a tool is running, so its idle bound has to
+stay above its own 10-minute bash-tool ceiling. A killed session is classified
+**dead, no delivery**, exactly as a tool-loop kill is: the daemon log and the
+session's `cause` carry the idle cause (`idle: no output for 15m0s`, or
+`idle: tool call ... open for 30m0s` when the per-call cap fired). `0` disables a
+bound; enforced by the `claude` and `opencode` adapters, inert under `codex`.
 
 **And one more thing is bounded: retries taken on a failure the harness could not
 name.** `opencode`'s error surface changes between versions, so beyond the anchored

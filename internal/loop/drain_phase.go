@@ -171,11 +171,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// A tool-loop kill is salvaged like any other end, but not with the
 		// emphatic "produced nothing" line: a clean tree there may well be work
 		// the session committed and pushed before it started looping.
-		if !requireReviewRecord {
+		//
+		// A run the plane says is gone is not salvaged at all: the task is
+		// someone else's now, and the plane told this run not to commit or push.
+		if !requireReviewRecord && at.runLost == nil {
 			d.salvageStrandedWork(ctx, t, &at.res, at.producedNothing && at.toolLoop == "", at.inv.WorkDir)
 		}
 		r.classifyExit(at)
 		r.openPhaseEnd(at)
+		if at.runLost != nil {
+			return r.result(r.endRunLost(at))
+		}
 		r.classifyHandoff(at)
 		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the
 		// driver's lease renewer renews a claim for a session's whole lifetime, so

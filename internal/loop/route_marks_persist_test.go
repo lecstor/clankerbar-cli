@@ -28,7 +28,7 @@ func TestRouteMarks_SurviveRestart(t *testing.T) {
 	prev := checkpointed(1, 0)
 	ph := config.Phase{Name: config.ReviewPhaseName, Prompt: config.ReviewOnlyBrief()}
 	phases := []config.Phase{{Name: "implement"}, ph, {Name: "fix"}}
-	inv, err := second.invocationFor(second.targets[0], 1, ph, &prev, "", "", phases)
+	inv, err := second.invocationFor(second.targets[0], 1, ph, &prev, "", "", phases, nil)
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}

@@ -94,7 +94,13 @@ func (s *drainSeq) buildHandoffPrompt(st *seqStep) seqNext {
 				continuation = config.HandoffContinuationFor(st.ph.Name, reviewOnly)
 			}
 		}
-		st.ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
+		if s.runnerClaimed {
+			// The runner holds the lease and the worktree, so the successor must
+			// not resume the run itself nor fetch a skill page.
+			st.ph.Prompt = config.RunnerHandoffPreamble + s.nextPrompt + config.RunnerHandoffContinuation(continuation)
+		} else {
+			st.ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
+		}
 		s.nextPrompt = ""
 	}
 
@@ -179,11 +185,19 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 	// call: the seam below may replace `carried` with this phase's own
 	// claim, which says nothing about how the phase was entered.
 	st.phaseResumed = s.carried != nil
+	opts := phaseRunOpts{taskDir: s.taskDir}
+	if s.runnerClaimed && s.carried != nil {
+		opts.runner = &runnerBriefing{task: s.claimedTask, runID: s.carried.Claim.RunID, start: s.i == s.start}
+		if opts.runner.start {
+			opts.runner.prep = s.prep
+			opts.runner.closeOut = s.closeOut
+		}
+	}
 	st.ptokens, st.pcost, st.pstop, st.end, st.perr = d.drainPhase(ctx, drainNum, ti, s.i, st.tag, st.ph, st.terminal, s.carried, t, spend{
 		start:  prior.start,
 		tokens: prior.tokens + s.tokens,
 		cost:   prior.cost + s.cost,
-	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, phaseRunOpts{taskDir: s.taskDir})
+	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, opts)
 	s.tokens += st.ptokens
 	s.cost += st.pcost
 	// CLA-630: one entry per session this pass spawned, in spawn order. nil
