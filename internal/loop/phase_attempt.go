@@ -98,6 +98,10 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	// Who this session is, for the record its done report becomes: resolved from
 	// the same inputs invocationFor filled the attribution placeholders from.
 	at.attr, at.role = d.doneAttribution(t, ph, phases, phaseIdx, at.inv)
+	// The report this phase owes, checked by the adapter before the session is
+	// allowed to end: the same pure validation the runner would apply, so a
+	// resumable harness can steer the session to fix its own report.
+	at.inv.CheckReport = r.reportCheck()
 	// The graded list is PREPENDED after placeholder substitution, never
 	// run through the one-pass replacer: it is driver-read text from the
 	// plane, and a finding quoting `{{model}}` must stay a quote.

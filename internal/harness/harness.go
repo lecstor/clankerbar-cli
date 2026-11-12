@@ -382,6 +382,13 @@ type Invocation struct {
 	// leaves Settled/HasWIP to be observed from the stream as usual.
 	ResumeClaim Claim
 
+	// CheckReport is the runner's check of a done report in the session's final
+	// message; nil means the phase owes none. An adapter that can resume a
+	// session in place (opencode) resumes once with the check's error as a steer
+	// when the final message fails it; others ignore it and the runner fails
+	// closed on the bad report as before.
+	CheckReport func(finalMessage string) error
+
 	// OnClaim, when non-nil, is called by the adapter's parser the moment it
 	// observes the session's clankerbar claim state change: a claim_task whose
 	// result carried both ids (the tracked claim), and a settle of that claim.

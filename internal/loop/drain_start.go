@@ -133,6 +133,10 @@ func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, 
 		log.Printf("%siteration %d: %s: the PR base did not merge cleanly; the session is briefed with the conflicting paths: %s",
 			labelOf(s.t), s.drainNum, claimLabel(claim), strings.Join(prep.Conflicts, ", "))
 	}
+	if prep.AdoptedOutside {
+		log.Printf("%siteration %d: %s: adopted the existing worktree %s (clean, at or behind origin) for the task",
+			labelOf(s.t), s.drainNum, claimLabel(claim), prep.Dir)
+	}
 	s.taskDir = prep.Dir
 	s.prep = prep
 	return choice, true
