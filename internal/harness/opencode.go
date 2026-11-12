@@ -287,6 +287,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			fmt.Fprintf(console, "!! resurrection %d succeeded — session continued in place\n", n+1)
 		}
 	}
+	// Last, so it judges the merged result of every recovery above and resumes
+	// on the route that finished. One resume; a second refusal is the runner's.
+	o.resumeBadReport(ctx, in, &res, deadline)
 	return res, nil
 }
 

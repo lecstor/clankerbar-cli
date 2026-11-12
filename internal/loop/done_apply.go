@@ -193,7 +193,7 @@ func (r *phaseRun) applyImplementReport(ctx context.Context, w plane.ReportWrite
 // the plane refuses the run's outcome write once its review record is sealed.
 func (r *phaseRun) applyReviewReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
 	tip := r.checkpointTip()
-	if err := rep.ValidateReview(tip); err != nil {
+	if err := r.checkReviewRecord(rep); err != nil {
 		r.noteReportProblem("its done report is not a valid review record: %v", err)
 		return
 	}
@@ -247,7 +247,7 @@ func (r *phaseRun) applyFixReport(ctx context.Context, w plane.ReportWriter, at 
 	if r.fixParked(ctx, at, rep) {
 		return
 	}
-	if err := config.ValidateFindingUpdates(rep.FindingUpdates); err != nil {
+	if err := r.checkFixReport(rep); err != nil {
 		r.noteReportProblem("its done report carries finding updates the plane would refuse: %v", err)
 		return
 	}
@@ -277,7 +277,7 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 	if r.fixParked(ctx, at, rep) {
 		return
 	}
-	if err := config.ValidateFindingUpdates(rep.FindingUpdates); err != nil {
+	if err := r.checkFixReport(rep); err != nil {
 		r.noteReportProblem("its done report carries finding updates the plane would refuse: %v", err)
 		return
 	}
@@ -321,8 +321,7 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 // the review block, then the durable record scoped to the fix delta. The record
 // is kept for the hand-over judgeVerifyRound performs once the round is closed.
 func (r *phaseRun) applyVerifyReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
-	tip := r.checkpointTip()
-	if err := rep.ValidateReview(tip); err != nil {
+	if err := r.checkReviewRecord(rep); err != nil {
 		r.noteReportProblem("its done report is not a valid verification record: %v", err)
 		return
 	}
