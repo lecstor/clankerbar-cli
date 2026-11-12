@@ -46,14 +46,15 @@ type worktreeRequest struct {
 
 // worktreePrep is the prepared tree the caller briefs the session with.
 type worktreePrep struct {
-	Dir       string
-	Tip       string   // HEAD after prep
-	OriginTip string   // origin/<branch> after the fetch; empty when the branch is not on origin
-	Ahead     int      // commits HEAD has that origin/<branch> lacks; 0 when OriginTip is empty
-	Created   bool     // worktree newly added (vs reused)
-	Merged    bool     // PRBase merged into a resumed branch, moving HEAD
-	UpToDate  bool     // merge was a no-op
-	Conflicts []string // merge stopped: conflicting paths; aborted, tree clean at the pre-merge tip
+	Dir            string
+	Tip            string   // HEAD after prep
+	OriginTip      string   // origin/<branch> after the fetch; empty when the branch is not on origin
+	Ahead          int      // commits HEAD has that origin/<branch> lacks; 0 when OriginTip is empty
+	Created        bool     // worktree newly added (vs reused)
+	AdoptedOutside bool     // reused a tree outside the task-worktree roots: clean, at or behind origin
+	Merged         bool     // PRBase merged into a resumed branch, moving HEAD
+	UpToDate       bool     // merge was a no-op
+	Conflicts      []string // merge stopped: conflicting paths; aborted, tree clean at the pre-merge tip
 }
 
 // registeredWorktree is one entry of `git worktree list --porcelain`.
@@ -74,11 +75,10 @@ var errWorktreeFetch = errors.New("fetching origin")
 // where it is and what happened to it. An error from the fetch is transient: the
 // caller should retry rather than treat the task as failed.
 func prepareTaskWorktree(ctx context.Context, req worktreeRequest) (worktreePrep, error) {
-	dir, err := taskWorktreeDir(req)
-	if err != nil {
+	if err := validateWorktreeRequest(req); err != nil {
 		return worktreePrep{}, err
 	}
-	prep := worktreePrep{Dir: dir}
+	prep := worktreePrep{}
 	if !req.Fetched {
 		if _, err := taskWorktreeGit(ctx, req.Checkout, "fetch", "origin", "--prune"); err != nil {
 			return prep, fmt.Errorf("%w in %s: %v", errWorktreeFetch, req.Checkout, err)
@@ -102,61 +102,142 @@ func prepareTaskWorktree(ctx context.Context, req worktreeRequest) (worktreePrep
 			return prep, err
 		}
 	}
+	// git lists the main worktree first: it decides where a task tree may live.
+	var main string
+	if len(registered) > 0 {
+		main = registered[0].path
+	}
+	prep.Dir = taskWorktreeDir(req, main)
 	for _, wt := range registered {
-		if taskWorktreeSamePath(wt.path, dir) {
+		if taskWorktreeSamePath(wt.path, prep.Dir) {
 			return reuseTaskWorktree(ctx, req, prep, wt)
 		}
 	}
 	// The branch may already be checked out elsewhere — a session can cut its
 	// own `<repo>/.worktrees/<name>` for it, and git refuses to add it twice.
-	// Only a tree under the task-worktree roots is provably this task's own;
-	// anything else may be another drain instance's checkout.
 	if wt, ok := taskWorktreeOnBranch(registered, req.Branch); ok {
-		// The main worktree is listed first: the operator's checkout, never a
-		// session's. req.Checkout itself may be a LINKED worktree (the fleet
-		// layout), so it is another run's tree too.
-		if len(registered) > 0 && taskWorktreeSamePath(wt.path, registered[0].path) {
-			return prep, fmt.Errorf("the branch %s is checked out in the main checkout %s — refusing to run a session there", req.Branch, wt.path)
-		}
-		if taskWorktreeSamePath(wt.path, req.Checkout) {
-			return prep, fmt.Errorf("the branch %s is checked out in %s — refusing to run a session there", req.Branch, wt.path)
-		}
-		roots := []string{panelWorktreeRoot(req.Checkout)}
-		if len(registered) > 0 {
-			roots = append(roots, filepath.Join(registered[0].path, ".worktrees"))
-		}
-		adoptable := false
-		for _, root := range roots {
-			adoptable = adoptable || taskWorktreeUnder(wt.path, root)
-		}
-		if !adoptable {
-			return prep, fmt.Errorf("the branch %s is checked out in %s, which is not a task worktree — refusing to adopt it", req.Branch, wt.path)
-		}
-		prep.Dir = wt.path
-		return reuseTaskWorktree(ctx, req, prep, wt)
+		return adoptBranchWorktree(ctx, req, prep, wt, main)
 	}
 	return createTaskWorktree(ctx, req, prep)
 }
 
-// taskWorktreeDir validates the request and resolves the deterministic path:
-// the fleet's worktree root for this checkout, then the task's id prefix.
-func taskWorktreeDir(req worktreeRequest) (string, error) {
+// adoptBranchWorktree takes over the tree the task's branch is already checked
+// out in, or refuses it by name. A tree under the task-worktree roots is this
+// task's own; one elsewhere is adopted only when it holds nothing origin does
+// not, because another cut of the same branch would otherwise be refused here
+// and burn the task's claim. Getting here means this run holds the task's claim,
+// so the previous holder's lease has ended, and nothing in the tree is moved
+// until the check below proved it holds nothing origin lacks.
+func adoptBranchWorktree(ctx context.Context, req worktreeRequest, prep worktreePrep, wt registeredWorktree, main string) (worktreePrep, error) {
+	// The main worktree is the operator's checkout, never a session's.
+	// req.Checkout itself may be a LINKED worktree (the fleet layout), so it is
+	// another run's tree too.
+	if main != "" && taskWorktreeSamePath(wt.path, main) {
+		return prep, fmt.Errorf("the branch %s is checked out in the main checkout %s — refusing to run a session there", req.Branch, wt.path)
+	}
+	if taskWorktreeSamePath(wt.path, req.Checkout) {
+		return prep, fmt.Errorf("the branch %s is checked out in %s — refusing to run a session there", req.Branch, wt.path)
+	}
+	roots := []string{taskWorktreeRoot(req.Checkout, main)}
+	if main != "" {
+		roots = append(roots, filepath.Join(main, ".worktrees"))
+	}
+	for _, root := range roots {
+		if taskWorktreeUnder(wt.path, root) {
+			prep.Dir = wt.path
+			return reuseTaskWorktree(ctx, req, prep, wt)
+		}
+	}
+	reason, err := taskWorktreeUnsafeToAdopt(ctx, req, wt)
+	if err != nil {
+		return prep, err
+	}
+	if reason != "" {
+		return prep, fmt.Errorf("the branch %s is checked out in %s, which is not a task worktree and is not safe to adopt (%s) — refusing to adopt it", req.Branch, wt.path, reason)
+	}
+	prep.Dir = wt.path
+	prep.AdoptedOutside = true
+	return reuseTaskWorktree(ctx, req, prep, wt)
+}
+
+// taskWorktreeUnsafeToAdopt names what a tree outside the task-worktree roots
+// holds that origin does not, or "" when adopting it would discard nothing: a
+// clean tree at or behind origin (or the PR base, for a branch never pushed)
+// carries no unpushed work, and this run holds the task's claim.
+func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt registeredWorktree) (string, error) {
+	dirty, err := taskWorktreeDirty(ctx, wt.path)
+	if err != nil {
+		return "", err
+	}
+	if dirty != "" {
+		return "uncommitted changes: " + dirty, nil
+	}
+	remote := "origin/" + req.Branch
+	if taskWorktreeCommitishExists(ctx, wt.path, remote) {
+		if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", remote); err != nil {
+			return fmt.Sprintf("it holds commits origin/%s does not have", req.Branch), nil
+		}
+		return "", nil
+	}
+	// A fresh task that pushed nothing yet: a tree at or behind the PR base is
+	// exactly what taskWorktreeAddNew would cut, so it holds nothing to lose.
+	if !req.Resume && req.PRBase != "" {
+		base := "origin/" + req.PRBase
+		if taskWorktreeCommitishExists(ctx, wt.path, base) {
+			if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", base); err == nil {
+				return "", nil
+			}
+			return fmt.Sprintf("the branch is not on origin and holds commits %s does not have", base), nil
+		}
+	}
+	return "the branch is not on origin", nil
+}
+
+// taskWorktreeDir is the deterministic path for one task's worktree. The request
+// must be validated first; only then is the id long enough to cut.
+func taskWorktreeDir(req worktreeRequest, mainCheckout string) string {
+	id := strings.TrimSpace(req.TaskID)
+	return filepath.Join(taskWorktreeRoot(req.Checkout, mainCheckout), id[:8])
+}
+
+// taskWorktreeRoot picks where a task's worktree lives. Unlike a panel tree it
+// outlives the session and holds installed dependencies, so it must never sit on
+// the OS temp directory, which is a tmpfs on many hosts.
+func taskWorktreeRoot(checkout, mainCheckout string) string {
+	if root, ok := fleetWorktreeRoot(checkout); ok {
+		return root
+	}
+	if mainCheckout != "" {
+		if wt := filepath.Join(mainCheckout, ".worktrees"); isDir(wt) {
+			return wt
+		}
+	}
+	abs, err := filepath.Abs(checkout)
+	if err != nil {
+		abs = filepath.Clean(checkout)
+	}
+	return abs + "-wt"
+}
+
+// validateWorktreeRequest rejects a request that cannot be prepared at all. It
+// runs before anything touches git, so a bad request costs no network.
+func validateWorktreeRequest(req worktreeRequest) error {
 	if strings.TrimSpace(req.Checkout) == "" {
-		return "", fmt.Errorf("no checkout to prepare a task worktree from")
+		return fmt.Errorf("no checkout to prepare a task worktree from")
 	}
 	id := strings.TrimSpace(req.TaskID)
 	if len(id) < 8 || !isHex(id[:8]) {
-		return "", fmt.Errorf("task id %q is not a UUID with at least 8 hex characters", req.TaskID)
+		return fmt.Errorf("task id %q is not a UUID with at least 8 hex characters", req.TaskID)
 	}
 	if strings.TrimSpace(req.Branch) == "" {
-		return "", fmt.Errorf("task %s has no branch to prepare", id[:8])
+		return fmt.Errorf("task %s has no branch to prepare", id[:8])
 	}
 	// A close-out checks out an existing branch and never branches from or
 	// merges the base, so it is the one shape that needs no PR base.
 	if !req.CloseOut && strings.TrimSpace(req.PRBase) == "" {
-		return "", fmt.Errorf("task %s has no PR base to branch from", id[:8])
+		return fmt.Errorf("task %s has no PR base to branch from", id[:8])
 	}
-	return filepath.Join(panelWorktreeRoot(req.Checkout), id[:8]), nil
+	return nil
 }
 
 func isHex(s string) bool {

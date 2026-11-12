@@ -620,25 +620,35 @@ func (d *Driver) removePanelWorktree(repoRoot, dir string) {
 // fleet's own worktrees directory so it sits inside the project's permission
 // scope.
 func panelWorktreeRoot(repoRoot string) string {
+	if root, ok := fleetWorktreeRoot(repoRoot); ok {
+		return root
+	}
+	return os.TempDir()
+}
+
+// fleetWorktreeRoot resolves the fleet's worktree area for a checkout. ok=false
+// means no known layout exists; each caller supplies its own fallback, because a
+// panel tree is throwaway and a task tree is not.
+func fleetWorktreeRoot(repoRoot string) (string, bool) {
 	abs, err := filepath.Abs(repoRoot)
 	if err != nil {
-		return os.TempDir()
+		return "", false
 	}
 	// The checkout may already BE a worktree under <project>/worktrees/<name>;
 	// its parent is then the fleet's area.
 	if filepath.Base(filepath.Dir(abs)) == config.WorktreesDirName {
-		return filepath.Dir(abs)
+		return filepath.Dir(abs), true
 	}
 	// The documented per-project layout: <project root>/worktrees beside the
 	// repo clone.
 	if wt := filepath.Join(filepath.Dir(abs), config.WorktreesDirName); isDir(wt) {
-		return wt
+		return wt, true
 	}
 	// The older convention: <checkout>-wt beside the checkout.
 	if wt := abs + "-wt"; isDir(wt) {
-		return wt
+		return wt, true
 	}
-	return os.TempDir()
+	return "", false
 }
 
 func isDir(dir string) bool {
