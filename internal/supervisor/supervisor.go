@@ -344,6 +344,11 @@ type Instance struct {
 	restartAt   time.Time // zero = not scheduled for a restart
 	lastBackoff time.Duration
 	halted      bool // HALT marker seen: never respawn
+	// limitStopped: the child ended on a Stop-class usage limit and left a
+	// LIMIT_STOP marker; limitReason is its first line. Not respawned until the
+	// operator deletes the marker (docs/limit-stop.md).
+	limitStopped bool
+	limitReason  string
 	// exitAt is when the last child's Wait goroutine saw it end (CLA-677). It
 	// is what the status report's `lastExit.at` and `since` carry: the
 	// supervisor stored the exit ERROR for its own logging, but a time has to be
@@ -945,6 +950,9 @@ func (d *Supervisor) ensureRunning(inst *Instance) {
 	if alive || pending {
 		return
 	}
+	if d.limitStopHolds(inst) {
+		return
+	}
 	if inst.cfg == nil {
 		return // nothing to start yet: the build failed and no last-known-good exists
 	}
@@ -1195,6 +1203,13 @@ func (d *Supervisor) onExit(inst *Instance, err error, at time.Time) {
 		return
 	}
 
+	// An explicit signal from the child, not an inference from uptime: the loop
+	// wrote LIMIT_STOP before it exited.
+	if d.limitStopHolds(inst) {
+		d.publishStatus()
+		return
+	}
+
 	inst.scheduleRestart(d, err, uptime)
 }
 
@@ -1300,6 +1315,8 @@ func (d *Supervisor) fleetStatus() string {
 			b.WriteString("refused")
 		case inst.halted:
 			b.WriteString("halted")
+		case inst.limitStopped:
+			fmt.Fprintf(&b, "stopped: %s", inst.limitReason)
 		case inst.policyRefused:
 			b.WriteString("refused (permission policy)")
 		case inst.desired != RosterDesiredRunning:
@@ -1365,7 +1382,7 @@ func (d *Supervisor) respawnDue() {
 		// state any more than the reconcile path would. Dropping the stale
 		// schedule is the idempotent move: the next reconcile re-evaluates the
 		// instance from the roster.
-		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused || inst.halted {
+		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused || inst.halted || inst.limitStopped {
 			continue
 		}
 		d.spawn(inst)

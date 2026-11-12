@@ -67,7 +67,7 @@ queue still works), and the publish gate stays a human's.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck - on the self-hosted runner |
+| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck - on the self-hosted runner; on PRs, also reports the `ci` outcome to the plane |
 | `promote.yml` | push to `staging` | create-or-update the standing promotion PR |
 | `release-on-merge.yml` | push to `main` | gate on `ci`, derive the version, tag, publish |
 | `realign-staging.yml` | push to `main` | fast-forward `staging` back up to `main` |
@@ -92,12 +92,20 @@ Moving the job here also moves a trust boundary. It checks out the PR's branch a
 `go test -race` compiles and executes that branch's own test code on a persistent
 container, whose installed toolchain, apt state and caches survive between jobs and are
 inherited by later runs - including the push runs on `main` and `staging` whose `ci` the
-release and realign gates read. The job holds only the run-scoped `contents: read`
-`GITHUB_TOKEN`, so there is no long-lived credential in reach, and the runner is
+release and realign gates read. The job holds the run-scoped `contents: read`
+`GITHUB_TOKEN` and, on pull requests, the report-only `CLANKERBAR_REPORT_KEY` in its last
+step's environment. That key is long-lived but can do one thing: post a check outcome to
+the plane. It does not need persisted code to reach it: a `pull_request` run uses the PR's
+own `ci.yml` and `scripts/report-check.sh`, so any same-repo branch can change them to
+print the key or post `success` for its own head. The key is project-scoped, not
+repo-scoped, so it can post for the plane repo's tasks too. A false green satisfies the CI
+arm of auto-approval (the other arms still apply), so a green report is only as
+trustworthy as the review of changes to those two files; the promotion PR's human review
+is what stands between it and a release. The runner is
 registered to this repo alone - but any collaborator who can open a PR can reach this
 box's CI execution path, so the check's result is only as trustworthy as every branch
 that has ever run on it. Keep the container isolated from the fleet's own state and
-credentials: no host mounts, no long-lived secrets, and rebuild it periodically (or run
+credentials: no host mounts, no long-lived secrets beyond the report-only key, and rebuild it periodically (or run
 it ephemeral) so a PR cannot persist into later checks.
 
 Two things to know before waiting on a check:
@@ -122,11 +130,11 @@ window; when it does, publishing is refused and `staging` is not fast-forwarded.
 
 That image is Ubuntu `actions-runner`, not the GitHub-hosted image, so a step needing a
 preinstalled tool must install it. `ci.yml` conditionally apt-installs `zstd` (what
-`actions/cache` shells out to, via `setup-go`'s `cache: true`) and a C toolchain
-(`go test -race` needs cgo); the step is conditional because the container persists, so
+`actions/cache` shells out to, via `setup-go`'s `cache: true`), a C toolchain
+(`go test -race` needs cgo), and `jq` and `curl` (the report step skips without them); the step is conditional because the container persists, so
 only a fresh one pays the apt round trip. To move the job back to GitHub-hosted, change
 its `runs-on` to `ubuntu-latest`: the install step then no-ops, because the hosted image
-ships both.
+ships all of them.
 
 ## Versioning
 
@@ -231,11 +239,21 @@ gh attestation verify clankerbar_0.4.0_darwin_arm64.tar.gz -R lecstor/clankerbar
   decision, 2026-08-10, taken over provisioning a scoped PAT. `promote.yml` opens
   the standing PR with the default `GITHUB_TOKEN`, and with this setting off that
   token can edit an open PR but is refused when it must *create* one - which
-  happens every cycle, since merging the promotion closes it. This repo holds **no
-  secrets**, which is the point: the alternative was its first long-lived
-  credential. Turning the setting back off breaks the standing PR on the cycle
+  happens every cycle, since merging the promotion closes it. This repo held **no
+  secrets** when that decision was taken, which is the point: the alternative was
+  its first long-lived credential (CLA-821 has since added one report-only key,
+  below). Turning the setting back off breaks the standing PR on the cycle
   *after* the next publish, not immediately - so the failure lands well away from
   the change that caused it.
+- **`CLANKERBAR_REPORT_KEY`, and only that secret.** The last step of `ci.yml`
+  POSTs the check's own outcome to the plane on pull requests, because the plane's
+  CI arm accepts only rows a repo's own workflow POSTed - never an agent's
+  attestation. The secret is a **report-only** key (mint it at
+  `/projects/<slug>/api-keys`; see `docs/auth.md` in `lecstor/clankerbar`): it can
+  post one check outcome and reach nothing else, so a leaked CI secret cannot
+  claim a task, record a verdict or write the backlog. Empty - unset, or a fork
+  PR, which receives no repository secrets - logs one line and skips; it never
+  fails the run.
 - **`ci.yml` running on push to `staging`.** Not a convenience: it is what makes
   the promotion PR mergeable at all. A PR created by `GITHUB_TOKEN` triggers a
   `pull_request` run that parks at `action_required`, contributing no check run

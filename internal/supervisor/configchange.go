@@ -102,7 +102,7 @@ func (d *Supervisor) refreshMaterialized(inst *Instance) {
 	// review finding 1.review-5.1).
 	inService := alive &&
 		inst.desired == RosterDesiredRunning &&
-		!inst.removed && !inst.refused && !inst.halted && !inst.policyRefused &&
+		!inst.removed && !inst.refused && !inst.halted && !inst.limitStopped && !inst.policyRefused &&
 		!stopOrHalt(dir)
 	if !inService {
 		d.withdrawQueuedRestart(inst, dir, cfg)

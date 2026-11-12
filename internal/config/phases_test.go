@@ -2582,4 +2582,36 @@ func TestEffectivePhases_VerifyInheritsTheFixModel(t *testing.T) {
 	if got[3].Model.First() != "verify/own" {
 		t.Errorf("an explicit verify model was overwritten: %q", got[3].Model)
 	}
+
+	// A verifier naming the fix phase's own harness still inherits.
+	c.Phases[2] = Phase{Name: FixPhaseName, Harness: "opencode", Model: ModelRoutes{"cheap/alias"}}
+	c.Phases[3] = Phase{Name: VerifyPhaseName, Harness: "opencode"}
+	got = c.EffectivePhases()
+	if got[3].Model.First() != "cheap/alias" {
+		t.Errorf("same-harness verify model = %q, want the fix phase's", got[3].Model)
+	}
+
+	// Fix phase with no harness of its own runs on the run-wide one, so a
+	// verifier naming that harness is the same harness.
+	c.Phases[2] = Phase{Name: FixPhaseName, Model: ModelRoutes{"cheap/alias"}}
+	c.Phases[3] = Phase{Name: VerifyPhaseName, Harness: "opencode"}
+	got = c.EffectivePhases()
+	if got[3].Model.First() != "cheap/alias" {
+		t.Errorf("verify naming the run-wide harness beside a harness-less fix: model = %q, want inherited", got[3].Model)
+	}
+
+	// Fix on another harness, verify naming the run-wide one: no inheritance.
+	c.Phases[2] = Phase{Name: FixPhaseName, Harness: "claude", Model: ModelRoutes{"claude/alias"}}
+	got = c.EffectivePhases()
+	if !got[3].Model.Empty() {
+		t.Errorf("verify on the run-wide harness inherited %q from a fix phase on claude", got[3].Model)
+	}
+	c.Phases[2] = Phase{Name: FixPhaseName, Harness: "opencode", Model: ModelRoutes{"cheap/alias"}}
+
+	// A verifier on a DIFFERENT harness must not receive the fix phase's alias.
+	c.Phases[3] = Phase{Name: VerifyPhaseName, Harness: "claude"}
+	got = c.EffectivePhases()
+	if !got[3].Model.Empty() || got[3].Tier != "" || got[3].Harness != "claude" {
+		t.Errorf("cross-harness verify = harness %q model %q tier %q, want claude with no inherited model", got[3].Harness, got[3].Model, got[3].Tier)
+	}
 }
