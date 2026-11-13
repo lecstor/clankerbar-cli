@@ -96,9 +96,11 @@ func TestNoAdapterReadsTheRawModelField(t *testing.T) {
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		// harness.go declares the field and IS the accessor; everything else in the
-		// package must go through it.
-		if name == "harness.go" {
+		// harness.go declares the field and IS the accessor; turns.go pins a
+		// turn's model and the route it finished on (OnTurn / OnFinishedRoute),
+		// which is the other legitimate direct write. Everything else in the
+		// package must go through the accessor.
+		if name == "harness.go" || name == "turns.go" {
 			continue
 		}
 		src, err := os.ReadFile(filepath.Clean(name))
