@@ -1,6 +1,7 @@
 package reviewmap
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -265,6 +266,33 @@ func (d *driver) pickTarget(name string) error {
 	want := []string{
 		"`driver.pickTarget` defined or changed at method.go:3; " +
 			"used at: caller.go:4, z_use.go:4, aaa_test.go:5, caller_test.go:7",
+	}
+	if got := flowMapHead(t, r, base); !reflect.DeepEqual(got, want) {
+		t.Errorf("FlowMap() = %#v\nwant %#v", got, want)
+	}
+}
+
+// TestGoFlowMapUseCap pins the shared use cap as Go feeds it: eight non-test
+// sites are shown and the test-file sites are counted into the remainder.
+func TestGoFlowMapUseCap(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("keep.go", "package demo\n\nvar placeholder = 1\n")
+	r.commit("base")
+	base := r.git("rev-parse", "HEAD")
+
+	r.write("widget.go", "package demo\n\ntype Widget struct{}\n")
+	for i := range 10 {
+		r.write(fmt.Sprintf("use%02d.go", i), fmt.Sprintf("package demo\n\nvar usedIn%02d Widget\n", i))
+	}
+	for _, name := range []string{"aaa_test.go", "zzz_test.go"} {
+		r.write(name, "package demo\n\nvar testUse Widget\n")
+	}
+	r.commit("head")
+
+	want := []string{
+		"`Widget` defined or changed at widget.go:3; used at: " +
+			"use00.go:3, use01.go:3, use02.go:3, use03.go:3, " +
+			"use04.go:3, use05.go:3, use06.go:3, use07.go:3 (+4 more)",
 	}
 	if got := flowMapHead(t, r, base); !reflect.DeepEqual(got, want) {
 		t.Errorf("FlowMap() = %#v\nwant %#v", got, want)
