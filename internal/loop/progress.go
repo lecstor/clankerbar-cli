@@ -334,14 +334,7 @@ const failureDetailMax = 400
 // say leaves the existing message exactly as it was rather than trailing a
 // colon and a blank.
 func failureDetail(diag string) string {
-	printable := strings.Map(func(r rune) rune {
-		if unicode.IsPrint(r) || unicode.IsSpace(r) {
-			return r
-		}
-		return -1
-	}, diag)
-
-	s := strings.Join(strings.Fields(printable), " ")
+	s := oneLine(diag)
 	if s == "" {
 		return ""
 	}
@@ -356,6 +349,21 @@ func failureDetail(diag string) string {
 		s = "..." + string(r[len(r)-failureDetailMax:])
 	}
 	return ": " + s
+}
+
+// oneLine renders arbitrary harness text as a single printable line: control
+// characters are stripped because this text reaches a terminal, where ESC is
+// executed, and whitespace is collapsed so a multi-line diagnostic cannot break
+// a one-line marker or log entry. The scoping rules that answer "what may a
+// classifier READ" are a different question; this is about what may be PRINTED.
+func oneLine(s string) string {
+	printable := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) || unicode.IsSpace(r) {
+			return r
+		}
+		return -1
+	}, s)
+	return strings.Join(strings.Fields(printable), " ")
 }
 
 // droppedNote says how much of a session's output the retained window did not

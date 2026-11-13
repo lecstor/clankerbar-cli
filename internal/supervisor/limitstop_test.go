@@ -11,6 +11,12 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/loop"
 )
 
+// fullLimitLine is the first line the loop writes after CLA-792: the reason,
+// the model route that stopped and the provider's own message. The supervisor
+// reports whatever the marker's first line says, so this is what the console
+// must show.
+const fullLimitLine = "budget_exhausted on opencode-go/deepseek-v4.1-flash: Upstream request failed: Insufficient account funds"
+
 // A child that ends through the Stop-limit path is not respawned, and the
 // report names the limit reason; it is a stop, not a crash.
 func TestLimitStopLeavesInstanceStopped(t *testing.T) {
@@ -27,8 +33,8 @@ func TestLimitStopLeavesInstanceStopped(t *testing.T) {
 	state := entryStateDir(cacheDir, "broke")
 	rep := waitForStatusState(t, plane, "broke", StatusStopped)
 	inst := runningInstance(rep, "broke")
-	if inst.Reason != "stopped: budget_exhausted" {
-		t.Errorf("reason = %q, want %q", inst.Reason, "stopped: budget_exhausted")
+	if want := "stopped: " + fullLimitLine; inst.Reason != want {
+		t.Errorf("reason = %q, want %q", inst.Reason, want)
 	}
 	if inst.NextRetryAt != nil {
 		t.Errorf("nextRetryAt = %v, want null", *inst.NextRetryAt)
@@ -80,11 +86,11 @@ func TestLimitStopResumesWhenMarkerDeleted(t *testing.T) {
 
 func TestFleetStatusNamesTheLimitStop(t *testing.T) {
 	d := &Supervisor{instances: []*Instance{{
-		name: "broke", desired: RosterDesiredRunning, limitStopped: true, limitReason: "budget_exhausted",
+		name: "broke", desired: RosterDesiredRunning, limitStopped: true, limitReason: fullLimitLine,
 	}}}
 	got := d.fleetStatus()
-	if !strings.Contains(got, "broke: stopped: budget_exhausted") || strings.Contains(got, "restarting") {
-		t.Errorf("fleet status = %q", got)
+	if want := "broke: stopped: " + fullLimitLine; !strings.Contains(got, want) || strings.Contains(got, "restarting") {
+		t.Errorf("fleet status = %q, want it to contain %q", got, want)
 	}
 }
 
