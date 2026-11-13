@@ -400,6 +400,19 @@ type Invocation struct {
 	// so there is nothing to announce. Called on the parser's goroutine;
 	// implementations must not block.
 	OnClaim func(Claim)
+
+	// Turns is an optional ordered list of follow-up turns to run in the SAME
+	// session as the first turn (Prompt/Model): each is sent as a continuation
+	// of the session the first turn created, so later turns reuse everything the
+	// earlier ones read. Empty - every invocation before this field existed -
+	// means one turn, byte-for-byte the previous behaviour.
+	//
+	// Only an adapter that can continue a live session may honour it; one that
+	// cannot must REFUSE an invocation with Turns rather than silently drop the
+	// later turns, because a half-run sequence is a wrong answer, not a shorter
+	// one. opencode is the adapter with that capability today (claude and codex
+	// refuse it with ErrTurnsUnsupported).
+	Turns []Turn
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -610,6 +623,32 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// TurnMessages is the final message of EACH turn of a multi-turn invocation,
+	// in order: TurnMessages[0] is the first turn's (Invocation.Prompt) and the
+	// last entry is the same text FinalMessage carries. It exists so the caller
+	// can put a notes turn's answer in the iteration log without confusing it
+	// with the findings turn that followed it.
+	//
+	// Empty for a single-turn invocation (the pre-Turns shape), and shorter than
+	// the planned sequence when a turn ended it early - len(TurnMessages) is how
+	// many turns actually ran.
+	TurnMessages []string
+
+	// TurnStopped is the 1-based index of the turn whose end stopped a
+	// multi-turn sequence, counting the first (Invocation.Prompt) turn as 1. It
+	// is 0 when every planned turn ran, which is also the only value a
+	// single-turn invocation can have.
+	TurnStopped int
+
+	// TurnStopReason names why the sequence stopped: "usage_limit",
+	// "output_cap_stall", "quiet_death", "claim_not_held", "untrusted_stream",
+	// "tool_loop", "idle_killed", "nonzero_exit", "cancelled", "no_session",
+	// "wall_clock" or "run_error" (the last also returns the run error). Empty
+	// when no turn stopped the sequence. The vocabulary is the same one the
+	// adapter's own resume guards use, so a caller can name the end without
+	// re-diagnosing it.
+	TurnStopReason string
 
 	// Usage is this session's token accounting normalised across harnesses (see
 	// TokenUsage's own comment for the buckets and the per-adapter mapping). It is

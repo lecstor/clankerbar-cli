@@ -310,6 +310,41 @@ func untrustedReport() Result {
 	return res
 }
 
+// A cap kill is now named by the shared resume guard, which runs before the
+// report resume's own budget check. A refused report must still say why it was
+// left alone rather than reading like one that passed; a report that PASSED owes
+// no resume and so earns no line.
+func TestReportResume_WallClockSkipSaysWhy(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+`)
+
+	res := reportSession(reportBadStream)
+	res.ExitCode = -1
+	res.Raw[TerminalReasonKey] = wallClockReason
+
+	console := &bytes.Buffer{}
+	in := Invocation{Prompt: "Work.", Console: console, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{})
+
+	if runs := stubRuns(t, logPath); len(runs) != 0 {
+		t.Errorf("stub ran %d times, want none — a cap-killed session cannot be resumed:\n%v", len(runs), runs)
+	}
+	if !strings.Contains(console.String(), "wall-clock budget exhausted") {
+		t.Errorf("console did not say why the refused report was left alone; got:\n%s", console.String())
+	}
+
+	// The same end with a report that passes: nothing was owed, so no line.
+	passing := &bytes.Buffer{}
+	in.Console = passing
+	in.CheckReport = func(string) error { return nil }
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{})
+	if out := passing.String(); out != "" {
+		t.Errorf("a passing report on a cap-killed session printed a resume line; got:\n%s", out)
+	}
+}
+
 // An errored resume is real spend that changes nothing: the dollars and tokens
 // are charged and the report stays the one the runner refused.
 func TestReportResume_ErroredResumeChargesSpendAndKeepsTheReport(t *testing.T) {

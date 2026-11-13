@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -106,6 +107,7 @@ type fakeCall struct {
 
 // fakeRequest is what one chat request carried, for assertions.
 type fakeRequest struct {
+	Model       string   // the model id the request asked for
 	Tools       []string // tool names offered
 	ToolResults []string // tool-result message contents, raw
 	User        []string // user message contents, raw
@@ -155,6 +157,7 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.hit.Add(1)
 	var body struct {
+		Model string `json:"model"`
 		Tools []struct {
 			Function struct {
 				Name string `json:"name"`
@@ -167,7 +170,7 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} `json:"messages"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
-	var rec fakeRequest
+	rec := fakeRequest{Model: body.Model}
 	turns := 0
 	for _, t := range body.Tools {
 		rec.Tools = append(rec.Tools, t.Function.Name)
@@ -916,6 +919,122 @@ func TestOpencodeConformance_resume(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("session holds %d assistant messages, want 2 (first run + resume)", n)
+	}
+}
+
+// Two planned turns in ONE session, the second on a DIFFERENT model. This pins
+// both halves of CLA-867 against the real binary:
+//
+//   - `-s <sid>` continues the same session, so the second turn reuses what the
+//     first read;
+//   - `-m <other model>` on the CONTINUED run really reaches the other model:
+//     the fake provider records the model id each request named, the session
+//     export records a `model-switched` message, and that turn is charged at
+//     the second model's own rates.
+//
+// Prompt caching is per model, so the switched turn pays full input once; that
+// is accepted (no cache reads are asserted). Verified on opencode 2.0.32 and
+// 2.2.7.
+func TestOpencodeConformance_turns(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	doc := fakeConfigDoc(srv.URL)
+	models := doc["provider"].(map[string]any)["fake"].(map[string]any)["models"].(map[string]any)
+	models["fake-model-2"] = map[string]any{
+		"name": "Fake Model Two",
+		"cost": map[string]any{"input": 7, "output": 31},
+	}
+	in := iso.invocation("Reply with exactly: ONE", t.TempDir(), writeJSON(t, doc))
+	in.Model = "fake/fake-model"
+	// A runner phase is seeded with the live claim; the sequence refuses to run
+	// a later turn under no lease, so the session needs one to continue.
+	in.ResumeClaim = Claim{TaskID: "T-9", Ref: "CLA-867", RunID: "run-1"}
+	in.Turns = []Turn{{Prompt: "Reply with exactly: TWO", Model: "fake/fake-model-2"}}
+	res := invokeConformance(t, in)
+	requireHit(t, fake)
+	requireV2Record(t, iso, res)
+
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0 (stderr %.300s)", res.ExitCode, res.Stderr)
+	}
+	if want := []string{"OK", "OK"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q (one message per turn)", res.TurnMessages, want)
+	}
+	if res.FinalMessage != "OK" {
+		t.Errorf("FinalMessage = %q, want the final turn's OK", res.FinalMessage)
+	}
+	if res.TurnStopped != 0 || res.TurnStopReason != "" {
+		t.Errorf("TurnStopped = %d (%q), want 0: both turns ran", res.TurnStopped, res.TurnStopReason)
+	}
+
+	// The switched turn reached the OTHER model. The request that carries the
+	// second prompt is the continued run's.
+	reqs := fake.requests()
+	var secondTurn *fakeRequest
+	for i := range reqs {
+		for _, u := range reqs[i].User {
+			if strings.Contains(u, "TWO") {
+				secondTurn = &reqs[i]
+			}
+		}
+	}
+	if secondTurn == nil {
+		t.Fatalf("no request carried the second turn's prompt; requests: %+v", reqs)
+	}
+	if secondTurn.Model != "fake-model-2" {
+		t.Errorf("the continued turn's request named model %q, want fake-model-2 - -m was not honoured on the resumed session", secondTurn.Model)
+	}
+	// The first turn ran on the invocation's model, so the switch is a change
+	// rather than a single model throughout.
+	sawFirstModel := false
+	for _, r := range reqs {
+		if r.Model == "fake-model" {
+			sawFirstModel = true
+		}
+	}
+	if !sawFirstModel {
+		t.Errorf("no request named the first turn's model; requests: %+v", reqs)
+	}
+
+	// Usage sums across both turns: title generation + first answer + second
+	// answer are three requests.
+	if want := 3 * fakeRequestTokens; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d summed across both turns", res.Tokens, want)
+	}
+	fakeSecondTurnCost := (fakePromptTokens*7 + fakeCompletionTokens*31) / 1e6
+	if want := 2*fakeRequestCost + fakeSecondTurnCost; res.CostUSD < want*0.999 || res.CostUSD > want*1.001 {
+		t.Errorf("CostUSD = %v, want %v (the switched turn at the second model's rates)", res.CostUSD, want)
+	}
+
+	// The session itself holds both turns, and records the model switch: the
+	// resumed turn was not a second session.
+	sid, _ := res.Raw[opencodeSessionIDKey].(string)
+	if sid == "" {
+		t.Fatal("no session id on the result")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+	exported, err := (opencode{}).exportSession(ctx, in, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistants, switched := 0, false
+	for _, m := range exported.Messages {
+		switch m.Type {
+		case "assistant":
+			assistants++
+		case "model-switched":
+			switched = true
+		}
+	}
+	if assistants != 2 {
+		t.Errorf("session holds %d assistant messages, want 2 (both turns)", assistants)
+	}
+	if !switched {
+		t.Errorf("the session records no model-switched message; the export shows the switch was not a model change")
 	}
 }
 

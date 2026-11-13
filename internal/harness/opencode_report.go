@@ -31,32 +31,49 @@ func reportSteerPrompt(err error) string {
 		"fixing the problem named above and keeping everything else the same."
 }
 
-// reportResumeSkipped reports whether this Result cannot take a report resume:
-// no session to resume into, or an end of its own that the resume must not talk
-// over (a probe, a teardown, a claim the session no longer holds, an unreadable
-// capture, an adapter kill, a stall or quiet death not yet recovered, a limit
-// end, or an unexplained non-zero exit).
+// resumeSkippedReason names the end that forbids resuming this session, or ""
+// when it may be resumed. ONE list serves two callers: the done-report resume,
+// which must not talk over an end of the adapter's own, and the multi-turn
+// sequence, which must not send a later turn into a session that ended badly.
+// The reasons are the Result.TurnStopReason vocabulary, plus "probe", which
+// only the report resume can see (a probe never reaches the turn sequence).
 //
 // A claim that is not held is one of those ends: the runner writes no record
 // under a claim the session does not hold, so there is nothing to re-emit. A
 // runner phase is seeded with in.ResumeClaim, so Held() is true whenever the
 // runner would apply the report.
-func (o opencode) reportResumeSkipped(ctx context.Context, in Invocation, res *Result) bool {
+func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *Result) string {
 	switch {
-	case in.Probe,
-		ctx.Err() != nil,
-		!res.Claim.Held(),
-		res.Untrusted != "",
-		res.ToolLoop != "",
-		res.IdleKilled != "",
-		o.OutputCapNoOutput(*res),
-		o.ZeroUsageUnknown(*res),
-		o.DetectLimit(*res).Limited,
-		res.ExitCode != 0 && RecoveredErrors(*res) == 0:
-		return true
+	case in.Probe:
+		return "probe"
+	case ctx.Err() != nil:
+		return "cancelled"
+	case !res.Claim.Held():
+		return "claim_not_held"
+	case res.Untrusted != "":
+		return "untrusted_stream"
+	case res.ToolLoop != "":
+		return "tool_loop"
+	case res.IdleKilled != "":
+		return "idle_killed"
+	case o.WallClockCapped(*res):
+		// The adapter's own cap killed the session, so the remaining budget is
+		// not enough to resume into - and the turn sequence must name the kill
+		// rather than the exit status it leaves behind.
+		return "wall_clock"
+	case o.OutputCapNoOutput(*res):
+		return "output_cap_stall"
+	case o.ZeroUsageUnknown(*res):
+		return "quiet_death"
+	case o.DetectLimit(*res).Limited:
+		return "usage_limit"
+	case res.ExitCode != 0 && RecoveredErrors(*res) == 0:
+		return "nonzero_exit"
 	}
-	sid, _ := resumeTargets(*res)
-	return sid == ""
+	if sid, _ := resumeTargets(*res); sid == "" {
+		return "no_session"
+	}
+	return ""
 }
 
 // resumeBadReport runs the runner's report check on the session's final message
@@ -67,7 +84,17 @@ func (o opencode) reportResumeSkipped(ctx context.Context, in Invocation, res *R
 // mergeResume replaces FinalMessage with the continuation's, so a corrected
 // report is what the runner reads off this Result.
 func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Result, deadline time.Time) {
-	if in.CheckReport == nil || o.reportResumeSkipped(ctx, in, res) {
+	if in.CheckReport == nil {
+		return
+	}
+	// The shared guard names a wall-clock kill before the budget check below, so
+	// its line would otherwise be skipped here. Say why the refused report was
+	// left alone; only when a resume was actually owed, so the line never
+	// describes a report that passed.
+	if reason := o.resumeSkippedReason(ctx, in, res); reason != "" {
+		if reason == "wall_clock" && in.CheckReport(res.FinalMessage) != nil && in.Console != nil {
+			fmt.Fprint(in.Console, opencodeReportWallClockMsg)
+		}
 		return
 	}
 	checkErr := in.CheckReport(res.FinalMessage)
