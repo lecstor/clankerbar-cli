@@ -13,10 +13,13 @@ const maxUses = 8
 
 // useGlobs limits git grep to the sources a use is worth reporting from:
 // declarations and minified bundles are never call sites.
-var useGlobs = []string{
-	"*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs",
-	":!*.d.ts", ":!*.min.js",
-}
+var (
+	tsUseGlobs = []string{
+		"*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs",
+		":!*.d.ts", ":!*.min.js",
+	}
+	goUseGlobs = []string{"*.go"}
+)
 
 var (
 	testDirRE  = regexp.MustCompile(`(^|/)(tests?|__tests__|e2e|spec)/`)
@@ -28,7 +31,8 @@ var (
 func grepUses(worktree string, d Definition) (string, error) {
 	// -z NUL-delimits the path and line number, so a path containing a colon
 	// still parses exactly.
-	args := append([]string{"grep", "-n", "-z", "-w", "-I", "-e", d.Name, "--"}, useGlobs...)
+	args := append([]string{"grep", "-n", "-z", "-w", "-I", "-e", d.grepName(), "--"},
+		useGlobsFor(d.At)...)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = worktree
 	out, err := cmd.Output()
@@ -37,9 +41,27 @@ func grepUses(worktree string, d Definition) (string, error) {
 		if errors.As(err, &exit) && exit.ExitCode() == 1 {
 			return "nowhere else", nil
 		}
-		return "", fmt.Errorf("git grep %q: %w", d.Name, err)
+		return "", fmt.Errorf("git grep %q: %w", d.grepName(), err)
 	}
 	return formatUses(string(out), d.At), nil
+}
+
+// grepName is the identifier git grep searches: a method's display name is
+// qualified, but its uses are the bare method name.
+func (d Definition) grepName() string {
+	if d.Grep != "" {
+		return d.Grep
+	}
+	return d.Name
+}
+
+// useGlobsFor picks the sources a definition's language is used from.
+func useGlobsFor(at string) []string {
+	path, _ := splitLocation(at)
+	if strings.HasSuffix(path, ".go") {
+		return goUseGlobs
+	}
+	return tsUseGlobs
 }
 
 // formatUses drops the definition's own line, orders non-test sites before
@@ -89,5 +111,7 @@ func splitLocation(at string) (path, line string) {
 }
 
 func isTestPath(path string) bool {
-	return testDirRE.MatchString(path) || testFileRE.MatchString(path)
+	return testDirRE.MatchString(path) ||
+		testFileRE.MatchString(path) ||
+		strings.HasSuffix(path, "_test.go")
 }

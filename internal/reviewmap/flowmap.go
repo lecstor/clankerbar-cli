@@ -3,26 +3,28 @@ package reviewmap
 import "fmt"
 
 // FlowMap returns one item per definition that diff adds or changes, in
-// first-seen order, each with the places it is used.
+// first-seen order, each with the places it is used. A declaration diff
+// removes is reported only when it is still referenced.
 //
-// Uses come from `git grep -n -w -I` run in worktree over the JavaScript and
-// TypeScript sources, excluding declarations and minified files. Non-test uses
-// are listed before test uses and at most maxUses are shown. maxNames == 0
-// selects DefaultMaxNames; a negative value disables the cap.
-func FlowMap(diff, worktree string, maxNames int) ([]string, error) {
-	return renderFlowItems(changedDefinitions(ParseDiff(diff)), maxNames,
+// Uses come from `git grep -n -w -I` run in r.Repo, excluding declarations
+// and minified files. Non-test uses are listed before test uses and at most
+// maxUses are shown. maxNames == 0 selects DefaultMaxNames; a negative value
+// disables the cap. src reads the files a language parser needs from r's
+// revisions.
+func FlowMap(diff string, r Range, maxNames int) ([]string, error) {
+	return renderFlowItems(changedDefinitions(ParseDiff(diff), sourceFor(r)), maxNames,
 		func(d Definition) (string, error) {
-			return grepUses(worktree, d)
+			return grepUses(r.Repo, d)
 		})
 }
 
 // changedDefinitions runs each file through its extractor and keeps the first
 // occurrence of every name across the whole diff.
-func changedDefinitions(files []FileDiff) []Definition {
+func changedDefinitions(files []FileDiff, src Source) []Definition {
 	var defs []Definition
 	seen := make(map[string]bool)
 	for _, f := range files {
-		for _, d := range extractorFor(f.Path).Names(f) {
+		for _, d := range extractorFor(f.Path).Names(f, src) {
 			if seen[d.Name] {
 				continue
 			}
@@ -52,6 +54,14 @@ func renderFlowItems(defs []Definition, maxNames int, find func(Definition) (str
 		uses, err := find(d)
 		if err != nil {
 			return nil, err
+		}
+		if d.Removed {
+			if uses == "nowhere else" {
+				continue
+			}
+			items = append(items, fmt.Sprintf("`%s` removed from %s; still referenced at: %s",
+				d.Name, d.At, uses))
+			continue
 		}
 		items = append(items, fmt.Sprintf("`%s` defined or changed at %s; used at: %s",
 			d.Name, d.At, uses))

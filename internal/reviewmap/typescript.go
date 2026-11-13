@@ -40,7 +40,7 @@ var tsSkip = map[string]bool{
 
 func (TypeScript) Match(path string) bool { return tsPathRE.MatchString(path) }
 
-func (TypeScript) Names(f FileDiff) []Definition {
+func (TypeScript) Names(f FileDiff, _ Source) []Definition {
 	var defs []Definition
 	seen := make(map[string]bool)
 	record := func(name, at string) {

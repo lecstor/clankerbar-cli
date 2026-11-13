@@ -16,7 +16,7 @@ func TestChangedDefinitionsDedupesAcrossFiles(t *testing.T) {
 		addedFile("a.go", 1, AddedLine{Line: 1, Code: "func alphaThing() {"}),
 	}
 	want := []Definition{{Name: "alphaThing", At: "a.ts:1"}}
-	if got := changedDefinitions(files); !reflect.DeepEqual(got, want) {
+	if got := changedDefinitions(files, nil); !reflect.DeepEqual(got, want) {
 		t.Errorf("changedDefinitions() = %#v, want %#v", got, want)
 	}
 }

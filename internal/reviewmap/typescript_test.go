@@ -9,7 +9,7 @@ func addedFile(path string, hunkStart int, lines ...AddedLine) FileDiff {
 	return FileDiff{Path: path, Hunks: []Hunk{{Start: hunkStart, Count: len(lines), Added: lines}}}
 }
 
-func tsNames(f FileDiff) []Definition { return TypeScript{}.Names(f) }
+func tsNames(f FileDiff) []Definition { return TypeScript{}.Names(f, nil) }
 
 func namesOf(defs []Definition) []string {
 	names := make([]string, len(defs))
@@ -155,10 +155,13 @@ func TestExtractorSelection(t *testing.T) {
 	if _, ok := extractorFor("a.ts").(TypeScript); !ok {
 		t.Errorf("extractorFor(a.ts) = %T, want TypeScript", extractorFor("a.ts"))
 	}
-	if _, ok := extractorFor("a.go").(noopExtractor); !ok {
-		t.Errorf("extractorFor(a.go) = %T, want noopExtractor", extractorFor("a.go"))
+	if _, ok := extractorFor("a.go").(Go); !ok {
+		t.Errorf("extractorFor(a.go) = %T, want Go", extractorFor("a.go"))
 	}
-	if got := extractorFor("a.go").Names(FileDiff{Path: "a.go"}); len(got) != 0 {
+	if _, ok := extractorFor("a.json").(noopExtractor); !ok {
+		t.Errorf("extractorFor(a.json) = %T, want noopExtractor", extractorFor("a.json"))
+	}
+	if got := extractorFor("a.json").Names(FileDiff{Path: "a.json"}, nil); len(got) != 0 {
 		t.Errorf("noop extractor returned %#v", got)
 	}
 }
