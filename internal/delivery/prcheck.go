@@ -91,7 +91,9 @@ import (
 )
 
 // PRVerified is the check on the pull request a session named in a delivery:
-// mergeable, and carrying a check rollup that actually ran and passed.
+// mergeable or already merged (a merged PR is judged on its rollup alone, since
+// GitHub stops computing mergeability), and carrying a check rollup that
+// actually ran and passed.
 const PRVerified Kind = "pr"
 
 // The polling window. Budgeted well inside the loop's deliveryCheckTimeout so
@@ -196,6 +198,7 @@ func (c ghCheck) neutral() bool {
 type ghPR struct {
 	Mergeable         string    `json:"mergeable"`         // MERGEABLE | CONFLICTING | UNKNOWN
 	MergeStateStatus  string    `json:"mergeStateStatus"`  // CLEAN | DIRTY | BLOCKED | ...
+	State             string    `json:"state"`             // OPEN | CLOSED | MERGED
 	StatusCheckRollup []ghCheck `json:"statusCheckRollup"` // null when none
 	URL               string    `json:"url"`
 	BaseRefName       string    `json:"baseRefName"`
@@ -214,15 +217,16 @@ const (
 	prConflict
 	prChecksFailed
 	prChecksPending // rollup present but not finished; poll
-	prNoChecks      // mergeable but empty rollup; poll (CI may not have registered)
+	prNoChecks      // empty rollup; poll (CI may not have registered)
 	prMergeableUnknown
 )
 
 // prJudgement is a verdict plus the labels and counts its message names.
 type prJudgement struct {
 	verdict prVerdict
-	passed  int // rollup entries that completed successfully (prPass)
-	neutral int // completed without failing and never going green: SKIPPED/NEUTRAL
+	merged  bool // the PR is MERGED; its mergeability was never computed
+	passed  int  // rollup entries that completed successfully (prPass)
+	neutral int  // completed without failing and never going green: SKIPPED/NEUTRAL
 	failing []string
 	pending []string
 }
@@ -237,24 +241,35 @@ type prJudgement struct {
 // becomes its refusal when the window closes — but they are distinct verdicts,
 // because the refusal must say which of the three it was.
 func judgePR(v ghPR) prJudgement {
+	j := prJudgement{}
 	state := strings.ToUpper(strings.TrimSpace(v.Mergeable))
 	dirty := strings.ToUpper(strings.TrimSpace(v.MergeStateStatus)) == "DIRTY"
-	// DIRTY is honoured even while `mergeable` still reads UNKNOWN: it is the
-	// same fact arrived from the other field, and a conflict needs no second
-	// opinion.
-	if state == "CONFLICTING" || dirty {
-		return prJudgement{verdict: prConflict}
-	}
-	if state != "MERGEABLE" {
-		// UNKNOWN, empty, or anything unrecognised: GitHub has not answered.
-		// Assuming MERGEABLE here is the hole this gate exists to close.
-		return prJudgement{verdict: prMergeableUnknown}
+	// A merged PR's mergeability is MOOT: GitHub stops computing it once the PR
+	// is merged, so it reads UNKNOWN forever and waiting on it can only end in a
+	// false refusal. Only the mergeability arms are skipped — its CI still has
+	// to have run and passed. As for an open PR, the head is not cross-checked
+	// against the claim's branch; the merge check is what proves the work landed.
+	j.merged = strings.EqualFold(strings.TrimSpace(v.State), "MERGED")
+	if !j.merged {
+		// DIRTY is honoured even while `mergeable` still reads UNKNOWN: it is the
+		// same fact arrived from the other field, and a conflict needs no second
+		// opinion.
+		if state == "CONFLICTING" || dirty {
+			j.verdict = prConflict
+			return j
+		}
+		if state != "MERGEABLE" {
+			// UNKNOWN, empty, or anything unrecognised: GitHub has not answered.
+			// Assuming MERGEABLE here is the hole this gate exists to close.
+			j.verdict = prMergeableUnknown
+			return j
+		}
 	}
 	if len(v.StatusCheckRollup) == 0 {
 		// THE inversion: no checks is a finding, not an absence of findings.
-		return prJudgement{verdict: prNoChecks}
+		j.verdict = prNoChecks
+		return j
 	}
-	j := prJudgement{}
 	for _, c := range v.StatusCheckRollup {
 		switch {
 		case !c.completed():
@@ -293,9 +308,14 @@ func settlePR(j prJudgement, prNum, slug string, waited time.Duration, allowUnch
 			// a 3am log should not have to guess which happened.
 			skipped = fmt.Sprintf(" (%s skipped/neutral)", plural(j.neutral, "check"))
 		}
+		// A merged PR was never judged MERGEABLE: GitHub does not compute it.
+		mergeState := "MERGEABLE"
+		if j.merged {
+			mergeState = "MERGED"
+		}
 		return Check{Kind: PRVerified, Status: Pass, Detail: fmt.Sprintf(
-			"PR %s (%s) is MERGEABLE and its %s passed%s",
-			prNum, slug, plural(j.passed, "check"), skipped)}
+			"PR %s (%s) is %s and its %s passed%s",
+			prNum, slug, mergeState, plural(j.passed, "check"), skipped)}
 	case prConflict:
 		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
 			"PR %s (%s) is CONFLICTING with its base — the delivery is refused. "+
@@ -696,7 +716,7 @@ func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []
 // prViewJSONFields is the exact --json selection of the delivery gate's read.
 // The doctor probe (ProbeGHJSON) sends the SAME fields: a preflight that parsed
 // a different command would stop proving the thing the gate depends on.
-const prViewJSONFields = "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid"
+const prViewJSONFields = "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid,state"
 
 // parseGHPR decodes one `gh pr view --json` answer. A decode failure is a
 // ghParseError — gh ran and answered, and the answer is not what this package

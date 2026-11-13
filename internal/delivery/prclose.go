@@ -134,7 +134,9 @@ func (v *Verifier) OpenPRs(ctx context.Context, repo, slug, head string) ([]PRRe
 // project's `allow_unchecked_pr` opt-out cannot make an empty rollup mergeable
 // here. It reaches settlePR, and all it can do there is word the refusal as a
 // warning; the verdict stays PRRefused either way. That is deliberate: a
-// deterministic merge has nobody reading the log afterwards.
+// deterministic merge has nobody reading the log afterwards. A PR that is not
+// OPEN is refused up front, whatever the gate made of its CI: there is nothing
+// to merge.
 func (v *Verifier) JudgePR(ctx context.Context, repo, slug string, num int) PRState {
 	state := PRState{PRRef: PRRef{Number: num}}
 	if num <= 0 {
@@ -150,13 +152,22 @@ func (v *Verifier) JudgePR(ctx context.Context, repo, slug string, num int) PRSt
 	}
 	scope := v.ghAPIScope(ctx, repo, slug)
 	view, chk := v.pollPR(ctx, repo, slug, num, scope)
-	j := judgePR(view)
 	state.PRRef = PRRef{
 		Number:  num,
 		Base:    view.BaseRefName,
 		Head:    view.HeadRefName,
 		HeadOID: view.HeadRefOid,
 	}
+	// The close-out exists to merge an OPEN PR. The gate judges a MERGED PR's CI
+	// as passing (its mergeability is never computed), so without this a merged
+	// PR would reach the merge call as PRReady.
+	if viewState := strings.ToUpper(strings.TrimSpace(view.State)); viewState != "" && viewState != "OPEN" {
+		state.Verdict = PRRefused
+		state.Check = Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+			"PR %d is %s, not open - there is nothing to merge", num, viewState)}
+		return state
+	}
+	j := judgePR(view)
 	// A read that named no base cannot be shown to target anything, and this
 	// surface exists to merge into ONE configured branch. Whatever the check
 	// said, an unnamed merge target is a refusal — never a pass that a caller
