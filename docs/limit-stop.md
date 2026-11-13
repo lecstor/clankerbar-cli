@@ -11,8 +11,10 @@ line is `<reason> on <route>: <provider message>`, for example:
 The route is the one that ENDED the session: after a mid-session route switch that is
 the last route the session tried, not the one it started on. It is omitted when no
 route is known. The message is the provider's own error text (the terminal error
-event's `message`, or the harness's stderr), never the agent's narration, and the
-whole line is clipped to stay well under the 200 bytes the supervisor reads.
+event's `message`, or the adapter's diagnostic text - which can include the terminal
+error event verbatim - when no message field is recognised), never the agent's
+narration, and the whole line is clipped to stay well under the 200 bytes the
+supervisor reads.
 
 The supervisor reads that marker on the child's exit. It does not schedule a restart:
 the instance stays stopped until the operator resumes it (decision 4468b833, CLA-835).

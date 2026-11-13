@@ -103,15 +103,16 @@ func terminalErrorMessage(diag string) string {
 }
 
 // limitStopLine composes the marker's first line: the reason, the route that
-// stopped when one is known, and the provider's message. It is clipped to fit
-// limitStopLineMax on a rune boundary, because a clipped multi-byte rune would
-// print as mojibake in the console.
+// stopped when one is known, and the provider's message. Each part is oneLine'd
+// here (idempotent) so no caller can write a second line into the marker file.
+// It is clipped to fit limitStopLineMax on a rune boundary, because a clipped
+// multi-byte rune would print as mojibake in the console.
 func limitStopLine(lim harness.Limit, route, msg string) string {
 	line := oneLine(LimitStopReason(lim))
-	if route != "" {
+	if route = oneLine(route); route != "" {
 		line += " on " + route
 	}
-	if msg != "" {
+	if msg = oneLine(msg); msg != "" {
 		line += ": " + msg
 	}
 	return clipLimitStopLine(line)

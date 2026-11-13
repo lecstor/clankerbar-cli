@@ -103,10 +103,18 @@ func TestLimitStopLineOmitsWhatItDoesNotKnow(t *testing.T) {
 }
 
 // A provider message longer than the marker's read is clipped, and the line is
-// one printable line whatever the diagnostic carried.
+// one printable line whatever the diagnostic carried. The long fixture mixes
+// multi-byte runes into the clip boundary on purpose: a byte-slice clip there
+// would split a rune and fail the UTF-8 assertion below.
 func TestLimitStopLineIsClippedToOneLine(t *testing.T) {
-	long := strings.Repeat("upstream failure \x1b[31m", 40) + "\nsecond line"
-	line := limitStopLine(harness.Limit{Stop: true, Reason: "budget_exhausted"}, "route/one", oneLine(long))
+	long := "upstream failure " + strings.Repeat("·→", 40) + "\nsecond line"
+	// Guard the fixture itself: the clip boundary must fall inside a multi-byte
+	// rune, or this test could not catch a byte-slice clip.
+	raw := oneLine("budget_exhausted on route/one second route: " + long)
+	if utf8.ValidString(raw[:limitStopLineMax-3]) {
+		t.Fatalf("fixture does not exercise a rune-boundary clip: raw[:%d] is valid UTF-8", limitStopLineMax-3)
+	}
+	line := limitStopLine(harness.Limit{Stop: true, Reason: "budget_exhausted"}, "route/one\r\nsecond route", long)
 
 	if len(line) > limitStopLineMax {
 		t.Errorf("line is %d bytes, want <= %d so the supervisor's 200-byte read sees it whole", len(line), limitStopLineMax)
@@ -120,7 +128,7 @@ func TestLimitStopLineIsClippedToOneLine(t *testing.T) {
 	if !strings.HasSuffix(line, "...") {
 		t.Errorf("line = %q, want the clip marked with ...", line)
 	}
-	if !strings.HasPrefix(line, "budget_exhausted on route/one: upstream failure") {
+	if !strings.HasPrefix(line, "budget_exhausted on route/one second route: upstream failure") {
 		t.Errorf("line = %q, want the reason and route kept ahead of the clipped message", line)
 	}
 }
