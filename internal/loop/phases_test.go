@@ -439,7 +439,7 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
 
 	phases := d.cfg.EffectivePhases()
-	inv, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "", phases, nil)
+	inv, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}
@@ -1619,14 +1619,14 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
 
 	phases := d.cfg.EffectivePhases()
-	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "", phases, nil)
+	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor phase 1: %v", err)
 	}
 	if got := inv1.MaxSessionWallClock; got != 20*time.Minute {
 		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
 	}
-	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "", "", phases, nil)
+	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "", "", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor phase 2: %v", err)
 	}
@@ -4166,7 +4166,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
 		CheckpointTip: testCheckpointTip,
 	}
-	inv, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging", phases, nil)
+	inv, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor review: %v", err)
 	}
@@ -4183,14 +4183,14 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	// Branchless (the plane's record): the no-code review-only brief, and the
 	// no-code fix brief (which must NOT tell the session to open a PR).
 	branchless := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}}
-	inv, err = d.invocationFor(d.targets[0], 1, phases[1], branchless, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 1, phases[1], branchless, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor branchless review: %v", err)
 	}
 	if !strings.Contains(inv.Prompt, "PLANE'S RECORD") || strings.Contains(inv.Prompt, "verified to exist on the origin") {
 		t.Errorf("a branchless checkpoint did not get the no-code review-only brief:\n%s", inv.Prompt)
 	}
-	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor branchless fix: %v", err)
 	}
@@ -4200,7 +4200,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	if !strings.Contains(inv.Prompt, "LAST `"+config.ReviewRecordHeading+"`") {
 		t.Errorf("the no-code fix prompt does not point at the LAST %q block:\n%s", config.ReviewRecordHeading, inv.Prompt)
 	}
-	inv, err = d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor fix: %v", err)
 	}
@@ -4214,7 +4214,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 		Claim:                harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
 		CheckpointUnverified: true,
 	}
-	inv, err = d.invocationFor(d.targets[0], 1, phases[1], unverified, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 1, phases[1], unverified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor unverified review: %v", err)
 	}
@@ -4239,7 +4239,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	// inherit the core's verified-branch claim either.
 	panelPhases := append([]config.Phase(nil), phases...)
 	panelPhases[1].PanelMember = true
-	inv, err = d.invocationFor(d.targets[0], 1, panelPhases[1], unverified, "", "staging", panelPhases, nil)
+	inv, err = d.invocationFor(d.targets[0], 1, panelPhases[1], unverified, "", "staging", panelPhases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor unverified panel member: %v", err)
 	}
@@ -5241,7 +5241,7 @@ func TestInvocationForResolvesTheIntentToolBriefs(t *testing.T) {
 		CheckpointTip: testCheckpointTip,
 	}
 	for idx := range phases {
-		inv, err := d.invocationFor(d.targets[0], idx, phases[idx], verified, "", "staging", phases, nil)
+		inv, err := d.invocationFor(d.targets[0], idx, phases[idx], verified, "", "staging", phases, nil, "")
 		if err != nil {
 			t.Fatalf("invocationFor phase %d: %v", idx+1, err)
 		}
@@ -5256,14 +5256,14 @@ func TestInvocationForResolvesTheIntentToolBriefs(t *testing.T) {
 	// The review records through record_review; the verifier closes its round on
 	// the hand-over itself (submit_for_review.closeRound), which is the one-call
 	// shape the plane's post-cutover guards accept.
-	review, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging", phases, nil)
+	review, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor review: %v", err)
 	}
 	if !strings.Contains(review.Prompt, "record_review(taskId, runId, {...})") {
 		t.Errorf("the review brief does not name record_review:\n%s", review.Prompt)
 	}
-	verify, err := d.invocationFor(d.targets[0], 3, phases[3], verified, "", "staging", phases, nil)
+	verify, err := d.invocationFor(d.targets[0], 3, phases[3], verified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor verify: %v", err)
 	}
@@ -5295,14 +5295,14 @@ func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
 		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
 		CheckpointTip: testCheckpointTip,
 	}
-	inv, err := d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging", phases, nil)
+	inv, err := d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor fix: %v", err)
 	}
 	if !strings.Contains(inv.Prompt, "Do NOT open a PR") || strings.Contains(inv.Prompt, "Open a PR targeting") {
 		t.Errorf("the four-phase fix did not get the no-PR variant:\n%s", inv.Prompt)
 	}
-	inv, err = d.invocationFor(d.targets[0], 3, phases[3], verified, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 3, phases[3], verified, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor verify: %v", err)
 	}
@@ -5319,7 +5319,7 @@ func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
 	// Branchless: the no-code fix-verify and the no-code verification brief,
 	// neither of which may open a PR or commit anything.
 	branchless := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}}
-	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor branchless fix: %v", err)
 	}
@@ -5329,7 +5329,7 @@ func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
 	if !strings.Contains(inv.Prompt, "the VERIFICATION round after you carries") {
 		t.Errorf("the branchless fix-verify brief does not promise the verifier's hand-over:\n%s", inv.Prompt)
 	}
-	inv, err = d.invocationFor(d.targets[0], 3, phases[3], branchless, "", "staging", phases, nil)
+	inv, err = d.invocationFor(d.targets[0], 3, phases[3], branchless, "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor branchless verify: %v", err)
 	}

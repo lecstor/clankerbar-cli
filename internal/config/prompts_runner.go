@@ -145,7 +145,7 @@ const runnerReviewResume = runnerResumeNoClaim + " An empty branch field on the 
 // runnerReviewWorktreeAndGate is reviewOnlyBriefWorktreeAndGate with the
 // worktree hunt replaced: the session starts at the reviewed tip.
 var runnerReviewWorktreeAndGate = " " + runnerWorktreeAtTip +
-	" Read the diff against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder +
+	" Read the diff against the PR base (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder +
 	") and run the adversarial review gate." + reviewGateScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +

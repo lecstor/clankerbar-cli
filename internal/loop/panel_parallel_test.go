@@ -125,6 +125,9 @@ type panelParallelAdapter struct {
 	// per member label: the directory it ran in and that directory's HEAD.
 	workdirs map[string]string
 	heads    map[string]string
+	// prompts is each member's role and the prompt the driver rendered for it,
+	// so a test can assert what a member was actually told.
+	prompts map[string]string
 	// order is the reviewer role of each panel member, in the order the DRIVER
 	// LAUNCHED it: recorded by the driver's panelLaunch seam at the launch
 	// boundary (phaseRunOpts.onSessionLaunch), before the member releases its
@@ -153,6 +156,7 @@ func newPanelParallelAdapter(rel *reviewReleaser, branch, tip string, members in
 		allStarted:       make(chan struct{}),
 		workdirs:         map[string]string{},
 		heads:            map[string]string{},
+		prompts:          map[string]string{},
 	}
 }
 
@@ -259,6 +263,7 @@ func (a *panelParallelAdapter) review(ctx context.Context, in harness.Invocation
 	a.reviewCalls++
 	a.workdirs[label] = in.WorkDir
 	a.heads[label] = head
+	a.prompts[label] = in.Prompt
 	a.inFlight++
 	if a.inFlight > a.maxInFlight {
 		a.maxInFlight = a.inFlight
@@ -1099,4 +1104,51 @@ func TestDrainPhases_ParallelPanelMemberLosingItsRunEndsTheDrain(t *testing.T) {
 		t.Errorf("the daemon log does not say why the drain ended:\n%s", out)
 	}
 	requireOneFleetRecord(t, ff)
+}
+
+// CLA-865: the fan-out threads the runner's prep merge-base into every member
+// (phaseRunOpts.baseSHA), because a panel member is spawned with no runner
+// briefing to carry it. Without that, a panel's brief would diff from
+// origin/<base> while the single reviewer's diffs from the SHA the runner
+// computed — two bases for the same round, which is what the maps review
+// (CLA-864) must not see.
+func TestRunPanelInParallel_PanelMembersDiffFromThePrepMergeBase(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers()
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	d, _ := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	phases := d.cfg.EffectivePhases()
+	start, end := 1, 1+len(members)
+	carried := &harness.Result{
+		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: branch},
+		CheckpointTip: tip,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, ok := d.runPanelInParallel(ctx, 1, 0, d.targets[0], phases, start, end, len(members), carried, spend{start: time.Now()}, testMergeBaseSHA); !ok {
+		t.Fatal("runPanelInParallel refused the fan-out")
+	}
+	a.mu.Lock()
+	prompts := make(map[string]string, len(a.prompts))
+	for role, p := range a.prompts {
+		prompts[role] = p
+	}
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if len(prompts) != len(members) {
+		t.Fatalf("members rendered %d prompts, want %d: %v", len(prompts), len(members), prompts)
+	}
+	want := "git diff " + testMergeBaseSHA + "..." + branch
+	for role, p := range prompts {
+		if !strings.Contains(p, want) {
+			t.Errorf("member %s does not diff from the prep merge-base (%q):\n%s", role, want, p)
+		}
+		if strings.Contains(p, "git diff origin/") || strings.Contains(p, "git diff staging...") {
+			t.Errorf("member %s diffs from a base branch although the join held the prep SHA:\n%s", role, p)
+		}
+	}
 }

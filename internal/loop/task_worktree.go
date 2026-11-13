@@ -48,6 +48,7 @@ type worktreeRequest struct {
 type worktreePrep struct {
 	Dir            string
 	Tip            string   // HEAD after prep
+	BaseSHA        string   // merge-base of origin/<PRBase> and Tip, after any prep merge; empty when unavailable
 	OriginTip      string   // origin/<branch> after the fetch; empty when the branch is not on origin
 	Ahead          int      // commits HEAD has that origin/<branch> lacks; 0 when OriginTip is empty
 	Created        bool     // worktree newly added (vs reused)
@@ -431,12 +432,26 @@ func taskWorktreeMerge(ctx context.Context, dir, base string) (merged, upToDate 
 // finishTaskWorktreePrep records the tip HEAD afterwards, plus where origin's
 // branch is: a reused tree ahead of origin keeps its unpushed commits, so its
 // Tip is not "the tip on origin" and the caller must be able to tell.
+//
+// BaseSHA is the commit a later review's `git diff` starts from. It is computed
+// here, after any prep merge, because that is the only place the runner already
+// has the prepared tree: a review that re-derived it could not know the tip the
+// prep merged to. A missing merge-base (unrelated histories) leaves it empty and
+// the briefs fall back to origin/<PRBase>, which computes the same thing itself.
 func finishTaskWorktreePrep(ctx context.Context, req worktreeRequest, prep worktreePrep) (worktreePrep, error) {
 	tip, err := taskWorktreeHead(ctx, prep.Dir)
 	if err != nil {
 		return prep, err
 	}
 	prep.Tip = tip
+	if req.PRBase != "" {
+		base := "origin/" + req.PRBase
+		if taskWorktreeCommitishExists(ctx, prep.Dir, base) {
+			if out, merr := taskWorktreeGit(ctx, prep.Dir, "merge-base", base, tip); merr == nil {
+				prep.BaseSHA = out
+			}
+		}
+	}
 	remote := "origin/" + req.Branch
 	if !taskWorktreeCommitishExists(ctx, prep.Dir, remote) {
 		return prep, nil

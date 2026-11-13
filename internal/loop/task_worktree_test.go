@@ -146,6 +146,9 @@ func TestTaskWorktree_FreshCreateFromBase(t *testing.T) {
 	if prep.Tip != baseTip {
 		t.Errorf("Tip = %s, want the base tip %s", prep.Tip, baseTip)
 	}
+	if prep.BaseSHA != baseTip {
+		t.Errorf("BaseSHA = %s, want the base tip %s (the merge-base of origin/staging and the tip)", prep.BaseSHA, baseTip)
+	}
 	if branch := gitOut(t, prep.Dir, "rev-parse", "--abbrev-ref", "HEAD"); branch != taskWorktreeBranch {
 		t.Errorf("worktree is on %q, want %q", branch, taskWorktreeBranch)
 	}
@@ -231,6 +234,12 @@ func TestTaskWorktree_ResumeMergesBase(t *testing.T) {
 	}
 	if got := gitOut(t, prep.Dir, "rev-parse", "HEAD^2"); got != mergeBaseTip {
 		t.Errorf("the merge's second parent is %s, want the base tip %s", got, mergeBaseTip)
+	}
+	// The prep merged the base into the branch, so the commit a review's diff
+	// must start from is the merged base tip, not the old fork point: anything
+	// earlier would re-show the base's own commits.
+	if prep.BaseSHA != mergeBaseTip {
+		t.Errorf("BaseSHA = %s, want the merged base tip %s", prep.BaseSHA, mergeBaseTip)
 	}
 	for _, file := range []string{"branch.txt", "base.txt"} {
 		if _, err := os.Stat(filepath.Join(prep.Dir, file)); err != nil {

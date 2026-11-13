@@ -105,7 +105,7 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 				start:  prior.start,
 				tokens: prior.tokens + s.tokens,
 				cost:   prior.cost + s.cost,
-			}); ok {
+			}, s.prep.BaseSHA); ok {
 				s.tokens += out.tokens
 				s.cost += out.cost
 				s.spawned += n

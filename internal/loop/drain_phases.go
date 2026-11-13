@@ -339,6 +339,13 @@ type phaseRunOpts struct {
 	// claimed: the runner-claimed briefs and the task context block. Nil is the
 	// session-claim path, which runs the shipped briefs.
 	runner *runnerBriefing
+
+	// baseSHA is the runner's prep merge-base for a spawn that has no runner
+	// briefing to carry it — a parallel panel member, which is spawned by the
+	// join with no briefing because it writes no report. Without it the member's
+	// brief falls back to origin/<prBase>, so the panel's diff base would differ
+	// from the single reviewer's SHA. Empty is the session-claim path.
+	baseSHA string
 }
 
 // panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).

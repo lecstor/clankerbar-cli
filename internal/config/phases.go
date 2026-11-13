@@ -360,6 +360,15 @@ const (
 	PhaseBranchPlaceholder = "{{branch}}"
 	PhasePRBasePlaceholder = "{{prBase}}"
 
+	// PhaseBasePlaceholder names the commit a brief's `git diff` starts from:
+	// the merge-base of origin/<prBase> and the worktree tip, as the runner
+	// computed it during worktree prep, or origin/<prBase> when no SHA was
+	// available. Never a bare local <prBase>: the local base branch can be far
+	// behind origin (the MAK-362 review's was 124 commits), and a diff from it
+	// carries unrelated files. Filled in every phase, like {{prBase}} — it needs
+	// no claim.
+	PhaseBasePlaceholder = "{{baseSha}}"
+
 	// PhaseHarnessPlaceholder and PhaseModelPlaceholder name the phase's OWN
 	// resolved harness and model. They are per-phase facts the driver knows and a
 	// session cannot reliably report for itself ("what model are you?" is a guess
