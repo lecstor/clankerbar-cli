@@ -35,7 +35,8 @@ func Diff(r Range) (string, error) {
 	defer cleanup()
 
 	cmd := exec.Command("git", "-c", "core.attributesFile="+name,
-		"diff", r.Base+".."+r.Head, "--")
+		"diff", "--no-ext-diff", "--no-textconv", "--end-of-options",
+		r.Base+".."+r.Head, "--")
 	cmd.Dir = r.Repo
 	out, err := cmd.Output()
 	if err != nil {

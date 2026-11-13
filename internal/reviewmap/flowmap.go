@@ -19,16 +19,21 @@ func FlowMap(diff string, r Range, maxNames int) ([]string, error) {
 }
 
 // changedDefinitions runs each file through its extractor and keeps the first
-// occurrence of every name across the whole diff.
+// occurrence of every name across the whole diff. A removal yields to a later
+// addition of the same name, so a declaration moved between files is reported
+// as changed rather than removed.
 func changedDefinitions(files []FileDiff, src Source) []Definition {
 	var defs []Definition
-	seen := make(map[string]bool)
+	index := make(map[string]int)
 	for _, f := range files {
 		for _, d := range extractorFor(f.Path).Names(f, src) {
-			if seen[d.Name] {
+			if i, ok := index[d.Name]; ok {
+				if defs[i].Removed && !d.Removed {
+					defs[i] = d
+				}
 				continue
 			}
-			seen[d.Name] = true
+			index[d.Name] = len(defs)
 			defs = append(defs, d)
 		}
 	}
