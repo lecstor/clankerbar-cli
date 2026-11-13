@@ -41,6 +41,22 @@ func TestReviewMethod_ParsesBothSpellings(t *testing.T) {
 		t.Fatalf("Validate() = %v, want the opencode maps-session review accepted", err)
 	}
 
+	// A mixed-harness sequence: the review phase names opencode under a claude
+	// run, with its own block. The capability question is about THIS PHASE's
+	// harness, not the run's.
+	mixed := mapsSessionConfig(t, `{
+		"harness": "claude",
+		"harnesses": {"opencode": {"config_dir": "/tmp/oc", "mcp_config_path": "/tmp/oc.json"}},
+		"phases": [
+			{"name": "implement"},
+			{"name": "review", "harness": "opencode", "review_method": "maps-session"},
+			{"name": "fix"}
+		]
+	}`)
+	if err := mixed.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a maps-session review phase on opencode under a claude run accepted", err)
+	}
+
 	plain := mapsSessionConfig(t, `{
 		"harness": "opencode",
 		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
