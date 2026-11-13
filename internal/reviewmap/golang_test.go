@@ -31,6 +31,7 @@ func staticRead(files map[string]string, path string) ([]byte, error) {
 func TestGoNames(t *testing.T) {
 	tests := []struct {
 		name    string
+		path    string
 		head    string
 		base    string
 		hunks   []Hunk
@@ -118,6 +119,34 @@ func (d *driver) Error() string { return "" }
 			hunks: []Hunk{{Start: 1, Count: 4}},
 		},
 		{
+			name: "shared method names are noise",
+			head: `package demo
+
+func (s *staticSource) Head(path string) ([]byte, error) { return nil, nil }
+func (s *staticSource) Base(path string) ([]byte, error) { return nil, nil }
+func (r *repo) Match(path string) bool { return false }
+func (g *Go) Names() {}
+func (d *driver) show() {}
+`,
+			base:  "package demo\n",
+			hunks: []Hunk{{Start: 1, Count: 7}},
+		},
+		{
+			name:  "test file declarations are not contracts",
+			path:  "a_test.go",
+			head:  "package demo\n\ntype helperThing struct{}\n",
+			base:  "package demo\n",
+			hunks: []Hunk{{Start: 1, Count: 3}},
+			// tests are uses, not contracts
+		},
+		{
+			name:  "base parse failure still reports changed definitions",
+			head:  "package demo\n\nfunc NewThing() {}\n",
+			base:  "package demo\n\nfunc Broken( {\n",
+			hunks: []Hunk{{Start: 1, Count: 3}},
+			want:  []Definition{{Name: "NewThing", At: "a.go:3"}},
+		},
+		{
 			name:  "hunk outside the span changes nothing",
 			head:  "package demo\n\ntype Widget struct{}\n",
 			base:  "package demo\n",
@@ -170,16 +199,42 @@ func (d *driver) Error() string { return "" }
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := FileDiff{Path: "a.go", Deleted: tc.deleted, Hunks: tc.hunks}
+			path := tc.path
+			if path == "" {
+				path = "a.go"
+			}
+			f := FileDiff{Path: path, Deleted: tc.deleted, Hunks: tc.hunks}
 			src := staticSource{
-				head: map[string]string{"a.go": tc.head},
-				base: map[string]string{"a.go": tc.base},
+				head: map[string]string{path: tc.head},
+				base: map[string]string{path: tc.base},
 			}
 			got := Go{}.Names(f, src)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("Go.Names() = %#v\nwant %#v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGoNamesReadDegradation pins the doc-comment promise: an unreadable base
+// drops only the removals, and an unreadable head falls back to the hunk
+// header rather than failing.
+func TestGoNamesReadDegradation(t *testing.T) {
+	f := FileDiff{Path: "a.go", Hunks: []Hunk{{Start: 1, Count: 3}}}
+	headOnly := staticSource{head: map[string]string{
+		"a.go": "package demo\n\nfunc NewThing() {}\n",
+	}}
+	want := []Definition{{Name: "NewThing", At: "a.go:3"}}
+	if got := (Go{}).Names(f, headOnly); !reflect.DeepEqual(got, want) {
+		t.Errorf("Names(base read error) = %#v\nwant %#v", got, want)
+	}
+
+	header := FileDiff{Path: "a.go", Hunks: []Hunk{{
+		Start: 3, Count: 1, Context: "func NewThing() {",
+	}}}
+	want = []Definition{{Name: "NewThing", At: "a.go:3 (body changed)"}}
+	if got := (Go{}).Names(header, staticSource{}); !reflect.DeepEqual(got, want) {
+		t.Errorf("Names(head read error) = %#v\nwant %#v", got, want)
 	}
 }
 
@@ -373,6 +428,59 @@ func TestGoFlowMapDeletedFile(t *testing.T) {
 	}
 	if got := flowMapHead(t, r, base); !reflect.DeepEqual(got, want) {
 		t.Errorf("FlowMap() = %#v\nwant %#v", got, want)
+	}
+}
+
+// TestGoFlowMapRenamedFileRemovedFunc pins the rename path: git records the
+// file move, so its base content must be read from the source path or the
+// declaration removed while the file was renamed never surfaces.
+func TestGoFlowMapRenamedFileRemovedFunc(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("old.go", `package demo
+
+func OldThing() error {
+	return nil
+}
+
+func KeepThing() error {
+	a := 1
+	b := 2
+	_ = a
+	_ = b
+	return nil
+}
+`)
+	r.write("uses.go", "package demo\n\nfunc UseOld() error {\n\treturn OldThing()\n}\n")
+	r.commit("base")
+	base := r.git("rev-parse", "HEAD")
+
+	r.git("mv", "old.go", "new.go")
+	r.write("new.go", `package demo
+
+func KeepThing() error {
+	a := 1
+	b := 2
+	_ = a
+	_ = b
+	return nil
+}
+`)
+	r.commit("head")
+
+	diff := diffHead(t, r, base)
+	if !strings.Contains(diff, "rename from old.go") {
+		t.Fatalf("diff carries no rename for old.go:\n%s", diff)
+	}
+	items, err := FlowMap(diff, Range{Repo: r.dir, Base: base, Head: "HEAD"}, 0)
+	if err != nil {
+		t.Fatalf("FlowMap() error: %v", err)
+	}
+	want := []string{
+		"`KeepThing` defined or changed at new.go:3; used at: nowhere else",
+		"`OldThing` removed from old.go; still referenced at: uses.go:4",
+	}
+	if !reflect.DeepEqual(items, want) {
+		t.Errorf("FlowMap() = %#v\nwant %#v", items, want)
 	}
 }
 

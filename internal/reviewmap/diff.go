@@ -18,6 +18,10 @@ const noNewlineMarker = `\ No newline at end of file`
 // FileDiff is one file's changed hunks, in diff order.
 type FileDiff struct {
 	Path string
+	// RenamedFrom is the path git reports the file came from, empty when the
+	// diff is not a rename. A rename's base content lives at that path, not at
+	// Path, so a flow map that reads the base must use it.
+	RenamedFrom string
 	// Deleted marks a file the diff removes entirely. Its hunks describe lines
 	// that no longer exist, so the change map skips it; the flow map still
 	// reads its base version to report removed declarations.
@@ -48,7 +52,8 @@ type AddedLine struct {
 // ParseDiff splits a unified diff into per-file hunks, keeping the added lines
 // and each header's context. A file the diff removes entirely is kept as a
 // Deleted entry with no hunks: its old lines are gone from the tree the map is
-// built for, but its removed declarations still matter.
+// built for, but its removed declarations still matter. A rename records the
+// source path in RenamedFrom, where the base content still lives.
 func ParseDiff(diff string) []FileDiff {
 	var files []FileDiff
 	fileIdx := -1
@@ -56,6 +61,7 @@ func ParseDiff(diff string) []FileDiff {
 	inHunk := false
 	line := 0
 	oldPath := ""
+	renamedFrom := ""
 
 	for _, raw := range strings.Split(diff, "\n") {
 		switch {
@@ -65,23 +71,7 @@ func ParseDiff(diff string) []FileDiff {
 			inHunk = false
 			hunkIdx = -1
 			oldPath = ""
-		case strings.HasPrefix(raw, "--- "):
-			oldPath = stripDiffPath(raw[4:])
-		case strings.HasPrefix(raw, "+++ "):
-			path := stripDiffPath(raw[4:])
-			inHunk = false
-			hunkIdx = -1
-			if path == "/dev/null" {
-				// Keep the path for the flow map, but leave fileIdx closed so
-				// the deletion's hunks attach to no file.
-				if oldPath != "" && oldPath != "/dev/null" {
-					files = append(files, FileDiff{Path: oldPath, Deleted: true})
-				}
-				fileIdx = -1
-				break
-			}
-			files = append(files, FileDiff{Path: path})
-			fileIdx = len(files) - 1
+			renamedFrom = ""
 		case fileIdx >= 0 && hunkHeaderRE.MatchString(raw):
 			m := hunkHeaderRE.FindStringSubmatch(raw)
 			start, _ := strconv.Atoi(m[1])
@@ -98,6 +88,9 @@ func ParseDiff(diff string) []FileDiff {
 			inHunk = true
 			line = start
 		case inHunk && hunkIdx >= 0:
+			// The body comes before the header prefixes: an added content line
+			// "-- foo" becomes "--- foo" once its '+' prefix is applied, and a
+			// deleted "++ foo" becomes "+++ foo", so those are content here.
 			switch {
 			case raw == noNewlineMarker:
 			case strings.HasPrefix(raw, "-"):
@@ -110,6 +103,25 @@ func ParseDiff(diff string) []FileDiff {
 				}
 				line++
 			}
+		case strings.HasPrefix(raw, "rename from "):
+			renamedFrom = strings.TrimSpace(strings.TrimPrefix(raw, "rename from "))
+		case strings.HasPrefix(raw, "--- "):
+			oldPath = stripDiffPath(raw[4:])
+		case strings.HasPrefix(raw, "+++ "):
+			path := stripDiffPath(raw[4:])
+			inHunk = false
+			hunkIdx = -1
+			if path == "/dev/null" {
+				// Keep the path for the flow map, but leave fileIdx closed so
+				// the deletion's hunks attach to no file.
+				if oldPath != "" && oldPath != "/dev/null" {
+					files = append(files, FileDiff{Path: oldPath, Deleted: true})
+				}
+				fileIdx = -1
+				break
+			}
+			files = append(files, FileDiff{Path: path, RenamedFrom: renamedFrom})
+			fileIdx = len(files) - 1
 		}
 	}
 	return files

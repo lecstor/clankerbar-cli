@@ -17,9 +17,15 @@ type Go struct{}
 func (Go) Match(path string) bool { return strings.HasSuffix(path, ".go") }
 
 // Names returns the changed declarations in f, then the exported declarations
-// f removes. A file that cannot be read or parsed falls back to hunk-header
-// names: a broken source file must cost detail, not the whole map.
+// f removes. Missing detail degrades rather than failing the map: a head that
+// cannot be read or parsed falls back to hunk-header names, and a base that
+// cannot be read or parsed leaves the head declarations without removals.
 func (Go) Names(f FileDiff, src Source) []Definition {
+	// Tests are uses, not contracts: a changed helper in a test file is not a
+	// contract a reader must check.
+	if strings.HasSuffix(f.Path, "_test.go") {
+		return nil
+	}
 	if src == nil {
 		return goHeaderDefinitions(f)
 	}
@@ -41,15 +47,20 @@ func (Go) Names(f FileDiff, src Source) []Definition {
 	}
 
 	defs := changedGoDefinitions(f, head)
-	baseData, err := src.Base(f.Path)
+	// A rename's base lives at the source path, not at the head path.
+	basePath := f.Path
+	if f.RenamedFrom != "" {
+		basePath = f.RenamedFrom
+	}
+	baseData, err := src.Base(basePath)
 	if err != nil {
 		return defs
 	}
-	base, ok := goParseBytes(f.Path, baseData)
+	base, ok := goParseBytes(basePath, baseData)
 	if !ok {
 		return defs
 	}
-	return append(defs, removedGoDefinitions(f.Path, base, head)...)
+	return append(defs, removedGoDefinitions(basePath, base, head)...)
 }
 
 // goDecl is one parsed declaration with its span in the file.
@@ -175,20 +186,15 @@ func changedGoDefinitions(f FileDiff, head []goDecl) []Definition {
 	return defs
 }
 
-// goOverlapsHunk reports whether any added line or hunk head range touches
-// start..end. The head range catches a deletion-only hunk, which has no added
-// lines to test.
+// goOverlapsHunk reports whether any hunk's head range touches start..end.
+// Every added line lies inside its own hunk's range, so the range test alone
+// decides: a deletion-only hunk still marks the declaration it covers.
 func goOverlapsHunk(f FileDiff, start, end int) bool {
 	for _, h := range f.Hunks {
 		hunkStart := h.Start
 		hunkEnd := h.Start + max(h.Count, 1) - 1
 		if hunkStart <= end && start <= hunkEnd {
 			return true
-		}
-		for _, l := range h.Added {
-			if l.Line >= start && l.Line <= end {
-				return true
-			}
 		}
 	}
 	return false
@@ -313,9 +319,12 @@ func goGrepName(display, name string) string {
 
 // goFuncNoise drops functions whose names say nothing about a changed
 // contract: entry points, the String/Error interface pair, and the test
-// function families. Tests are uses, not contracts.
+// function families. Tests are uses, not contracts. The shared method names
+// are here because they collide with unrelated namesakes in every package, so
+// their use lists would hide the real call sites rather than show them.
 var goFuncNoise = map[string]bool{
 	"init": true, "main": true, "String": true, "Error": true,
+	"Head": true, "Base": true, "Match": true, "Names": true, "show": true,
 }
 
 func goNoiseFunc(name string) bool {
