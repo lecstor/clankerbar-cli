@@ -109,10 +109,12 @@ func (c *Config) validateReviewMethods() error {
 			return fmt.Errorf("%s: unknown review_method %q (want: %q or %q, or omit it for the single-pass default)",
 				step, ph.ReviewMethod, ReviewMethodSinglePass, ReviewMethodMapsSession)
 		}
-		// The method only means anything on a review phase: its prompt is what
+		// The method only means anything on a REVIEW phase: its prompt is what
 		// the maps section is appended to, and a non-review step has no review
-		// record for the findings turn to write.
-		if !ReviewShaped(ph.Prompt) {
+		// record for the findings turn to write. A verification round is
+		// review-SHAPED but adjudicates prior findings over a fix delta, so it is
+		// explicitly out: its done report is the verifier's, not a fresh review's.
+		if !ReviewShaped(ph.Prompt) || VerifyShaped(ph.Prompt) {
 			hint := ""
 			if ph.Name == ReviewPhaseName {
 				hint = " (this phase runs the FINAL combined review-and-fix brief; the maps-session turns are the review-only gate's, so put a phase after the review)"

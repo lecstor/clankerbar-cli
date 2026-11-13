@@ -54,7 +54,10 @@ func (r *phaseRun) mapsSessionRequested() bool {
 	if r.shape.captured.Prompt != r.ph.Prompt {
 		return false
 	}
-	return config.ReviewShaped(r.shape.captured.Prompt)
+	// A verification round is review-SHAPED but adjudicates a fix delta; the
+	// method is the review phase's, and VerifyShaped is the same exclusion the
+	// driver uses to keep the two reports apart (config.Validate refuses it too).
+	return config.ReviewShaped(r.shape.captured.Prompt) && !config.VerifyShaped(r.shape.captured.Prompt)
 }
 
 // mapsSessionEnding is the last sentence of the findings turn: the record the

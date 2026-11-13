@@ -163,6 +163,16 @@ func TestReviewMethod_ValidateRefusals(t *testing.T) {
 			t.Fatalf("Validate() = %v, want a negative-chunk-size refusal", err)
 		}
 	})
+	t.Run("the method on a verify phase", func(t *testing.T) {
+		cfg := mapsSessionConfig(t, `{
+			"harness": "opencode",
+			"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}, {"name": "verify", "review_method": "maps-session"}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "needs a review phase") {
+			t.Fatalf("Validate() = %v, want a verify phase refused the review method", err)
+		}
+	})
 	t.Run("negative flow cap", func(t *testing.T) {
 		cfg := mapsSessionConfig(t, `{
 			"harness": "opencode",
