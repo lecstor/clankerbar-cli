@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"path/filepath"
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -57,9 +58,18 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 	// A task with no recorded branch has nothing to ask origin about, and the
 	// fetch would only cost a round-trip before the branch exists.
 	of := originBranchFacts{Known: true}
-	if task.HasWIP {
+	fetched := false
+	switch {
+	case s.preClaimTask == task.ID && s.preClaimCheckout == checkout && s.preClaimOrigin.Known:
+		// The pre-claim worktree check already fetched origin for this task:
+		// reuse it, then consume it so a retry re-derives origin instead of
+		// resuming on a read that predates a whole session.
+		of, fetched = s.preClaimOrigin, true
+	case task.HasWIP:
 		of = s.d.originBranchFn()(ctx, checkout, task.Branch, doneTip)
+		fetched = of.Known
 	}
+	s.clearPreClaimOrigin()
 	f := startFacts{
 		CloseOut: task.AwaitingMerge, HasWIP: task.HasWIP, Branch: task.Branch,
 		NoCodeDelivered: st.DeliveryNoCode, OriginKnown: of.Known, OnOrigin: of.OnOrigin, Tip: of.Tip,
@@ -76,7 +86,7 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 	s.closeOut = choice.CloseOut
 	if !choice.Branchless {
 		var ok bool
-		if choice, ok = s.prepareTaskDir(ctx, checkout, prBase, claim, task, of, choice); !ok {
+		if choice, ok = s.prepareTaskDir(ctx, checkout, prBase, claim, task, of, fetched, choice); !ok {
 			return startAbort
 		}
 	}
@@ -96,17 +106,27 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 // the tree leaves standing: a tree holding unpushed commits cannot resume the
 // recorded tip, so the start drops to implement. ok=false means the claim is no
 // longer usable — handed back, or parked by startRefused.
-func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, claim harness.Claim, task plane.TaskBrief, of originBranchFacts, choice startChoice) (startChoice, bool) {
+//
+// A close-out still gets a prepared tree: the close-out brief directs a red
+// check's repair onto the branch in this worktree, so there is no close-out
+// shape that provably needs no tree.
+func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, claim harness.Claim, task plane.TaskBrief, of originBranchFacts, fetched bool, choice startChoice) (startChoice, bool) {
 	req := worktreeRequest{
 		Checkout: checkout, TaskID: claim.TaskID, Branch: task.Branch, PRBase: prBase,
 		Resume: of.OnOrigin, CloseOut: choice.CloseOut, NoMerge: choice.Index != 0,
-		// The origin read already fetched, but only a WIP task runs one.
-		Fetched: of.Known && task.HasWIP,
+		// A WIP task's origin read already fetched, and so may the pre-claim
+		// worktree check; either way the prep must not pay for a second fetch.
+		Fetched:     fetched,
+		ScratchRoot: s.d.worktreeScratchRoot(),
 	}
 	prep, err := s.d.prepareWorktreeFn()(ctx, req)
 	if err != nil {
 		s.startRefused(ctx, claim, err)
 		return choice, false
+	}
+	if prep.ScratchAside != "" {
+		log.Printf("%siteration %d: %s: moved untracked session files aside to %s to reuse the task worktree",
+			labelOf(s.t), s.drainNum, claimLabel(claim), prep.ScratchAside)
 	}
 	if choice.Index != 0 && prep.Ahead > 0 {
 		// The session would see the local tip, not the checkpoint's, so the phase
@@ -140,6 +160,17 @@ func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, 
 	s.taskDir = prep.Dir
 	s.prep = prep
 	return choice, true
+}
+
+// worktreeScratchRoot is where a prepared tree's cleared untracked files go:
+// under the runner's state dir, outside every tree a session may edit. Empty
+// lets prepareTaskWorktree fall back beside the task-worktree root.
+func (d *Driver) worktreeScratchRoot() string {
+	dir, err := d.cfg.ResolveStateDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "worktree-scratch")
 }
 
 // startRefused handles a failed worktree prep. A fetch failure is transient, so

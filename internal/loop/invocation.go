@@ -425,26 +425,34 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), err)
 		}
 	}
+	dir, err := d.checkoutFor(t, repo)
+	return dir, briefed, repo, err
+}
+
+// checkoutFor resolves a repo identity to the local checkout this target runs
+// the project in. It is sessionDir's resolution without the task read, for the
+// pre-claim worktree check, which knows the identity from the offer already.
+//
+// With the per-project layout declared, the session must START inside the
+// project root its permission scope is bounded to. ResolveCheckout prefers an
+// explicit `repos` path, so a stale override pointing at a developer checkout
+// would otherwise run the session outside the project and hand that path to the
+// policy (CLA-678 review round 2, finding 3). The materialized config already
+// rewrites the overrides; this is the driver-side refusal that holds even for a
+// config that adopted the layout by hand.
+func (d *Driver) checkoutFor(t Target, repo string) (string, error) {
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
 	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
 	if err != nil {
-		return dir, briefed, repo, err
+		return dir, err
 	}
-	// With the per-project layout declared, the session must START inside the
-	// project root its permission scope is bounded to. ResolveCheckout prefers
-	// an explicit `repos` path, so a stale override pointing at a developer
-	// checkout would otherwise run the session outside the project and hand
-	// that path to the policy (CLA-678 review round 2, finding 3). The
-	// materialized config already rewrites the overrides; this is the
-	// driver-side refusal that holds even for a config that adopted the layout
-	// by hand.
 	if t.ProjectRoot && dir != "" && !insideProjectRoot(workdir, dir) {
-		return dir, briefed, repo, fmt.Errorf("repo checkout %s resolves outside the project root %s - refusing to start the session outside its declared scope", dir, workdir)
+		return dir, fmt.Errorf("repo checkout %s resolves outside the project root %s - refusing to start the session outside its declared scope", dir, workdir)
 	}
-	return dir, briefed, repo, nil
+	return dir, nil
 }
 
 // extraDirsFor lists the directories a session's permission policy must cover

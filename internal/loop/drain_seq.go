@@ -45,6 +45,13 @@ type drainSeq struct {
 	prep worktreePrep
 	// closeOut marks a close-out claim, which takes the close-out brief.
 	closeOut bool
+	// preClaimOrigin is the origin read the pre-claim worktree check made, keyed
+	// to preClaimTask/preClaimCheckout. prepareStart consumes it ONCE: a retry
+	// after a long session must re-derive origin rather than resume on a stale
+	// read. An unknown (zero) originBranchFacts means there is none to reuse.
+	preClaimOrigin   originBranchFacts
+	preClaimTask     string
+	preClaimCheckout string
 
 	// What the drain returns.
 	tokens   int

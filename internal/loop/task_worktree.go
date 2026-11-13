@@ -9,8 +9,11 @@ package loop
 // prompt instruction and a full-context turn happens here instead.
 //
 // Two rules the code below keeps:
-//   - never discard work. A reused worktree that is dirty, detached, on another
-//     branch, or diverged from origin is REFUSED with a reason; only a
+//   - never discard work. A reused worktree that is detached, on another
+//     branch, or holds tracked changes or commits origin lacks is REFUSED with
+//     a reason. Untracked files are not committed work: when HEAD is at or
+//     behind a ref origin has, they are moved aside to a logged directory
+//     OUTSIDE the tree (nothing deleted) and the tree is reused. Only a
 //     fast-forward is applied to a clean, matching tree.
 //   - a conflict is not a failure. The merge is aborted, the conflicting paths
 //     are returned, and the session starts clean at the pre-merge tip with the
@@ -22,6 +25,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +47,10 @@ type worktreeRequest struct {
 	CloseOut bool   // approved close-out: check out, never merge PRBase
 	NoMerge  bool   // resume without merging PRBase: a review/fix/verify start must keep origin's tip
 	Fetched  bool   // the caller already fetched origin in Checkout
+	// ScratchRoot is where untracked files cleared for a reuse are moved, from
+	// the caller's point of view: the runner passes its state dir, outside every
+	// tree a session may edit. Empty falls back beside the task-worktree root.
+	ScratchRoot string
 }
 
 // worktreePrep is the prepared tree the caller briefs the session with.
@@ -56,6 +65,9 @@ type worktreePrep struct {
 	Merged         bool     // PRBase merged into a resumed branch, moving HEAD
 	UpToDate       bool     // merge was a no-op
 	Conflicts      []string // merge stopped: conflicting paths; aborted, tree clean at the pre-merge tip
+	// ScratchAside is where untracked files were moved so the tree could be
+	// reused; empty when nothing was moved.
+	ScratchAside string
 }
 
 // registeredWorktree is one entry of `git worktree list --porcelain`.
@@ -163,19 +175,38 @@ func adoptBranchWorktree(ctx context.Context, req worktreeRequest, prep worktree
 
 // taskWorktreeUnsafeToAdopt names what a tree outside the task-worktree roots
 // holds that origin does not, or "" when adopting it would discard nothing: a
-// clean tree at or behind origin (or the PR base, for a branch never pushed)
-// carries no unpushed work, and this run holds the task's claim.
+// tree at or behind origin (or the PR base, for a branch never pushed) carries
+// no unpushed work, and this run holds the task's claim. Untracked files are
+// cleared by reuse, so they are unsafe only when HEAD could hold work origin
+// lacks.
 func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt registeredWorktree) (string, error) {
-	dirty, err := taskWorktreeDirty(ctx, wt.path)
+	tracked, err := taskWorktreeTrackedSummary(ctx, wt.path)
 	if err != nil {
 		return "", err
 	}
-	if dirty != "" {
-		return "uncommitted changes: " + dirty, nil
+	if tracked != "" {
+		return "uncommitted changes: " + tracked, nil
+	}
+	untracked, err := taskWorktreeUntracked(ctx, wt.path)
+	if err != nil {
+		return "", err
+	}
+	if len(untracked) > 0 {
+		ref, err := taskWorktreeClearedRef(ctx, req, wt.path)
+		if err != nil {
+			return "", err
+		}
+		if ref == "" {
+			return fmt.Sprintf("untracked files (%s) and %s",
+				taskWorktreeSummary(untracked), taskWorktreeUnclearableReason(ctx, req, wt.path)), nil
+		}
 	}
 	remote := "origin/" + req.Branch
 	if taskWorktreeCommitishExists(ctx, wt.path, remote) {
 		if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", remote); err != nil {
+			if !negativeFact(err) {
+				return "", err
+			}
 			return fmt.Sprintf("it holds commits origin/%s does not have", req.Branch), nil
 		}
 		return "", nil
@@ -187,11 +218,124 @@ func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt regi
 		if taskWorktreeCommitishExists(ctx, wt.path, base) {
 			if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", base); err == nil {
 				return "", nil
+			} else if !negativeFact(err) {
+				return "", err
 			}
 			return fmt.Sprintf("the branch is not on origin and holds commits %s does not have", base), nil
 		}
 	}
 	return "the branch is not on origin", nil
+}
+
+// claimWorktreeRefusal is the pre-claim, READ-ONLY answer for one task: the
+// deterministic reason the task's existing worktree cannot be prepared for a
+// claim, or "" when taking the claim is worth it. It moves, fetches-to-reset and
+// prunes nothing, so a refusal here happens BEFORE the claim and costs no
+// reclaim — the park that two refused claims produce is what this exists to
+// prevent.
+//
+// Only what can be proven is refused. Everything judged against origin is
+// decided after one fetch; a fresh tree at a PR base the request does not carry
+// is deferred to the post-claim prep, which resolves that base itself. A check
+// that cannot run is not a refusal: the prep repeats the same decision with the
+// same facts, and a transient failure must not starve the task.
+//
+// The origin facts it fetched are returned so the post-claim prep can reuse them
+// instead of paying a second round-trip.
+func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip string) (string, originBranchFacts, error) {
+	id := strings.TrimSpace(req.TaskID)
+	if strings.TrimSpace(req.Checkout) == "" || strings.TrimSpace(req.Branch) == "" || len(id) < 8 || !isHex(id[:8]) {
+		return "", originBranchFacts{}, nil
+	}
+	registered, err := taskWorktreeWorktrees(ctx, req.Checkout)
+	if err != nil {
+		return "", originBranchFacts{}, err
+	}
+	if len(registered) == 0 {
+		return "", originBranchFacts{}, nil
+	}
+	main := registered[0].path
+	wt, found := taskWorktreeExisting(registered, taskWorktreeDir(req, main), req.Branch)
+	if !found {
+		// A new tree will be cut from origin: nothing local can refuse it.
+		return "", originBranchFacts{}, nil
+	}
+	switch {
+	case main != "" && taskWorktreeSamePath(wt.path, main):
+		return fmt.Sprintf("the branch %s is checked out in the main checkout %s", req.Branch, wt.path), originBranchFacts{}, nil
+	case taskWorktreeSamePath(wt.path, req.Checkout):
+		return fmt.Sprintf("the branch %s is checked out in %s, this run's own checkout", req.Branch, wt.path), originBranchFacts{}, nil
+	case wt.detached:
+		return fmt.Sprintf("worktree %s is detached, not on %s", wt.path, req.Branch), originBranchFacts{}, nil
+	case wt.branch != req.Branch:
+		return fmt.Sprintf("worktree %s is on %s, not %s", wt.path, wt.branch, req.Branch), originBranchFacts{}, nil
+	}
+	tracked, err := taskWorktreeTrackedSummary(ctx, wt.path)
+	if err != nil {
+		return "", originBranchFacts{}, err
+	}
+	if tracked != "" {
+		return fmt.Sprintf("worktree %s has uncommitted changes (%s)", wt.path, tracked), originBranchFacts{}, nil
+	}
+	untracked, err := taskWorktreeUntracked(ctx, wt.path)
+	if err != nil {
+		return "", originBranchFacts{}, err
+	}
+	// Untracked files need origin to prove they are clearable, and a resumed or
+	// close-out tree is synced against origin by the prep.
+	var facts originBranchFacts
+	if len(untracked) > 0 || req.Resume || req.CloseOut {
+		if _, err := taskWorktreeGit(ctx, req.Checkout, "fetch", "origin", "--prune"); err != nil {
+			return "", originBranchFacts{}, fmt.Errorf("%w in %s: %v", errWorktreeFetch, req.Checkout, err)
+		}
+		facts = readOriginBranchFetched(ctx, req.Checkout, req.Branch, doneTip)
+	}
+	remote := "origin/" + req.Branch
+	onOrigin := taskWorktreeCommitishExists(ctx, wt.path, remote)
+	if (req.Resume || req.CloseOut) && !onOrigin {
+		return fmt.Sprintf("the branch %s is not on origin", req.Branch), facts, nil
+	}
+	if len(untracked) > 0 {
+		if !onOrigin {
+			// A fresh tree at the PR base may be safe to clear; the post-claim
+			// prep resolves that base, so defer rather than guess.
+			return "", facts, nil
+		}
+		ref, err := taskWorktreeClearedRef(ctx, req, wt.path)
+		if err != nil {
+			return "", facts, err
+		}
+		if ref == "" {
+			return fmt.Sprintf("worktree %s has untracked files (%s) and %s",
+				wt.path, taskWorktreeSummary(untracked), taskWorktreeUnclearableReason(ctx, req, wt.path)), facts, nil
+		}
+	}
+	if req.Resume || req.CloseOut {
+		out, err := taskWorktreeGit(ctx, wt.path, "rev-list", "--left-right", "--count", "HEAD..."+remote)
+		if err != nil {
+			return "", facts, err
+		}
+		ahead, behind, err := taskWorktreeCounts(out)
+		if err != nil {
+			return "", facts, err
+		}
+		if ahead > 0 && behind > 0 {
+			return fmt.Sprintf("worktree %s has diverged from %s (%d local and %d remote commit(s))",
+				wt.path, remote, ahead, behind), facts, nil
+		}
+	}
+	return "", facts, nil
+}
+
+// taskWorktreeExisting finds the tree a prep would reuse: the one at the
+// deterministic path, else one already checked out on the branch elsewhere.
+func taskWorktreeExisting(list []registeredWorktree, dir, branch string) (registeredWorktree, bool) {
+	for _, wt := range list {
+		if taskWorktreeSamePath(wt.path, dir) {
+			return wt, true
+		}
+	}
+	return taskWorktreeOnBranch(list, branch)
 }
 
 // taskWorktreeDir is the deterministic path for one task's worktree. The request
@@ -253,8 +397,11 @@ func isHex(s string) bool {
 }
 
 // reuseTaskWorktree takes over a worktree that is already registered for this
-// repo. It only adopts one that is demonstrably the task's own tree and clean;
-// anything else is refused by name, because the alternative is discarding work.
+// repo. It only adopts one that is demonstrably the task's own tree; anything
+// that could hold committed work is refused by name, because the alternative is
+// discarding work. Untracked files cannot hold committed work once HEAD is
+// proven to be at or behind origin: they are moved aside, never deleted, and
+// the tree is reused.
 func reuseTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreePrep, wt registeredWorktree) (worktreePrep, error) {
 	switch {
 	case wt.detached:
@@ -262,12 +409,32 @@ func reuseTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreePr
 	case wt.branch != req.Branch:
 		return prep, fmt.Errorf("worktree %s is on %s, not %s — refusing to reuse it", prep.Dir, wt.branch, req.Branch)
 	}
-	dirty, err := taskWorktreeDirty(ctx, prep.Dir)
+	tracked, err := taskWorktreeTrackedSummary(ctx, prep.Dir)
 	if err != nil {
 		return prep, err
 	}
-	if dirty != "" {
-		return prep, fmt.Errorf("worktree %s has uncommitted changes (%s) — refusing to reuse it", prep.Dir, dirty)
+	if tracked != "" {
+		return prep, fmt.Errorf("worktree %s has uncommitted changes (%s) — refusing to reuse it", prep.Dir, tracked)
+	}
+	untracked, err := taskWorktreeUntracked(ctx, prep.Dir)
+	if err != nil {
+		return prep, err
+	}
+	if len(untracked) > 0 {
+		ref, err := taskWorktreeClearedRef(ctx, req, prep.Dir)
+		if err != nil {
+			return prep, err
+		}
+		if ref == "" {
+			return prep, fmt.Errorf("worktree %s has untracked files (%s) and %s — refusing to reuse it",
+				prep.Dir, taskWorktreeSummary(untracked), taskWorktreeUnclearableReason(ctx, req, prep.Dir))
+		}
+		dest, err := taskWorktreeMoveUntracked(ctx, prep.Dir, req.ScratchRoot, req.TaskID, untracked)
+		if err != nil {
+			return prep, fmt.Errorf("worktree %s has untracked files that could not be moved aside (%v) — refusing to reuse it", prep.Dir, err)
+		}
+		prep.ScratchAside = dest
+		log.Printf("worktree %s: moved %d untracked path(s) aside to %s (nothing deleted)", prep.Dir, len(untracked), dest)
 	}
 	if req.Resume || req.CloseOut {
 		if err := taskWorktreeSyncBranch(ctx, prep.Dir, req.Branch); err != nil {
@@ -550,21 +717,211 @@ func taskWorktreeUnder(path, root string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// taskWorktreeDirty summarises uncommitted changes for a refusal message; ""
-// means clean. Untracked files count: a session's leftovers are work too.
-func taskWorktreeDirty(ctx context.Context, dir string) (string, error) {
-	out, err := taskWorktreeGit(ctx, dir, "status", "--porcelain")
+// taskWorktreeTrackedSummary summarises the TRACKED changes for a refusal
+// message: staged, unstaged or conflicted. "" means the tracked tree is clean.
+// Untracked files are deliberately excluded — they cannot hold committed work,
+// so reuse clears them rather than refusing.
+func taskWorktreeTrackedSummary(ctx context.Context, dir string) (string, error) {
+	out, err := taskWorktreeGit(ctx, dir, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
 		return "", err
 	}
-	lines := taskWorktreeLines(out)
-	if len(lines) == 0 {
+	return taskWorktreeSummary(taskWorktreeLines(out)), nil
+}
+
+// taskWorktreeUntracked lists the untracked, not-ignored paths in dir. A wholly
+// untracked directory comes back as one "dir/" entry, so a large scratch tree
+// is one move, not thousands.
+func taskWorktreeUntracked(ctx context.Context, dir string) ([]string, error) {
+	out, err := taskWorktreeGit(ctx, dir, "ls-files", "--others", "--exclude-standard", "--directory", "-z")
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	var paths []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
+// taskWorktreeSummary renders up to three status lines for a message.
+func taskWorktreeSummary(lines []string) string {
+	switch {
+	case len(lines) == 0:
+		return ""
+	case len(lines) > 3:
+		return strings.Join(lines[:3], "; ") + fmt.Sprintf("; and %d more", len(lines)-3)
+	}
+	return strings.Join(lines, "; ")
+}
+
+// taskWorktreeClearedRef is the ref that proves a tree whose only dirt is
+// untracked files holds nothing origin lacks: HEAD must be that ref or an
+// ancestor of it. origin/<branch> is preferred; a task's first session may cut
+// its branch from the PR base before anything is pushed, so a non-resume
+// request also accepts origin/<PRBase>. "" means no ref proves it.
+func taskWorktreeClearedRef(ctx context.Context, req worktreeRequest, dir string) (string, error) {
+	candidates := []string{"origin/" + req.Branch}
+	if !req.Resume && !req.CloseOut && req.PRBase != "" {
+		candidates = append(candidates, "origin/"+req.PRBase)
+	}
+	for _, ref := range candidates {
+		if !taskWorktreeCommitishExists(ctx, dir, ref) {
+			continue
+		}
+		if _, err := taskWorktreeGit(ctx, dir, "merge-base", "--is-ancestor", "HEAD", ref); err == nil {
+			return ref, nil
+		} else if !negativeFact(err) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+// taskWorktreeUnclearableReason says why no ref proves a tree with untracked
+// files safe to clear: HEAD either has commits the branch's origin tip lacks, or
+// the branch is not on origin at all. Callers use it only after
+// taskWorktreeClearedRef found no proving ref.
+func taskWorktreeUnclearableReason(ctx context.Context, req worktreeRequest, dir string) string {
+	remote := "origin/" + req.Branch
+	if taskWorktreeCommitishExists(ctx, dir, remote) {
+		return fmt.Sprintf("HEAD holds commits %s does not have", remote)
+	}
+	return "HEAD is not at or behind a ref origin has"
+}
+
+// taskWorktreeMoveUntracked moves the listed untracked paths out of dir into a
+// fresh directory under scratchRoot, preserving each path relative to dir, and
+// reports where they went. Nothing is deleted: a path leaves the tree only after
+// its content is at the destination.
+func taskWorktreeMoveUntracked(ctx context.Context, dir, scratchRoot, taskID string, paths []string) (string, error) {
+	if len(paths) == 0 {
 		return "", nil
 	}
-	if len(lines) > 3 {
-		return strings.Join(lines[:3], "; ") + fmt.Sprintf("; and %d more", len(lines)-3), nil
+	if got, err := taskWorktreeUntracked(ctx, dir); err != nil {
+		return "", err
+	} else if len(got) != len(paths) {
+		// The caller decided on an earlier listing; a tree that changed under it
+		// is not this function's to clear blindly.
+		return "", fmt.Errorf("the untracked set changed while it was being moved aside")
 	}
-	return strings.Join(lines, "; "), nil
+	dest, err := taskWorktreeScratchDir(dir, scratchRoot, taskID)
+	if err != nil {
+		return "", err
+	}
+	for _, rel := range paths {
+		clean := strings.TrimSuffix(rel, "/")
+		if !filepath.IsLocal(clean) {
+			return dest, fmt.Errorf("untracked path %q escapes %s", rel, dir)
+		}
+		src := filepath.Join(dir, clean)
+		dst := filepath.Join(dest, clean)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+			return dest, err
+		}
+		if err := taskWorktreeMovePath(src, dst); err != nil {
+			return dest, fmt.Errorf("moving %s aside: %w", rel, err)
+		}
+	}
+	return dest, nil
+}
+
+// taskWorktreeScratchDir makes the timestamped directory cleared files go to.
+// It must sit OUTSIDE the worktree: the caller passes the runner's state dir;
+// with none, a sibling of the task-worktree root is used rather than the OS temp
+// dir, and the same fallback applies if the state dir itself is inside the tree.
+func taskWorktreeScratchDir(dir, scratchRoot, taskID string) (string, error) {
+	if scratchRoot == "" || taskWorktreeUnder(scratchRoot, dir) {
+		scratchRoot = filepath.Join(filepath.Dir(dir), ".scratch-aside")
+	}
+	id := strings.TrimSpace(taskID)
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	if err := os.MkdirAll(scratchRoot, 0o700); err != nil {
+		return "", err
+	}
+	base := filepath.Join(scratchRoot, id+"-"+time.Now().UTC().Format("20060102T150405.000Z"))
+	for n := 0; ; n++ {
+		dest := base
+		if n > 0 {
+			dest = fmt.Sprintf("%s-%d", base, n)
+		}
+		err := os.Mkdir(dest, 0o700)
+		if err == nil {
+			return dest, nil
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+	}
+}
+
+// taskWorktreeMovePath moves one path. A rename is atomic; across filesystems it
+// falls back to a copy followed by removing the source, so the source is never
+// gone before the destination holds it.
+func taskWorktreeMovePath(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if err := taskWorktreeCopyPath(src, dst, info); err != nil {
+		return err
+	}
+	return os.RemoveAll(src)
+}
+
+func taskWorktreeCopyPath(src, dst string, info os.FileInfo) error {
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(target, dst)
+	case info.IsDir():
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		for _, e := range entries {
+			child := filepath.Join(src, e.Name())
+			childInfo, err := os.Lstat(child)
+			if err != nil {
+				return err
+			}
+			if err := taskWorktreeCopyPath(child, filepath.Join(dst, e.Name()), childInfo); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		in, err := os.Open(src)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(out, in); err != nil {
+			out.Close()
+			return err
+		}
+		return out.Close()
+	}
 }
 
 func taskWorktreeCommitishExists(ctx context.Context, dir, commitish string) bool {

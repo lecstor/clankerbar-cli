@@ -26,6 +26,13 @@ func readOriginBranch(ctx context.Context, checkout, branch, doneTip string) ori
 	if _, err := taskWorktreeGit(ctx, checkout, "fetch", "origin", "--prune"); err != nil {
 		return originBranchFacts{}
 	}
+	return readOriginBranchFetched(ctx, checkout, branch, doneTip)
+}
+
+// readOriginBranchFetched is readOriginBranch's questions after a fetch the
+// caller already ran: the pre-claim worktree check fetches once and hands the
+// facts on, so a resumed claim does not pay a second round-trip.
+func readOriginBranchFetched(ctx context.Context, checkout, branch, doneTip string) originBranchFacts {
 	f := originBranchFacts{Known: true}
 	if branch == "" {
 		// No recorded branch: nothing about origin can be asked.

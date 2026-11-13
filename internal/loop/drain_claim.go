@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -76,11 +77,17 @@ func (s *drainSeq) claimForDrain(ctx context.Context) drainClaim {
 			return claimNothing
 		}
 		next := offer.Next
+		next = s.declineUnpreparable(ctx, offer)
+		if next == nil {
+			return claimNothing
+		}
 		ct, err := claimer.ClaimTask(ctx, next.ID, next.RequiresTakeover)
 		if errors.Is(err, plane.ErrNotClaimable) && offer.ReadyNext != nil {
 			// The takeover or close-out was withheld, so take what the plane
-			// offers a plain claim instead.
-			next = offer.ReadyNext
+			// offers a plain claim instead — checked before the claim like Next.
+			if next = s.declineUnpreparable(ctx, plane.Offer{Next: offer.ReadyNext}); next == nil {
+				return claimNothing
+			}
 			ct, err = claimer.ClaimTask(ctx, next.ID, next.RequiresTakeover)
 		}
 		switch {
@@ -132,6 +139,71 @@ func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 		kind = "close-out"
 	}
 	log.Printf("%siteration %d: runner claimed %s (%s)", labelOf(s.t), s.drainNum, claimLabel(res.Claim), kind)
+}
+
+// declineUnpreparable returns the task to claim after the pre-claim worktree
+// check, or nil when the offer must be left alone. A deterministic local
+// refusal is found BEFORE the claim, so it costs no reclaim: the task is simply
+// not claimed, the drain idles, and the next offer retries once the tree is
+// fixed. When the plane offered a ReadyNext (a declined takeover or close-out),
+// that task is checked and claimed instead.
+func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) *plane.TaskBrief {
+	next := offer.Next
+	for {
+		reason := s.worktreeRefusal(ctx, next)
+		if reason == "" {
+			return next
+		}
+		log.Printf("%siteration %d: %s: not claiming it: %s — fix the worktree and the task will be offered again; no reclaim is spent",
+			labelOf(s.t), s.drainNum, claimLabel(harness.Claim{TaskID: next.ID, Ref: next.Ref}), reason)
+		if offer.ReadyNext == nil {
+			return nil
+		}
+		next = offer.ReadyNext
+		offer.ReadyNext = nil
+	}
+}
+
+// worktreeRefusal runs the driver's pre-claim worktree check for one offered
+// task and caches the origin facts its fetch produced, keyed to the task and
+// checkout they describe. A check that cannot run is NOT a refusal: the claim is
+// worth taking and the post-claim prep repeats the decision with the same facts.
+func (s *drainSeq) worktreeRefusal(ctx context.Context, b *plane.TaskBrief) string {
+	if b == nil {
+		return ""
+	}
+	checkout, err := s.d.checkoutFor(s.t, b.Repo)
+	if err != nil || checkout == "" {
+		return ""
+	}
+	req := worktreeRequest{
+		Checkout: checkout, TaskID: b.ID, Branch: b.Branch,
+		Resume: b.HasWIP, CloseOut: b.AwaitingMerge,
+	}
+	doneTip := b.PhasesDone[config.ImplementPhaseName].Tip
+	reason, facts, err := s.d.worktreeCheckFn()(ctx, req, doneTip)
+	if err != nil {
+		log.Printf("%siteration %d: %s: could not pre-check the task worktree (%v) — claiming anyway",
+			labelOf(s.t), s.drainNum, claimLabel(harness.Claim{TaskID: b.ID, Ref: b.Ref}), err)
+		s.clearPreClaimOrigin()
+		return ""
+	}
+	if facts.Known {
+		s.preClaimOrigin = facts
+		s.preClaimTask = b.ID
+		s.preClaimCheckout = checkout
+	} else {
+		s.clearPreClaimOrigin()
+	}
+	return reason
+}
+
+// clearPreClaimOrigin drops the cached pre-claim read, so nothing can resume on
+// facts that belong to another task or a failed fetch.
+func (s *drainSeq) clearPreClaimOrigin() {
+	s.preClaimOrigin = originBranchFacts{}
+	s.preClaimTask = ""
+	s.preClaimCheckout = ""
 }
 
 // reclaimForRetry re-takes the claim a runner-claimed retry is about to resume,

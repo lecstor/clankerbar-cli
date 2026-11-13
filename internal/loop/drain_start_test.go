@@ -172,6 +172,38 @@ func TestPrepareStart_ResumesReviewAtTheRecordedTip(t *testing.T) {
 	}
 }
 
+// The pre-claim worktree check fetches origin once; prepareStart reuses that
+// read instead of paying for a second round-trip.
+func TestPrepareStart_ReusesThePreClaimOriginRead(t *testing.T) {
+	brief := wipBrief("CLA-926")
+	f := newStartFixture(t, brief, plane.TaskState{Status: "in_progress"}, twoPhases(),
+		[]invokeStep{{res: okResult(1, 0)}})
+	// Make the target's repo identity resolve, so the pre-claim check runs
+	// instead of skipping on an unresolvable checkout.
+	f.d.targets[0].Repos = map[string]string{"acme/repo": t.TempDir()}
+	originCalls := 0
+	f.d.originBranch = func(context.Context, string, string, string) originBranchFacts {
+		originCalls++
+		return originBranchFacts{Known: true, OnOrigin: true, Tip: startTip, DoneIsAncestor: true}
+	}
+	f.d.worktreeCheck = func(context.Context, worktreeRequest, string) (string, originBranchFacts, error) {
+		return "", originBranchFacts{Known: true, OnOrigin: true, Tip: startTip, DoneIsAncestor: true}, nil
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if originCalls != 0 {
+		t.Errorf("origin was read %d time(s) after the pre-claim check, want 0", originCalls)
+	}
+	if len(f.preps) != 1 {
+		t.Fatalf("prepared the worktree %d time(s), want once", len(f.preps))
+	}
+	if !f.preps[0].Fetched {
+		t.Errorf("worktree request = %+v, want Fetched: the pre-claim check already fetched", f.preps[0])
+	}
+}
+
 func TestPrepareStart_UnreadableOriginHandsTheClaimBack(t *testing.T) {
 	brief := wipBrief("CLA-912")
 	f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), nil)

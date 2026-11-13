@@ -373,3 +373,63 @@ func TestReclaimForRetry_FallsBackToAFreshOffer(t *testing.T) {
 		}
 	}
 }
+
+// A deterministic worktree refusal is found BEFORE the claim, so the task is
+// not claimed at all and no reclaim is spent on it.
+func TestClaimForDrain_UnpreparableWorktreeIsNotClaimed(t *testing.T) {
+	dir := t.TempDir()
+	b := plane.TaskBrief{ID: "t-1", Ref: "CLA-1", Branch: "clanker/t-1", Repo: "acme/repo", HasWIP: true}
+	f := &claimingReleaser{offers: []plane.Offer{{Next: &b}}}
+	s := claimSeq(f)
+	s.t.Repos = map[string]string{"acme/repo": dir}
+	s.d.cfg.WorkDir = dir
+	checks := 0
+	s.d.worktreeCheck = func(context.Context, worktreeRequest, string) (string, originBranchFacts, error) {
+		checks++
+		return "worktree /x has uncommitted changes (M a.txt)", originBranchFacts{}, nil
+	}
+
+	if got := s.claimForDrain(context.Background()); got != claimNothing {
+		t.Fatalf("claimForDrain = %v, want claimNothing: the worktree cannot be prepared", got)
+	}
+	if checks != 1 {
+		t.Errorf("worktree checks = %d, want 1", checks)
+	}
+	if len(f.claimCalls) != 0 {
+		t.Errorf("claim calls = %v, want none: a refusal before the claim spends no reclaim", f.claimCalls)
+	}
+	if s.carried != nil || s.runnerClaimed {
+		t.Error("nothing may be held after declining an unpreparable task")
+	}
+}
+
+// A refused close-out or takeover with a ReadyNext falls through to the task the
+// plane offers a plain claim instead, after checking that one too.
+func TestClaimForDrain_UnpreparableNextFallsBackToReadyNext(t *testing.T) {
+	dir := t.TempDir()
+	taken := plane.TaskBrief{ID: "taken", Ref: "CLA-4", Branch: "clanker/taken", Repo: "acme/repo", HasWIP: true, RequiresTakeover: true}
+	ready := plane.TaskBrief{ID: "ready", Ref: "CLA-5", Branch: "clanker/ready", Repo: "acme/repo"}
+	f := &claimingReleaser{
+		offers:  []plane.Offer{{Next: &taken, ReadyNext: &ready}},
+		claimFn: claimedBrief(ready),
+	}
+	s := claimSeq(f)
+	s.t.Repos = map[string]string{"acme/repo": dir}
+	s.d.cfg.WorkDir = dir
+	s.d.worktreeCheck = func(_ context.Context, req worktreeRequest, _ string) (string, originBranchFacts, error) {
+		if req.TaskID == "taken" {
+			return "worktree /x has uncommitted changes (M a.txt)", originBranchFacts{}, nil
+		}
+		return "", originBranchFacts{}, nil
+	}
+
+	if got := s.claimForDrain(context.Background()); got != claimHeld {
+		t.Fatalf("claimForDrain = %v, want claimHeld on the ready task", got)
+	}
+	if got := s.carried.Claim.TaskID; got != "ready" {
+		t.Errorf("carried task = %q, want the ready fallback", got)
+	}
+	if len(f.claimCalls) != 1 || f.claimCalls[0] != (claimCall{"ready", false}) {
+		t.Errorf("claim calls = %v, want one plain claim of the ready task", f.claimCalls)
+	}
+}
