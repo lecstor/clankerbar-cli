@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os/exec"
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -108,6 +109,17 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 		// left the worktree at the branch's origin tip, and HEAD is that tree.
 		head = "HEAD"
 	}
+	// The diff is revision-exact, but the flow map's `git grep` reads the
+	// CHECKED-OUT tree. A worktree parked on another revision would list uses
+	// from code the review is not of, so refuse rather than present that as the
+	// change's checklist.
+	if head != "HEAD" {
+		if at, err := gitHeadSHA(repo); err != nil {
+			return nil, fmt.Errorf("review_method maps-session could not read the worktree's HEAD: %w", err)
+		} else if at != head {
+			return nil, fmt.Errorf("review_method maps-session needs the worktree at the reviewed tip %s, but it is at %s: the flow map's git grep reads the checked-out tree, so a map built here would list uses from the wrong revision", head, at)
+		}
+	}
 	rng := reviewmap.Range{Repo: repo, Base: base, Head: head}
 	diff, err := reviewmap.Diff(rng)
 	if err != nil {
@@ -119,6 +131,17 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 		return nil, fmt.Errorf("review_method maps-session could not map the changed definitions: %w", err)
 	}
 	return planMapsSession(opts, at.inv.Model, base, diff, flow, r.mapsSessionEnding()), nil
+}
+
+// gitHeadSHA is the commit the worktree has checked out.
+func gitHeadSHA(repo string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = repo
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // planMapsSession turns a diff and its flow items into the plan: numbered items,

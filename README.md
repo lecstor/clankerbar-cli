@@ -512,15 +512,19 @@ model at all and only `notes_model` is set, the findings turn runs on the notes
 model too, because a live session cannot return to a harness's own default
 mid-conversation.
 
-**Two requirements, both refused rather than degraded.** The turn sequence needs
-a harness that can continue one session — **opencode today**. `Validate` refuses
+**Two requirements, both refused rather than degraded.** The method applies to
+the review-only gate — the built-in `review` phase with a phase after it —
+because its turns end with a review record and nothing else; the final combined
+review-and-fix brief, and a review phase with a prompt of its own, are refused.
+The turn sequence needs a harness that can continue one session — **opencode
+today**. `Validate` refuses
 maps-session on claude or codex with a message naming the harness, and never
 silently runs only the first turn. And the maps are built in the worktree the
 **runner** prepared at the reviewed tip (or a parallel panel member's own
-checkout at that tip), so the method needs a runner-claimed review: a
-session-claimed review, a sequential panel member in the shared checkout, or a
-branchless checkpoint with nothing to map, is refused before anything spawns
-rather than reviewing a map of the wrong tree.
+checkout at that tip), so the method needs a runner-prepared review. A branchless
+checkpoint with nothing to map has no such tree, and a session-claimed run has no
+runner-owned worktree at all; both are refused before anything spawns rather
+than reviewing a map of the wrong tree.
 
 **Limits, and what was not changed.** A maps-session review is one phase
 session, so the existing bounds apply: the turn cap defaults to 400 (opencode

@@ -150,7 +150,8 @@ func panelLabels(cfg *config.Config) []string {
 
 // singleReviewerLabel renders the single reviewer a config runs when it sets no
 // panel (CLA-639): the built-in, non-final review phase at the harness/model it
-// will spawn on. Empty when no such phase exists, so an unphased config or one
+// will spawn on, parenthesized and followed by its review method when it names
+// one (CLA-869). Empty when no such phase exists, so an unphased config or one
 // whose review runs the final combined brief reports nothing extra — matching
 // how doctor reports a phase detail only when the phase is there to report.
 func singleReviewerLabel(cfg *config.Config) string {

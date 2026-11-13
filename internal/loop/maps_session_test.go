@@ -526,3 +526,45 @@ func TestPlanMapsSession_RecordEndingForAPanelMember(t *testing.T) {
 		t.Errorf("the record ending is not on the findings turn:\n%s", plan.turns[len(plan.turns)-1].Prompt)
 	}
 }
+
+// TestMapsSessionPlanFor_RefusesAWorktreePastTheTip (CLA-869): the flow map's
+// git grep reads the checked-out tree, so a worktree parked past the reviewed
+// tip would list uses from the wrong revision. It is refused, not mapped.
+func TestMapsSessionPlanFor_DiffsTheReviewedTip(t *testing.T) {
+	repo, base, tip := mapsRepo(t)
+	// Move the worktree past the reviewed tip, as a stray commit would.
+	extra := filepath.Join(repo, "later.ts")
+	if err := os.WriteFile(extra, []byte("export function afterTipThing() {\n  return 1\n}\n"), 0o600); err != nil {
+		t.Fatalf("write later.ts: %v", err)
+	}
+	cmd := exec.Command("git", "add", ".")
+	cmd.Dir = repo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "later")
+	cmd.Dir = repo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, out)
+	}
+
+	ph := config.Phase{
+		Name:         config.ReviewPhaseName,
+		Prompt:       config.ReviewOnlyBrief(),
+		ReviewMethod: config.ReviewMethodMapsSession,
+	}
+	r := &phaseRun{
+		ph:     ph,
+		shape:  phaseShape{captured: ph},
+		opts:   phaseRunOpts{taskDir: repo, runner: &runnerBriefing{baseSHA: base}},
+		prev:   &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}, CheckpointTip: tip},
+		prBase: "main",
+	}
+	plan, err := r.mapsSessionPlanFor(&phaseAttempt{inv: harness.Invocation{WorkDir: repo}})
+	if err == nil {
+		t.Fatalf("a worktree past the reviewed tip was mapped:\n%+v", plan)
+	}
+	if !strings.Contains(err.Error(), "reviewed tip") || !strings.Contains(err.Error(), "wrong revision") {
+		t.Errorf("the refusal does not say why the tree must be at the tip: %v", err)
+	}
+}
