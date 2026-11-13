@@ -22,8 +22,6 @@ var tsPatterns = []*regexp.Regexp{
 
 // minNameLen drops one- and two-character names: they match too much to be a
 // useful checklist entry.
-const minNameLen = 3
-
 // tsSkip drops names that are almost always incidental matches rather than
 // definitions worth a checklist entry.
 var tsSkip = map[string]bool{

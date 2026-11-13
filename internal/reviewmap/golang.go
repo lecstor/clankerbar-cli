@@ -149,9 +149,9 @@ func goSpecDecls(path string, fset *token.FileSet, d *ast.GenDecl) []goDecl {
 				decls = append(decls, goDecl{
 					def: Definition{
 						Name: n.Name,
-						At:   fmt.Sprintf("%s:%d", path, line(s.Pos())),
+						At:   fmt.Sprintf("%s:%d", path, line(n.Pos())),
 					},
-					start: line(s.Pos()),
+					start: line(n.Pos()),
 					end:   line(s.End()),
 				})
 			}

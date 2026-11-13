@@ -51,6 +51,27 @@ func TestParseDiffNoNewlineMarkerDoesNotAdvance(t *testing.T) {
 	}
 }
 
+func TestParseDiffDeletedFile(t *testing.T) {
+	diff := `diff --git a/old.go b/old.go
+deleted file mode 100644
+--- a/old.go
++++ /dev/null
+@@ -1,2 +0,0 @@
+-package old
+-
+`
+	files := ParseDiff(diff)
+	want := []FileDiff{{Path: "old.go", Deleted: true}}
+	if !reflect.DeepEqual(files, want) {
+		t.Errorf("ParseDiff() = %#v, want %#v", files, want)
+	}
+	// A deleted file describes old lines only; the change map must not list
+	// them as if they existed at head.
+	if items := ChangeMap(diff, 0); len(items) != 0 {
+		t.Errorf("ChangeMap(deleted file) = %#v, want none", items)
+	}
+}
+
 func TestParseDiffMultipleFiles(t *testing.T) {
 	diff := `diff --git a/a.go b/a.go
 --- a/a.go

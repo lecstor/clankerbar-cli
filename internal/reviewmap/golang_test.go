@@ -221,6 +221,10 @@ func TestGoFlowMapMethodChange(t *testing.T) {
 	r.write("driver.go", "package demo\n\ntype driver struct{}\n")
 	r.write("method.go", "package demo\n\nfunc (d *driver) pickTarget(name string) error {\n\treturn nil\n}\n")
 	r.write("caller.go", "package demo\n\nfunc useDriver(d *driver) error {\n\treturn d.pickTarget(\"a\")\n}\n")
+	r.write("z_use.go", "package demo\n\nfunc useAgain(d *driver) error {\n\treturn d.pickTarget(\"z\")\n}\n")
+	// aaa_test.go sorts before caller.go, so only test-last ordering puts its
+	// use after z_use.go.
+	r.write("aaa_test.go", "package demo\n\nfunc helperPick() {\n\tvar d *driver\n\t_ = d.pickTarget(\"t\")\n}\n")
 	r.write("caller_test.go", `package demo
 
 import "testing"
@@ -246,7 +250,7 @@ func (d *driver) pickTarget(name string) error {
 
 	want := []string{
 		"`driver.pickTarget` defined or changed at method.go:3; " +
-			"used at: caller.go:4, caller_test.go:7",
+			"used at: caller.go:4, z_use.go:4, aaa_test.go:5, caller_test.go:7",
 	}
 	if got := flowMapHead(t, r, base); !reflect.DeepEqual(got, want) {
 		t.Errorf("FlowMap() = %#v\nwant %#v", got, want)
@@ -324,6 +328,25 @@ func TestGoFlowMapDeletedFile(t *testing.T) {
 
 	want := []string{
 		"`Legacy` removed from legacy.go; still referenced at: uses.go:3",
+	}
+	if got := flowMapHead(t, r, base); !reflect.DeepEqual(got, want) {
+		t.Errorf("FlowMap() = %#v\nwant %#v", got, want)
+	}
+}
+
+func TestGoFlowMapExportedConst(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("limits.go", "package demo\n\nconst placeholder = 1\n")
+	r.write("use.go", "package demo\n\nvar current = 1\n")
+	r.commit("base")
+	base := r.git("rev-parse", "HEAD")
+
+	r.write("limits.go", "package demo\n\nconst MaxRetries = 3\n")
+	r.write("use.go", "package demo\n\nvar current = MaxRetries\n")
+	r.commit("head")
+
+	want := []string{
+		"`MaxRetries` defined or changed at limits.go:3; used at: use.go:3",
 	}
 	if got := flowMapHead(t, r, base); !reflect.DeepEqual(got, want) {
 		t.Errorf("FlowMap() = %#v\nwant %#v", got, want)

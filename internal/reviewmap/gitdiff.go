@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -57,7 +58,14 @@ func goAttributesFile() (string, func(), error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("reviewmap diff: %w", err)
 	}
-	name := f.Name()
+	// git runs with its own working directory, so the path must be absolute
+	// for a relative TMPDIR to resolve the same file.
+	name, err := filepath.Abs(f.Name())
+	if err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", nil, fmt.Errorf("reviewmap diff: %w", err)
+	}
 	cleanup := func() { os.Remove(name) }
 	if _, err := f.WriteString(goAttributes); err != nil {
 		f.Close()

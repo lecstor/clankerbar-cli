@@ -16,6 +16,10 @@ type Definition struct {
 	Removed bool
 }
 
+// minNameLen drops one- and two-character names: they match too much to be a
+// useful checklist entry.
+const minNameLen = 3
+
 // Source reads one path's content from the two sides of a diff.
 type Source interface {
 	// Head returns the file at the diff's head revision.
