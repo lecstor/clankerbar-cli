@@ -32,11 +32,9 @@ func builtinBriefs() map[string]string {
 		"panel member":            panelMemberReviewOnlyBrief,
 		"unverified panel member": panelMemberUnverifiedReviewOnlyBrief,
 		"no-code review-only":     noCodeReviewOnlyBrief,
-		"fix":                     fixBrief,
 		"fix-verify":              fixVerifyBrief,
 		"no-code fix":             noCodeFixBrief,
 		"no-code fix-verify":      noCodeFixVerifyBrief,
-		"verify":                  verifyBrief,
 		"no-code verify":          noCodeVerifyBrief,
 		"runner implement":        runnerImplementBrief,
 		"runner close-out":        runnerCloseOutBrief,
@@ -114,8 +112,9 @@ func TestEveryBuiltinBriefDiffsFromAResolvedCommit(t *testing.T) {
 	}
 }
 
-// The review-shaped briefs that read a diff must carry the placeholder this
-// test renders as a SHA, so the driver's substitution is what decides the base.
+// The review-shaped briefs that read a diff must carry the placeholder the
+// driver fills with the resolved base, so which commit is diffed from is the
+// driver's decision, not the model's.
 // The verify briefs are exempt by design: their fix-delta is already SHA-based
 // (<reviewedTip>..HEAD) and has no base branch to resolve.
 func TestReviewBriefsCarryTheResolvedDiffBase(t *testing.T) {

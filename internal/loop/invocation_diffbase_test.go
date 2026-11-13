@@ -51,7 +51,7 @@ func TestInvocationForRendersTheRunnerMergeBaseSHA(t *testing.T) {
 		t.Fatalf("invocationFor: %v", err)
 	}
 	if want := "git diff " + testMergeBaseSHA + "...clanker/abc"; !strings.Contains(inv.Prompt, want) {
-		t.Errorf("the review brief does not diffuse from the runner's merge-base SHA (%q):\n%s", want, inv.Prompt)
+		t.Errorf("the review brief does not diff from the runner's merge-base SHA (%q):\n%s", want, inv.Prompt)
 	}
 	if strings.Contains(inv.Prompt, "git diff staging...") {
 		t.Errorf("the review brief still diffs from the bare local PR base:\n%s", inv.Prompt)
