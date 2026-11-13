@@ -16,6 +16,21 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
+// diffBase is the commit a brief's `git diff` starts from: the runner's
+// merge-base SHA when worktree prep computed one, else origin/<prBase> (git
+// computes the merge-base itself, and the prep fetch refreshed the ref). Empty
+// only when no PR base is known: the placeholder then stays standing, as any
+// other placeholder does when its fact is absent.
+func diffBase(prBase, baseSHA string) string {
+	if baseSHA != "" {
+		return baseSHA
+	}
+	if prBase != "" {
+		return "origin/" + prBase
+	}
+	return ""
+}
+
 // invocationFor builds the invocation for one PHASE: the target's invocation,
 // carrying this phase's prompt and turn cap, with the previous phase's claim
 // substituted into the prompt's placeholders.
@@ -247,6 +262,16 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	}
 	if prBase != "" {
 		repl = append(repl, config.PhasePRBasePlaceholder, prBase)
+	}
+	// {{baseSha}} is the one diff base: the runner's merge-base SHA when its
+	// worktree prep computed one, else origin/<prBase>. Filled for every phase,
+	// runner-claimed or not, because it needs no claim - only the repo's base.
+	baseSHA := ""
+	if runner != nil {
+		baseSHA = runner.baseSHA
+	}
+	if base := diffBase(prBase, baseSHA); base != "" {
+		repl = append(repl, config.PhaseBasePlaceholder, base)
 	}
 	if prev != nil && prev.Claim.Held() {
 		branch := verifiedBranch(prev)

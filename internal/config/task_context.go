@@ -29,6 +29,9 @@ const taskContextTruncationNote = "(truncated — the full text is on the task: 
 // runner's merge of PRBase stopped on before the runner aborted it. MergeHint
 // is the plane's own close-out instruction: the session must be able to follow
 // it verbatim, so it is rendered as a section of its own and never shrunk.
+// DiffBase is the commit a diff in this phase starts from — the runner's
+// merge-base SHA, or origin/PRBase when no SHA was available — so a later phase
+// (a maps-building review) can reuse the base the runner resolved.
 // Questions and Decisions are newest-first except for the blocking questions,
 // which the plane appends at the END. RunnerNext is one sentence naming what
 // the runner does after this session ends.
@@ -50,6 +53,7 @@ type TaskContext struct {
 	Worktree    string
 	Branch      string
 	PRBase      string
+	DiffBase    string
 	Tip         string
 	Resumed     bool
 	Merge       string
@@ -239,6 +243,7 @@ func taskContextHeader(c TaskContext) string {
 		{"Worktree", c.Worktree},
 		{"Branch", c.Branch},
 		{"PR base", c.PRBase},
+		{"Diff base", c.DiffBase},
 		{"Tip", c.Tip},
 	} {
 		if value := strings.TrimSpace(field.value); value != "" {

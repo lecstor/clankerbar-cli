@@ -12,6 +12,7 @@ type runnerBriefing struct {
 	task     plane.TaskBrief
 	runID    string
 	prep     worktreePrep // only on the phase the walk started at; zero otherwise
+	baseSHA  string       // merge-base of origin/<prBase> and the tip; every phase, for its diffs
 	start    bool         // this phase is the one the walk started at
 	closeOut bool         // close-out claim (only ever true with start)
 }
@@ -70,6 +71,7 @@ func runnerTaskContext(rb *runnerBriefing, phases []config.Phase, phaseIdx int, 
 		Worktree:    worktree,
 		Branch:      branch,
 		PRBase:      prBase,
+		DiffBase:    diffBase(prBase, rb.baseSHA),
 		Tip:         tip,
 		CloseOut:    rb.closeOut,
 	}
