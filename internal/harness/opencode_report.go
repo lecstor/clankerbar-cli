@@ -31,32 +31,50 @@ func reportSteerPrompt(err error) string {
 		"fixing the problem named above and keeping everything else the same."
 }
 
-// reportResumeSkipped reports whether this Result cannot take a report resume:
-// no session to resume into, or an end of its own that the resume must not talk
-// over (a probe, a teardown, a claim the session no longer holds, an unreadable
-// capture, an adapter kill, a stall or quiet death not yet recovered, a limit
-// end, or an unexplained non-zero exit).
+// reportResumeSkipped reports whether this Result cannot take a report resume.
+// It is resumeSkippedReason's yes/no form; see that function for the ends it
+// names.
+func (o opencode) reportResumeSkipped(ctx context.Context, in Invocation, res *Result) bool {
+	return o.resumeSkippedReason(ctx, in, res) != ""
+}
+
+// resumeSkippedReason names the end that forbids resuming this session, or ""
+// when it may be resumed. ONE list serves two callers: the done-report resume,
+// which must not talk over an end of the adapter's own, and the multi-turn
+// sequence, which must not send a later turn into a session that ended badly.
+// The reasons are the Result.TurnStopReason vocabulary.
 //
 // A claim that is not held is one of those ends: the runner writes no record
 // under a claim the session does not hold, so there is nothing to re-emit. A
 // runner phase is seeded with in.ResumeClaim, so Held() is true whenever the
 // runner would apply the report.
-func (o opencode) reportResumeSkipped(ctx context.Context, in Invocation, res *Result) bool {
+func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *Result) string {
 	switch {
-	case in.Probe,
-		ctx.Err() != nil,
-		!res.Claim.Held(),
-		res.Untrusted != "",
-		res.ToolLoop != "",
-		res.IdleKilled != "",
-		o.OutputCapNoOutput(*res),
-		o.ZeroUsageUnknown(*res),
-		o.DetectLimit(*res).Limited,
-		res.ExitCode != 0 && RecoveredErrors(*res) == 0:
-		return true
+	case in.Probe:
+		return "probe"
+	case ctx.Err() != nil:
+		return "cancelled"
+	case !res.Claim.Held():
+		return "claim_not_held"
+	case res.Untrusted != "":
+		return "untrusted_stream"
+	case res.ToolLoop != "":
+		return "tool_loop"
+	case res.IdleKilled != "":
+		return "idle_killed"
+	case o.OutputCapNoOutput(*res):
+		return "output_cap_stall"
+	case o.ZeroUsageUnknown(*res):
+		return "quiet_death"
+	case o.DetectLimit(*res).Limited:
+		return "usage_limit"
+	case res.ExitCode != 0 && RecoveredErrors(*res) == 0:
+		return "nonzero_exit"
 	}
-	sid, _ := resumeTargets(*res)
-	return sid == ""
+	if sid, _ := resumeTargets(*res); sid == "" {
+		return "no_session"
+	}
+	return ""
 }
 
 // resumeBadReport runs the runner's report check on the session's final message

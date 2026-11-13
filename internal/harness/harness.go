@@ -400,6 +400,86 @@ type Invocation struct {
 	// so there is nothing to announce. Called on the parser's goroutine;
 	// implementations must not block.
 	OnClaim func(Claim)
+
+	// Turns is an optional ordered list of follow-up turns to run in the SAME
+	// session as the first turn (Prompt/Model): each is sent as a continuation
+	// of the session the first turn created, so later turns reuse everything the
+	// earlier ones read. Empty - every invocation before this field existed -
+	// means one turn, byte-for-byte the previous behaviour.
+	//
+	// Only an adapter that can continue a live session may honour it; one that
+	// cannot must REFUSE an invocation with Turns rather than silently drop the
+	// later turns, because a half-run sequence is a wrong answer, not a shorter
+	// one. opencode is the adapter with that capability today (claude and codex
+	// refuse it with ErrTurnsUnsupported).
+	Turns []Turn
+}
+
+// Turn is one follow-up message in a multi-turn invocation.
+type Turn struct {
+	// Prompt is the message this turn sends.
+	Prompt string
+
+	// Model optionally names the model THIS turn runs on, overriding
+	// Invocation.Model for the turn alone. Blank (or whitespace) means the
+	// invocation's model. A named model is a single explicit route: it does not
+	// inherit Invocation.Routes, so a usage limit on that turn ends the sequence
+	// rather than silently swapping the stage onto another model.
+	Model string
+}
+
+// OnTurn returns a copy of the invocation pinned to one follow-up turn: the
+// turn's own model when it names one, otherwise the invocation's current one.
+//
+// A turn that names a model also DROPS the route list, deliberately: a fallback
+// is a property of the stage's configured route, and walking it after a per-turn
+// model hits a limit would run the stage on a model its caller did not choose.
+func (in Invocation) OnTurn(t Turn) Invocation {
+	if m := strings.TrimSpace(t.Model); m != "" {
+		in.Model = m
+		in.Routes = nil
+	}
+	return in
+}
+
+// OnFinishedRoute pins the invocation to the route a turn finished on, dropping
+// the routes already abandoned. A later turn's own limit must not walk the list
+// back onto a route this session has already exhausted.
+func (in Invocation) OnFinishedRoute(route string) Invocation {
+	route = strings.TrimSpace(route)
+	if route == "" {
+		return in
+	}
+	if routes := in.RouteList(); len(routes) > 0 {
+		for i, r := range routes {
+			if r == route {
+				in.Model = route
+				in.Routes = append([]string(nil), routes[i:]...)
+				return in
+			}
+		}
+	}
+	in.Model = route
+	in.Routes = nil
+	return in
+}
+
+// ErrTurnsUnsupported is what an adapter that cannot continue a live session
+// returns for an invocation carrying Invocation.Turns. It is a refusal, not a
+// fallback: a caller that planned a sequence has to hear that this harness
+// cannot run one, because silently running only the first turn produces a
+// half-finished answer that looks like a complete one.
+var ErrTurnsUnsupported = errors.New("multi-turn invocations (Invocation.Turns) are not supported by this harness")
+
+// refuseTurns is the check an adapter without session continuation runs before
+// anything else, so a planned sequence is refused up front rather than run as
+// its first turn. The adapter name prefixes the error: the caller picked the
+// harness, and the message has to say which one cannot do this.
+func refuseTurns(harness string, in Invocation) error {
+	if len(in.Turns) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", harness, ErrTurnsUnsupported)
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -610,6 +690,32 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// TurnMessages is the final message of EACH turn of a multi-turn invocation,
+	// in order: TurnMessages[0] is the first turn's (Invocation.Prompt) and the
+	// last entry is the same text FinalMessage carries. It exists so the caller
+	// can put a notes turn's answer in the iteration log without confusing it
+	// with the findings turn that followed it.
+	//
+	// Empty for a single-turn invocation (the pre-Turns shape), and shorter than
+	// the planned sequence when a turn ended it early - len(TurnMessages) is how
+	// many turns actually ran.
+	TurnMessages []string
+
+	// TurnStopped is the 1-based index of the turn whose end stopped a
+	// multi-turn sequence, counting the first (Invocation.Prompt) turn as 1. It
+	// is 0 when every planned turn ran, which is also the only value a
+	// single-turn invocation can have.
+	TurnStopped int
+
+	// TurnStopReason names why the sequence stopped: "usage_limit",
+	// "output_cap_stall", "quiet_death", "claim_not_held", "untrusted_stream",
+	// "tool_loop", "idle_killed", "nonzero_exit", "cancelled", "no_session",
+	// "wall_clock" or "run_error" (the last also returns the run error). Empty
+	// when no turn stopped the sequence. The vocabulary is the same one the
+	// adapter's own resume guards use, so a caller can name the end without
+	// re-diagnosing it.
+	TurnStopReason string
 
 	// Usage is this session's token accounting normalised across harnesses (see
 	// TokenUsage's own comment for the buckets and the per-adapter mapping). It is

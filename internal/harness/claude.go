@@ -105,6 +105,9 @@ func claudeArgs(in Invocation) []string {
 }
 
 func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	if err := refuseTurns("claude", in); err != nil {
+		return Result{}, err
+	}
 	if in.Probe {
 		return c.probe(ctx, in)
 	}
