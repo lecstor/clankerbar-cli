@@ -450,6 +450,18 @@ func (d *driver) pickTarget(name string) error {
 	}
 }
 
+// TestDiffBadRevision pins the error path: an unknown revision fails with
+// git's own message rather than an empty diff.
+func TestDiffBadRevision(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("a.go", "package demo\n")
+	r.commit("base")
+
+	if _, err := Diff(Range{Repo: r.dir, Base: "no-such-revision", Head: "HEAD"}); err == nil {
+		t.Fatal("Diff() error = nil, want a bad-revision failure")
+	}
+}
+
 // TestGoAttributesFile pins the attributes content the helper passes with -c.
 func TestGoAttributesFile(t *testing.T) {
 	r := newTestRepo(t)
