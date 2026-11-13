@@ -2,14 +2,22 @@
 
 A child whose harness reports a Stop-class usage limit (`Limit.Stop`, for example
 `budget_exhausted`: credits gone, no stated reset) ends its run with
-`iteration N stopped: <reason> - no reset to wait for, stopping (resume once resolved)`.
+`iteration N stopped: <reason> on <route>: <provider message> - no reset to wait for, stopping (resume once resolved)`.
 Before it exits, the daemon writes a `LIMIT_STOP` marker into its state dir; the first
-line is the limit reason.
+line is `<reason> on <route>: <provider message>`, for example:
+
+    budget_exhausted on opencode-go/deepseek-v4.1-flash: Upstream request failed: Insufficient account funds
+
+The route is the one that ENDED the session: after a mid-session route switch that is
+the last route the session tried, not the one it started on. It is omitted when no
+route is known. The message is the provider's own error text (the terminal error
+event's `message`, or the harness's stderr), never the agent's narration, and the
+whole line is clipped to stay well under the 200 bytes the supervisor reads.
 
 The supervisor reads that marker on the child's exit. It does not schedule a restart:
 the instance stays stopped until the operator resumes it (decision 4468b833, CLA-835).
-The fleet listing shows `stopped: <reason>` and the status report sends state `stopped`
-with reason `stopped: <reason>`, never `restarting in ...`. An ordinary crash, with no
+The fleet listing shows `stopped: <line>` and the status report sends state `stopped`
+with reason `stopped: <line>`, never `restarting in ...`. An ordinary crash, with no
 marker, still goes through the backoff ladder.
 
 ## Resume

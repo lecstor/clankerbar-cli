@@ -180,7 +180,7 @@ func helperMain() {
 		// The loop's Stop-limit path: leave LIMIT_STOP, exit 0. The -once
 		// variant only does so on its first run, so a resume has a child to find.
 		if mode == "limit-stop" || countHelperRuns(spec.StateDir) == 1 {
-			if err := os.WriteFile(filepath.Join(spec.StateDir, loop.LimitStopName), []byte("budget_exhausted\n"), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(spec.StateDir, loop.LimitStopName), []byte(fullLimitLine+"\n"), 0o600); err != nil {
 				os.Exit(9)
 			}
 			os.Exit(0)
