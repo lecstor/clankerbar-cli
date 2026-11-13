@@ -70,7 +70,8 @@ const runnerImplementReportFields = "summary (what changed), tests (what you act
 var runnerReviewReportFields = "verdict (\"pass\" with no findings, or \"findings\"), reviewedTip (the SHA " +
 	"`git rev-parse HEAD` shows, which must be the tip the context block names), findings (at most 20: keep every " +
 	"MUST, then the most important of the rest, and put the count you left out in omitted - each finding is " +
-	runnerDoneFindingShape + ", and a MUST carries evidenceKind, one of the bar's kinds, and evidence), omitted, " +
+	runnerDoneFindingShape + ", and a MUST carries evidenceKind, one of the bar's kinds, and evidence), " +
+	"omitted (an integer count, 0 when you left nothing out - never a list), " +
 	"and notes (optional: anything the operator should read beside the findings)"
 
 var runnerFixReportFields = "summary (what changed), tests (what you actually ran and saw), " +
@@ -83,7 +84,8 @@ var runnerVerifyReportFields = "verdict (\"pass\" when this round raises no new 
 	"does), reviewedTip (the SHA `git rev-parse HEAD` shows), findings (the NEW MUSTs this round raises and " +
 	"nothing else - only within the fix delta and its regression surface, at most 20, each one " +
 	runnerDoneFindingShape + " carrying evidenceKind and evidence, and the count you left out in omitted), " +
-	"omitted, " + runnerFindingUpdatesField + ", notes (why any finding is still open, and the reason you " +
+	"omitted (an integer count, 0 when you left nothing out - never a list), " + runnerFindingUpdatesField +
+	", notes (why any finding is still open, and the reason you " +
 	"state for a full second pass), and tests (what you actually ran and saw while verifying)"
 
 // RunnerDoneReportFor is the report-format paragraph of a runner brief, and ""

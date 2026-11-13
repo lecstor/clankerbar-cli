@@ -96,9 +96,10 @@ type Claim struct {
 	IntegrationBranch string
 
 	// PR is the pull request the session named as carrying the delivery
-	// (CLA-310). Verified through the `gh` CLI — mergeable, with a check
-	// rollup that actually ran and passed; see prcheck.go for the two
-	// conditions, the bounded wait, and the no-CI decision.
+	// (CLA-310). Verified through the `gh` CLI — mergeable (or already merged,
+	// when GitHub no longer computes mergeability), with a check rollup that
+	// actually ran and passed; see prcheck.go for the two conditions, the
+	// bounded wait, and the no-CI decision.
 	PR string
 
 	// Repo is the repository the claim lives in ("owner/name"). When set, it resolves ambiguity when the same branch exists in multiple repos (CLA-351).

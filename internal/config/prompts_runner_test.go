@@ -240,6 +240,20 @@ func TestRunnerVerifyBriefReportsTheRound(t *testing.T) {
 	}
 }
 
+// A field list that ends a findings entry with a bare `omitted,` reads as one
+// more member of the findings array: the session then sends "omitted": [] and
+// loses its report. The type has to be stated beside the field.
+func TestRunnerReportFieldsStateTheOmittedType(t *testing.T) {
+	for _, tc := range []struct{ name, brief string }{
+		{"review-only", RunnerReviewOnlyBrief()},
+		{"verify", RunnerVerifyBrief()},
+	} {
+		if !strings.Contains(tc.brief, "omitted (an integer count") {
+			t.Errorf("the %s brief leaves omitted's type to guesswork:\n%s", tc.name, tc.brief)
+		}
+	}
+}
+
 func TestRunnerImplementBriefEndsAtAPushedBranch(t *testing.T) {
 	brief := RunnerImplementBrief()
 	for _, want := range []string{

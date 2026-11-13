@@ -223,6 +223,61 @@ func TestParseDoneDecodesTheWholeReport(t *testing.T) {
 	}
 }
 
+// A session reporting "nothing left out" reaches for [] or null as readily as 0.
+// A list of anything is not a count, so it is refused rather than guessed at.
+func TestParseDoneOmittedShapes(t *testing.T) {
+	body := func(omitted string) string {
+		return DoneMarker + "\n" +
+			`{"verdict":"pass","reviewedTip":"` + validTip() + `","findings":[],"omitted":` + omitted +
+			`,"findingUpdates":[],"notes":"","tests":"- go build ./...: pass"}`
+	}
+
+	for _, tc := range []struct {
+		name    string
+		omitted string
+		want    DoneCount
+	}{
+		{name: "zero", omitted: "0", want: 0},
+		{name: "a count", omitted: "3", want: 3},
+		{name: "an empty array", omitted: "[]", want: 0},
+		{name: "an empty array with whitespace", omitted: "[ ]", want: 0},
+		{name: "null", omitted: "null", want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep, found, err := ParseDone(body(tc.omitted))
+			if !found || err != nil {
+				t.Fatalf("found = %v, err = %v", found, err)
+			}
+			if rep.Omitted != tc.want {
+				t.Errorf("omitted = %d, want %d", rep.Omitted, tc.want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		omitted string
+		errHas  string
+	}{
+		{name: "a list of one", omitted: `["a"]`, errHas: "not a list"},
+		{name: "a negative count", omitted: "-1", errHas: "must not be negative"},
+		{name: "a quoted count", omitted: `"2"`, errHas: "does not decode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, found, err := ParseDone(body(tc.omitted))
+			if !found {
+				t.Fatal("found = false, want true: the marker line is present")
+			}
+			if err == nil {
+				t.Fatalf("ParseDone accepted omitted %s; want an error", tc.omitted)
+			}
+			if !strings.Contains(err.Error(), tc.errHas) {
+				t.Errorf("error %q does not name %q", err, tc.errHas)
+			}
+		})
+	}
+}
+
 func TestParseDoneRefusesAnOversizeBody(t *testing.T) {
 	const wrapper = `{"notes":""}`
 	atCap := `{"notes":"` + strings.Repeat("x", DoneReportMax-len(wrapper)) + `"}`

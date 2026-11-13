@@ -25,9 +25,39 @@ type DoneReport struct {
 	Verdict        string              `json:"verdict,omitempty"`
 	ReviewedTip    string              `json:"reviewedTip,omitempty"`
 	Findings       []DoneFinding       `json:"findings,omitempty"`
-	Omitted        int                 `json:"omitted,omitempty"`
+	Omitted        DoneCount           `json:"omitted,omitempty"`
 	FindingUpdates []DoneFindingUpdate `json:"findingUpdates,omitempty"`
 	Notes          string              `json:"notes,omitempty"`
+}
+
+// DoneCount is a non-negative count that also accepts the shapes a model writes
+// for "none": [] and null decode as 0. A non-empty array is refused - its
+// elements are not counts, and guessing would misreport the record.
+type DoneCount int
+
+func (c *DoneCount) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	// null needs no branch: decoding it into an int below leaves 0.
+	if strings.HasPrefix(s, "[") {
+		var list []json.RawMessage
+		if err := json.Unmarshal(b, &list); err != nil {
+			return err
+		}
+		if len(list) > 0 {
+			return errors.New("omitted must be a count (an integer), not a list")
+		}
+		*c = 0
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	if n < 0 {
+		return errors.New("omitted must not be negative")
+	}
+	*c = DoneCount(n)
+	return nil
 }
 
 // DoneRisk is the session's risk declaration for submit_for_review. A nil Risk
