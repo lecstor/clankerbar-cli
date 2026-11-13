@@ -120,6 +120,7 @@ func TestEveryBuiltinBriefDiffsFromAResolvedCommit(t *testing.T) {
 func TestReviewBriefsCarryTheResolvedDiffBase(t *testing.T) {
 	for name, brief := range map[string]string{
 		"review":                  builtinPhasePrompts[ReviewPhaseName],
+		"unverified review":       unverifiedReviewBrief,
 		"review-only":             reviewOnlyBrief,
 		"unverified review-only":  unverifiedReviewOnlyBrief,
 		"panel member":            panelMemberReviewOnlyBrief,

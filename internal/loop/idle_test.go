@@ -64,7 +64,7 @@ func TestInvocationForArmsTheSessionIdleWatchdog(t *testing.T) {
 		{0, 10 * time.Minute, 30 * time.Minute},
 		{1, 15 * time.Minute, 0},
 	} {
-		inv, err := d.invocationFor(d.targets[0], tc.idx, phases[tc.idx], nil, "", "", phases, nil)
+		inv, err := d.invocationFor(d.targets[0], tc.idx, phases[tc.idx], nil, "", "", phases, nil, "")
 		if err != nil {
 			t.Fatalf("phase %d: invocationFor: %v", tc.idx, err)
 		}

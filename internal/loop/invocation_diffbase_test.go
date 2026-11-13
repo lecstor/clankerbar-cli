@@ -46,7 +46,7 @@ func TestInvocationForRendersTheRunnerMergeBaseSHA(t *testing.T) {
 		start:   true,
 		baseSHA: testMergeBaseSHA,
 	}
-	inv, err := d.invocationFor(d.targets[0], 1, phases[1], heldReviewClaim(), "", "staging", phases, runner)
+	inv, err := d.invocationFor(d.targets[0], 1, phases[1], heldReviewClaim(), "", "staging", phases, runner, "")
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestInvocationForRendersTheRunnerMergeBaseSHA(t *testing.T) {
 // never the bare local branch.
 func TestInvocationForFallsBackToOriginBase(t *testing.T) {
 	d, phases := diffBaseDriver(t)
-	inv, err := d.invocationFor(d.targets[0], 1, phases[1], heldReviewClaim(), "", "staging", phases, nil)
+	inv, err := d.invocationFor(d.targets[0], 1, phases[1], heldReviewClaim(), "", "staging", phases, nil, "")
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}
@@ -101,5 +101,39 @@ func TestRunnerTaskContextCarriesTheDiffBaseOnEveryPhase(t *testing.T) {
 	fallback := runnerTaskContext(&runnerBriefing{task: rb.task, runID: rb.runID}, runnerTestPhases(), 1, "/wt", "clanker/abc", "staging", testCheckpointTip)
 	if fallback.DiffBase != "origin/staging" {
 		t.Errorf("DiffBase without a prep SHA = %q, want origin/staging", fallback.DiffBase)
+	}
+}
+
+// The prep-to-prompt link (CLA-865 review 1.review-1.3): a runner-claimed drain
+// whose worktree prep computed a merge-base spawns its review phase with that
+// SHA in the diff command AND in the context block. Every other briefing test
+// either drives the session-claim path (origin/<base> fallback) or hand-builds a
+// runnerBriefing, so deleting baseSHA: s.prep.BaseSHA from drain_seq_phase.go
+// would leave them all green. This one drives the production wiring end to end.
+func TestDrainPhases_ReviewSpawnsWithThePreparedMergeBase(t *testing.T) {
+	brief := wipBrief("CLA-924")
+	f := newStartFixture(t, brief, plane.TaskState{Status: "in_progress"}, twoPhases(),
+		[]invokeStep{{res: okResult(1, 0)}})
+	f.origin = originBranchFacts{Known: true, OnOrigin: true, Tip: startTip, DoneIsAncestor: true}
+	f.prep = worktreePrep{Dir: f.prepDir, Created: true, BaseSHA: testMergeBaseSHA}
+
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if f.h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want the review phase only", f.h.invokeCalls)
+	}
+	inv := f.h.invocations[0]
+	if !strings.Contains(inv.Prompt, "PHASE 2") {
+		t.Fatalf("the spawn is not the review phase: %q", inv.Prompt)
+	}
+	if want := "git diff " + testMergeBaseSHA + "..." + brief.Branch; !strings.Contains(inv.Prompt, want) {
+		t.Errorf("the review brief does not carry %q, so the prep's merge-base never reached the prompt:\n%s", want, inv.Prompt)
+	}
+	if want := "Diff base: " + testMergeBaseSHA; !strings.Contains(inv.Prompt, want) {
+		t.Errorf("the context block does not carry %q:\n%s", want, inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, "git diff origin/") || strings.Contains(inv.Prompt, "git diff staging...") {
+		t.Errorf("the review brief fell back to a branch base although the prep computed a SHA:\n%s", inv.Prompt)
 	}
 }

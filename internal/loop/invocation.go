@@ -66,12 +66,18 @@ func diffBase(prBase, baseSHA string) string {
 // swaps the shipped briefs for the ones that assume the runner already holds the
 // claim, and names the branch a fresh claim has not recorded yet.
 //
+// baseSHA is the runner's prep merge-base when this spawn has no runner briefing
+// to carry it (a parallel panel member), so the member's brief still diffs from
+// the commit the runner computed rather than the origin/<prBase> fallback. A
+// runner briefing's own baseSHA wins when there is one: the prep fact is the
+// same value, and the briefing is what the context block reads.
+//
 // phases is the sequence as CAPTURED when the drain started, and supplies every
 // positional/attribution fact here — the "PHASE i of N" total and the previous
 // phase's harness/model. A RELOAD applied inside a wait swaps the live config
 // under an in-flight sequence (CLA-664), and the sequence must keep its own
 // shape and attribution until the next drain.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing) (harness.Invocation, error) {
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing, baseSHA string) (harness.Invocation, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
@@ -266,7 +272,6 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// {{baseSha}} is the one diff base: the runner's merge-base SHA when its
 	// worktree prep computed one, else origin/<prBase>. Filled for every phase,
 	// runner-claimed or not, because it needs no claim - only the repo's base.
-	baseSHA := ""
 	if runner != nil {
 		baseSHA = runner.baseSHA
 	}
