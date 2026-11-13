@@ -320,3 +320,35 @@ func TestTaskWorktree_UntrackedScratchInWorktreeOnBranchMovedAside(t *testing.T)
 
 // A reused tree keeps its unpushed commits, so its Tip is not origin's; the
 // caller has to be told both, or it reports the wrong tip on origin.
+
+// The cross-filesystem fallback copies first: the source is still intact when
+// the copy completes, and a symlink is copied as a link, never followed.
+func TestTaskWorktreeCopyPathPreservesContentAndSymlinks(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(filepath.Join(src, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(src, "nested", "notes.txt"), "reference")
+	if err := os.Symlink("../target", filepath.Join(src, "link")); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(root, "dst")
+	info, err := os.Lstat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := taskWorktreeCopyPath(src, dst, info); err != nil {
+		t.Fatalf("taskWorktreeCopyPath: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(dst, "nested", "notes.txt")); err != nil || strings.TrimSpace(string(body)) != "reference" {
+		t.Errorf("copied file = %q (%v), want the original content", body, err)
+	}
+	if target, err := os.Readlink(filepath.Join(dst, "link")); err != nil || target != "../target" {
+		t.Errorf("copied symlink = %q (%v), want it copied as a link", target, err)
+	}
+	if _, err := os.Stat(filepath.Join(src, "nested", "notes.txt")); err != nil {
+		t.Errorf("the copy removed the source: %v", err)
+	}
+}

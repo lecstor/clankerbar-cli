@@ -103,7 +103,7 @@ func taskWorktreeMoveUntracked(ctx context.Context, dir, scratchRoot, taskID str
 	}
 	if got, err := taskWorktreeUntracked(ctx, dir); err != nil {
 		return "", err
-	} else if len(got) != len(paths) {
+	} else if strings.Join(got, "\x00") != strings.Join(paths, "\x00") {
 		// The caller decided on an earlier listing; a tree that changed under it
 		// is not this function's to clear blindly.
 		return "", fmt.Errorf("the untracked set changed while it was being moved aside")
@@ -209,14 +209,16 @@ func taskWorktreeCopyPath(src, dst string, info os.FileInfo) error {
 		if err != nil {
 			return err
 		}
-		defer in.Close()
 		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
 		if err != nil {
+			in.Close()
 			return err
 		}
-		if _, err := io.Copy(out, in); err != nil {
+		_, cerr := io.Copy(out, in)
+		in.Close()
+		if cerr != nil {
 			out.Close()
-			return err
+			return cerr
 		}
 		return out.Close()
 	}
