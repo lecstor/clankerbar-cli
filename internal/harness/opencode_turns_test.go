@@ -4,6 +4,7 @@ package harness
 // optional model per turn.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -279,6 +280,64 @@ func TestOpencodeInvokeSwitchesRouteBetweenTurns(t *testing.T) {
 	}
 }
 
+// A session can exhaust more than one route across its turns. The report is
+// CUMULATIVE: the route the session STARTED on stays the start and every
+// abandoned route keeps its fallback, so the driver's run-wide marks cover both
+// (routes.go). Turn 1's limit switches free -> paid; the final turn's limit
+// switches paid -> third.
+func TestOpencodeTurnsKeepEveryAbandonedRouteInTheReport(t *testing.T) {
+	const thirdRoute = "third/model"
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, turnScript(logPath,
+		turnStubTurn{"turn-one", turnLimit},
+		turnStubTurn{"turn-two", turnLimit},
+		turnStubTurn{"--model " + thirdRoute, turnAnswer("switched-two", 40, "0.004")},
+		turnStubTurn{"-s ses_live", turnAnswer("switched-one", 20, "0.002")},
+	))
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "turn-one",
+		Model:       routeFree,
+		Routes:      []string{routeFree, routePaid, thirdRoute},
+		ResumeClaim: turnClaim,
+		Turns:       []Turn{{Prompt: "turn-two"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	calls := stubCalls(t, logPath)
+	if len(calls) != 4 {
+		t.Fatalf("the stub ran %d times, want 4 (turn 1, its switch, turn 2, its switch):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	started, finished, fallbacks := RouteFallbacks(res)
+	if started != routeFree {
+		t.Errorf("route_started = %q, want the route the session STARTED on %q — a later switch overwrote it", started, routeFree)
+	}
+	if finished != thirdRoute {
+		t.Errorf("route_finished = %q, want the route that ended the session %q", finished, thirdRoute)
+	}
+	if len(fallbacks) != 2 {
+		t.Fatalf("fallbacks = %+v, want both abandoned routes", fallbacks)
+	}
+	want := []RouteFallback{
+		{Route: routeFree, Next: routePaid, Reason: "usage_limit"},
+		{Route: routePaid, Next: thirdRoute, Reason: "usage_limit"},
+	}
+	for i, fb := range fallbacks {
+		if fb.Route != want[i].Route || fb.Next != want[i].Next || fb.Reason != want[i].Reason {
+			t.Errorf("fallback[%d] = %+v, want %+v", i, fb, want[i])
+		}
+	}
+	if res.TurnStopped != 0 || res.TurnStopReason != "" {
+		t.Errorf("TurnStopped = %d (%q), want 0: both turns ran and every limit was switched", res.TurnStopped, res.TurnStopReason)
+	}
+	if want := []string{"switched-one", "switched-two"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q", res.TurnMessages, want)
+	}
+}
+
 // The done-report check runs on the FINAL turn only. A notes turn's answer must
 // never be judged as a done report — the check here fails anything that is not
 // the last turn's text, and the stub would serve an extra resume if it fired.
@@ -539,6 +598,106 @@ func TestOpencodeRunTurnsStopsWhenTheWallClockIsSpent(t *testing.T) {
 	}
 	if want := []string{res.TurnMessages[0]}; !reflect.DeepEqual(res.TurnMessages, want) || len(res.TurnMessages) != 1 {
 		t.Errorf("TurnMessages = %q, want only the first turn's message", res.TurnMessages)
+	}
+}
+
+// turnFailWriter is a console that works until the adapter announces the LAST
+// follow-up turn, then fails every write. Only that turn's process copy is driven
+// into runSession's error arm: the first turn and its stream are already done.
+type turnFailWriter struct {
+	notes   bytes.Buffer
+	failing bool
+}
+
+func (w *turnFailWriter) Write(p []byte) (int, error) {
+	w.notes.Write(p)
+	if strings.Contains(string(p), "turn 2 of 2") {
+		w.failing = true
+		return len(p), nil
+	}
+	if w.failing {
+		return 0, errors.New("console gone")
+	}
+	return len(p), nil
+}
+
+// A follow-up whose process errors is still charged: a resumed run re-sends the
+// transcript, so its tokens and cost are real money, its message stays in the
+// turn record, and the sequence names the turn that ended it. The console fails
+// only once the adapter announces turn 2, so the FIRST turn's runSession is
+// untouched and only the follow-up takes the error arm.
+func TestOpencodeInvokeChargesAnErroredFollowUpTurn(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	// ONE write for the whole turn: the failing console stops the copy at its
+	// first chunk, so later writes could race whether the step is ever parsed.
+	turnTwo := `    printf '%s\n%s\n' ` +
+		`'{"type":"text","sessionID":"ses_live","part":{"type":"text","text":"two"}}' ` +
+		`'{"type":"step_finish","sessionID":"ses_live","part":{"type":"step-finish","reason":"stop","tokens":{"total":20,"input":20,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.002}}'`
+	opencodeStub(t, turnScript(logPath,
+		turnStubTurn{"turn-one", turnAnswer("one", 10, "0.001")},
+		turnStubTurn{"turn-two", turnTwo},
+	))
+
+	console := &turnFailWriter{}
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "turn-one",
+		Model:       routeFree,
+		Console:     console,
+		ResumeClaim: turnClaim,
+		Turns:       []Turn{{Prompt: "turn-two"}},
+	})
+	if err == nil {
+		t.Fatalf("Invoke returned no error, want the follow-up's runSession error; console:\n%s", console.notes.String())
+	}
+	// Precondition: the follow-up must really have taken the error arm, or this
+	// test would pass through mergeResume without exercising chargeTurn.
+	if !strings.Contains(console.notes.String(), "turn 2 errored") {
+		t.Fatalf("the follow-up did not take the error arm; console got:\n%s", console.notes.String())
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 2 {
+		t.Errorf("the stub ran %d times, want 2 (turn 1 + the errored follow-up):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if res.TurnStopped != 2 || res.TurnStopReason != "run_error" {
+		t.Errorf("TurnStopped = %d (%q), want turn 2 stopped on run_error", res.TurnStopped, res.TurnStopReason)
+	}
+	if want := 10 + 20; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d — the errored turn's spend is real spend", res.Tokens, want)
+	}
+	if res.CostUSD < 0.0029 || res.CostUSD > 0.0031 {
+		t.Errorf("CostUSD = %v, want 0.003 summed across both runs", res.CostUSD)
+	}
+	if want := []string{"one", "two"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q — the errored turn's message is kept", res.TurnMessages, want)
+	}
+}
+
+// The turns SHARE the invocation's one wall-clock cap: turnInvocation carries
+// over the budget actually left and seeds the live claim. Without that assignment
+// every follow-up would start on a fresh full cap, multiplying the phase backstop
+// by the number of turns.
+func TestTurnInvocationSeedsTheRemainingWallClock(t *testing.T) {
+	stale := Claim{TaskID: "stale-task", Ref: "CLA-1", RunID: "old-run"}
+	res := Result{Claim: turnClaim}
+	in := Invocation{
+		Model:               routeFree,
+		MaxSessionWallClock: 30 * time.Minute,
+		ResumeClaim:         stale,
+	}
+	deadline := time.Now().Add(90 * time.Second)
+
+	got := (opencode{}).turnInvocation(in, &res, deadline)
+
+	remaining := time.Until(deadline)
+	if got.MaxSessionWallClock > remaining+time.Second || got.MaxSessionWallClock < remaining-time.Second {
+		t.Errorf("MaxSessionWallClock = %s, want the ~%s left of the invocation's cap, not the original %s",
+			got.MaxSessionWallClock, remaining, in.MaxSessionWallClock)
+	}
+	if got.ResumeClaim != turnClaim {
+		t.Errorf("ResumeClaim = %+v, want the live claim %+v", got.ResumeClaim, turnClaim)
+	}
+	if in.MaxSessionWallClock != 30*time.Minute || in.ResumeClaim != stale {
+		t.Errorf("turnInvocation mutated the base invocation: %+v", in)
 	}
 }
 

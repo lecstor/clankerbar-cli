@@ -127,6 +127,12 @@ func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes
 // setRouteReport writes the fallback report onto the Result. Nothing is written
 // when the session never switched, so a single-route run's Raw is exactly the
 // shape it had before this feature existed.
+//
+// The report is CUMULATIVE across switches: a multi-turn session can exhaust more
+// than one route, and the driver marks EVERY abandoned route from this report
+// (routes.go). A later switch therefore keeps the route the session started on
+// and appends to the fallbacks already reported; RouteFinishedKey is the latest
+// route, the one that ended the session.
 func setRouteReport(res *Result, started, finished string, fallbacks []RouteFallback) {
 	if len(fallbacks) == 0 {
 		return
@@ -134,9 +140,12 @@ func setRouteReport(res *Result, started, finished string, fallbacks []RouteFall
 	if res.Raw == nil {
 		res.Raw = map[string]any{}
 	}
-	res.Raw[RouteStartedKey] = started
+	if existing, _ := res.Raw[RouteStartedKey].(string); existing == "" {
+		res.Raw[RouteStartedKey] = started
+	}
 	res.Raw[RouteFinishedKey] = finished
-	res.Raw[RouteFallbacksKey] = fallbacks
+	prior, _ := res.Raw[RouteFallbacksKey].([]RouteFallback)
+	res.Raw[RouteFallbacksKey] = append(append([]RouteFallback(nil), prior...), fallbacks...)
 }
 
 // mergeRouteSwitch folds a continuation run made on a DIFFERENT model route into
