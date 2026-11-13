@@ -1,7 +1,8 @@
 package loop
 
 // The origin half of the start-phase facts: the fetch and the questions the
-// start-phase table asks of it. A WIP task's read is the drain's one fetch — the
+// start-phase table asks of it. A WIP task's read is the drain's one fetch, and
+// the pre-claim worktree check may already have made it — either way the
 // worktree prep is told so with worktreeRequest.Fetched.
 
 import (

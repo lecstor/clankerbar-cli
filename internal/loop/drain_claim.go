@@ -77,15 +77,15 @@ func (s *drainSeq) claimForDrain(ctx context.Context) drainClaim {
 			return claimNothing
 		}
 		next := offer.Next
-		next = s.declineUnpreparable(ctx, offer)
+		next, usedReady := s.declineUnpreparable(ctx, offer)
 		if next == nil {
 			return claimNothing
 		}
 		ct, err := claimer.ClaimTask(ctx, next.ID, next.RequiresTakeover)
-		if errors.Is(err, plane.ErrNotClaimable) && offer.ReadyNext != nil {
+		if errors.Is(err, plane.ErrNotClaimable) && offer.ReadyNext != nil && !usedReady {
 			// The takeover or close-out was withheld, so take what the plane
 			// offers a plain claim instead — checked before the claim like Next.
-			if next = s.declineUnpreparable(ctx, plane.Offer{Next: offer.ReadyNext}); next == nil {
+			if next, _ = s.declineUnpreparable(ctx, plane.Offer{Next: offer.ReadyNext}); next == nil {
 				return claimNothing
 			}
 			ct, err = claimer.ClaimTask(ctx, next.ID, next.RequiresTakeover)
@@ -146,21 +146,23 @@ func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 // refusal is found BEFORE the claim, so it costs no reclaim: the task is simply
 // not claimed, the drain idles, and the next offer retries once the tree is
 // fixed. When the plane offered a ReadyNext (a declined takeover or close-out),
-// that task is checked and claimed instead.
-func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) *plane.TaskBrief {
-	next := offer.Next
+// that task is checked and claimed instead; usedReady says the returned task is
+// that fallback, so the caller does not offer it twice.
+func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) (next *plane.TaskBrief, usedReady bool) {
+	next = offer.Next
 	for {
 		reason := s.worktreeRefusal(ctx, next)
 		if reason == "" {
-			return next
+			return next, usedReady
 		}
 		log.Printf("%siteration %d: %s: not claiming it: %s — fix the worktree and the task will be offered again; no reclaim is spent",
 			labelOf(s.t), s.drainNum, claimLabel(harness.Claim{TaskID: next.ID, Ref: next.Ref}), reason)
 		if offer.ReadyNext == nil {
-			return nil
+			return nil, usedReady
 		}
 		next = offer.ReadyNext
 		offer.ReadyNext = nil
+		usedReady = true
 	}
 }
 
