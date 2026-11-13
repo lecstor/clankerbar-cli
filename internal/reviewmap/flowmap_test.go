@@ -2,6 +2,7 @@ package reviewmap
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -56,6 +57,38 @@ func TestRenderFlowItemsCap(t *testing.T) {
 	}
 	if len(def) != 3 {
 		t.Errorf("renderFlowItems(0) returned %d items, want 3", len(def))
+	}
+}
+
+// TestRenderFlowItemsDefaultCap pins the benchmark default at 40 names: 40
+// definitions fit exactly, and 41 yields 40 items plus the overflow item.
+func TestRenderFlowItemsDefaultCap(t *testing.T) {
+	defs := make([]Definition, 41)
+	for i := range defs {
+		defs[i] = Definition{Name: fmt.Sprintf("def%02d", i), At: fmt.Sprintf("a.ts:%d", i+1)}
+	}
+	find := func(Definition) (string, error) { return "nowhere else", nil }
+
+	atCap, err := renderFlowItems(defs[:40], 0, find)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atCap) != 40 {
+		t.Errorf("renderFlowItems(40 defs, 0) returned %d items, want 40", len(atCap))
+	}
+	if got, want := atCap[39], "`def39` defined or changed at a.ts:40; used at: nowhere else"; got != want {
+		t.Errorf("last item at the cap = %q, want %q", got, want)
+	}
+
+	overCap, err := renderFlowItems(defs, 0, find)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overCap) != 41 {
+		t.Fatalf("renderFlowItems(41 defs, 0) returned %d items, want 41", len(overCap))
+	}
+	if got, want := overCap[40], "(1 more changed definitions not listed)"; got != want {
+		t.Errorf("overflow item = %q, want %q", got, want)
 	}
 }
 

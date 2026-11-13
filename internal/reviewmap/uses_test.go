@@ -24,25 +24,37 @@ func TestFormatUses(t *testing.T) {
 		},
 		{
 			name:    "definition line is dropped",
-			grepOut: "a.ts:3:function alphaThing() {\n",
+			grepOut: "a.ts\x003\x00function alphaThing() {\n",
 			defAt:   "a.ts:3",
 			want:    "nowhere else",
 		},
 		{
 			name:    "body-changed definition location is dropped",
-			grepOut: "a.ts:10:function alphaThing() {\n",
+			grepOut: "a.ts\x0010\x00function alphaThing() {\n",
 			defAt:   "a.ts:10 (body changed)",
 			want:    "nowhere else",
 		},
 		{
 			name:    "text after the line number may contain colons",
-			grepOut: "a.ts:4:alphaThing(\"x:y\")\n",
+			grepOut: "a.ts\x004\x00alphaThing(\"x:y\")\n",
 			defAt:   "a.ts:3",
 			want:    "a.ts:4",
 		},
 		{
+			name:    "path containing a colon keeps its line",
+			grepOut: "src/a:b.ts\x003\x00alphaThing()\n",
+			defAt:   "src/z.ts:9",
+			want:    "src/a:b.ts:3",
+		},
+		{
+			name:    "definition line in a colon path is dropped",
+			grepOut: "src/a:b.ts\x003\x00alphaThing()\n",
+			defAt:   "src/a:b.ts:3",
+			want:    "nowhere else",
+		},
+		{
 			name:    "test uses come last",
-			grepOut: "src/a.ts:1:alphaThing()\npkg/foo.test.ts:2:alphaThing()\ntest/b.ts:3:alphaThing()\n",
+			grepOut: "src/a.ts\x001\x00alphaThing()\npkg/foo.test.ts\x002\x00alphaThing()\ntest/b.ts\x003\x00alphaThing()\n",
 			defAt:   "src/z.ts:9",
 			want:    "src/a.ts:1, pkg/foo.test.ts:2, test/b.ts:3",
 		},
@@ -66,7 +78,7 @@ func TestFormatUses(t *testing.T) {
 func useLines(n int) []string {
 	lines := make([]string, n)
 	for i := range n {
-		lines[i] = fmt.Sprintf("src/a.ts:%d:alphaThing()", i+1)
+		lines[i] = fmt.Sprintf("src/a.ts\x00%d\x00alphaThing()", i+1)
 	}
 	return lines
 }
@@ -103,53 +115,70 @@ func TestIsTestPath(t *testing.T) {
 	}
 }
 
+// testRepo is a throwaway git repository for the integration tests.
+type testRepo struct {
+	t   *testing.T
+	dir string
+}
+
+func newTestRepo(t *testing.T) *testRepo {
+	t.Helper()
+	r := &testRepo{t: t, dir: t.TempDir()}
+	r.git("init", "-q")
+	r.git("config", "user.email", "reviewmap@example.com")
+	r.git("config", "user.name", "reviewmap test")
+	r.git("config", "commit.gpgsign", "false")
+	return r
+}
+
+func (r *testRepo) git(args ...string) string {
+	r.t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = r.dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		r.t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (r *testRepo) write(name, content string) {
+	r.t.Helper()
+	path := filepath.Join(r.dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+func (r *testRepo) commit(message string) {
+	r.t.Helper()
+	r.git("add", "-A")
+	r.git("commit", "-q", "-m", message)
+}
+
 // TestFlowMapIntegration builds a real repository, diffs two commits and lets
 // FlowMap run the real git grep in the checked-out head.
 func TestFlowMapIntegration(t *testing.T) {
-	dir := t.TempDir()
+	r := newTestRepo(t)
 
-	git := func(args ...string) string {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	write := func(name, content string) {
-		t.Helper()
-		path := filepath.Join(dir, name)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	git("init", "-q")
-	git("config", "user.email", "reviewmap@example.com")
-	git("config", "user.name", "reviewmap test")
-	git("config", "commit.gpgsign", "false")
-
-	write("src/defs.ts", "export const placeholder = 1\n")
-	write("src/beta-uses.ts", strings.Repeat("betaThing()\n", 10))
-	write("src/uses-a.ts", strings.Repeat("alphaThing()\n", 3))
-	write("src/other.spec.ts", "alphaThing()\n")
-	write("test/uses.test.ts", strings.Repeat("alphaThing()\n", 2))
+	r.write("src/defs.ts", "export const placeholder = 1\n")
+	r.write("src/beta-uses.ts", strings.Repeat("betaThing()\n", 10))
+	r.write("src/uses-a.ts", strings.Repeat("alphaThing()\n", 3))
+	r.write("src/other.spec.ts", "alphaThing()\n")
+	r.write("test/uses.test.ts", strings.Repeat("alphaThing()\n", 2))
 	// These must never show up as uses: declarations, minified bundles and
 	// files outside the searched globs.
-	write("src/globals.d.ts", "declare function alphaThing(): void\n")
-	write("src/vendor.min.js", "alphaThing()\n")
-	write("docs/notes.md", "alphaThing is mentioned here\n")
+	r.write("src/globals.d.ts", "declare function alphaThing(): void\n")
+	r.write("src/vendor.min.js", "alphaThing()\n")
+	r.write("docs/notes.md", "alphaThing is mentioned here\n")
 
-	git("add", "-A")
-	git("commit", "-q", "-m", "base")
-	base := git("rev-parse", "HEAD")
+	r.commit("base")
+	base := r.git("rev-parse", "HEAD")
 
-	write("src/defs.ts", `export const placeholder = 1
+	r.write("src/defs.ts", `export const placeholder = 1
 
 export function alphaThing() {
   return 1
@@ -163,10 +192,9 @@ export function gammaThing() {
   return 3
 }
 `)
-	git("add", "-A")
-	git("commit", "-q", "-m", "head")
+	r.commit("head")
 
-	diff := git("diff", base, "HEAD")
+	diff := r.git("diff", base, "HEAD")
 
 	want := []string{
 		"`alphaThing` defined or changed at src/defs.ts:3; used at: " +
@@ -178,7 +206,7 @@ export function gammaThing() {
 		"`gammaThing` defined or changed at src/defs.ts:11; used at: nowhere else",
 	}
 
-	got, err := FlowMap(diff, dir, 0)
+	got, err := FlowMap(diff, r.dir, 0)
 	if err != nil {
 		t.Fatalf("FlowMap() error: %v", err)
 	}
@@ -189,6 +217,31 @@ export function gammaThing() {
 	changeWant := []string{"src/defs.ts:1-13"}
 	if changeGot := ChangeMap(diff, 0); !reflect.DeepEqual(changeGot, changeWant) {
 		t.Errorf("ChangeMap(real diff) = %#v, want %#v", changeGot, changeWant)
+	}
+}
+
+// TestFlowMapExcludedOnlyMatch pins the exit-1 classification: when the only
+// occurrence of a definition is in a file git grep excludes, that is "nowhere
+// else", not an error.
+func TestFlowMapExcludedOnlyMatch(t *testing.T) {
+	r := newTestRepo(t)
+	r.write("src/keep.ts", "export const placeholder = 1\n")
+	r.commit("base")
+	base := r.git("rev-parse", "HEAD")
+
+	// TypeScript.Match accepts a .d.ts path, but useGlobs excludes it, so
+	// git grep exits 1 with no output for the only occurrence.
+	r.write("src/types.d.ts", "export interface OnlyHere {\n  value: string\n}\n")
+	r.commit("head")
+
+	diff := r.git("diff", base, "HEAD")
+	got, err := FlowMap(diff, r.dir, 0)
+	if err != nil {
+		t.Fatalf("FlowMap() error: %v", err)
+	}
+	want := []string{"`OnlyHere` defined or changed at src/types.d.ts:1; used at: nowhere else"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FlowMap() = %#v, want %#v", got, want)
 	}
 }
 

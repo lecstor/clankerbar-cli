@@ -145,27 +145,38 @@ func TestChangeMap(t *testing.T) {
 	}
 }
 
-func TestChangeMapDefaultCap(t *testing.T) {
+// hunksDiff builds a one-file diff with n hunks, each adding a line at
+// start+1.
+func hunksDiff(n int) string {
 	var b strings.Builder
 	b.WriteString("+++ b/a.ts\n")
+	for i := range n {
+		start := 1 + i*3
+		fmt.Fprintf(&b, "@@ -%d,1 +%d,2 @@\n x\n+y\n", start, start)
+	}
+	return b.String()
+}
+
+// TestChangeMapDefaultCap pins the benchmark default at 60 hunks: 60 keep one
+// item each, 61 merge per file.
+func TestChangeMapDefaultCap(t *testing.T) {
+	if got := ChangeMap(hunksDiff(60), 0); len(got) != 60 {
+		t.Errorf("ChangeMap(60 hunks, 0) returned %d items, want 60", len(got))
+	}
+
 	var regions []string
 	for i := range 61 {
 		start := 1 + i*3
-		fmt.Fprintf(&b, "@@ -%d,1 +%d,2 @@\n x\n+y\n", start, start)
 		regions = append(regions, fmt.Sprintf("%d-%d", start, start+1))
 	}
-	diff := b.String()
-
-	got := ChangeMap(diff, 0)
 	want := []string{fmt.Sprintf("a.ts: %s (61 changed regions)", strings.Join(regions, ", "))}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("ChangeMap(0) = %#v\nwant %#v", got, want)
+	if got := ChangeMap(hunksDiff(61), 0); !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangeMap(61 hunks, 0) = %#v\nwant %#v", got, want)
 	}
 
-	// The benchmark default is a cap, not unlimited: at a cap above the hunk
-	// count every hunk keeps its own item.
-	if got := ChangeMap(diff, 61); len(got) != 61 {
-		t.Errorf("ChangeMap(61) returned %d items, want 61", len(got))
+	// An explicit cap above the hunk count keeps every hunk.
+	if got := ChangeMap(hunksDiff(61), 61); len(got) != 61 {
+		t.Errorf("ChangeMap(61 hunks, 61) returned %d items, want 61", len(got))
 	}
 }
 

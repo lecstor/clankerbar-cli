@@ -26,7 +26,9 @@ var (
 // grepUses lists where d is used, or "nowhere else". git is run with argv,
 // never a shell.
 func grepUses(worktree string, d Definition) (string, error) {
-	args := append([]string{"grep", "-n", "-w", "-I", "-e", d.Name, "--"}, useGlobs...)
+	// -z NUL-delimits the path and line number, so a path containing a colon
+	// still parses exactly.
+	args := append([]string{"grep", "-n", "-z", "-w", "-I", "-e", d.Name, "--"}, useGlobs...)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = worktree
 	out, err := cmd.Output()
@@ -41,7 +43,8 @@ func grepUses(worktree string, d Definition) (string, error) {
 }
 
 // formatUses drops the definition's own line, orders non-test sites before
-// test sites, and applies the display cap.
+// test sites, and applies the display cap. grepOut is `git grep -n -z` output:
+// "path\0line\0text" per record.
 func formatUses(grepOut, defAt string) string {
 	defPath, defLine := splitLocation(defAt)
 	var nonTest, test []string
@@ -49,8 +52,7 @@ func formatUses(grepOut, defAt string) string {
 		if line == "" {
 			continue
 		}
-		// git grep -n prints "path:line:text"; the text may contain colons.
-		parts := strings.SplitN(line, ":", 3)
+		parts := strings.SplitN(line, "\x00", 3)
 		if len(parts) < 3 {
 			continue
 		}

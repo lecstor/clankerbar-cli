@@ -60,21 +60,28 @@ func TestTypeScriptPatterns(t *testing.T) {
 }
 
 func TestTypeScriptSkipSet(t *testing.T) {
-	for _, code := range []string{
-		"function render() {",
-		"const props = () => ({})",
-		"const index = () => 0",
-		"const state = () => ({})",
-		"function test() {",
-		"function it() {",
-		"function map() {",
-		"const handler = () => {}",
-		"function constructor() {",
-	} {
+	// Every name the benchmark's skip set lists (CLA-864), so a dropped or
+	// misspelled entry fails.
+	skipNames := []string{
+		"constructor", "render", "default", "props", "state", "index", "main",
+		"init", "setup", "test", "it", "describe", "expect", "then", "catch",
+		"map", "filter", "reduce", "forEach", "push", "get", "set", "has",
+		"toString", "value", "data", "error", "result", "options", "config",
+		"handler", "callback", "fn", "cb", "if", "for", "while", "switch",
+		"return", "function",
+	}
+	for _, name := range skipNames {
+		code := "function " + name + "() {"
 		f := addedFile("src/a.ts", 1, AddedLine{Line: 1, Code: code})
 		if got := tsNames(f); len(got) != 0 {
 			t.Errorf("Names(%q) = %v, want none (skip set)", code, namesOf(got))
 		}
+	}
+
+	// Control: a name outside the set is kept.
+	f := addedFile("src/a.ts", 1, AddedLine{Line: 1, Code: "function keptThing() {"})
+	if got := namesOf(tsNames(f)); !reflect.DeepEqual(got, []string{"keptThing"}) {
+		t.Errorf("Names(control) = %v, want [keptThing]", got)
 	}
 }
 
