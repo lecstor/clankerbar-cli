@@ -325,25 +325,6 @@ func TestTaskWorktree_CloseOutNeverMerges(t *testing.T) {
 	}
 }
 
-func TestTaskWorktree_DirtyReuseRefused(t *testing.T) {
-	f := newTaskWorktreeRepo(t)
-	first, err := f.prepare(t, f.request())
-	if err != nil {
-		t.Fatalf("first prepare: %v", err)
-	}
-	stray := filepath.Join(first.Dir, "stray.txt")
-	writeTestFile(t, stray, "work in progress")
-
-	if _, err := f.prepare(t, f.request()); err == nil {
-		t.Fatalf("a dirty worktree must be refused")
-	} else if !strings.Contains(err.Error(), "uncommitted changes") {
-		t.Errorf("error %q does not say why the worktree was refused", err)
-	}
-	if _, err := os.Stat(stray); err != nil {
-		t.Errorf("the refusal discarded the work: %v", err)
-	}
-}
-
 func TestTaskWorktree_DivergedLocalBranchRefused(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
 	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
@@ -635,29 +616,6 @@ func TestTaskWorktree_AdoptsSiblingWorktreeBehindOrigin(t *testing.T) {
 	}
 }
 
-// An untracked file in the sibling is work: adopting would hide it, so it is
-// refused with the reason.
-func TestTaskWorktree_DirtySiblingWorktreeRefused(t *testing.T) {
-	f := newTaskWorktreeRepo(t)
-	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
-	gitRun(t, f.checkout, "fetch", "origin")
-	sibling := filepath.Join(f.checkout, ".cla848")
-	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, sibling, "origin/"+taskWorktreeBranch)
-	writeTestFile(t, filepath.Join(sibling, "stray.txt"), "work in progress")
-	req := f.request()
-	req.Resume = true
-
-	_, err := f.prepare(t, req)
-	if err == nil {
-		t.Fatalf("a dirty sibling worktree must be refused, not adopted")
-	}
-	if !strings.Contains(err.Error(), ".cla848") || !strings.Contains(err.Error(), "uncommitted") {
-		t.Errorf("error %q does not name the sibling and its dirty state", err)
-	}
-}
-
-// A sibling holding a commit origin never got is refused: adopting it would make
-// that work look like the task's own.
 func TestTaskWorktree_SiblingWorktreeAheadOfOriginRefused(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
 	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
@@ -801,30 +759,6 @@ func TestTaskWorktree_MainCheckoutOnBranchRefused(t *testing.T) {
 	}
 }
 
-func TestTaskWorktree_DirtyWorktreeOnBranchRefused(t *testing.T) {
-	f := newTaskWorktreeRepo(t)
-	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
-	gitRun(t, f.checkout, "fetch", "origin")
-	elsewhere := filepath.Join(f.checkout, ".worktrees", "session-wt")
-	gitRun(t, f.checkout, "worktree", "add", "-b", taskWorktreeBranch, elsewhere, "origin/"+taskWorktreeBranch)
-	stray := filepath.Join(elsewhere, "stray.txt")
-	writeTestFile(t, stray, "work in progress")
-	req := f.request()
-	req.Resume = true
-
-	if _, err := f.prepare(t, req); err == nil {
-		t.Fatalf("a dirty worktree on the branch must be refused")
-	} else if !strings.Contains(err.Error(), "session-wt") || !strings.Contains(err.Error(), "uncommitted changes") {
-		// The basename: git may report the path symlink-resolved.
-		t.Errorf("error %q does not name %s and its dirty state", err, elsewhere)
-	}
-	if _, err := os.Stat(stray); err != nil {
-		t.Errorf("the refusal discarded the work: %v", err)
-	}
-}
-
-// A reused tree keeps its unpushed commits, so its Tip is not origin's; the
-// caller has to be told both, or it reports the wrong tip on origin.
 func TestTaskWorktree_ReuseReportsUnpushedCommits(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
 	branchTip := f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")

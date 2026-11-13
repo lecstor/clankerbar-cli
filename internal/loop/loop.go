@@ -438,6 +438,13 @@ type Driver struct {
 	// drain runs in. A field because tests stub the git the start-phase prep does.
 	prepareWorktree func(ctx context.Context, req worktreeRequest) (worktreePrep, error)
 
+	// worktreeCheck is the READ-ONLY pre-claim verdict on the task's existing
+	// worktree, made before the claim so a deterministic refusal costs no
+	// reclaim. It returns the refusal reason ("" when the claim is worth
+	// taking) and the origin facts its fetch produced for that task. A field
+	// for the same reason as the two above.
+	worktreeCheck func(ctx context.Context, req worktreeRequest, doneTip string) (string, originBranchFacts, error)
+
 	// newAdapter resolves a harness NAME to its adapter, for a sequence whose
 	// phases are not all on one harness (CLA-366). Production is harness.Get; a
 	// field so tests can hand out their own fakes per name.
@@ -650,6 +657,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 
 		originBranch:    readOriginBranch,
 		prepareWorktree: prepareTaskWorktree,
+		worktreeCheck:   claimWorktreeRefusal,
 	}
 	// The clock the scheduled pause reads; a test moves it to enter a window.
 	d.now = time.Now
@@ -694,6 +702,14 @@ func (d *Driver) prepareWorktreeFn() func(ctx context.Context, req worktreeReque
 		return d.prepareWorktree
 	}
 	return prepareTaskWorktree
+}
+
+// worktreeCheckFn is claimWorktreeRefusal, with the same nil fallback.
+func (d *Driver) worktreeCheckFn() func(ctx context.Context, req worktreeRequest, doneTip string) (string, originBranchFacts, error) {
+	if d.worktreeCheck != nil {
+		return d.worktreeCheck
+	}
+	return claimWorktreeRefusal
 }
 
 // orRef was folded into sessionDir's log line; kept out to avoid a helper with

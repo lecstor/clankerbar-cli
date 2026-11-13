@@ -1,7 +1,8 @@
 package loop
 
 // The origin half of the start-phase facts: the fetch and the questions the
-// start-phase table asks of it. A WIP task's read is the drain's one fetch — the
+// start-phase table asks of it. A WIP task's read is the drain's one fetch, and
+// the pre-claim worktree check may already have made it — either way the
 // worktree prep is told so with worktreeRequest.Fetched.
 
 import (
@@ -26,6 +27,13 @@ func readOriginBranch(ctx context.Context, checkout, branch, doneTip string) ori
 	if _, err := taskWorktreeGit(ctx, checkout, "fetch", "origin", "--prune"); err != nil {
 		return originBranchFacts{}
 	}
+	return readOriginBranchFetched(ctx, checkout, branch, doneTip)
+}
+
+// readOriginBranchFetched is readOriginBranch's questions after a fetch the
+// caller already ran: the pre-claim worktree check fetches once and hands the
+// facts on, so a resumed claim does not pay a second round-trip.
+func readOriginBranchFetched(ctx context.Context, checkout, branch, doneTip string) originBranchFacts {
 	f := originBranchFacts{Known: true}
 	if branch == "" {
 		// No recorded branch: nothing about origin can be asked.
