@@ -250,3 +250,68 @@ func TestReviewMethod_AbsentKeepsTheConfigIdentity(t *testing.T) {
 		t.Error("adopting maps-session must move the identity — it is a config edit")
 	}
 }
+
+// TestReviewMethod_StoredDocumentCarriesTheKnobs (CLA-869): the plane's stored
+// document shape decodes and applies the method and its options onto the phase
+// and the panel member, so a plane whose schema learns the keys needs no
+// second change here.
+func TestReviewMethod_StoredDocumentCarriesTheKnobs(t *testing.T) {
+	base := &Config{Harness: "opencode", Prompt: "local"}
+	doc := &RunConfigDoc{SchemaVersion: 1,
+		Phases: []RunConfigPhase{
+			{Name: "implement"},
+			{Name: "review", ReviewMethod: ReviewMethodMapsSession,
+				MapsSession: &MapsSessionOptions{ChunkSize: 7, FindingsModel: "opencode-go/cheap"}},
+			{Name: "fix"},
+		},
+		ReviewPanel: []RunConfigPanelMember{
+			{Model: "opencode-go/one"},
+			{Model: "opencode-go/two", ReviewMethod: ReviewMethodSinglePass},
+		},
+	}
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if !base.Phases[1].UsesMapsSession() {
+		t.Fatalf("the stored review phase lost its method: %#v", base.Phases[1])
+	}
+	if got := base.Phases[1].MapsSessionDefaults(); got.ChunkSize != 7 || got.FindingsModel != "opencode-go/cheap" {
+		t.Errorf("stored options = %+v, want chunk_size 7 / findings opencode-go/cheap", got)
+	}
+	if got := base.ReviewPanel[1].ReviewMethod; got != ReviewMethodSinglePass {
+		t.Errorf("stored member method = %q, want single-pass", got)
+	}
+	// A clone must not alias the stored block.
+	clone := base.Clone()
+	clone.Phases[1].MapsSession.ChunkSize = 99
+	if base.Phases[1].MapsSession.ChunkSize != 7 {
+		t.Error("a clone shares the base config's maps_session block")
+	}
+}
+
+// TestReviewMethod_ProposeRefusesUntilThePlaneKnowsIt (CLA-869): propose-config
+// must not emit a document the plane's v1 schema would refuse, and must not
+// silently drop the method either.
+func TestReviewMethod_ProposeRefusesUntilThePlaneKnowsIt(t *testing.T) {
+	cfg := mapsSessionConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review", "review_method": "maps-session"}, {"name": "fix"}]
+	}`)
+	_, err := cfg.RunConfigDocument()
+	if err == nil {
+		t.Fatal("RunConfigDocument exported a maps-session phase the plane's v1 schema refuses")
+	}
+	if !strings.Contains(err.Error(), "review_method") || !strings.Contains(err.Error(), "schema") {
+		t.Errorf("the refusal does not name the key and the reason: %v", err)
+	}
+
+	// A panel member's own method is refused the same way.
+	panel := mapsSessionConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"model": "opencode-go/one", "review_method": "maps-session"}]
+	}`)
+	if _, err := panel.RunConfigDocument(); err == nil || !strings.Contains(err.Error(), "review_panel[0]") {
+		t.Errorf("RunConfigDocument() = %v, want a refusal naming the member", err)
+	}
+}

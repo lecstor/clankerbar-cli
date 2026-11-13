@@ -455,6 +455,90 @@ bounded by the sessions running alongside it, at most `cap - 1`. `clankerbar
 doctor` prints the resolved panel, with each member's harness and model, so an
 overnight run's review spend is visible before it happens.
 
+### The maps-session review method: notes first, findings after
+
+The shipped review is one session: read the diff, write the record. Setting
+`review_method: "maps-session"` on a review phase — or on one `review_panel`
+member — replaces that session's shape with the maps+notes technique measured
+for CLA-864. It is opt-in per phase and per member; with no `review_method`, the
+single-pass review is byte for byte what it was.
+
+```json
+"phases": [
+  { "name": "implement" },
+  {
+    "name": "review",
+    "harness": "opencode",
+    "review_method": "maps-session",
+    "maps_session": {
+      "chunk_size": 25,
+      "notes_model": "opencode-go/gpt-6-luna",
+      "findings_model": ""
+    }
+  },
+  { "name": "fix" }
+]
+```
+
+The reason is measured, not aesthetic. On ReviewBench's TypeScript dev split
+(judged by Claude Sonnet 5) the technique took Opus 5.5 from 59.9% to 76.8%
+grounded F1 and Sonnet 5.5 from 62.2% to 70.4%; DeepSeek V4.1 Flash on
+opencode-go scored 67.9-70.9% with the best precision of any configuration
+(86-88%) at about $0.09 a PR. The cost is time: about 17-18 minutes and up to
+~100 model steps for a Flash review.
+
+**How the phase runs.** The driver maps `<merge-base>..<tip>` in the task
+worktree into items: one `M` item per changed region (no cap, because a missed
+region is missed entirely), then one `F` item per changed definition with its
+uses from `git grep` (capped at `flow_max`, with the overflow summarised
+unnumbered). It numbers them `M1..` then `F1..` and chunks them at `chunk_size`:
+a change with no items still gets one chunk saying so. Turn 1 is the ordinary
+review brief plus the first chunk; one follow-up turn carries each remaining
+chunk; the final turn asks for findings built from the notes. That is ceil(items
+/ chunk_size) notes turns plus one findings turn, all in ONE opencode session, so
+every later turn sees everything the earlier ones read. Every notes turn's reply
+is written to the iteration log under its turn and chunk heading — it is the
+evidence a later missed-finding analysis reads, and it is never sent to the
+plane. The findings turn's done report goes through exactly the check, resume and
+record path a single-pass review's report does, and a turn that ends badly stops
+the sequence and fails the phase with no record written.
+
+The options: `chunk_size` (items per notes turn, default 25), `flow_max` (the
+flow map's item cap, default 40), `notes_model` and `findings_model` (each
+stage's model; empty inherits the phase's own). The per-stage models exist so a
+stronger note-taker can feed a cheaper findings writer, or the reverse — the
+choice is yours, and the runner never picks one. One edge: if the phase names no
+model at all and only `notes_model` is set, the findings turn runs on the notes
+model too, because a live session cannot return to a harness's own default
+mid-conversation.
+
+**Two requirements, both refused rather than degraded.** The turn sequence needs
+a harness that can continue one session — **opencode today**. `Validate` refuses
+maps-session on claude or codex with a message naming the harness, and never
+silently runs only the first turn. And the maps are built in the worktree the
+**runner** prepared at the reviewed tip (or a parallel panel member's own
+checkout at that tip), so the method needs a runner-claimed review: a
+session-claimed review, a sequential panel member in the shared checkout, or a
+branchless checkpoint with nothing to map, is refused before anything spawns
+rather than reviewing a map of the wrong tree.
+
+**Limits, and what was not changed.** A maps-session review is one phase
+session, so the existing bounds apply: the turn cap defaults to 400 (opencode
+takes no turn flag, so it is not the binding cap there), the per-session token
+ceiling floor is 150M, and `max_wall_clock` is **off by default**. Those defaults
+hold the measured 17-18 minutes and ~100 model steps without change; if you set a
+per-phase `max_wall_clock`, give a maps-session review at least about 30 minutes.
+`clankerbar doctor` prints the method and each stage's resolved model beside the
+reviewer — `review: single reviewer (opencode/model) (maps-session:
+notes=..., findings=..., chunk_size=25, flow_max=40)` — so the spend is visible
+before the run.
+
+`propose-config` refuses to store these keys today: the plane's stored-run-config
+schema does not accept `review_method` or `maps_session` yet, and the refusal
+says so rather than silently dropping the method (which would run every machine
+single-pass while your config asks for maps-session). The method is local-file
+only until the plane's schema and this build's `$schema_version` move together.
+
 ### Session-initiated handoff: a boundary the session chooses
 
 Phases cut at two fixed, driver-chosen points. A session can also choose its own

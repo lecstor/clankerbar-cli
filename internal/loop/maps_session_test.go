@@ -49,7 +49,7 @@ func TestPlanMapsSession_NumbersAndChunks(t *testing.T) {
 		"`betaThing` defined or changed at src/a.ts:43; used at: src/b.ts:9",
 		"`alphaThing` defined or changed at src/a.ts:10 (body changed); used at: src/b.ts:2",
 	}
-	plan := planMapsSession(mapsTestOpts(), "phase-model", "abc1234", mapsTsDiff, flow)
+	plan := planMapsSession(mapsTestOpts(), "phase-model", "abc1234", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
 
 	// 2 M items + 2 F items at 2 per chunk = 2 notes turns.
 	if plan.notesTurns != 2 {
@@ -89,7 +89,7 @@ func TestPlanMapsSession_NumbersAndChunks(t *testing.T) {
 // still gets one notes turn carrying the sentence, so the findings turn never
 // asks a session to turn notes it never wrote into findings.
 func TestPlanMapsSession_NoItemsStillOneChunk(t *testing.T) {
-	plan := planMapsSession(mapsTestOpts(), "", "", "", nil)
+	plan := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionDoneReportEnding)
 	if plan.notesTurns != 1 {
 		t.Fatalf("notesTurns = %d, want 1", plan.notesTurns)
 	}
@@ -130,7 +130,7 @@ func TestPlanMapsSession_StageModels(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil)
+			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionDoneReportEnding)
 			if plan.notesModel != tc.wantNotes {
 				t.Errorf("notes model = %q, want %q", plan.notesModel, tc.wantNotes)
 			}
@@ -157,7 +157,7 @@ func TestPlanMapsSession_CapNoteIsNotAnItem(t *testing.T) {
 		"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else",
 		"(3 more changed definitions not listed)",
 	}
-	plan := planMapsSession(config.MapsSessionOptions{ChunkSize: 25}.Resolved(), "", "", mapsTsDiff, flow)
+	plan := planMapsSession(config.MapsSessionOptions{ChunkSize: 25}.Resolved(), "", "", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
 	if strings.Contains(plan.section, "F2.") {
 		t.Errorf("the cap note was numbered as an item:\n%s", plan.section)
 	}
@@ -502,5 +502,27 @@ func TestMapsSessionDrain_DefaultReviewUnchanged(t *testing.T) {
 	}
 	if strings.Contains(inv.Prompt, "How this review works") {
 		t.Errorf("the default review got the maps-session section:\n%s", inv.Prompt)
+	}
+}
+
+// TestPlanMapsSession_RecordEndingForAPanelMember (CLA-869): a phase that writes
+// its own record (a panel member) is told to write that record, not a done
+// report it does not owe.
+func TestPlanMapsSession_RecordEndingForAPanelMember(t *testing.T) {
+	r := &phaseRun{
+		ph:    config.Phase{Name: "review-1", Prompt: config.PanelMemberReviewOnlyBrief(), ReviewMethod: config.ReviewMethodMapsSession},
+		shape: phaseShape{captured: config.Phase{Name: "review-1", Prompt: config.PanelMemberReviewOnlyBrief()}},
+		kind:  reportNone,
+	}
+	if got := r.mapsSessionEnding(); got != config.MapsSessionRecordEnding {
+		t.Errorf("a report-less review phase's ending = %q, want the record ending", got)
+	}
+	r.kind = reportReview
+	if got := r.mapsSessionEnding(); got != config.MapsSessionDoneReportEnding {
+		t.Errorf("a done-report review phase's ending = %q, want the done-report ending", got)
+	}
+	plan := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionRecordEnding)
+	if !strings.Contains(plan.turns[len(plan.turns)-1].Prompt, "write the record it asks for") {
+		t.Errorf("the record ending is not on the findings turn:\n%s", plan.turns[len(plan.turns)-1].Prompt)
 	}
 }

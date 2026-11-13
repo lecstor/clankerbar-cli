@@ -82,10 +82,21 @@ func MapsSessionNotesTurn(chunk, chunks int, items string) string {
 		"Do NOT write a done report in this turn."
 }
 
+// The two endings a findings turn can have, chosen by the phase's own brief: a
+// runner-claimed review ends with a done report the runner turns into records,
+// and a panel member (or any phase writing its own record) ends by writing that
+// record itself.
+const (
+	MapsSessionDoneReportEnding = "Then end with the done report exactly as the review brief specifies " +
+		"(verdict, reviewedTip, findings, omitted, notes)."
+	MapsSessionRecordEnding = "Then end exactly as your brief specifies: write the record it asks for " +
+		"(verdict, reviewedTip, findings, omitted, notes)."
+)
+
 // MapsSessionFindingsTurn is the final turn: confirm every doubtful note against
-// the code, look across the notes for problems no single item showed, and write
-// the done report the review brief specifies.
-func MapsSessionFindingsTurn() string {
+// the code, look across the notes for problems no single item showed, and end
+// with the record the phase's brief specifies.
+func MapsSessionFindingsTurn(ending string) string {
 	return "You have been through every item. Now turn your notes into findings.\n" +
 		"1. Go through all your notes from every chunk. For each note that names a problem or a doubt, confirm it " +
 		"against the code: find the line that proves it, or the line that shows it is fine. Use the tools again " +
@@ -101,8 +112,7 @@ func MapsSessionFindingsTurn() string {
 		"inconsistency). Do not report pure formatting, naming preferences, errors the compiler or linter already " +
 		"rejects, or concerns you could not confirm.\n\n" +
 		"Severity: MUST only for what violates the task's done-when bar, the repo's gates, or correctness/safety; " +
-		"SHOULD for a real problem that does not block; NIT for small issues. Then end with the done report " +
-		"exactly as the review brief specifies (verdict, reviewedTip, findings, omitted, notes)."
+		"SHOULD for a real problem that does not block; NIT for small issues. " + ending
 }
 
 // mapsSessionChunkHeading names one chunk in a notes turn.

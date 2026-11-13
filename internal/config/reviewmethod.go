@@ -113,8 +113,12 @@ func (c *Config) validateReviewMethods() error {
 		// the maps section is appended to, and a non-review step has no review
 		// record for the findings turn to write.
 		if !ReviewShaped(ph.Prompt) {
-			return fmt.Errorf("%s: review_method %q needs a review phase, and this step's brief is not one of the shipped review briefs — the maps-session turns end in a review record, which this step does not write",
-				step, ReviewMethodMapsSession)
+			hint := ""
+			if ph.Name == ReviewPhaseName {
+				hint = " (this phase runs the FINAL combined review-and-fix brief; the maps-session turns are the review-only gate's, so put a phase after the review)"
+			}
+			return fmt.Errorf("%s: review_method %q needs a review phase, and this step's brief is not one of the shipped review briefs — the maps-session turns end in a review record, which this step does not write%s",
+				step, ReviewMethodMapsSession, hint)
 		}
 		h := c.HarnessFor(ph)
 		caps, known := harness.CapabilitiesOf(h)

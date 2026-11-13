@@ -12,6 +12,7 @@ package loop
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -55,12 +56,27 @@ func (r *phaseRun) mapsSessionRequested() bool {
 	return config.ReviewShaped(r.shape.captured.Prompt)
 }
 
+// mapsSessionEnding is the last sentence of the findings turn: the record the
+// phase's own brief asks for. A runner-claimed review ends with a done report;
+// a panel member writes the durable record itself.
+func (r *phaseRun) mapsSessionEnding() string {
+	if r.kind == reportNone {
+		return config.MapsSessionRecordEnding
+	}
+	return config.MapsSessionDoneReportEnding
+}
+
 // mapsSessionPlanFor builds this attempt's maps-session plan, or returns nil
 // when the phase did not ask for the method. Every failure is a refusal to have
 // the phase run at all: a half-built map would make the reviewer's checklist
 // silently wrong, which is the one thing this method must not do.
 func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error) {
+	if !r.ph.UsesMapsSession() {
+		return nil, nil
+	}
 	if !r.mapsSessionRequested() {
+		log.Printf("%siteration %d: the %s phase runs a handoff continuation, so its maps-session turns are not applied — the successor continues the work the predecessor already read",
+			labelOf(r.t), r.drainNum, r.phaseLabel())
 		return nil, nil
 	}
 	// The maps are built from the tree the session will read, and that tree has
@@ -75,7 +91,10 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 	if repo == "" {
 		repo = r.spawnDir
 	}
-	baseSHA := ""
+	// The merge-base the brief diffs from, resolved exactly as invocationFor
+	// resolves it: a runner briefing is authoritative when there is one (even
+	// with an empty SHA), and a parallel panel member carries it in opts.
+	baseSHA := r.opts.baseSHA
 	if r.opts.runner != nil {
 		baseSHA = r.opts.runner.baseSHA
 	}
@@ -99,13 +118,13 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 	if err != nil {
 		return nil, fmt.Errorf("review_method maps-session could not map the changed definitions: %w", err)
 	}
-	return planMapsSession(opts, at.inv.Model, base, diff, flow), nil
+	return planMapsSession(opts, at.inv.Model, base, diff, flow, r.mapsSessionEnding()), nil
 }
 
 // planMapsSession turns a diff and its flow items into the plan: numbered items,
 // chunks, the first-turn section and the follow-up turns. Pure, so the
 // numbering, chunking and per-stage models are testable without a repository.
-func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string) *mapsSessionPlan {
+func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string, ending string) *mapsSessionPlan {
 	items, overflow := mapsSessionItems(reviewmap.ChangeMap(diff, reviewmap.Unlimited), flow)
 	chunks := mapsSessionChunks(items, opts.ChunkSize)
 	bodies := make([]string, len(chunks))
@@ -136,7 +155,7 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 	for i := 1; i < len(chunks); i++ {
 		plan.turns = append(plan.turns, harness.Turn{Prompt: config.MapsSessionNotesTurn(i+1, len(chunks), bodies[i])})
 	}
-	findings := harness.Turn{Prompt: config.MapsSessionFindingsTurn()}
+	findings := harness.Turn{Prompt: config.MapsSessionFindingsTurn(ending)}
 	// A blank Turn.Model means "inherit the session's current model", which after
 	// the notes turns is the notes model. Name the findings model whenever that
 	// inheritance would land somewhere else — including when the phase names no
