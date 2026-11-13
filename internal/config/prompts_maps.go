@@ -75,7 +75,7 @@ func MapsSessionFirstTurn(base string, chunk, chunks int, items string) string {
 // reminder that the instructions still stand and the report still does not
 // belong in this turn.
 func MapsSessionNotesTurn(chunk, chunks int, items string) string {
-	return "## Chunk " + fmt.Sprintf("%d of %d", chunk, chunks) + "\n" +
+	return mapsSessionChunkHeading(chunk, chunks) + "\n" +
 		"Same instructions as before: read each item and its context, apply the checklist, and note everything " +
 		"you notice, however small.\n\n" + items + "\n\n" +
 		"Reply with one note per item, in order, each starting with its id. " +
