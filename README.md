@@ -1899,6 +1899,35 @@ config too - though such a run still has no per-session turn or token cap (see
 `max_turns` and `budget.max_session_tokens` above), so set this dial
 deliberately.
 
+#### Pause windows
+
+`pause_windows` keeps the loop from STARTING new work during recurring
+local-time windows — the DeepSeek peak-pricing hours, say:
+
+```json
+"pause_windows": {
+  "timezone": "Australia/Brisbane",
+  "lead": "30m",
+  "windows": [
+    { "days": "mon-fri", "from": "11:00", "to": "14:00" },
+    { "days": "mon-fri", "from": "16:00", "to": "20:00" }
+  ]
+}
+```
+
+It is checked between iterations, like the console pause: an in-flight session,
+and the rest of a phase sequence already under way, always finishes — nothing is
+killed mid-session — and the next claim waits for the window to end. `lead`
+stops new claims that long BEFORE a window too, so a fresh sequence is not
+started only to run into it; it is capped at 24h, since it is how long before a
+window new work stops. `days` is the day the window STARTS in `timezone`
+(three-letter names, case-insensitive; a `-` range, which may not wrap, or
+`daily`), so an overnight window reads as one entry — `{"days": "fri", "from":
+"22:00", "to": "06:00"}` runs Friday night into Saturday morning. `to` before
+`from` crosses midnight, and `from` equal to `to` is a whole 24 hours. Windows
+that overlap or abut are one pause. Unset (or an empty `windows` list) means no
+schedule at all; `doctor` reports the schedule, and whether it is holding now.
+
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default
 is what gives spawned sessions their clankerbar tools. It always gives the driver a

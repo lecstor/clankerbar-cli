@@ -42,7 +42,8 @@ import (
 //   - iteration mid-drain: n is the 1-based iteration number, taskRef the task
 //     being worked (empty until a claim has been observed), phase the label of
 //     the phase session about to spawn or running
-//   - draining  alive but not spawning new sessions (console pause, fleet pause)
+//   - draining  alive but not spawning new sessions (console pause, fleet pause,
+//     startup-failure pause, scheduled pause window)
 //   - stopping  shutting down on purpose (STOP/HALT, a marker restart, budget or
 //     max-iterations reached, signal); sent as the final beacon
 //   - limited   parked by a harness usage limit and waiting it out (CLA-728):

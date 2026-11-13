@@ -99,7 +99,7 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 // tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases:
 //
 //   - mid-drain                -> iteration {n, taskRef, phase}
-//   - console-, fleet- or startup-paused -> draining (alive, spawning nothing new)
+//   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new)
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:
@@ -113,7 +113,9 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	if s.on {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) {
+	// A scheduled pause is reported after the iteration check: a session still in
+	// flight reports its iteration, and the window holds only the NEXT spawn.
+	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.schedPaused {
 		return fleet.State{Kind: fleet.StateDraining}
 	}
 	return fleet.State{Kind: fleet.StateIdle}

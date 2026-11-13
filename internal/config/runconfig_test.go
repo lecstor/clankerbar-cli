@@ -906,3 +906,35 @@ func TestReviewPanelOptionalSurvivesTheStoredPipeline(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyRunConfig_LeavesPauseWindowsAlone: pause_windows is machine-local
+// scheduling, not part of the plane's stored policy, so the overlay must neither
+// apply nor CLEAR it — a stored document arriving mid-run must not unpause a
+// project the operator scheduled quiet.
+func TestApplyRunConfig_LeavesPauseWindowsAlone(t *testing.T) {
+	pw := mustPause(t, &PauseWindows{
+		Timezone: "Australia/Brisbane",
+		Lead:     Duration(30 * time.Minute),
+		Windows:  []PauseWindow{{Days: "mon-fri", From: "11:00", To: "14:00"}},
+	})
+	base := overlayBase()
+	base.PauseWindows = pw
+
+	// A document that replaces the pipeline and a backstop: the broadest overlay
+	// a run applies mid-flight.
+	doc := &RunConfigDoc{
+		SchemaVersion: 1,
+		Phases:        []RunConfigPhase{{Name: "implement"}, {Name: "review"}, {Name: "fix"}},
+		MaxTurns:      42,
+		Budget:        &RunConfigBudget{MaxTokens: 77_000_000},
+	}
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if base.PauseWindows != pw {
+		t.Fatal("the overlay replaced or cleared the local pause_windows")
+	}
+	if got, want := base.PauseWindows.Describe(), "mon-fri 11:00-14:00 (Australia/Brisbane, lead 30m)"; got != want {
+		t.Errorf("pause windows = %q, want the local schedule %q", got, want)
+	}
+}

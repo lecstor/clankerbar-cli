@@ -190,6 +190,13 @@ type Driver struct {
 	state   *statedir.Dir
 	blind   bool // no cheap backlog read available — drain then idle-poll
 
+	// now is the clock the scheduled-pause check reads, and ONLY that: the
+	// back-off ladder in progress.go still reads the wall clock. Nil falls back
+	// to time.Now, so a hand-built test Driver works. schedPaused is whether a
+	// window is active — kept so the enter and exit are logged once, not per poll.
+	now         func() time.Time
+	schedPaused bool
+
 	// echoOut is where an ENABLED session echo writes (cfg.EchoSessions true).
 	// Nil = os.Stderr, the real terminal. The field exists so a test can watch
 	// what the terminal would have received without capturing the process's
@@ -644,6 +651,8 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		originBranch:    readOriginBranch,
 		prepareWorktree: prepareTaskWorktree,
 	}
+	// The clock the scheduled pause reads; a test moves it to enter a window.
+	d.now = time.Now
 	for i := range d.rcVersions {
 		d.rcVersions[i] = -1 // unfetched; 0 is a REAL answer (nothing stored)
 	}
