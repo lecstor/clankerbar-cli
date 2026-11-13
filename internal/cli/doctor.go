@@ -259,7 +259,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkOpencodeAuth(ctx, cfg, e)...)
 	checks = append(checks, checkOpencodeMCPDisables(cfg)...)
 	checks = append(checks, checkPermissionsAll(cfg)...)
-	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(ctx, cfg, e))
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPauseWindows(cfg), checkPRGate(ctx, cfg, e))
 }
 
 func doctorFailed(n int) error {

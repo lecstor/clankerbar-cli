@@ -573,6 +573,9 @@ func (d *Supervisor) conflictSay(key, format string, args ...any) {
 // session composition: the same config, the same env overlay, the same MCP config
 // the fleet's phases use, and the same per-session ceilings, so a conflict session
 // is bounded and equipped exactly like any other session on that harness.
+//
+// Deliberately does not consult pause_windows: the schedule gates the loop's
+// claims, and a conflict run is close-out of work already delivered.
 func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error) {
 	adapter, err := harness.Get(req.Harness)
 	if err != nil {

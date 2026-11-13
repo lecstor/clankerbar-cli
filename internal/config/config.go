@@ -404,6 +404,13 @@ type Config struct {
 	// questions, promotions, and newly filed work. 0 = a built-in default.
 	IdlePollInterval Duration `json:"idle_poll_interval"`
 
+	// PauseWindows is the operator's recurring local-time schedule of hours in
+	// which the loop starts no new work — checked between iterations, like the
+	// console pause, so an in-flight session or phase sequence always finishes.
+	// Nil/empty = no schedule. `omitempty` is load-bearing for the same reason as
+	// ProjectRoot: an unset key must not change a daemon's config identity.
+	PauseWindows *PauseWindows `json:"pause_windows,omitempty"`
+
 	// BacklogURL is the clankerbar base URL the driver reads backlog counts from
 	// (cheap, no tokens). The project-scoped API key comes from CLANKERBAR_API_KEY
 	// in the environment, never the config file.

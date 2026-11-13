@@ -14,6 +14,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	// tzdata embeds the IANA zone database, so pause_windows can resolve its
+	// named zone on hosts with no system zoneinfo (a scratch container, Windows).
+	_ "time/tzdata"
 
 	"github.com/lecstor/clankerbar-cli/internal/cli"
 	"github.com/lecstor/clankerbar-cli/internal/version"
