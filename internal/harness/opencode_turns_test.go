@@ -379,36 +379,40 @@ func TestOpencodeTurnMessagesDoNotRepeatThePreviousMessage(t *testing.T) {
 	}
 }
 
-// The turn's parser is seeded with the live claim, exactly as every other
-// continuation is: a `run -s` streams only the new turn, so without the seed a
-// heartbeat or branch record the NOTES turn makes would go unobserved.
+// The turn's parser is seeded with the claim the PREVIOUS turn left, exactly
+// as every other continuation is: a `run -s` streams only the new turn, so
+// without the seed a branch record the NOTES turn makes is matched against the
+// staler invocation seed and dropped. The first turn re-claims under a new id,
+// which is the case the seed exists for.
 func TestOpencodeTurnsSeedTheLiveClaim(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "log")
+	claim := opencodeToolLine("c0", "clankerbar_claim_task", `{"taskId":"uuid-new"}`,
+		"completed", `{"task":{"id":"uuid-new","ref":"CLA-2"},"run":{"id":"run-new"}}`)
+	progress := opencodeToolLine("c1", "clankerbar_record_progress",
+		`{"taskId":"uuid-new","branch":"clanker/turns-work"}`, "completed", `{}`)
 	opencodeStub(t, turnScript(logPath,
-		turnStubTurn{"turn-one", turnAnswer("one", 10, "0.001")},
-		turnStubTurn{"turn-two", turnAnswer("two", 20, "0.002")},
+		turnStubTurn{"turn-one", "    echo '" + claim + "'\n" + turnAnswer("one", 10, "0.001")},
+		turnStubTurn{"turn-two", "    echo '" + progress + "'\n" + turnAnswer("two", 20, "0.002")},
 	))
 
-	var seen []Claim
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:      "turn-one",
 		Model:       routeFree,
-		ResumeClaim: turnClaim,
+		ResumeClaim: turnClaim, // uuid-1 / CLA-867
 		Turns:       []Turn{{Prompt: "turn-two"}},
-		OnClaim:     func(c Claim) { seen = append(seen, c) },
 	})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
-	if !res.Claim.Held() || res.Claim.TaskID != turnClaim.TaskID {
-		t.Errorf("Claim = %+v, want the seeded claim held through the turns", res.Claim)
+	if res.Claim.TaskID != "uuid-new" || res.Claim.RunID != "run-new" {
+		t.Fatalf("Claim = %+v, want the second task the first turn claimed", res.Claim)
 	}
-	// OnClaim is not required to fire for an unchanged seed, so this test's
-	// actual assertion is the merge: a turn that observes no clankerbar tool
-	// events must not wipe the claim the sequence started with.
-	if len(seen) != 0 {
-		t.Errorf("OnClaim fired %d times for an unchanged claim; want none", len(seen))
+	if !res.Claim.HasWIP || res.Claim.Branch != "clanker/turns-work" {
+		t.Errorf("Claim = %+v, want the branch the SECOND turn recorded - its parser was not seeded with the live claim", res.Claim)
+	}
+	if len(res.Reports) != 1 || res.Reports[0].Branch != "clanker/turns-work" || res.Reports[0].RunID != "run-new" {
+		t.Errorf("Reports = %+v, want the second turn's branch record signed by the live run", res.Reports)
 	}
 }
 
