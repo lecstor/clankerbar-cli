@@ -1,6 +1,22 @@
 package reviewmap
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+// overflowFormat renders the note appended when the flow map's name cap hides
+// definitions. Exported as a predicate below because a caller that NUMBERS the
+// items must not number this note: it is not an item to review.
+const overflowFormat = "(%d more changed definitions not listed)"
+
+// IsOverflowItem reports whether item is renderFlowItems' "more not listed"
+// note rather than a definition to review.
+func IsOverflowItem(item string) bool {
+	// A rendering of overflowFormat only ever has this prefix and suffix, and a
+	// definition item never starts with "(" (they all start with a backtick).
+	return strings.HasPrefix(item, "(") && strings.HasSuffix(item, "not listed)")
+}
 
 // FlowMap returns one item per definition that diff adds or changes, in
 // first-seen order, each with the places it is used. A declaration diff
@@ -72,7 +88,7 @@ func renderFlowItems(defs []Definition, maxNames int, find func(Definition) (str
 			d.Name, d.At, uses))
 	}
 	if overflow > 0 {
-		items = append(items, fmt.Sprintf("(%d more changed definitions not listed)", overflow))
+		items = append(items, fmt.Sprintf(overflowFormat, overflow))
 	}
 	return items, nil
 }

@@ -114,6 +114,14 @@ func TestRenderFlowItemsDefaultCap(t *testing.T) {
 	if got, want := overCap[40], "(1 more changed definitions not listed)"; got != want {
 		t.Errorf("overflow item = %q, want %q", got, want)
 	}
+	if !IsOverflowItem(overCap[40]) {
+		t.Error("IsOverflowItem did not recognise the cap's own note")
+	}
+	for _, item := range overCap[:40] {
+		if IsOverflowItem(item) {
+			t.Errorf("IsOverflowItem recognised a definition as the overflow note: %q", item)
+		}
+	}
 }
 
 func TestRenderFlowItemsFinderError(t *testing.T) {

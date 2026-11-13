@@ -1,0 +1,86 @@
+package cli
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/config"
+)
+
+// reviewLine returns doctor's reviewer line (single reviewer or panel).
+func reviewLine(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+	for _, l := range checkConfig(cfg).info {
+		if strings.HasPrefix(l, "review: ") || strings.HasPrefix(l, "review panel: ") {
+			return l
+		}
+	}
+	t.Fatalf("doctor reported no reviewer line; info = %v", checkConfig(cfg).info)
+	return ""
+}
+
+// TestDoctor_ReportsTheMapsSessionMethod (CLA-869): a single reviewer on the
+// maps-session method reports the method and the model each stage will run on,
+// with an unset stage resolved to the phase's own model.
+func TestDoctor_ReportsTheMapsSessionMethod(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{
+				Name:         "review",
+				Model:        config.ModelRoutes{"opencode-go/base"},
+				ReviewMethod: config.ReviewMethodMapsSession,
+				MapsSession:  &config.MapsSessionOptions{NotesModel: "opencode-go/strong"},
+			},
+			{Name: "fix"},
+		},
+	}
+	line := reviewLine(t, cfg)
+	for _, want := range []string{
+		"review: single reviewer (opencode/opencode-go/base)",
+		"maps-session: notes=opencode-go/strong",
+		"findings=opencode-go/base",
+		"chunk_size=25",
+		"flow_max=40",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("doctor's reviewer line does not carry %q: %s", want, line)
+		}
+	}
+}
+
+// TestDoctor_ReportsEachPanelMembersMethod (CLA-869): the panel line marks the
+// maps-session seats and leaves a single-pass seat unmarked, so a mixed panel is
+// readable before the run.
+func TestDoctor_ReportsEachPanelMembersMethod(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{Name: "review", ReviewMethod: config.ReviewMethodMapsSession},
+			{Name: "fix"},
+		},
+		ReviewPanel: []config.ReviewPanelMember{
+			{Model: config.ModelRoutes{"opencode-go/maps"}},
+			{Model: config.ModelRoutes{"opencode-go/plain"}, ReviewMethod: config.ReviewMethodSinglePass},
+		},
+	}
+	line := reviewLine(t, cfg)
+	if !strings.Contains(line, "review-1 -> opencode/opencode-go/maps (maps-session:") {
+		t.Errorf("the maps-session seat is not marked with its method: %s", line)
+	}
+	if strings.Contains(line, "review-2 -> opencode/opencode-go/plain (maps-session:") {
+		t.Errorf("the single-pass seat was marked maps-session: %s", line)
+	}
+	if !strings.Contains(line, "review-2 -> opencode/opencode-go/plain") {
+		t.Errorf("the single-pass seat is missing from the panel line: %s", line)
+	}
+}

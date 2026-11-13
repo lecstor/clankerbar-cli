@@ -179,4 +179,8 @@ type phaseAttempt struct {
 	noMCPNow           bool
 	retryNoMCP         bool
 	verifyNeedsHold    bool
+	// mapsNotes is how many NOTES turns a maps-session invocation planned (turn 1
+	// included). The replies before that index go to the iteration log; the turn
+	// after them is the findings turn whose report the runner reads.
+	mapsNotes int
 }

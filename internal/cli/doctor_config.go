@@ -70,7 +70,7 @@ func checkConfig(cfg *config.Config) check {
 		}
 		c.info = append(c.info, line)
 	} else if r := singleReviewerLabel(cfg); r != "" {
-		c.info = append(c.info, "review: single reviewer ("+r+")")
+		c.info = append(c.info, "review: single reviewer "+r)
 	}
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
@@ -143,7 +143,7 @@ func panelLabels(cfg *config.Config) []string {
 		if ph.IsOptionalPanelMember() {
 			name += " (optional)"
 		}
-		out = append(out, name+" -> "+reviewerHarnessModel(cfg, ph))
+		out = append(out, name+" -> "+reviewerHarnessModel(cfg, ph)+reviewMethodLabel(cfg, ph))
 	}
 	return out
 }
@@ -164,9 +164,32 @@ func singleReviewerLabel(cfg *config.Config) string {
 			// review gate doctor talks about.
 			continue
 		}
-		return reviewerHarnessModel(cfg, ph)
+		return "(" + reviewerHarnessModel(cfg, ph) + ")" + reviewMethodLabel(cfg, ph)
 	}
 	return ""
+}
+
+// reviewMethodLabel renders the review method doctor reports after a reviewer's
+// harness/model (CLA-869): empty for the shipped single-pass review, and for
+// maps-session the model each stage will actually run on — an unset stage model
+// inherits the phase's, and a phase naming neither runs the harness's default.
+func reviewMethodLabel(cfg *config.Config, ph config.Phase) string {
+	if !ph.UsesMapsSession() {
+		return ""
+	}
+	opts := ph.MapsSessionDefaults()
+	phaseModel, _ := cfg.ModelForPhase(ph)
+	stage := func(model string) string {
+		if model == "" {
+			model = phaseModel
+		}
+		if model == "" {
+			return "harness default"
+		}
+		return model
+	}
+	return fmt.Sprintf(" (maps-session: notes=%s, findings=%s, chunk_size=%d, flow_max=%d)",
+		stage(opts.NotesModel), stage(opts.FindingsModel), opts.ChunkSize, opts.FlowMax)
 }
 
 // reviewerHarnessModel is the `<harness>/<model>` a review phase spawns on:
