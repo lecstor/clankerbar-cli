@@ -76,6 +76,9 @@ func (c *Config) Validate() error {
 	if err := c.validatePanelExpands(); err != nil {
 		return err
 	}
+	if err := c.validateReviewMethods(); err != nil {
+		return err
+	}
 	if err := c.validatePhaseClaimTracking(); err != nil {
 		return err
 	}

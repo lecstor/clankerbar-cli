@@ -178,6 +178,22 @@ type Phase struct {
 	// naming a harness with no block of its own.
 	Harness string `json:"harness"`
 
+	// ReviewMethod names how this phase produces its review findings. Empty and
+	// "single-pass" are the shipped single-pass review, unchanged. "maps-session"
+	// replaces the one session's prompt with the maps+notes turn sequence (see
+	// MapsSessionOptions): the driver builds the maps in the task worktree, sends
+	// them as chunks, and the findings turn writes the same done report a
+	// single-pass review would. Only a review phase may set it (Validate refuses
+	// otherwise), and only a harness that can continue one session across turns
+	// can run it (opencode today).
+	ReviewMethod string `json:"review_method,omitempty"`
+
+	// MapsSession configures the maps-session method. It is meaningless without
+	// `review_method: "maps-session"` and Validate refuses that shape rather than
+	// leaving the options inert. A pointer with `omitempty` so an unset key does
+	// not move Config.Identity for a config that never adopts the method.
+	MapsSession *MapsSessionOptions `json:"maps_session,omitempty"`
+
 	// PanelMember marks this phase as one reviewer of an expanded review panel
 	// (CLA-639). It is set by EffectivePhases and NOT a config key: the operator
 	// writes the panel, not its expansion, and a config that names a dozen
@@ -260,6 +276,17 @@ type ReviewPanelMember struct {
 	// Validate refuses a panel whose members are ALL optional: with no required
 	// seat there is no review a round could ever be said to have produced.
 	Optional bool `json:"optional,omitempty"`
+
+	// ReviewMethod overrides the review phase's method for this member alone.
+	// Empty inherits the phase's, exactly as Harness and Model do — so a panel
+	// can run one maps-session seat beside a single-pass one.
+	ReviewMethod string `json:"review_method,omitempty"`
+
+	// MapsSession overrides the review phase's maps-session options for this
+	// member. Nil inherits the phase's block (a member that sets only the method
+	// therefore gets the phase's profile, not the benchmark defaults by
+	// accident).
+	MapsSession *MapsSessionOptions `json:"maps_session,omitempty"`
 }
 
 // HarnessConfig is one harness's own invocation fields, for a run whose phases
@@ -515,6 +542,19 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 		// the review phase's pinned alias. The member's own tier is the more
 		// specific statement, so it clears the inherited model too.
 		ph.Model = nil
+	}
+	// The method is the same kind of per-member statement as the model: the
+	// member's own wins, an empty one inherits the phase's (copied above), and a
+	// member that sets only the options keeps the inherited method so a panel can
+	// tune one seat's chunking without restating `maps-session`. Naming a METHOD
+	// takes the member's own options with it — nil means the benchmark defaults —
+	// so a seat that opts OUT of maps-session cannot keep inheriting the phase's
+	// knobs into a method that has no use for them.
+	if v := strings.TrimSpace(m.ReviewMethod); v != "" {
+		ph.ReviewMethod = v
+		ph.MapsSession = m.MapsSession
+	} else if m.MapsSession != nil {
+		ph.MapsSession = m.MapsSession
 	}
 	return ph
 }
