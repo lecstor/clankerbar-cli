@@ -9,7 +9,7 @@ import "fmt"
 // Uses come from `git grep -n -w -I` run in r.Repo, excluding declarations
 // and minified files. Non-test uses are listed before test uses and at most
 // maxUses are shown. maxNames == 0 selects DefaultMaxNames; a negative value
-// disables the cap. src reads the files a language parser needs from r's
+// disables the cap. Whole-file parsers read their input at r's base and head
 // revisions.
 func FlowMap(diff string, r Range, maxNames int) ([]string, error) {
 	return renderFlowItems(changedDefinitions(ParseDiff(diff), sourceFor(r)), maxNames,

@@ -67,6 +67,17 @@ func TestGoNames(t *testing.T) {
 			want:  []Definition{{Name: "LoadConfig", At: "a.go:3"}},
 		},
 		{
+			name: "hunk without added lines still marks the declaration it covers",
+			head: "package demo\n\nfunc (d *driver) pickTarget() {\n\ta := 1\n\tb := 2\n}\n",
+			base: "package demo\n",
+			// A deletion with context but no added line: the head range is
+			// the only way this hunk can mark the function.
+			hunks: []Hunk{{Start: 5, Count: 2}},
+			want: []Definition{{
+				Name: "driver.pickTarget", Grep: "pickTarget", At: "a.go:3",
+			}},
+		},
+		{
 			name: "exported const and var, unexported dropped",
 			head: `package demo
 
@@ -114,9 +125,12 @@ func (d *driver) Error() string { return "" }
 		{
 			name:  "removed exported func and type",
 			head:  "package demo\n",
-			base:  "package demo\n\nfunc OldThing() {}\nfunc oldThing() {}\nconst RemovedConst = 1\n",
+			base:  "package demo\n\nfunc OldThing() {}\nfunc oldThing() {}\ntype OldWidget struct{}\nconst RemovedConst = 1\n",
 			hunks: []Hunk{{Start: 1, Count: 1}},
-			want:  []Definition{{Name: "OldThing", At: "a.go", Removed: true}},
+			want: []Definition{
+				{Name: "OldThing", At: "a.go", Removed: true},
+				{Name: "OldWidget", At: "a.go", Removed: true},
+			},
 		},
 		{
 			name:  "removed exported method",

@@ -20,8 +20,6 @@ var tsPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|async|override|readonly)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\([^)]*\)\s*(?::[^{]+)?\{\s*$`),
 }
 
-// minNameLen drops one- and two-character names: they match too much to be a
-// useful checklist entry.
 // tsSkip drops names that are almost always incidental matches rather than
 // definitions worth a checklist entry.
 var tsSkip = map[string]bool{
