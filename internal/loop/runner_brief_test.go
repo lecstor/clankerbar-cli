@@ -158,7 +158,7 @@ func TestInvocationForAppliesTheRunnerImplementBrief(t *testing.T) {
 		start: true,
 	}
 	prev := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}}
-	inv, err := d.invocationFor(d.targets[0], 0, phases[0], prev, "", "staging", phases, rb)
+	inv, err := d.invocationFor(d.targets[0], 0, phases[0], prev, "", "staging", phases, rb, "")
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}

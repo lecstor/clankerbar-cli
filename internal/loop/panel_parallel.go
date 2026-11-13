@@ -270,7 +270,10 @@ func releaseMember(k int, onRelease func(k int), unblock func()) {
 // set up at all (no live claim, no repo, no resolvable tip) and the caller must
 // run the shipped sequential path instead — a worktree failure that would only
 // make one member fail does not refuse the panel.
-func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Target, phases []config.Phase, start, end, concurrency int, carried *harness.Result, prior spend) (*panelRunOutcome, bool) {
+//
+// baseSHA is the start prep's merge-base, threaded into every member so its
+// brief diffs from the same commit a single reviewer's would.
+func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Target, phases []config.Phase, start, end, concurrency int, carried *harness.Result, prior spend, baseSHA string) (*panelRunOutcome, bool) {
 	if carried == nil || !carried.Claim.Held() {
 		log.Printf("%siteration %d: the review panel has no live claim to resume — running its members sequentially",
 			labelOf(t), drainNum)
@@ -348,6 +351,10 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 				worktree:      dir,
 				panelParallel: true,
 				panelSpend:    &panelSpendHandle{ledger: ledger, self: ledger.join()},
+				// A member carries no runner briefing (it writes no report), so
+				// the prep's merge-base rides the opts instead: its brief must
+				// diff from the same commit the single reviewer's would.
+				baseSHA: baseSHA,
 				// The next member starts only once THIS member's session launch
 				// has actually begun (CLA-738 review 3.2). Signalling when the
 				// worktree was ready woke the scheduler first: a later member

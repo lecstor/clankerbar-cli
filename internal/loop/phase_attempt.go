@@ -85,7 +85,7 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 	// refuses an existing path either way; this stops it turning into a denial
 	// of the log itself.
-	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner)
+	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
 	if at.ierr != nil {
 		// The session env refused to resolve (a failing or empty-output
 		// fromCommand, an unreadable @path file — the error names the

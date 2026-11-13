@@ -196,6 +196,7 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 		config.PhaseRunPlaceholder, claim.RunID,
 		config.PhaseBranchPlaceholder, "clanker/x",
 		config.PhasePRBasePlaceholder, config.DefaultIntegrationBranch,
+		config.PhaseBasePlaceholder, "origin/"+config.DefaultIntegrationBranch,
 		config.PhaseHarnessPlaceholder, attributionOr(tc.HarnessFor(reviewer), "unknown harness"),
 		config.PhaseModelPlaceholder, attributionOr(reviewModel, "harness default"),
 		config.PhasePrevHarnessPlaceholder, attributionOr(tc.HarnessFor(implementer), "unknown harness"),

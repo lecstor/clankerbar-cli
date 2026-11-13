@@ -498,3 +498,29 @@ func writeTestFile(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+// CLA-865 review 1.review-1.4: the changed-path list that feeds review-tier
+// escalation must never be built from a bare local integration branch — the
+// local `staging` can be far behind origin, so the list would describe a
+// different change set than the review does. With origin/staging unresolvable
+// and a stale local staging present, the driver reports no paths.
+func TestDiffAgainstIntegrationDoesNotFallBackToALocalBase(t *testing.T) {
+	repo := t.TempDir()
+	gitRun(t, repo, "init", "-b", "staging")
+	writeTestFile(t, filepath.Join(repo, "base.txt"), "base")
+	gitRun(t, repo, "add", ".")
+	gitRun(t, repo, "commit", "-m", "base")
+	gitRun(t, repo, "checkout", "-b", "clanker/work")
+	writeTestFile(t, filepath.Join(repo, "work.txt"), "work")
+	gitRun(t, repo, "add", ".")
+	gitRun(t, repo, "commit", "-m", "work")
+
+	d := &Driver{cfg: &config.Config{}}
+	paths, err := d.diffAgainstIntegration(Target{Name: "t"}, "clanker/work", repo)
+	if err != nil {
+		t.Fatalf("diffAgainstIntegration: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Errorf("changed paths = %v, want none: a local staging branch must not stand in for origin/staging", paths)
+	}
+}

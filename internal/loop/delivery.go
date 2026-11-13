@@ -169,18 +169,15 @@ func (d *Driver) diffAgainstIntegration(t Target, branchName string, workDir str
 		}
 	}
 	// Use git diff against the integration branch (staging by default).
-	// The command compares the branch tip to origin/staging.
+	// The remote-tracking ref is the only safe base: a local branch can be far
+	// behind origin, and a diff from the stale one would mis-shape the escalation
+	// rules that read this list.
 	cmd := exec.Command("git", "-C", wd, "diff", "--name-only", "origin/staging..."+branchName)
 	out, err := cmd.Output()
 	if err != nil {
-		// If the branch is new or the diff command fails, fall back to comparing
-		// the branch to the local staging branch.
-		cmd2 := exec.Command("git", "-C", wd, "diff", "--name-only", "staging..."+branchName)
-		out, err = cmd2.Output()
-		if err != nil {
-			// If both fail, return empty paths rather than failing the spawn.
-			return nil, nil
-		}
+		// No remote-tracking base to compare against: return no paths rather than
+		// falling back to the bare local branch, which can be far behind origin.
+		return nil, nil
 	}
 	paths := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(paths) == 1 && paths[0] == "" {
