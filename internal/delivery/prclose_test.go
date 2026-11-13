@@ -238,6 +238,26 @@ func TestJudgePRWithNoGHIsARefusalNotAPass(t *testing.T) {
 	}
 }
 
+// A MERGED PR is not a merge candidate. The gate judges its CI as passing (its
+// mergeability is never computed), so without the openness guard this path
+// would hand an already-merged PR to the close-out as PRReady.
+func TestJudgePRRefusesAPRThatIsNotOpen(t *testing.T) {
+	root := prEnv(t)
+	v := New(root, "").WithGHBin(fakeGH(t, jsonMergedPassing))
+
+	state := v.JudgePR(context.Background(), filepath.Join(root, "repo"), "acme/widgets", 541)
+
+	if state.Verdict != PRRefused {
+		t.Fatalf("verdict = %s, want %s (%s)", state.Verdict, PRRefused, state.Check.Detail)
+	}
+	if state.Check.Status != Fail {
+		t.Errorf("status = %s, want Fail: a merged PR is not a pass to merge", state.Check.Status)
+	}
+	if !strings.Contains(state.Check.Detail, "not open") {
+		t.Errorf("detail should say the PR is not open: %s", state.Check.Detail)
+	}
+}
+
 func TestMergePRMergesAsAMergeCommitPinnedToTheJudgedHeadAndBase(t *testing.T) {
 	root := prEnv(t)
 	repo := filepath.Join(root, "repo")

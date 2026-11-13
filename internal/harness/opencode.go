@@ -125,6 +125,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if o.OutputCapNoOutput(res) {
 		o.resumeOutputCapStall(ctx, in, &res, deadline)
 	}
+	// A silent 130 gets one resume before the route switch, so a quota error
+	// the resume surfaces is switched on evidence rather than a guess.
+	o.resumeInterrupted(ctx, in, &res, deadline)
 	// CLA-782: a usage limit on one model route is not the end of the session
 	// when the config named a fallback. Runs BEFORE the resurrection loop (a
 	// switch resumes the same session, and a later quiet death then resurrects on

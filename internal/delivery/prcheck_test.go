@@ -42,6 +42,13 @@ const (
 		`{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"FAILURE"},` +
 		`{"__typename":"CheckRun","name":"docs","status":"COMPLETED","conclusion":"SUCCESS"}]}`
 
+	// A MERGED PR: GitHub stops computing mergeability once the PR is merged, so
+	// `mergeable` reads UNKNOWN forever while the CI that ran on it is green.
+	jsonMergedPassing = `{"state":"MERGED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","statusCheckRollup":[` +
+		`{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"},` +
+		`{"__typename":"StatusContext","context":"docs","state":"SUCCESS"}],"url":"https://github.com/acme/widgets/pull/541",` +
+		`"baseRefName":"staging","headRefName":"clanker/x","headRefOid":"abc1234def5678"}`
+
 	// ghFakeToken is what every fake gh answers the `auth token --user`
 	// credential probe with when GH_FAKE_TOKEN names it: the asserted VALUE,
 	// so the chain "derive owner -> resolve THAT account -> plumb the resolved
@@ -441,6 +448,39 @@ func TestPollingResolvesWhenGitHubCatchesUp(t *testing.T) {
 	n, err := os.ReadFile(counter)
 	if err != nil || strings.TrimSpace(string(n)) != "2" {
 		t.Fatalf("expected exactly 2 gh reads (poll then resolve), got %q (%v)", n, err)
+	}
+}
+
+// gh returns only the fields --json names, and the fakes answer whatever they are
+// given, so without this pin a dropped `state` turns the merged-PR handling off
+// in production while every fake-gh test stays green.
+func TestPRViewFieldsRequestState(t *testing.T) {
+	for _, f := range strings.Split(prViewJSONFields, ",") {
+		if f == "state" {
+			return
+		}
+	}
+	t.Fatalf("prViewJSONFields = %q, want it to request state", prViewJSONFields)
+}
+
+// A delivery naming an ALREADY-MERGED PR is decided on the FIRST read. Read as
+// a mergeability condition it waited out the whole budget (GitHub never
+// computes a merged PR's mergeability) and then refused with a line that was
+// false; the read counter is what proves no wait happened.
+func TestMergedPRIsDecidedOnTheFirstRead(t *testing.T) {
+	dir := prEnv(t)
+	gh, counter := fakeGHSeq(t, jsonMergedPassing)
+	v := prVerifier(t, dir, gh)
+
+	rep := verifyWith(t, v, Claim{Label: "CLA-310", PR: "541"})
+	c := mustStatus(t, rep, PRVerified, Pass)
+	if !strings.Contains(c.Detail, "is MERGED and") {
+		t.Errorf("pass detail should say the PR is MERGED: %s", c.Detail)
+	}
+
+	n, err := os.ReadFile(counter)
+	if err != nil || strings.TrimSpace(string(n)) != "1" {
+		t.Fatalf("expected exactly 1 gh read for a merged PR (no waiting), got %q (%v)", n, err)
 	}
 }
 
@@ -858,6 +898,60 @@ func TestJudgePRReadsBothRollupShapes(t *testing.T) {
 	dirty := judgePR(ghPR{Mergeable: "UNKNOWN", MergeStateStatus: "DIRTY"})
 	if dirty.verdict != prConflict {
 		t.Errorf("DIRTY merge state: got %+v, want prConflict without waiting", dirty)
+	}
+}
+
+// GitHub stops computing `mergeable` once a PR merges, so it reads UNKNOWN
+// forever: waiting on it burned the whole poll budget and then refused a
+// delivery whose CI had passed. A MERGED PR skips ONLY the mergeability arms —
+// the rollup still has to have run and gone green.
+func TestJudgePRSkipsMergeabilityForAMergedPR(t *testing.T) {
+	green := []ghCheck{{Name: "ci", Status: "COMPLETED", Conclusion: "SUCCESS"}}
+	failing := []ghCheck{{Name: "ci", Status: "COMPLETED", Conclusion: "FAILURE"}}
+	cases := []struct {
+		name string
+		view ghPR
+		want prVerdict
+	}{
+		{"merged, mergeability uncomputed, green CI", ghPR{State: "MERGED", Mergeable: "UNKNOWN", StatusCheckRollup: green}, prPass},
+		{"merged with no rollup", ghPR{State: "MERGED", Mergeable: "UNKNOWN"}, prNoChecks},
+		{"merged with a failing rollup", ghPR{State: "MERGED", Mergeable: "UNKNOWN", StatusCheckRollup: failing}, prChecksFailed},
+		{"merged and DIRTY: the conflict arm is moot too", ghPR{State: "MERGED", Mergeable: "UNKNOWN", MergeStateStatus: "DIRTY", StatusCheckRollup: green}, prPass},
+		{"open with mergeability uncomputed still waits", ghPR{State: "OPEN", Mergeable: "UNKNOWN"}, prMergeableUnknown},
+		{"open and DIRTY is still a conflict", ghPR{State: "OPEN", Mergeable: "UNKNOWN", MergeStateStatus: "DIRTY"}, prConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := judgePR(tc.view)
+			if got.verdict != tc.want {
+				t.Fatalf("verdict = %v, want %v", got.verdict, tc.want)
+			}
+			if wantMerged := strings.EqualFold(tc.view.State, "MERGED"); got.merged != wantMerged {
+				t.Errorf("merged = %v, want %v", got.merged, wantMerged)
+			}
+		})
+	}
+}
+
+// The pass line is what a human reads in the log, so it must not claim a merged
+// PR is MERGEABLE: GitHub never said so.
+func TestMergedPassDetailSaysMergedNotMergeable(t *testing.T) {
+	j := judgePR(ghPR{State: "MERGED", Mergeable: "UNKNOWN", StatusCheckRollup: []ghCheck{
+		{Name: "ci", Status: "COMPLETED", Conclusion: "SUCCESS"},
+	}})
+	if j.verdict != prPass {
+		t.Fatalf("premise changed: merged green PR judged %v, want prPass", j.verdict)
+	}
+
+	c := settlePR(j, "541", "acme/widgets", time.Second, false)
+	if c.Status != Pass {
+		t.Fatalf("status = %s, want Pass (%s)", c.Status, c.Detail)
+	}
+	if !strings.Contains(c.Detail, "is MERGED and") {
+		t.Errorf("detail should say the PR is MERGED: %s", c.Detail)
+	}
+	if strings.Contains(c.Detail, "MERGEABLE") {
+		t.Errorf("a merged PR's mergeability was never computed, so the detail must not claim it: %s", c.Detail)
 	}
 }
 
