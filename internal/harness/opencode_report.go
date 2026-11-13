@@ -31,13 +31,6 @@ func reportSteerPrompt(err error) string {
 		"fixing the problem named above and keeping everything else the same."
 }
 
-// reportResumeSkipped reports whether this Result cannot take a report resume.
-// It is resumeSkippedReason's yes/no form; see that function for the ends it
-// names.
-func (o opencode) reportResumeSkipped(ctx context.Context, in Invocation, res *Result) bool {
-	return o.resumeSkippedReason(ctx, in, res) != ""
-}
-
 // resumeSkippedReason names the end that forbids resuming this session, or ""
 // when it may be resumed. ONE list serves two callers: the done-report resume,
 // which must not talk over an end of the adapter's own, and the multi-turn
@@ -91,7 +84,17 @@ func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *R
 // mergeResume replaces FinalMessage with the continuation's, so a corrected
 // report is what the runner reads off this Result.
 func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Result, deadline time.Time) {
-	if in.CheckReport == nil || o.reportResumeSkipped(ctx, in, res) {
+	if in.CheckReport == nil {
+		return
+	}
+	// The shared guard names a wall-clock kill before the budget check below, so
+	// its line would otherwise be skipped here. Say why the refused report was
+	// left alone; only when a resume was actually owed, so the line never
+	// describes a report that passed.
+	if reason := o.resumeSkippedReason(ctx, in, res); reason != "" {
+		if reason == "wall_clock" && in.CheckReport(res.FinalMessage) != nil && in.Console != nil {
+			fmt.Fprint(in.Console, opencodeReportWallClockMsg)
+		}
 		return
 	}
 	checkErr := in.CheckReport(res.FinalMessage)
