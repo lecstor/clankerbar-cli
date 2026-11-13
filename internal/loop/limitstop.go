@@ -107,7 +107,7 @@ func terminalErrorMessage(diag string) string {
 // limitStopLineMax on a rune boundary, because a clipped multi-byte rune would
 // print as mojibake in the console.
 func limitStopLine(lim harness.Limit, route, msg string) string {
-	line := LimitStopReason(lim)
+	line := oneLine(LimitStopReason(lim))
 	if route != "" {
 		line += " on " + route
 	}
