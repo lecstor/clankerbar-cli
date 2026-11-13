@@ -143,11 +143,20 @@ func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 
 // declineUnpreparable returns the task to claim after the pre-claim worktree
 // check, or nil when the offer must be left alone. A deterministic local
-// refusal is found BEFORE the claim, so it costs no reclaim: the task is simply
-// not claimed, the drain idles, and the next offer retries once the tree is
-// fixed. When the plane offered a ReadyNext (a declined takeover or close-out),
-// that task is checked and claimed instead; usedReady says the returned task is
-// that fallback, so the caller does not offer it twice.
+// refusal is found BEFORE the claim, so it normally costs no reclaim: the task
+// is simply not claimed, the drain idles, and the next offer retries once the
+// tree is fixed.
+//
+// That is only safe while the tree can be fixed. A tree that refuses every
+// check never parks and never lets the queue advance — next_task keeps offering
+// the same head — so the refusal streak is bounded: at startRefusalBound the
+// claim is taken anyway, the post-claim prep refuses it again, and startRefused
+// parks the task for the operator. One reclaim buys the park, which is the
+// ending the claimless path can never reach.
+//
+// When the plane offered a ReadyNext (a declined takeover or close-out), that
+// task is checked and claimed instead; usedReady says the returned task is that
+// fallback, so the caller does not offer it twice.
 func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) (next *plane.TaskBrief, usedReady bool) {
 	next = offer.Next
 	for {
@@ -155,8 +164,15 @@ func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) (
 		if reason == "" {
 			return next, usedReady
 		}
-		log.Printf("%siteration %d: %s: not claiming it: %s — fix the worktree and the task will be offered again; no reclaim is spent",
-			labelOf(s.t), s.drainNum, claimLabel(harness.Claim{TaskID: next.ID, Ref: next.Ref}), reason)
+		label := claimLabel(harness.Claim{TaskID: next.ID, Ref: next.Ref})
+		n := s.d.bumpStartRefusal(next.ID)
+		if n >= startRefusalBound {
+			log.Printf("%siteration %d: %s: not claimable (%s) on %d consecutive offers — claiming it anyway so the prep refuses it and parks the task",
+				labelOf(s.t), s.drainNum, label, reason, n)
+			return next, usedReady
+		}
+		log.Printf("%siteration %d: %s: not claiming it (refusal %d of %d): %s — fix the worktree and the task will be offered again; no reclaim is spent",
+			labelOf(s.t), s.drainNum, label, n, startRefusalBound, reason)
 		if offer.ReadyNext == nil {
 			return nil, usedReady
 		}
@@ -181,6 +197,11 @@ func (s *drainSeq) worktreeRefusal(ctx context.Context, b *plane.TaskBrief) stri
 	req := worktreeRequest{
 		Checkout: checkout, TaskID: b.ID, Branch: b.Branch,
 		Resume: b.HasWIP, CloseOut: b.AwaitingMerge,
+	}
+	if !b.HasWIP && !b.AwaitingMerge {
+		// A create cuts from origin/<PRBase>, so resolving the base now lets the
+		// pre-claim check prove a missing one; a resume never uses it.
+		req.PRBase = s.d.prBaseFor(ctx, s.t, checkout, b.Repo)
 	}
 	doneTip := b.PhasesDone[config.ImplementPhaseName].Tip
 	reason, facts, err := s.d.worktreeCheckFn()(ctx, req, doneTip)

@@ -113,6 +113,9 @@ func taskWorktreeMoveUntracked(ctx context.Context, dir, scratchRoot, taskID str
 		return "", err
 	}
 	for _, rel := range paths {
+		if err := ctx.Err(); err != nil {
+			return dest, err
+		}
 		clean := strings.TrimSuffix(rel, "/")
 		if !filepath.IsLocal(clean) {
 			return dest, fmt.Errorf("untracked path %q escapes %s", rel, dir)
@@ -122,7 +125,7 @@ func taskWorktreeMoveUntracked(ctx context.Context, dir, scratchRoot, taskID str
 		if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 			return dest, err
 		}
-		if err := taskWorktreeMovePath(src, dst); err != nil {
+		if err := taskWorktreeMovePath(ctx, src, dst); err != nil {
 			return dest, fmt.Errorf("moving %s aside: %w", rel, err)
 		}
 	}
@@ -160,10 +163,12 @@ func taskWorktreeScratchDir(dir, scratchRoot, taskID string) (string, error) {
 	}
 }
 
-// taskWorktreeMovePath moves one path. A rename is atomic; across filesystems it
-// falls back to a copy followed by removing the source, so the source is never
-// gone before the destination holds it.
-func taskWorktreeMovePath(src, dst string) error {
+// taskWorktreeMovePath moves one path. A rename is atomic and is the only move
+// a non-regular entry may take: across filesystems it falls back to a copy
+// followed by removing the source, so the source is never gone before the
+// destination holds it. A FIFO cannot be copied (opening it would block with no
+// writer), so the fallback refuses it by name.
+func taskWorktreeMovePath(ctx context.Context, src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
@@ -171,13 +176,19 @@ func taskWorktreeMovePath(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if err := taskWorktreeCopyPath(src, dst, info); err != nil {
+	if !info.Mode().IsRegular() && !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%s cannot be copied across filesystems: it is not a regular file, directory or symlink", src)
+	}
+	if err := taskWorktreeCopyPath(ctx, src, dst, info); err != nil {
 		return err
 	}
 	return os.RemoveAll(src)
 }
 
-func taskWorktreeCopyPath(src, dst string, info os.FileInfo) error {
+func taskWorktreeCopyPath(ctx context.Context, src, dst string, info os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	switch {
 	case info.Mode()&os.ModeSymlink != 0:
 		target, err := os.Readlink(src)
@@ -194,17 +205,20 @@ func taskWorktreeCopyPath(src, dst string, info os.FileInfo) error {
 			return err
 		}
 		for _, e := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			child := filepath.Join(src, e.Name())
 			childInfo, err := os.Lstat(child)
 			if err != nil {
 				return err
 			}
-			if err := taskWorktreeCopyPath(child, filepath.Join(dst, e.Name()), childInfo); err != nil {
+			if err := taskWorktreeCopyPath(ctx, child, filepath.Join(dst, e.Name()), childInfo); err != nil {
 				return err
 			}
 		}
 		return nil
-	default:
+	case info.Mode().IsRegular():
 		in, err := os.Open(src)
 		if err != nil {
 			return err
@@ -214,12 +228,46 @@ func taskWorktreeCopyPath(src, dst string, info os.FileInfo) error {
 			in.Close()
 			return err
 		}
-		_, cerr := io.Copy(out, in)
+		_, cerr := taskWorktreeCopyStream(ctx, out, in)
 		in.Close()
 		if cerr != nil {
 			out.Close()
 			return cerr
 		}
+		if err := ctx.Err(); err != nil {
+			out.Close()
+			return err
+		}
 		return out.Close()
+	default:
+		// A FIFO, socket or device: opening it could block forever, and it is
+		// not work a session left behind in any copyable sense.
+		return fmt.Errorf("%s is not a regular file, directory or symlink: refusing to copy it", src)
+	}
+}
+
+// taskWorktreeCopyStream copies src to dst in bounded chunks, checking ctx
+// between reads so a cancelled drain does not wait out a large scratch file.
+func taskWorktreeCopyStream(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			w, werr := dst.Write(buf[:n])
+			written += int64(w)
+			if werr != nil {
+				return written, werr
+			}
+		}
+		if rerr == io.EOF {
+			return written, nil
+		}
+		if rerr != nil {
+			return written, rerr
+		}
 	}
 }

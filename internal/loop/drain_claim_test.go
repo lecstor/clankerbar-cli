@@ -7,6 +7,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -431,5 +432,100 @@ func TestClaimForDrain_UnpreparableNextFallsBackToReadyNext(t *testing.T) {
 	}
 	if len(f.claimCalls) != 1 || f.claimCalls[0] != (claimCall{"ready", false}) {
 		t.Errorf("claim calls = %v, want one plain claim of the ready task", f.claimCalls)
+	}
+}
+
+// A pre-check that cannot run is not a refusal: the claim is still taken, and a
+// stale origin read from an earlier attempt must not survive into the start.
+func TestClaimForDrain_WorktreeCheckErrorClaimsAnyway(t *testing.T) {
+	dir := t.TempDir()
+	b := plane.TaskBrief{ID: "t-1", Ref: "CLA-1", Branch: "clanker/t-1", Repo: "acme/repo", HasWIP: true}
+	f := &claimingReleaser{offers: []plane.Offer{{Next: &b}}, claimFn: claimedBrief(b)}
+	s := claimSeq(f)
+	s.t.Repos = map[string]string{"acme/repo": dir}
+	s.d.cfg.WorkDir = dir
+	s.d.worktreeCheck = func(context.Context, worktreeRequest, string) (string, originBranchFacts, error) {
+		return "", originBranchFacts{Known: true, OnOrigin: true, Tip: "abc"}, errors.New("transient git error")
+	}
+	s.preClaimOrigin = originBranchFacts{Known: true, OnOrigin: true, Tip: "stale"}
+	s.preClaimTask = b.ID
+	s.preClaimCheckout = dir
+
+	if got := s.claimForDrain(context.Background()); got != claimHeld {
+		t.Fatalf("claimForDrain = %v, want claimHeld: a check that cannot run must not starve the task", got)
+	}
+	if s.preClaimOrigin.Known || s.preClaimTask != "" || s.preClaimCheckout != "" {
+		t.Errorf("stale pre-claim read survived the fail-open: %+v/%q/%q", s.preClaimOrigin, s.preClaimTask, s.preClaimCheckout)
+	}
+}
+
+// A pre-claim refusal that repeats on the same queue head would otherwise end
+// every drain without a claim: nothing parks the task and next_task keeps
+// offering it. At the bound the claim is taken anyway, the prep refuses it and
+// the task is parked, so the queue reaches other ready work.
+func TestDrain_RepeatedPreClaimRefusalIsClaimedAndParked(t *testing.T) {
+	head := noWIPBrief("CLA-927")
+	head.Repo = "acme/repo"
+	other := plane.TaskBrief{ID: "33333333-4444-5555-6666-777777777777", Ref: "CLA-928", Branch: "clanker/33333333-other", Repo: "acme/repo"}
+	f := newStartFixture(t, head, plane.TaskState{}, twoPhases(), []invokeStep{{res: okResult(1, 0)}})
+	f.d.targets[0].Repos = map[string]string{"acme/repo": t.TempDir()}
+	f.rel.offers = []plane.Offer{{Next: &head}, {Next: &head}, {Next: &other}}
+	f.rel.claimFn = func(taskID string, _ bool) (plane.ClaimedTask, error) {
+		b := head
+		if taskID == other.ID {
+			b = other
+		}
+		return plane.ClaimedTask{Task: b, RunID: "run-" + b.ID}, nil
+	}
+	refusal := "worktree /repo-wt/11111111 has uncommitted changes (M a.txt)"
+	f.d.worktreeCheck = func(_ context.Context, req worktreeRequest, _ string) (string, originBranchFacts, error) {
+		if req.TaskID == head.ID {
+			return refusal, originBranchFacts{}, nil
+		}
+		return "", originBranchFacts{}, nil
+	}
+	f.prepFn = func(int) (worktreePrep, error) {
+		if last := f.preps[len(f.preps)-1]; last.TaskID == head.ID {
+			return worktreePrep{}, errors.New(refusal + " — refusing to reuse it")
+		}
+		return f.prep, nil
+	}
+
+	// Drain 1: refused before the claim, so no reclaim is spent.
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drain 1: err=%v stop=%v", err, stop)
+	}
+	if len(f.rel.claimCalls) != 0 {
+		t.Fatalf("drain 1 claimed %v, want none: the refusal is pre-claim", f.rel.claimCalls)
+	}
+	if got := f.d.startRefusals[head.ID]; got != 1 {
+		t.Fatalf("refusal count after drain 1 = %d, want 1", got)
+	}
+
+	// Drain 2: the bound is reached, so the claim is taken and the prep refuses
+	// it — one reclaim buys the park the claimless path can never reach.
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drain 2: err=%v stop=%v", err, stop)
+	}
+	if len(f.rel.claimCalls) != 1 || f.rel.claimCalls[0] != (claimCall{head.ID, false}) {
+		t.Fatalf("claim calls after drain 2 = %v, want exactly one claim of the head", f.rel.claimCalls)
+	}
+	if len(f.rel.parks) != 1 || f.rel.parks[0].taskID != head.ID {
+		t.Fatalf("parks = %+v, want the head parked once", f.rel.parks)
+	}
+	if len(f.rel.questions) != 1 {
+		t.Errorf("questions = %d, want the park's one", len(f.rel.questions))
+	}
+
+	// Drain 3: the parked head is gone from the queue, so other ready work is
+	// claimable and its session runs.
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drain 3: err=%v stop=%v", err, stop)
+	}
+	if got := f.rel.claimCalls[len(f.rel.claimCalls)-1]; got != (claimCall{other.ID, false}) {
+		t.Errorf("last claim = %v, want the other ready task", got)
+	}
+	if f.h.invokeCalls != 1 {
+		t.Errorf("spawned %d session(s), want the other task's one", f.h.invokeCalls)
 	}
 }

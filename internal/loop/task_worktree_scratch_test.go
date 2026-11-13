@@ -6,9 +6,12 @@ package loop
 // lacks.
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -31,10 +34,6 @@ func TestTaskWorktree_TrackedDirtyReuseRefused(t *testing.T) {
 		t.Errorf("the refusal discarded the tracked change: %q (%v)", body, err)
 	}
 }
-
-// Untracked session scratch cannot hold committed work when HEAD is at the PR
-// base, so the tree is reused after the files are moved to a logged directory
-// outside it. Nothing is deleted.
 
 // Untracked session scratch cannot hold committed work when HEAD is at the PR
 // base, so the tree is reused after the files are moved to a logged directory
@@ -87,9 +86,6 @@ func TestTaskWorktree_UntrackedScratchMovedAsideAndReused(t *testing.T) {
 
 // The same scratch on a RESUMED branch at origin's tip: the incident shape that
 // parked CLA-847.
-
-// The same scratch on a RESUMED branch at origin's tip: the incident shape that
-// parked CLA-847.
 func TestTaskWorktree_UntrackedScratchAtOriginTipMovedAside(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
 	branchTip := f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
@@ -130,9 +126,6 @@ func TestTaskWorktree_UntrackedScratchAtOriginTipMovedAside(t *testing.T) {
 
 // HEAD behind origin's tip is also proven to hold nothing origin lacks: the
 // scratch is cleared and the branch fast-forwards.
-
-// HEAD behind origin's tip is also proven to hold nothing origin lacks: the
-// scratch is cleared and the branch fast-forwards.
 func TestTaskWorktree_UntrackedScratchBehindOriginMovedAside(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
 	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
@@ -164,9 +157,6 @@ func TestTaskWorktree_UntrackedScratchBehindOriginMovedAside(t *testing.T) {
 		t.Errorf("Tip = %s, want the fast-forwarded origin tip %s", second.Tip, originTip)
 	}
 }
-
-// HEAD holding a local commit is work origin lacks, so the untracked files are
-// NOT cleared: the refusal leaves everything where it was.
 
 // HEAD holding a local commit is work origin lacks, so the untracked files are
 // NOT cleared: the refusal leaves everything where it was.
@@ -262,8 +252,6 @@ func TestTaskWorktree_UntrackedScratchInSiblingMovedAsideAndAdopted(t *testing.T
 }
 
 // A tracked change in the sibling could be uncommitted work: it still refuses.
-
-// A tracked change in the sibling could be uncommitted work: it still refuses.
 func TestTaskWorktree_TrackedDirtySiblingWorktreeRefused(t *testing.T) {
 	f := newTaskWorktreeRepo(t)
 	f.commitOn(t, taskWorktreeBranch, "origin/staging", "branch.txt", "branch work", "the work")
@@ -282,9 +270,6 @@ func TestTaskWorktree_TrackedDirtySiblingWorktreeRefused(t *testing.T) {
 		t.Errorf("error %q does not name the sibling and its dirty state", err)
 	}
 }
-
-// A sibling holding a commit origin never got is refused: adopting it would make
-// that work look like the task's own.
 
 // A tree on the branch with untracked-only dirt is this task's tree: its
 // scratch is moved aside and the tree reused.
@@ -318,9 +303,6 @@ func TestTaskWorktree_UntrackedScratchInWorktreeOnBranchMovedAside(t *testing.T)
 	}
 }
 
-// A reused tree keeps its unpushed commits, so its Tip is not origin's; the
-// caller has to be told both, or it reports the wrong tip on origin.
-
 // The cross-filesystem fallback copies first: the source is still intact when
 // the copy completes, and a symlink is copied as a link, never followed.
 func TestTaskWorktreeCopyPathPreservesContentAndSymlinks(t *testing.T) {
@@ -339,7 +321,7 @@ func TestTaskWorktreeCopyPathPreservesContentAndSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := taskWorktreeCopyPath(src, dst, info); err != nil {
+	if err := taskWorktreeCopyPath(context.Background(), src, dst, info); err != nil {
 		t.Fatalf("taskWorktreeCopyPath: %v", err)
 	}
 	if body, err := os.ReadFile(filepath.Join(dst, "nested", "notes.txt")); err != nil || strings.TrimSpace(string(body)) != "reference" {
@@ -350,5 +332,124 @@ func TestTaskWorktreeCopyPathPreservesContentAndSymlinks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(src, "nested", "notes.txt")); err != nil {
 		t.Errorf("the copy removed the source: %v", err)
+	}
+}
+
+// The move re-lists before it touches anything: a path that appeared after the
+// caller's listing is not cleared on that stale decision, and nothing is moved.
+func TestTaskWorktreeMoveUntracked_RefusesASetThatChanged(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	first, err := f.prepare(t, f.request())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	writeTestFile(t, filepath.Join(first.Dir, "one.txt"), "listed")
+	paths, err := taskWorktreeUntracked(context.Background(), first.Dir)
+	if err != nil {
+		t.Fatalf("taskWorktreeUntracked: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != "one.txt" {
+		t.Fatalf("untracked = %v, want the one listed path", paths)
+	}
+	// A writer leaves a second path between the listing and the move.
+	writeTestFile(t, filepath.Join(first.Dir, "two.txt"), "appeared later")
+	scratchRoot := filepath.Join(t.TempDir(), "scratch-aside")
+
+	dest, err := taskWorktreeMoveUntracked(context.Background(), first.Dir, scratchRoot, taskWorktreeID, paths)
+	if err == nil {
+		t.Fatal("a set that changed after the listing must be refused")
+	}
+	if !strings.Contains(err.Error(), "untracked set changed") {
+		t.Errorf("error %q does not say the set changed", err)
+	}
+	if dest != "" {
+		t.Errorf("dest = %q, want none: nothing may be moved on a stale listing", dest)
+	}
+	for _, rel := range paths {
+		if _, err := os.Stat(filepath.Join(first.Dir, rel)); err != nil {
+			t.Errorf("listed path %s left the tree on a refused move: %v", rel, err)
+		}
+	}
+	if _, err := os.Stat(scratchRoot); !os.IsNotExist(err) {
+		t.Errorf("the refused move created the scratch directory %s (err %v)", scratchRoot, err)
+	}
+}
+
+// A FIFO inside an untracked directory moves aside with it: the move renames the
+// directory and never opens what it is clearing.
+func TestTaskWorktree_UntrackedFIFOMovedAside(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	first, err := f.prepare(t, f.request())
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	scratchDir := filepath.Join(first.Dir, ".scratch")
+	if err := os.MkdirAll(scratchDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(scratchDir, "repro.pipe"), 0o600); err != nil {
+		t.Skipf("mkfifo is unavailable: %v", err)
+	}
+	req := f.request()
+	req.ScratchRoot = t.TempDir()
+
+	second, err := f.prepare(t, req)
+	if err != nil {
+		t.Fatalf("an untracked directory holding a FIFO must be moved, not opened: %v", err)
+	}
+	if second.ScratchAside == "" {
+		t.Fatal("ScratchAside is empty: the FIFO's directory was not reported as moved")
+	}
+	moved := filepath.Join(second.ScratchAside, ".scratch", "repro.pipe")
+	info, err := os.Lstat(moved)
+	if err != nil {
+		t.Fatalf("the FIFO is not at the logged path %s: %v", moved, err)
+	}
+	if info.Mode()&os.ModeNamedPipe == 0 {
+		t.Errorf("mode of %s = %v, want the FIFO preserved as one", moved, info.Mode())
+	}
+}
+
+// The copy fallback refuses a non-regular entry instead of opening it: os.Open
+// on a FIFO with no writer would block the worktree prep forever.
+func TestTaskWorktreeCopyPath_RefusesAFIFO(t *testing.T) {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo is unavailable: %v", err)
+	}
+	info, err := os.Lstat(fifo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(root, "dst")
+
+	err = taskWorktreeCopyPath(context.Background(), fifo, dst, info)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("taskWorktreeCopyPath error = %v, want a refusal naming the non-regular file", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("the refused copy created %s (err %v)", dst, err)
+	}
+}
+
+// A cancelled drain must not wait out the copy: the context is checked as the
+// walk starts, not only after the whole tree is written.
+func TestTaskWorktreeCopyPath_HonoursContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(src, "a.txt"), "work")
+	info, err := os.Lstat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := taskWorktreeCopyPath(ctx, src, filepath.Join(root, "dst"), info); !errors.Is(err, context.Canceled) {
+		t.Errorf("taskWorktreeCopyPath error = %v, want context.Canceled", err)
 	}
 }

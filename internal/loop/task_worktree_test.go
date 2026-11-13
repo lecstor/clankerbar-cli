@@ -878,7 +878,3 @@ func taskWorktreeEnvCount(env []string, kv string) int {
 	}
 	return n
 }
-
-// claimWorktreeRefusal is the pre-claim check: it must decide the deterministic
-// refusals WITHOUT touching the tree, because its whole purpose is to refuse
-// before a claim is spent.
