@@ -20,10 +20,6 @@ var tsPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|async|override|readonly)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\([^)]*\)\s*(?::[^{]+)?\{\s*$`),
 }
 
-// minNameLen drops one- and two-character names: they match too much to be a
-// useful checklist entry.
-const minNameLen = 3
-
 // tsSkip drops names that are almost always incidental matches rather than
 // definitions worth a checklist entry.
 var tsSkip = map[string]bool{
@@ -40,7 +36,7 @@ var tsSkip = map[string]bool{
 
 func (TypeScript) Match(path string) bool { return tsPathRE.MatchString(path) }
 
-func (TypeScript) Names(f FileDiff) []Definition {
+func (TypeScript) Names(f FileDiff, _ Source) []Definition {
 	var defs []Definition
 	seen := make(map[string]bool)
 	record := func(name, at string) {

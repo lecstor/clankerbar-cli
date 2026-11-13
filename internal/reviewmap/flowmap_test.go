@@ -16,8 +16,32 @@ func TestChangedDefinitionsDedupesAcrossFiles(t *testing.T) {
 		addedFile("a.go", 1, AddedLine{Line: 1, Code: "func alphaThing() {"}),
 	}
 	want := []Definition{{Name: "alphaThing", At: "a.ts:1"}}
-	if got := changedDefinitions(files); !reflect.DeepEqual(got, want) {
+	if got := changedDefinitions(files, nil); !reflect.DeepEqual(got, want) {
 		t.Errorf("changedDefinitions() = %#v, want %#v", got, want)
+	}
+}
+
+func TestChangedDefinitionsMoveIsNotARemoval(t *testing.T) {
+	src := staticSource{
+		head: map[string]string{
+			"a.go": "package demo\n",
+			"b.go": "package demo\n\ntype Widget struct{}\n",
+		},
+		base: map[string]string{
+			"a.go": "package demo\n\ntype Widget struct{}\n",
+			"b.go": "package demo\n",
+		},
+	}
+	removed := FileDiff{Path: "a.go"}
+	added := FileDiff{Path: "b.go", Hunks: []Hunk{{Start: 1, Count: 3}}}
+	want := []Definition{{Name: "Widget", At: "b.go:3"}}
+
+	// Whichever file the diff lists first, a name that still exists at head
+	// is a move, not a removal.
+	for _, files := range [][]FileDiff{{removed, added}, {added, removed}} {
+		if got := changedDefinitions(files, src); !reflect.DeepEqual(got, want) {
+			t.Errorf("changedDefinitions() = %#v\nwant %#v", got, want)
+		}
 	}
 }
 

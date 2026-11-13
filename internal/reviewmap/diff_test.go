@@ -51,6 +51,27 @@ func TestParseDiffNoNewlineMarkerDoesNotAdvance(t *testing.T) {
 	}
 }
 
+func TestParseDiffDeletedFile(t *testing.T) {
+	diff := `diff --git a/old.go b/old.go
+deleted file mode 100644
+--- a/old.go
++++ /dev/null
+@@ -1,2 +0,0 @@
+-package old
+-
+`
+	files := ParseDiff(diff)
+	want := []FileDiff{{Path: "old.go", Deleted: true}}
+	if !reflect.DeepEqual(files, want) {
+		t.Errorf("ParseDiff() = %#v, want %#v", files, want)
+	}
+	// A deleted file describes old lines only; the change map must not list
+	// them as if they existed at head.
+	if items := ChangeMap(diff, 0); len(items) != 0 {
+		t.Errorf("ChangeMap(deleted file) = %#v, want none", items)
+	}
+}
+
 func TestParseDiffMultipleFiles(t *testing.T) {
 	diff := `diff --git a/a.go b/a.go
 --- a/a.go
@@ -80,5 +101,64 @@ diff --git a/b.go b/b.go
 		{Line: 7, Code: "var Z = 3"},
 	}) {
 		t.Errorf("second file added = %#v", got)
+	}
+}
+
+// TestParseDiffRename pins the source path a whole-file parser must read the
+// base from: the head path does not exist in the base revision.
+func TestParseDiffRename(t *testing.T) {
+	diff := `diff --git a/old.go b/new.go
+similarity index 70%
+rename from old.go
+rename to new.go
+--- a/old.go
++++ b/new.go
+@@ -1,2 +1,2 @@
+ package demo
+-var Old = 1
++var New = 1
+`
+	files := ParseDiff(diff)
+	want := []FileDiff{{
+		Path:        "new.go",
+		RenamedFrom: "old.go",
+		Hunks: []Hunk{{
+			Start: 1,
+			Count: 2,
+			Added: []AddedLine{{Line: 2, Code: "var New = 1"}},
+		}},
+	}}
+	if !reflect.DeepEqual(files, want) {
+		t.Errorf("ParseDiff() = %#v\nwant %#v", files, want)
+	}
+}
+
+// TestParseDiffHeaderPrefixStaysInHunk pins the body-before-header order: an
+// added content line of "++ /dev/null" is "+++ /dev/null" in the raw diff and
+// must not be read as a whole-file deletion header.
+func TestParseDiffHeaderPrefixStaysInHunk(t *testing.T) {
+	diff := `diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -1,1 +1,2 @@
+ package a
++++ /dev/null
+`
+	files := ParseDiff(diff)
+	want := []FileDiff{{
+		Path: "a.go",
+		Hunks: []Hunk{{
+			Start: 1,
+			Count: 2,
+			Added: []AddedLine{{Line: 2, Code: "++ /dev/null"}},
+		}},
+	}}
+	if !reflect.DeepEqual(files, want) {
+		t.Errorf("ParseDiff() = %#v\nwant %#v", files, want)
+	}
+	for _, f := range files {
+		if f.Deleted {
+			t.Errorf("ParseDiff() recorded %q as a whole-file deletion", f.Path)
+		}
 	}
 }

@@ -104,7 +104,9 @@ func TestIsTestPath(t *testing.T) {
 		{"src/spec/a.ts", true},
 		{"src/a.test.ts", true},
 		{"src/a.spec.tsx", true},
+		{"src/a_test.go", true},
 		{"src/a.ts", false},
+		{"src/a.go", false},
 		{"src/contest/a.ts", false},
 		{"src/spectrum/a.ts", false},
 	}
@@ -206,7 +208,7 @@ export function gammaThing() {
 		"`gammaThing` defined or changed at src/defs.ts:11; used at: nowhere else",
 	}
 
-	got, err := FlowMap(diff, r.dir, 0)
+	got, err := FlowMap(diff, Range{Repo: r.dir, Base: base, Head: "HEAD"}, 0)
 	if err != nil {
 		t.Fatalf("FlowMap() error: %v", err)
 	}
@@ -235,7 +237,7 @@ func TestFlowMapExcludedOnlyMatch(t *testing.T) {
 	r.commit("head")
 
 	diff := r.git("diff", base, "HEAD")
-	got, err := FlowMap(diff, r.dir, 0)
+	got, err := FlowMap(diff, Range{Repo: r.dir, Base: base, Head: "HEAD"}, 0)
 	if err != nil {
 		t.Fatalf("FlowMap() error: %v", err)
 	}
@@ -247,7 +249,7 @@ func TestFlowMapExcludedOnlyMatch(t *testing.T) {
 
 func TestFlowMapOutsideRepository(t *testing.T) {
 	diff := "+++ b/a.ts\n@@ -1 +1,2 @@\n x\n+function alphaThing() {\n"
-	if _, err := FlowMap(diff, t.TempDir(), 0); err == nil {
+	if _, err := FlowMap(diff, Range{Repo: t.TempDir(), Base: "HEAD", Head: "HEAD"}, 0); err == nil {
 		t.Fatal("FlowMap() error = nil, want a git grep failure outside a repository")
 	}
 }

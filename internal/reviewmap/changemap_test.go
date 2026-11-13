@@ -62,10 +62,13 @@ func TestChangeMap(t *testing.T) {
 		},
 		{
 			name: "dev null file is skipped without stealing the previous file",
-			diff: `+++ b/keep.ts
+			diff: `diff --git a/keep.ts b/keep.ts
++++ b/keep.ts
 @@ -1 +1,2 @@
  a
 +b
+diff --git a/gone.ts b/gone.ts
+--- a/gone.ts
 +++ /dev/null
 @@ -1,3 +0,0 @@
 -a
@@ -76,13 +79,15 @@ func TestChangeMap(t *testing.T) {
 		},
 		{
 			name: "above the cap hunks merge per file",
-			diff: `+++ b/a.ts
+			diff: `diff --git a/a.ts b/a.ts
++++ b/a.ts
 @@ -10,2 +10,3 @@
  x
 +y
 @@ -40,2 +40,3 @@ ctx
  x
 +y
+diff --git a/b.ts b/b.ts
 +++ b/b.ts
 @@ -1 +1 @@
 -x
@@ -110,13 +115,15 @@ func TestChangeMap(t *testing.T) {
 		},
 		{
 			name: "unlimited keeps every hunk",
-			diff: `+++ b/a.ts
+			diff: `diff --git a/a.ts b/a.ts
++++ b/a.ts
 @@ -10,2 +10,3 @@
  x
 +y
 @@ -40,2 +40,3 @@ ctx
  x
 +y
+diff --git a/b.ts b/b.ts
 +++ b/b.ts
 @@ -1 +1 @@
 -x
