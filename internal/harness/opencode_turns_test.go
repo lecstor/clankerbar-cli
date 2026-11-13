@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // turnStubTurn is one prompt-selected arm of the stub script.
@@ -500,6 +501,87 @@ func TestOpencodeProbeIgnoresTurns(t *testing.T) {
 	}
 	if strings.Contains(calls[0], "turn-one") {
 		t.Errorf("a probe sent the invocation prompt instead of its one-word check: %s", calls[0])
+	}
+}
+
+// The wall-clock budget is shared across the whole sequence: once less than the
+// continuation floor is left, the next turn is not started (it could only be
+// cap-killed on arrival) and the sequence says which turn it withheld.
+func TestOpencodeRunTurnsStopsWhenTheWallClockIsSpent(t *testing.T) {
+	res := opencodeParsed(opencodeStream)
+	// The claim a runner phase is seeded with; the turn sequence refuses to
+	// continue without one, which would mask the wall-clock gate.
+	res.Claim = turnClaim
+	in := Invocation{
+		Prompt:      "turn-one",
+		Model:       routeFree,
+		ResumeClaim: turnClaim,
+		Turns:       []Turn{{Prompt: "turn-two"}},
+	}
+	console := &strings.Builder{}
+	in.Console = console
+	_, completed, err := (opencode{}).runTurns(context.Background(), in, &res, time.Now())
+	if err != nil {
+		t.Fatalf("runTurns: %v", err)
+	}
+	if completed {
+		t.Error("the sequence completed with no wall-clock budget left")
+	}
+	if res.TurnStopped != 2 || res.TurnStopReason != "wall_clock" {
+		t.Errorf("TurnStopped = %d (%q), want turn 2 stopped on wall_clock", res.TurnStopped, res.TurnStopReason)
+	}
+	if !strings.Contains(console.String(), "wall-clock budget exhausted") {
+		t.Errorf("console does not name the wall-clock stop:\n%s", console.String())
+	}
+	if want := []string{res.TurnMessages[0]}; !reflect.DeepEqual(res.TurnMessages, want) || len(res.TurnMessages) != 1 {
+		t.Errorf("TurnMessages = %q, want only the first turn's message", res.TurnMessages)
+	}
+}
+
+// A refused done report is re-emitted by the ONE report resume, on the FINAL
+// turn: the per-turn record is updated to the corrected report, and no notes
+// turn is ever re-steered.
+func TestOpencodeReportResumeAppliesToTheFinalTurn(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, turnScript(logPath,
+		turnStubTurn{"turn-one", turnAnswer("notes", 10, "0.001")},
+		turnStubTurn{"turn-two", turnAnswer("BAD REPORT", 20, "0.002")},
+		turnStubTurn{"done report was not accepted", turnAnswer("GOOD REPORT", 5, "0.0005")},
+	))
+
+	var checked []string
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "turn-one",
+		Model:       routeFree,
+		ResumeClaim: turnClaim,
+		Turns:       []Turn{{Prompt: "turn-two"}},
+		CheckReport: func(final string) error {
+			checked = append(checked, final)
+			if final != "GOOD REPORT" {
+				return fmt.Errorf("the report must be the run's JSON block, got %q", final)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if want := []string{"BAD REPORT", "GOOD REPORT"}; !reflect.DeepEqual(checked, want) {
+		t.Errorf("CheckReport saw %q, want %q", checked, want)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 3 {
+		t.Fatalf("the stub ran %d times, want 3 (two turns + one report resume):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !strings.Contains(calls[2], "done report was not accepted") {
+		t.Errorf("the extra run is not the report steer: %s", calls[2])
+	}
+	if res.FinalMessage != "GOOD REPORT" {
+		t.Errorf("FinalMessage = %q, want the corrected report", res.FinalMessage)
+	}
+	if want := []string{"notes", "GOOD REPORT"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q (the final entry follows the corrected report)", res.TurnMessages, want)
 	}
 }
 
