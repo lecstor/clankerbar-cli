@@ -77,6 +77,31 @@ func TestLimitStopRouteNamesTheRouteThatStopped(t *testing.T) {
 	}
 }
 
+// A marker line omits the parts it does not know, and a reason-less limit keeps
+// the original 'usage limit' fallback.
+func TestLimitStopLineOmitsWhatItDoesNotKnow(t *testing.T) {
+	tests := []struct {
+		name  string
+		lim   harness.Limit
+		route string
+		msg   string
+		want  string
+	}{
+		{"everything known", harness.Limit{Reason: "budget_exhausted"}, "r/one", "no funds", "budget_exhausted on r/one: no funds"},
+		{"no message", harness.Limit{Reason: "budget_exhausted"}, "r/one", "", "budget_exhausted on r/one"},
+		{"no route", harness.Limit{Reason: "budget_exhausted"}, "", "no funds", "budget_exhausted: no funds"},
+		{"neither", harness.Limit{Reason: "budget_exhausted"}, "", "", "budget_exhausted"},
+		{"blank reason keeps the fallback", harness.Limit{}, "r/one", "no funds", "usage limit on r/one: no funds"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitStopLine(tc.lim, tc.route, tc.msg); got != tc.want {
+				t.Errorf("limitStopLine() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // A provider message longer than the marker's read is clipped, and the line is
 // one printable line whatever the diagnostic carried.
 func TestLimitStopLineIsClippedToOneLine(t *testing.T) {
@@ -130,9 +155,9 @@ func TestLimitStopMessageNeverQuotesAssistantText(t *testing.T) {
 	}
 }
 
-// The provider's message is read from the shapes the adapters actually emit:
-// the opencode wrapper, its older APIError data envelope, and codex's error
-// string.
+// The provider's message is read from the shapes adapters actually emit: the
+// opencode wrapper, its older APIError data envelope, and an event that carries
+// the error as a plain string.
 func TestLimitStopMessageReadsTheProvidersOwnField(t *testing.T) {
 	tests := []struct {
 		name string
@@ -141,7 +166,7 @@ func TestLimitStopMessageReadsTheProvidersOwnField(t *testing.T) {
 	}{
 		{"opencode 2.x error.message", limitStop402, "Upstream request failed: Insufficient account funds"},
 		{"opencode APIError data.message", `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402}}}`, "Payment Required"},
-		{"codex error string", `{"type":"error","error":"rate limit reached"}`, "rate limit reached"},
+		{"error as a bare string", `{"type":"error","error":"rate limit reached"}`, "rate limit reached"},
 		{"no typed error event", "Error: Out of credits", ""},
 		{"nothing said", "", ""},
 	}

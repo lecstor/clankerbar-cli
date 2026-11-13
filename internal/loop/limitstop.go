@@ -58,9 +58,11 @@ func limitStopMessage(a harness.Adapter, res harness.Result) string {
 }
 
 // terminalErrorMessage picks the provider's own message out of the last JSON
-// error event in an adapter's diagnostic text. The shapes differ per harness:
-// opencode puts it under error.message (2.x) or error.data.message (the older
-// APIError shape), codex under error as a string or an object's message.
+// error event in an adapter's diagnostic text. opencode nests the provider's
+// response under error.message (2.x) or error.data.message (the older APIError
+// shape); an adapter that reports a whole event with the error as a plain
+// string is read too. Anything else yields "" and the caller falls back to the
+// diagnostic text.
 func terminalErrorMessage(diag string) string {
 	lines := strings.Split(diag, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
