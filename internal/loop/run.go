@@ -318,6 +318,9 @@ func (d *Driver) sweepPendingStop(runErr error) {
 // runStop means the run ends, with err as its error.
 func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target, runNext, error) {
 	var target Target
+	// Read once per pass, so one boundary landing mid-pass cannot give a target a
+	// different answer from its siblings.
+	sched := d.scheduledPause()
 	if !d.blind {
 		candidates := make([]bool, len(d.targets))
 		anyCandidate := false
@@ -384,7 +387,12 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 						d.paused[i] = false
 						log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 					}
-					d.judgeProgress(i, sum)
+					// A poll taken while the loop has stopped spawning cannot tell "our
+					// last drain settled nothing" from "nothing happened because we
+					// stopped", so the verdict waits until the loop is live again.
+					if !sched {
+						d.judgeProgress(i, sum)
+					}
 					// CLA-396: a target the fleet counter paused stays
 					// paused until the operator answers the raised question
 					// — the open-question count falls back to what it was at
@@ -404,7 +412,7 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 						d.startupRaised[i] = false
 						log.Printf("%sstartup-failure pause cleared - the operator answered the harness question; resuming", d.prefix(i))
 					}
-					if sum.Spawnable() && !d.backedOff(i) && !d.fleetPaused[i] && !d.startupPaused[i] {
+					if sum.Spawnable() && !d.backedOff(i) && !sched && !d.fleetPaused[i] && !d.startupPaused[i] {
 						candidates[i] = true
 						anyCandidate = true
 					}
@@ -438,6 +446,11 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 		}
 	}
 	if d.blind {
+		// An active window chooses no target at all, before the rotation below
+		// can reach for one.
+		if sched {
+			return target, d.idleThroughPause(runCtx, idle), nil
+		}
 		// Blind mode has no counts to route on - rotate across targets so every
 		// queue still gets sessions. A target sitting out a harness failure
 		// (CLA-507) is skipped here exactly as the wired gate skips it; the only

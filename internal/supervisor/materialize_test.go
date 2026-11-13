@@ -493,3 +493,53 @@ func TestApplyDerivedWorkdirsRewritesEveryProjectToItsOwnClone(t *testing.T) {
 		}
 	}
 }
+
+// The generated child config must carry the operator's pause_windows schedule:
+// it is top-level machine-layer policy, and a field materialization dropped
+// would leave the child running — and paying peak rates — straight through the
+// window the base config names.
+func TestMaterializedConfigCarriesPauseWindows(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	src := filepath.Join(t.TempDir(), "source.json")
+	body := `{
+		"harness": "claude",
+		"workdir": "` + t.TempDir() + `",
+		"pause_windows": {
+			"timezone": "Australia/Brisbane",
+			"lead": "30m",
+			"windows": [{"days": "mon-fri", "from": "11:00", "to": "14:00"}]
+		}
+	}`
+	if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	cfg, err := config.Load(src)
+	if err != nil {
+		t.Fatalf("Load(source): %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("source does not validate: %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	d := &Supervisor{o: materializeOptions(t, cacheDir, ""), hostname: "testhost", cacheDir: cacheDir}
+	inst := &Instance{name: "pause-windows", cfg: cfg, stateDir: t.TempDir()}
+	path, err := d.materializeConfig(inst)
+	if err != nil {
+		t.Fatalf("materializeConfig: %v", err)
+	}
+
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("the materialized config does not load: %v", err)
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Fatalf("the materialized config does not validate: %v", err)
+	}
+	if loaded.PauseWindows == nil {
+		t.Fatal("the materialized config has no pause_windows — the child would run through the window")
+	}
+	if got, want := loaded.PauseWindows.Describe(), "mon-fri 11:00-14:00 (Australia/Brisbane, lead 30m)"; got != want {
+		t.Errorf("materialized pause windows = %q, want %q", got, want)
+	}
+}
