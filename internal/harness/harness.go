@@ -475,11 +475,11 @@ var ErrTurnsUnsupported = errors.New("multi-turn invocations (Invocation.Turns) 
 // anything else, so a planned sequence is refused up front rather than run as
 // its first turn. The adapter name prefixes the error: the caller picked the
 // harness, and the message has to say which one cannot do this.
-func refuseTurns(harness string, in Invocation) error {
+func refuseTurns(name string, in Invocation) error {
 	if len(in.Turns) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%s: %w", harness, ErrTurnsUnsupported)
+	return fmt.Errorf("%s: %w", name, ErrTurnsUnsupported)
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no

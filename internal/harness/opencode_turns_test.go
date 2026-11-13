@@ -538,6 +538,45 @@ func TestOpencodeRunTurnsStopsWhenTheWallClockIsSpent(t *testing.T) {
 	}
 }
 
+// The same rule on the FINAL turn: its limit reaches the caller's recovery
+// passes with the per-turn invocation, which has no route list, so the existing
+// switchRoutesOnLimit cannot swap the stage onto the invocation's route.
+func TestOpencodeFinalPerTurnModelLimitIsNotSwapped(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, turnScript(logPath,
+		turnStubTurn{"turn-one", turnAnswer("one", 10, "0.001")},
+		turnStubTurn{"turn-two", turnLimit},
+		turnStubTurn{"previous model route hit a usage limit", turnAnswer("switched", 40, "0.004")},
+	))
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "turn-one",
+		Model:       routeFree,
+		Routes:      []string{routeFree, routePaid},
+		ResumeClaim: turnClaim,
+		Turns:       []Turn{{Prompt: "turn-two", Model: "other/model"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 2 {
+		t.Fatalf("the stub ran %d times, want 2 — the final turn's limit must not cause a route switch:\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	for _, call := range calls {
+		if strings.Contains(call, routePaid) {
+			t.Errorf("the final per-turn model was silently swapped onto the invocation's route: %s", call)
+		}
+	}
+	if !(opencode{}).DetectLimit(res).Limited {
+		t.Error("the final turn's limit did not survive to the Result")
+	}
+	if res.TurnStopped != 0 {
+		t.Errorf("TurnStopped = %d (%q), want 0: every planned turn ran", res.TurnStopped, res.TurnStopReason)
+	}
+}
+
 // A refused done report is re-emitted by the ONE report resume, on the FINAL
 // turn: the per-turn record is updated to the corrected report, and no notes
 // turn is ever re-steered.
@@ -582,6 +621,20 @@ func TestOpencodeReportResumeAppliesToTheFinalTurn(t *testing.T) {
 	}
 	if want := []string{"notes", "GOOD REPORT"}; !reflect.DeepEqual(res.TurnMessages, want) {
 		t.Errorf("TurnMessages = %q, want %q (the final entry follows the corrected report)", res.TurnMessages, want)
+	}
+}
+
+// The shared guard names a wall-clock kill as the cap it is, not as the exit
+// status the kill leaves behind: both stop a sequence, but only one of them
+// tells the operator the budget ran out.
+func TestResumeSkippedReasonNamesAWallClockKill(t *testing.T) {
+	res := opencodeParsed(opencodeStream)
+	res.Claim = turnClaim
+	res.ExitCode = -1
+	res.Raw[TerminalReasonKey] = wallClockReason
+	got := (opencode{}).resumeSkippedReason(context.Background(), Invocation{}, &res)
+	if got != "wall_clock" {
+		t.Errorf("resumeSkippedReason = %q, want wall_clock", got)
 	}
 }
 

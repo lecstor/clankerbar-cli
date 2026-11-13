@@ -1012,6 +1012,9 @@ func TestOpencodeConformance_turns(t *testing.T) {
 	// The session itself holds both turns, and records the model switch: the
 	// resumed turn was not a second session.
 	sid, _ := res.Raw[opencodeSessionIDKey].(string)
+	if sid == "" {
+		t.Fatal("no session id on the result")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
 	defer cancel()
 	exported, err := (opencode{}).exportSession(ctx, in, sid)
