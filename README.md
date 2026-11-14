@@ -1110,8 +1110,8 @@ A CONFLICTING PR used to wait for whichever clanker finished its current task �
 full implement-phase session, with the whole drain brief, to resolve a merge
 conflict. The supervisor now handles it: it takes the claim itself (so an agent
 close-out and this path cannot both work the task — a refused claim means no
-session), then starts **one** short session on the fleet's implement harness and
-model, configurable as the `conflict` step:
+session), then starts a short session on the fleet's implement harness and model
+routes — one session per attempted model — configurable as the `conflict` step:
 
 ```json
 "conflict": { "harness": "opencode", "model": ["opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"], "max_turns": 80 }
@@ -1121,9 +1121,9 @@ Every field is optional and defaults to the implement step's own, so an untouche
 config runs the conflict session on the model that implemented the branch — the
 whole route list, not just its first entry. `model` takes the same ordered route
 list a phase does, and an attempt that ends on a usage limit or an exhausted
-quota is retried on the next route, exactly as a phase falls back; a single
-pinned model runs only that model. Each attempt is logged with the model it ran
-on, so a quota failure names the route it hit. The brief is narrow: create a
+quota is retried on a route still left in the list; a single pinned model runs
+only that model. Each attempt is logged with the model it ran on, so a quota
+failure names the route it hit. The brief is narrow: create a
 worktree of the branch, merge the PR's base into it (a
 merge, **never** a rebase — the branch is already pushed), resolve **only** the
 conflicting hunks, run the repo-wide gate (`go test ./...` when the checkout has

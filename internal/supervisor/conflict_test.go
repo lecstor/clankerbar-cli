@@ -919,6 +919,64 @@ func TestConflictModelLadderSkipsTheRouteTheSessionEndedOn(t *testing.T) {
 	}
 }
 
+// An UNTRUSTED stream is not evidence of a limit: the phase ladder ends such an
+// attempt unclassified and the adapter declines to switch routes on it (CLA-262),
+// so the ladder must not start a paid session on the next route either.
+func TestConflictModelLadderDoesNotRetryAnUntrustedStream(t *testing.T) {
+	req := ConflictRunRequest{PR: "#12", Model: "free", Routes: []string{"free", "paid"}}
+	var ran []string
+
+	untrusted := harness.Result{
+		ExitCode:  1,
+		Stdout:    conflictQuotaEvent,
+		Untrusted: "a stdout line overran the capture",
+	}
+	if lim := (conflictLimitScan{}).DetectLimit(untrusted); !lim.Limited {
+		t.Fatalf("the fixture is not classified as a usage limit (%+v), so this test would pass vacuously", lim)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	res, err := runConflictModelLadder("CLA-2", req, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		return untrusted, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if !slices.Equal(ran, []string{"free"}) {
+		t.Errorf("models run = %v, want one attempt: a stream with a hole in it is not proof of a limit", ran)
+	}
+	if res.Untrusted != untrusted.Untrusted {
+		t.Errorf("result = %+v, want the untrusted attempt returned unchanged", res)
+	}
+	if !strings.Contains(buf.String(), "could not be read whole") {
+		t.Errorf("the attempt log does not say why the stream was not classified:\n%s", buf.String())
+	}
+}
+
+// The ladder hands each attempt its own model and the routes still left; a retry
+// must reach the adapter as an invocation on that model, not the first one.
+func TestConflictAttemptCarriesTheRetryModelIntoTheInvocation(t *testing.T) {
+	const free, paid = "opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"
+	cfg := &config.Config{Harness: "opencode", Model: "run-model", MaxTurns: 150}
+	step := config.ConflictStep{Harness: "opencode", Model: config.ModelRoutes{free, paid}, MaxTurns: 40}
+	req := ConflictRunRequest{Harness: "opencode", Model: free, Routes: []string{free, paid}, WorkDir: "/fleet/acme/widgets"}
+
+	inv, err := conflictInvocation(cfg, "acme", conflictAttemptRequest(req, paid, []string{paid}), step)
+	if err != nil {
+		t.Fatalf("conflictInvocation: %v", err)
+	}
+	if inv.Model != paid {
+		t.Errorf("invocation model = %q, want the retry's %q", inv.Model, paid)
+	}
+	if !slices.Equal(inv.Routes, []string{paid}) {
+		t.Errorf("invocation routes = %v, want only the route still left", inv.Routes)
+	}
+}
+
 // The adapter's own mid-session switch can finish the job: the ladder must not
 // retry then, and the log must name the route that actually did the work rather
 // than only the one the attempt started on.

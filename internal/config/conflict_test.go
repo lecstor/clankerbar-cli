@@ -327,6 +327,7 @@ func TestConflictStepInheritsTheWholeImplementModelList(t *testing.T) {
 		{
 			name: "the harness block's own list",
 			configure: func(c *Config) {
+				c.Conflict = nil // no conflict block at all
 				c.Harness = "opencode"
 				c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{free, paid}}}
 				c.Phases = []Phase{{Name: ImplementPhaseName}}
@@ -335,6 +336,7 @@ func TestConflictStepInheritsTheWholeImplementModelList(t *testing.T) {
 		{
 			name: "the implement phase's tier route list",
 			configure: func(c *Config) {
+				c.Conflict = nil // no conflict block at all
 				c.Harness = "opencode"
 				c.Harnesses = map[string]HarnessConfig{"opencode": {
 					Models: map[string]ModelRoutes{"flash": {free, paid}},
@@ -355,7 +357,6 @@ func TestConflictStepInheritsTheWholeImplementModelList(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := defaults()
 			tc.configure(c)
-			c.Conflict = nil
 
 			step := c.ConflictStep()
 			if got := step.Model.List(); !slices.Equal(got, []string{free, paid}) {

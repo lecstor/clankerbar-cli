@@ -78,7 +78,8 @@ func (c *Config) ConflictStep() ConflictStep {
 			step.Model = implRoutes
 		} else {
 			// A different harness is a different dialect with its own default
-			// model; another harness's alias would be a name it does not serve.
+			// route list; another harness's alias would be a name it does not
+			// serve.
 			step.Model = c.SessionFor(step.Harness).Model
 		}
 	}

@@ -15,10 +15,11 @@ package supervisor
 //  1. takes the plane CLAIM itself, so the claim is the lock an agent close-out
 //     and this path both race for. A refused claim means someone else has the
 //     task: no session is started.
-//  2. starts ONE session, on the fleet's IMPLEMENT harness/model routes unless
+//  2. runs the session on the fleet's IMPLEMENT harness/model routes unless
 //     the config's `conflict` step names its own, and logs one line with the
 //     task, the PR, the conflicting paths and the outcome. An attempt that ends
-//     on a usage limit is re-run on the next model in the list (CLA-890).
+//     on a usage limit is re-run on a later route in the list (CLA-890), so a
+//     conflict can cost more than one short session.
 //  3. lets the session do the work under that claim: merge the base into the
 //     branch (never a rebase), resolve only the conflicting hunks, run the
 //     repo-wide gate, push, and hand the task back. The brief is short and lives
@@ -597,14 +598,21 @@ func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, re
 		label = req.TaskID
 	}
 	return runConflictModelLadder(label, req, adapter, func(model string, routes []string) (harness.Result, error) {
-		attempt := req
-		attempt.Model, attempt.Routes = model, routes
-		inv, err := conflictInvocation(cfg, slug, attempt, step)
+		inv, err := conflictInvocation(cfg, slug, conflictAttemptRequest(req, model, routes), step)
 		if err != nil {
 			return harness.Result{}, err
 		}
 		return adapter.Invoke(ctx, inv)
 	})
+}
+
+// conflictAttemptRequest is the request ONE ladder attempt runs: the conflict
+// request carrying that attempt's model and the routes still left from it. Split
+// out so a test can follow a retry all the way to the invocation it composes.
+func conflictAttemptRequest(req ConflictRunRequest, model string, routes []string) ConflictRunRequest {
+	attempt := req
+	attempt.Model, attempt.Routes = model, routes
+	return attempt
 }
 
 // conflictModelRun launches ONE conflict session pinned to model, offered the
@@ -621,7 +629,7 @@ type conflictLimitReader interface {
 
 // runConflictModelLadder runs the conflict session on the step's first model and,
 // when an attempt ends on a usage limit while a model is left, runs the session
-// again on the next one (CLA-890).
+// again on a later route still left (CLA-890).
 //
 // The classification is the harness's own DetectLimit — the same one the phase
 // ladder's limit branch reads — so a limit the adapter already handled by
@@ -659,6 +667,16 @@ func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimi
 		}
 		log.Printf("conflict: %s PR %s - attempt on %s (route %d of %d)", label, req.PR, name, i+1, len(models))
 		res, err = run(model, models[i:])
+		// A stream that could not be read whole is not evidence a limit was hit:
+		// the limit event the classifier read may not be the session's last word.
+		// The phase ladder ends such an attempt unclassified, and the opencode
+		// adapter declines to act on it for the same reason — so the ladder must
+		// not turn it into a fresh paid session on the next route.
+		if res.Untrusted != "" {
+			log.Printf("conflict: %s PR %s - %s ended on a stream that could not be read whole (%s) - not classifying it as a limit",
+				label, req.PR, name, res.Untrusted)
+			return res, err
+		}
 		lim := a.DetectLimit(res)
 		if !lim.Limited {
 			// The adapter may have switched routes MID-session and finished the
