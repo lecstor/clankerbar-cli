@@ -414,7 +414,12 @@ func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	// wall-clock kill can land mid-turn, but a cap is an orderly end with its
 	// own marker — retrying it would re-spend against the same cap and parking
 	// it would read a doing-its-job backstop as a silent death.
-	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
+	// CLA-877: a report-resume failure is a resume-only failure and rides the same
+	// retry ladder, but under a different claim disposition: the session's own
+	// run is not what failed, so the claim is KEPT and the retry resumes it
+	// rather than settling, expiring the lease and re-claiming.
+	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
+		(deadPhase(at.res) || at.toolLoop != "" || at.res.ReportResumeFailed != "")
 }
 
 // openPhaseEnd books the exit into the dead-phase tally and starts the

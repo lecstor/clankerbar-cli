@@ -106,12 +106,34 @@ func TestRunnerCloseOutBriefKeepsItsHandBack(t *testing.T) {
 	}
 }
 
-// Every brief still ends at handoffGuidance: a declared handoff is the one way a
-// session ends without the phase's own ending.
+// Every report-writing brief still ends at handoffGuidance, optionally followed
+// by the report reminder: a declared handoff is the one way a session ends
+// without the phase's own ending, and the reminder defers to it explicitly.
 func TestRunnerBriefsEndAtHandoffGuidance(t *testing.T) {
 	for _, tc := range runnerBriefs() {
-		if !strings.HasSuffix(tc.brief, handoffGuidance) {
-			t.Errorf("the %s brief does not end with the handoff guidance", tc.name)
+		tail := strings.TrimSuffix(tc.brief, runnerReportReminder)
+		if !strings.HasSuffix(tail, handoffGuidance) {
+			t.Errorf("the %s brief does not end with the handoff guidance (optionally followed by the report reminder)", tc.name)
+		}
+	}
+}
+
+// The report reminder is the brief's last word for every phase that owes a
+// report, and names the marker so a session that reads only the tail cannot
+// mistake the contract for prose.
+func TestRunnerReportReminderIsLast(t *testing.T) {
+	for _, tc := range runnerBriefs() {
+		if !tc.doneReport {
+			if strings.Contains(tc.brief, runnerReportReminder) {
+				t.Errorf("the %s brief carries the report reminder but owes no report", tc.name)
+			}
+			continue
+		}
+		if !strings.HasSuffix(tc.brief, runnerReportReminder) {
+			t.Errorf("the %s brief does not end with the report reminder", tc.name)
+		}
+		if !strings.Contains(runnerReportReminder, DoneMarker) {
+			t.Errorf("the report reminder does not name the marker %q", DoneMarker)
 		}
 	}
 }
