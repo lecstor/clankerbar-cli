@@ -117,11 +117,11 @@ func (d *Driver) handBackClaim(ctx context.Context, t Target, res harness.Result
 		return true, false
 	}
 	if !res.Claim.Releasable() {
-		// CLA-708: the claim has pushed work, so Release is forbidden — it would
-		// post `ready` over the branch and throw away the takeover hand-off. The
-		// plane's expireLease ends the dead run's lease NOW and leaves the task an
-		// immediate takeover with its branch, which is the same disposition the
-		// lease's own expiry sweep produces, half an hour sooner.
+		// CLA-708: the claim has pushed work, so ReleaseDriver is forbidden — it
+		// would post `ready` over the branch and throw away the takeover hand-off.
+		// The plane's expireLease ends the dead run's lease NOW and leaves the
+		// task an immediate takeover with its branch, which is the same
+		// disposition the lease's own expiry sweep produces, half an hour sooner.
 		//
 		// Leaving the lease to expire remains the fallback on every failure below
 		// (an unwired plane, a plane older than the field, a refused write), and
@@ -177,7 +177,7 @@ func (d *Driver) handBackClaim(ctx context.Context, t Target, res harness.Result
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 	defer cancel()
 
-	if err := t.Releaser.Release(rctx, res.Claim.TaskID, res.Claim.RunID); err != nil {
+	if err := t.Releaser.ReleaseDriver(rctx, res.Claim.TaskID, res.Claim.RunID); err != nil {
 		if !errors.Is(err, plane.ErrNotWired) {
 			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
 		}
@@ -198,7 +198,7 @@ func (d *Driver) handBackClaim(ctx context.Context, t Target, res harness.Result
 // refusal falls back to the pre-CLA-708 behaviour — leave the lease to expire —
 // and says which refusal it got.
 //
-// The call is detached from ctx and bounded exactly like the Release call: a
+// The call is detached from ctx and bounded exactly like the ReleaseDriver call: a
 // cancelled run (Ctrl-C, SIGTERM, RESTART_NOW) is precisely when a claim would
 // otherwise be abandoned, so the handback has to outlive the signal that
 // prompted it without letting a wedged plane hold up shutdown.

@@ -2031,16 +2031,19 @@ type releaseCall struct{ taskID, runID string }
 // test on this fake runs the UNWIRED-plane path, where every seam is judged on
 // branch evidence alone (CLA-457) and the review-only outcome gate has nothing
 // to read. Tests that need the plane's task state use wiredReleaser below.
+//
+// calls records every handback the driver made. plane.Releaser has no unmarked
+// release since CLA-556 — the marked form is the only one — so there is nothing
+// here to tell apart.
 type fakeReleaser struct {
 	calls       []releaseCall
-	driverCalls []releaseCall
 	expireCalls []releaseCall
 	err         error
 	expireErr   error
-	onCall      func() // fired inside Release, to observe what has NOT happened yet
+	onCall      func() // fired inside the handback, to observe what has NOT happened yet
 }
 
-func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error {
+func (f *fakeReleaser) ReleaseDriver(_ context.Context, taskID, runID string) error {
 	f.calls = append(f.calls, releaseCall{taskID, runID})
 	if f.onCall != nil {
 		f.onCall()
@@ -2048,14 +2051,10 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 	return f.err
 }
 
-func (f *fakeReleaser) ReleaseDriver(_ context.Context, taskID, runID string) error {
-	f.driverCalls = append(f.driverCalls, releaseCall{taskID, runID})
-	return f.err
-}
-
 // ExpireLease records the CLA-708 handback. The two lists are separate because
-// which one a branch-bearing claim uses is the whole safety property: Release
-// would post `ready` over the branch, ExpireLease keeps it for takeover.
+// which one a branch-bearing claim uses is the whole safety property:
+// ReleaseDriver would post `ready` over the branch, ExpireLease keeps it for
+// takeover.
 func (f *fakeReleaser) ExpireLease(_ context.Context, taskID, runID string) error {
 	f.expireCalls = append(f.expireCalls, releaseCall{taskID, runID})
 	return f.expireErr

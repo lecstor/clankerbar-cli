@@ -50,11 +50,11 @@ func serve(t *testing.T, status int, body string) (*httptest.Server, *capture) {
 	return srv, got
 }
 
-func TestRelease_RequestShape(t *testing.T) {
+func TestReleaseDriver_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 
-	if err := New(srv.URL+"/mcp/demo", "k-1").Release(context.Background(), "t-1", "r-1"); err != nil {
-		t.Fatalf("Release: %v", err)
+	if err := New(srv.URL+"/mcp/demo", "k-1").ReleaseDriver(context.Background(), "t-1", "r-1"); err != nil {
+		t.Fatalf("ReleaseDriver: %v", err)
 	}
 
 	if got.method != http.MethodPost {
@@ -83,17 +83,23 @@ func TestRelease_RequestShape(t *testing.T) {
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
 	}
-	// The default handback is the call itself: neither the expiry nor the driver
-	// marker is set, and a handback must not carry a status or an outcome. The
-	// session may have written an outcome; releasing must not clobber it.
-	for _, forbidden := range []string{"expire", "driver", "checkGreen", "status", "outcome", "delivery"} {
+	// CLA-556: this is the driver's handback, so it must carry the marker that
+	// tells the plane a driver ended the run rather than the session handing it
+	// back. There is no unmarked release in the client, so this test is the whole
+	// discrimination on the wire.
+	if args["driver"] != true {
+		t.Errorf("arguments = %+v, want driver=true - a release this client makes is always a driver's", args)
+	}
+	// Neither an expiry nor a status/outcome write rides a release: the session
+	// may have written an outcome, and releasing must not clobber it.
+	for _, forbidden := range []string{"expire", "checkGreen", "status", "outcome", "delivery"} {
 		if _, present := args[forbidden]; present {
 			t.Errorf("release must not carry %q: %+v", forbidden, args)
 		}
 	}
 }
 
-func TestRelease_ResponseHandling(t *testing.T) {
+func TestReleaseDriver_ResponseHandling(t *testing.T) {
 	tests := []struct {
 		name       string
 		status     int
@@ -142,7 +148,7 @@ func TestRelease_ResponseHandling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv, _ := serve(t, tt.status, tt.body)
-			err := New(srv.URL+"/mcp/demo", "k-1").Release(context.Background(), "t-1", "r-1")
+			err := New(srv.URL+"/mcp/demo", "k-1").ReleaseDriver(context.Background(), "t-1", "r-1")
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected an error, got nil")
@@ -153,7 +159,7 @@ func TestRelease_ResponseHandling(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("Release: %v", err)
+				t.Fatalf("ReleaseDriver: %v", err)
 			}
 		})
 	}
@@ -166,7 +172,7 @@ func TestNew_NotWired(t *testing.T) {
 		{"neither", "", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			err := New(tt.url, tt.key).Release(context.Background(), "t-1", "r-1")
+			err := New(tt.url, tt.key).ReleaseDriver(context.Background(), "t-1", "r-1")
 			if !errors.Is(err, ErrNotWired) {
 				t.Errorf("err = %v, want ErrNotWired", err)
 			}
@@ -175,7 +181,7 @@ func TestNew_NotWired(t *testing.T) {
 }
 
 // Both ids are required: a half-claim must never reach the plane as a write.
-func TestRelease_RequiresBothIDs(t *testing.T) {
+func TestReleaseDriver_RequiresBothIDs(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 	r := New(srv.URL+"/mcp/demo", "k-1")
 
@@ -184,7 +190,7 @@ func TestRelease_RequiresBothIDs(t *testing.T) {
 		{"no run", "t-1", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := r.Release(context.Background(), tt.task, tt.run); err == nil {
+			if err := r.ReleaseDriver(context.Background(), tt.task, tt.run); err == nil {
 				t.Fatal("expected an error")
 			}
 			if got.method != "" {
@@ -213,9 +219,9 @@ func TestRecordBranch_RequestShape(t *testing.T) {
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" || args["branch"] != "clanker/x" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1 branch=clanker/x", args)
 	}
-	// The whole distinction from Release. record_progress has no status field at
-	// all, but it can carry an outcome and a delivery, so those must stay absent:
-	// this call is a hand-off record and nothing else.
+	// The whole distinction from ReleaseDriver. record_progress has no status
+	// field at all, but it can carry an outcome and a delivery, so those must
+	// stay absent: this call is a hand-off record and nothing else.
 	for _, forbidden := range []string{"outcome", "delivery"} {
 		if _, present := args[forbidden]; present {
 			t.Errorf("a branch record carried %q (%+v) - it must revise the record and nothing else", forbidden, args)
@@ -446,9 +452,9 @@ func TestAskProjectQuestion_FailureIsQuestionNotFiled(t *testing.T) {
 }
 
 // Heartbeat (CLA-358) renews a live claim's lease. The request shape is pinned
-// for the same reason Release's is: the loop beats on this every ten minutes
-// for the life of every session, and a shape drift would read as "renewal
-// failing" on every run at once.
+// for the same reason ReleaseDriver's is: the loop beats on this every ten
+// minutes for the life of every session, and a shape drift would read as
+// "renewal failing" on every run at once.
 
 func TestHeartbeat_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
@@ -533,25 +539,6 @@ func TestExpireLease_RequestShape(t *testing.T) {
 	}
 }
 
-func TestReleaseDriver_RequestShape(t *testing.T) {
-	srv, got := serve(t, http.StatusOK, okBody)
-
-	if err := New(srv.URL+"/mcp/demo", "k-1").ReleaseDriver(context.Background(), "t-1", "r-1"); err != nil {
-		t.Fatalf("ReleaseDriver: %v", err)
-	}
-	params, _ := got.body["params"].(map[string]any)
-	if params["name"] != "release_task" {
-		t.Errorf("tool = %v, want release_task", params["name"])
-	}
-	args, _ := params["arguments"].(map[string]any)
-	if args["driver"] != true {
-		t.Errorf("arguments = %+v, want driver=true", args)
-	}
-	if _, present := args["expire"]; present {
-		t.Errorf("ReleaseDriver must not send expire: %+v", args)
-	}
-}
-
 // CLA-748: the merge attestation is a RECORD write. It goes through
 // record_progress with the delivery echoed whole, and it must NOT call
 // complete_task - attesting a delivery is not closing the task, and a CLI that
@@ -601,7 +588,6 @@ func TestUnknownTool_NamesTheRequiredPlaneVersionAndDoesNotRetry(t *testing.T) {
 		tool string
 		call func(Releaser) error
 	}{
-		{"Release", "release_task", func(r Releaser) error { return r.Release(context.Background(), "t-1", "r-1") }},
 		{"ReleaseDriver", "release_task", func(r Releaser) error { return r.ReleaseDriver(context.Background(), "t-1", "r-1") }},
 		{"ExpireLease", "release_task", func(r Releaser) error { return r.ExpireLease(context.Background(), "t-1", "r-1") }},
 		{"RecordBranch", "record_progress", func(r Releaser) error {
