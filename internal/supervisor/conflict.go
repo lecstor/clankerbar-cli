@@ -329,10 +329,10 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 		return
 	}
 
-	// The session did not hand the task back: it is still held. Release it, run or
-	// no run, and classify by the marker the session left (a mechanical resolution
-	// whose release call failed is still mechanical; a session that left no marker
-	// is a failure).
+	// The session did not hand the task back: it is still held. Release it and
+	// classify by the marker the session left (a mechanical resolution whose
+	// release call failed is still mechanical; a session that left no marker is a
+	// failure).
 	//
 	// The plane serves PRESENCE only (CLA-509), so there is no holder id to compare
 	// against ours. The release call is the check instead: signing it with our own
