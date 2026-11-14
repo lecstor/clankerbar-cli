@@ -1627,7 +1627,7 @@ resolved path:
 
 ```sh
 touch ~/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP   # stop gracefully (responsive even mid-wait)
-clankerbar ctl restart    # finish the session, then re-exec at the iteration boundary
+clankerbar ctl restart    # finish the session, then re-exec at the next phase seam or iteration boundary
 clankerbar ctl restart --now   # kill the in-flight session, release its claim, re-exec now
 clankerbar ctl reload     # re-read the config file at the next boundary, no exec
 ```
@@ -1635,14 +1635,20 @@ clankerbar ctl reload     # re-read the config file at the next boundary, no exe
 `ctl` writes a marker into the same state dir (`RESTART` / `RESTART_NOW` /
 `RELOAD`, read exactly where `STOP` is read), resolved from `-c <config>` —
 plus `--workdir`, if the daemon was launched with that override — the same way
-`run` resolves them. A **graceful restart** never cuts a session short:
-the daemon finishes what it is doing, holds no claim across the iteration
-boundary (the plane keeps all durable state, so resume is by construction),
-then re-execs itself with the **same argv and environment**, through its launch
-path - so restarting after installing a new build runs the new build. **Reload**
-re-reads the config file at the next iteration boundary without replacing
-anything: budget, ceiling, prompt and poll-interval edits apply to the next
-iteration; harness, env and binary changes need a restart.
+`run` resolves them. `STOP` and `RESTART` act at the **next phase seam or
+iteration boundary**. A phase seam is the moment one phase of a task's sequence
+has checkpointed and the next is about to start: the daemon releases the claim
+(no session is running, so nothing is killed or lost) and stops, or re-execs,
+and the next claim resumes the next phase from its checkpoint. That is what
+bounds a stop or a restart to one phase session — normally 10-20 minutes —
+instead of a whole task sequence. A **graceful restart** never cuts a session
+short: the daemon finishes what it is doing, holds no claim across the boundary
+(the plane keeps all durable state, so resume is by construction), then re-execs
+itself with the **same argv and environment**, through its launch path - so
+restarting after installing a new build runs the new build. **Reload** re-reads
+the config file at the next iteration boundary without replacing anything:
+budget, ceiling, prompt and poll-interval edits apply to the next iteration;
+harness, env and binary changes need a restart.
 
 On a **supervised** child there is nothing to reach for: the file its `-c`
 names is the supervisor's generated `materialized.json`, not the base config
@@ -1665,8 +1671,12 @@ if your workdir happens to contain `~/.local/state`.
 You can also **pause a run remotely from the clankerbar web console** (Settings →
 Pause) — per project. A paused project stops getting new sessions (other projects
 keep draining) and the loop idle-polls until you Resume — without exiting, and
-without killing an in-flight session (a pause is honoured between iterations, like
-`STOP`). Remote pause rides on the driver's cheap backlog read, so it needs a
+without killing an in-flight session. A pause only gates **new claims**: the task
+already in flight runs every remaining phase of its sequence to the end, and the
+next claim waits for the pause to clear. That is deliberately unlike `STOP`,
+which now also acts at a phase seam (handing the in-flight task back to the
+queue for another clanker to resume); pausing is how you get the current task
+finished. Remote pause rides on the driver's cheap backlog read, so it needs a
 **wired poller**: a `CLANKERBAR_API_KEY` and a resolvable plane URL. Your
 **account key** (mint at `clankerbar.com/account/api-keys`) is the normal choice —
 the driver polls the project-in-path summary route whenever it knows the slug, which

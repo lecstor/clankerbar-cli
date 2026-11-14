@@ -269,6 +269,14 @@ walk:
 		if st.panelMember && st.end.reviewRound > 0 {
 			s.panelRound = st.end.reviewRound
 		}
+		// CLA-879: STOP and RESTART act HERE, on the seam a verified checkpoint
+		// has just opened, rather than waiting for the whole sequence to finish.
+		// Reaching this point means this phase checkpointed and the next one is
+		// about to spawn on the held claim; no marker means the walk advances
+		// exactly as it always did.
+		if s.stopAtSeamMarker(ctx, st, s.i+1) {
+			break walk
+		}
 		s.i++
 	}
 

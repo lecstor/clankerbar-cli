@@ -503,14 +503,14 @@ func (d *Driver) checkMarkers() bool {
 		log.Print("STOP requested — stopping")
 		return true
 	}
-	// The restart/reload markers (CLA-461), honoured exactly where STOP is:
-	// the ITERATION boundary. Never a mid-drain phase seam — the run holds
-	// the task there. Reaching this point means the previous drain has fully
-	// unwound and handed its claim back, so a graceful restart holds no claim
-	// across the boundary by construction (resume is the plane's job anyway).
-	// A RESTART_NOW consumed here found no session in flight and acts as a
-	// plain restart; when one IS in flight the watcher in watchRestartNow has
-	// already cancelled the drain and this block is never reached.
+	// The restart/reload markers (CLA-461), honoured exactly where STOP is: the
+	// ITERATION boundary and, for STOP and RESTART, a verified phase seam
+	// (CLA-879). Reaching this point means the previous drain has fully unwound
+	// and handed its claim back, so a graceful restart holds no claim across the
+	// boundary by construction (resume is the plane's job anyway). A RESTART_NOW
+	// consumed here found no session in flight and acts as a plain restart; when
+	// one IS in flight the watcher in watchRestartNow has already cancelled the
+	// drain and this block is never reached.
 	if present, msg := d.readMarker(MarkerRestart); present {
 		_ = d.state.Remove(MarkerRestart)
 		if msg != "" {

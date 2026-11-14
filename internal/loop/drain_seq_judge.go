@@ -308,6 +308,13 @@ func (s *drainSeq) judgeVerifyGate(ctx context.Context, st *seqStep) seqNext {
 		localRounds := s.verifyRoundsRun + 1
 		capHit := st.end.verifyCounted >= config.ReviewRoundCap || localRounds >= config.ReviewRoundCap
 		if reason == "" && !capHit && fixIdx >= 0 && st.end.checkpoint && s.carried != nil {
+			// CLA-879: the rewind spawns the fix phase on the same verified
+			// checkpoint, so it is a phase seam too: a STOP or RESTART dropped
+			// during the verification round must act here, not after the fix
+			// round it would otherwise start.
+			if s.stopAtSeamMarker(ctx, st, fixIdx) {
+				return seqBreak
+			}
 			for _, id := range st.end.verifyResolvedIDs {
 				s.verifyResolved[id] = true
 			}
