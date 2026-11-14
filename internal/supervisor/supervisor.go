@@ -199,12 +199,12 @@ type Options struct {
 	VersionOf func() string
 
 	// VerifyTimeout is how long the phase-5b roll waits for ONE child's next
-	// beacon to report the target version before halting the roll — and, since
-	// phase 5c, how long the replace waits for the whole fleet to drain before
-	// halting the replacement. 0 = defaultVerifyTimeout. A drain finishes at
-	// the child's next phase seam or iteration boundary, so the wait must be generous; the cap
-	// exists so a child that never comes back halts the roll — or a child that
-	// never drains halts the replacement — instead of hanging it.
+	// beacon to report the target version before halting the roll. It also
+	// bounds the phase-5c replacement's one unavoidable wait: a conflict-only
+	// session (CLA-759) is an in-process goroutine that exec cannot carry
+	// across, so the replace waits for it to finish before the handoff. The
+	// fleet itself no longer drains for a replacement — the children are
+	// adopted across the exec. 0 = defaultVerifyTimeout.
 	VerifyTimeout time.Duration
 
 	// LaunchVersion reports the version of the binary at the fleet's launch
@@ -221,8 +221,8 @@ type Options struct {
 	// binary at the fleet's launch path, invoked with the same argv and env
 	// (phase 5c). Nil = the platform's exec(2). The hook exists so tests can
 	// simulate the replacement without exec'ing the test binary over itself:
-	// the drain happens before it, and a returned error resumes the loop with
-	// the marker already consumed.
+	// the handoff is written before it, and a returned error keeps the old
+	// image and its children and deletes the handoff.
 	ExecInPlace func(bin string, argv []string, env []string) error
 
 	// PlaneFor builds the write client the supervisor uses to hand a dead
@@ -415,11 +415,13 @@ type Supervisor struct {
 	// "exited" (which would imply a crash left it down).
 	stopping bool
 
-	// replacing is true only for the duration of drainForReplace: a child the
-	// supervisor itself drained for a REPLACE is reported "stopped" (a
-	// planned upgrade), not "exited" (a crash). It must NOT be d.stopping:
-	// a timed-out drain resumes the loop and respawns the fleet, so the flag
-	// cannot mean "this supervisor is exiting".
+	// replacing is set only by the no-exec(2) drain path (replace_drain.go,
+	// behind the build tag): a child the supervisor itself drained for a
+	// REPLACE is reported "stopped" (a planned upgrade), not "exited" (a
+	// crash). It must NOT be d.stopping: a timed-out drain resumes the loop
+	// and respawns the fleet, so the flag cannot mean "this supervisor is
+	// exiting". On platforms with exec(2) the fleet never drains for a
+	// replacement, so this stays false.
 	replacing bool
 
 	// closeOutSaid remembers the last close-out line logged per key, so an
@@ -438,6 +440,11 @@ type Supervisor struct {
 	// closeOutWG tracks that pass, so a fleet stop can wait (bounded) for it to
 	// hand back a claim it had already taken.
 	closeOutWG sync.WaitGroup
+
+	// adoptWG tracks the reapers and the roll goroutine started by adoption
+	// across an exec(2) replacement, so a fleet stop can wait for them to
+	// finish after stopAll has drained every child.
+	adoptWG sync.WaitGroup
 
 	// conflictBusy is set while a conflict-only session runs (CLA-759): at most
 	// one at a time on this supervisor, so a second conflicting task waits for the
@@ -522,18 +529,27 @@ func Supervise(ctx context.Context, o Options) error {
 	// all a burst of simultaneous exits needs.
 	d.exits = make(chan exitEvent, 16)
 
+	// A re-exec'd supervisor starts here: the previous image wrote the handoff
+	// before exec'ing this one, and its children are still our children. Adopt
+	// them BEFORE the first reconcile, so the reconcile sees them alive and
+	// spawns no duplicate; the returned instances are rolled onto this binary
+	// after the first roster refresh.
+	adopted := d.adoptReplaceHandoff()
+
 	if err := d.reconcile(); err != nil {
 		return err
 	}
-	if d.entries == nil {
+	if d.entries == nil && len(d.instances) == 0 {
 		// The plane was unreachable at start and no cached roster exists;
-		// reconcile already said so. Nothing to supervise.
+		// reconcile already said so. Nothing to supervise. Adopted children
+		// keep the loop alive below, because their processes are still ours.
 		return nil
 	}
 	if len(d.instances) == 0 {
 		log.Print("roster holds no local instances - nothing to supervise")
 		return nil
 	}
+	d.startAdoptedRoll(adopted)
 
 	pollTicker := time.NewTicker(d.o.PollInterval)
 	defer pollTicker.Stop()
@@ -549,6 +565,11 @@ func Supervise(ctx context.Context, o Options) error {
 			// what lets it release the claim it holds rather than leaving it to
 			// expire.
 			d.waitConflict()
+			// Adopted reapers and the adopted-child roll stop with the context;
+			// stopAll has already drained every child, so their Wait4 calls are
+			// returning and this wait only keeps the process alive long enough
+			// for them to finish cleanly.
+			d.adoptWG.Wait()
 			return err
 		case ev := <-d.exits:
 			d.onExit(ev.inst, ev.err, ev.at)
@@ -574,16 +595,16 @@ func (d *Supervisor) reconcile() error {
 		return nil
 	}
 	// The phase-5c replacement gate runs before the roster is even fetched:
-	// the drain acts on the fleet this process already holds, and an
+	// the handoff acts on the fleet this process already holds, and an
 	// unreachable plane must not postpone a replacement the operator asked
-	// for.
+	// for. On unix it execs at once; on a no-exec platform it drains here.
 	d.checkReplace()
 	if d.ctx.Err() != nil {
-		// The fleet stop landed while the replacement drain was in progress
-		// (the drain can hold this pass for up to VerifyTimeout): the drain
-		// aborted, and acting on the roster now could spawn a child stopAll
-		// is about to drain. A cancelled context reconciles to nothing,
-		// exactly as at the top of this pass.
+		// The fleet stop landed while the replacement was in progress (the
+		// no-exec drain or the conflict-session wait can hold this pass for up
+		// to VerifyTimeout): the replacement aborted, and acting on the roster
+		// now could spawn a child stopAll is about to drain. A cancelled
+		// context reconciles to nothing, exactly as at the top of this pass.
 		return nil
 	}
 	entries, err := d.roster.Fetch(d.ctx)
