@@ -180,7 +180,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		d.fleetOpenQ[ti] = d.openQs[ti]
 		why := fmt.Sprintf("Each task died producing nothing (final step reason %q, no branch recorded) before this", deadReason(res))
 		if res != nil && res.ReportResumeFailed != "" {
-			why = "Each task's session delivered its work but its done report could not be re-emitted (the provider stream kept hanging) before this"
+			why = fmt.Sprintf("Each task's session delivered its work but could not re-emit its done report (%s) before this", res.ReportResumeFailed)
 		}
 		body := fmt.Sprintf(
 			"**%d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks.** %s, so the driver paused this project rather than burning more sessions against a provider that is already known to be failing.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",

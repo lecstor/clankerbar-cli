@@ -720,8 +720,10 @@ type Result struct {
 
 	// ReportResumeFailed is the cause when the adapter's bounded re-emission of
 	// a refused done report failed: it stalled on a silent provider and was
-	// killed by the REPORT RESUME's own short idle bound, or its process errored
-	// before producing a reply (CLA-877). Empty for every other end.
+	// killed by the REPORT RESUME's own short idle bound, its process errored
+	// before producing a reply, its reply was still not a report the runner could
+	// apply, or the phase's wall clock left no room to resume at all (CLA-877).
+	// Empty for every other end.
 	//
 	// It is deliberately separate from IdleKilled: the session's own run ended
 	// as it did (usually cleanly, with its work pushed), and only the follow-up

@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	// opencodeReportWallClockMsg is the console line for the one place the report
-	// resume's wall-clock gate declines: the remaining budget is under the
-	// continuation floor, so a resume could only be cap-killed on arrival.
-	opencodeReportWallClockMsg = "!! wall-clock budget exhausted before the report resume — leaving the report as it was\n"
+	// opencodeReportWallClockMsg is the console line for the two places the
+	// report resume's wall-clock gate declines: the remaining budget is under
+	// the continuation floor, so a resume could only be cap-killed on arrival.
+	// The report stays refused and the marker makes the phase fail closed.
+	opencodeReportWallClockMsg = "!! wall-clock budget exhausted before the report resume — leaving the report refused\n"
 
 	// opencodeReportResumeAttempts bounds the resume processes ONE refused report
 	// earns. A silent provider hang is usually transient, so a stalled resume is
@@ -115,9 +116,12 @@ func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *R
 // the steer. A resume that stalls on a silent provider earns ONE fresh attempt
 // with the same steer (CLA-877): a hang is usually transient, and the alternative
 // is losing the phase — and every finished, pushed commit in it — to a bound
-// tuned for a working session. A second stall, or a resume process that errors,
-// fails closed: the report stands refused, the session's OWN end is left
-// untouched, and Result.ReportResumeFailed names what really failed.
+// tuned for a working session. A second stall, a resume process that errors, a
+// reply the runner still cannot apply, or a wall clock with no room left to
+// resume all fail closed: the report stands refused, the session's OWN end is
+// left untouched, and Result.ReportResumeFailed names what really failed. That
+// marker is STICKY once a stall is seen — no later return may leave the phase
+// looking like a clean end.
 //
 // mergeResume replaces FinalMessage with the continuation's, so a corrected
 // report is what the runner reads off this Result.
@@ -140,8 +144,12 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 		return
 	}
 	// The wall clock is checked only once a resume is owed: its line must not
-	// describe a report that passed.
+	// describe a report that passed. A resume the budget leaves no room to START
+	// is still a resume-only failure — the report stays refused — so it must
+	// fail closed too, or the phase advances on a report the runner never
+	// accepted (an implement phase would checkpoint on its pushed branch).
 	if !deadline.IsZero() && time.Until(deadline) < opencodeResumeWallClockFloor {
+		res.ReportResumeFailed = reportResumeWallClockCause(time.Until(deadline))
 		if in.Console != nil {
 			fmt.Fprint(in.Console, opencodeReportWallClockMsg)
 		}
@@ -152,10 +160,25 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 		fmt.Fprintf(in.Console, "\n!! done report refused (%v) — resuming session %s up to %d times to re-emit it (idle bound %s each)\n",
 			checkErr, sid, opencodeReportResumeAttempts, reportResumeIdle(in.MaxSessionIdle))
 	}
+	// stalled is the first attempt's idle cause, made STICKY: once a resume has
+	// gone silent, every later return that leaves the report refused must fail
+	// closed on that stall. Returning without the marker would leave the
+	// session's own clean exit as the phase's whole verdict, which is how an
+	// implement phase checkpoints on its branch and advances to review with no
+	// delivery record (review finding 1.review-1.1).
+	stalled := ""
 	for attempt := 1; attempt <= opencodeReportResumeAttempts; attempt++ {
 		if !deadline.IsZero() && time.Until(deadline) < opencodeResumeWallClockFloor {
-			if in.Console != nil {
-				fmt.Fprint(in.Console, opencodeReportWallClockMsg)
+			if stalled != "" {
+				res.ReportResumeFailed = stalled
+				if in.Console != nil {
+					fmt.Fprintf(in.Console, "!! report resume stalled (%s) and the wall-clock budget is now exhausted — failing closed on the stall; the session's own end stands\n", stalled)
+				}
+			} else {
+				res.ReportResumeFailed = reportResumeWallClockCause(time.Until(deadline))
+				if in.Console != nil {
+					fmt.Fprint(in.Console, opencodeReportWallClockMsg)
+				}
 			}
 			return
 		}
@@ -184,6 +207,7 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 			// way, and adopting it would brand the whole phase dead (CLA-868).
 			chargeReportResume(res, contRes)
 			if attempt < opencodeReportResumeAttempts {
+				stalled = contRes.IdleKilled
 				if in.Console != nil {
 					fmt.Fprintf(in.Console, "!! report resume stalled (%s) — retrying it with the same steer\n", contRes.IdleKilled)
 				}
@@ -196,24 +220,69 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 			}
 			return
 		}
-		mergeResume(res, contRes)
-		verr := in.CheckReport(res.FinalMessage)
-		// The driver applies a report only on an orderly end or a recovered one, so
-		// a corrected report on any other end is text nothing will ever read.
-		usable := res.ExitCode == 0 || RecoveredErrors(*res) > 0
-		if in.Console == nil {
+		// The resume ran. Judge BEFORE merging: the runner applies a report only
+		// on an orderly end or a recovered one, so a reply that still fails the
+		// check, or an end no report is ever read on (a cap kill, a non-zero exit
+		// with nothing recovered, a tool loop, an untrusted capture), produced
+		// nothing the runner can act on. Merging that end would brand the whole
+		// phase with the resume's process outcome, and NOT merging it while
+		// leaving the marker empty is the fail-open this finding is about: the
+		// session's own clean exit would read as a finished phase.
+		verr := in.CheckReport(contRes.FinalMessage)
+		if verr != nil || !reportResumeUsable(contRes) {
+			chargeReportResume(res, contRes)
+			res.ReportResumeFailed = reportResumeUnusable(contRes, verr)
+			if in.Console != nil {
+				fmt.Fprintf(in.Console, "!! report resume done — %s; leaving the report as it was (the session's own end stands)\n",
+					res.ReportResumeFailed)
+			}
 			return
 		}
-		switch {
-		case verr != nil:
-			fmt.Fprintf(in.Console, "!! report resume done — the report still fails the check (%v); the runner will fail closed\n", verr)
-		case !usable:
-			fmt.Fprintf(in.Console, "!! report resume done — the corrected report passes the check, but the resumed session ended %s, so the runner will not apply it\n", res.ExitString())
-		default:
+		mergeResume(res, contRes)
+		if in.Console != nil {
 			fmt.Fprint(in.Console, "!! report resume done — the corrected report passes the check\n")
 		}
 		return
 	}
+}
+
+// reportResumeUsable reports whether the runner would APPLY a completed resume's
+// report: it must end the way a report is read on (a clean exit, or a non-zero
+// one the harness itself recovered from) and its capture must be trustworthy.
+// A tool-loop kill is none of those, exactly as it is not for the session.
+func reportResumeUsable(contRes Result) bool {
+	if contRes.Untrusted != "" || contRes.ToolLoop != "" || contRes.IdleKilled != "" {
+		return false
+	}
+	return contRes.ExitCode == 0 || RecoveredErrors(contRes) > 0
+}
+
+// reportResumeUnusable names why a completed resume left no report the runner
+// can act on. The cause rides Result.ReportResumeFailed, which the driver prints
+// as "failed re-emitting its done report (<cause>)".
+func reportResumeUnusable(contRes Result, verr error) string {
+	cause := "the report resume produced no report the runner can apply"
+	if verr != nil {
+		cause += " (the report still fails the check: " + verr.Error() + ")"
+	}
+	switch {
+	case contRes.Untrusted != "":
+		cause += " (its capture was untrusted)"
+	case contRes.ToolLoop != "":
+		cause += " (it was killed for repeating a failing tool call)"
+	case contRes.ExitCode != 0 && RecoveredErrors(contRes) == 0:
+		cause += " (it ended " + contRes.ExitString() + ")"
+	}
+	return cause
+}
+
+// reportResumeWallClockCause is the marker for a refused report whose resume
+// the phase's wall clock left no room to start. No process ran, but the report
+// is still refused, so the phase must fail closed and be retried under the
+// claim rather than advance on it.
+func reportResumeWallClockCause(remaining time.Duration) string {
+	return fmt.Sprintf("the phase's wall-clock budget left %s before the report resume, under the %s floor",
+		remaining.Round(time.Second), opencodeResumeWallClockFloor)
 }
 
 // chargeReportResume charges one report-resume process's spend and folds its
