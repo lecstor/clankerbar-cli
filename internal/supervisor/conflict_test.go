@@ -212,6 +212,119 @@ func TestConflictSessionSafetyNetReleasesAStrandedClaim(t *testing.T) {
 	}
 }
 
+// serveClaimOutcome rewrites the claim response so the conflict path takes the
+// given outcome as its pre-session baseline. The plane serves the task view
+// (outcome included) beside the run credential at the claim, and that view is the
+// only copy of the pre-session text a holder can get (CLA-509).
+func (f *closeOutFixture) serveClaimOutcome(outcome string) {
+	f.plane.serveTool("claim_task", fmt.Sprintf(
+		`{"task":{"id":%q,"outcome":%q},"run":{"id":%q}}`,
+		closeOutTestTask, outcome, closeOutTestRunCredential))
+}
+
+// CLA-889: the brief tells the session to copy the stored outcome verbatim and
+// append its block, so a re-offered task carries older attempts' markers ABOVE
+// this session's. The safety-net release classifies only what THIS session wrote:
+// an unchanged outcome is "no marker" (never an older attempt's attestation), and
+// a changed one is read on its LAST marker.
+func TestConflictSessionClassifiesOnlyThisSessionsWrite(t *testing.T) {
+	const (
+		oldMechanical = "The reviewed evidence.\n\nRESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept both sides"
+		newFailed     = "RESOLUTION: failed\n\n- the free quota was exhausted before the merge"
+		newMechanical = "RESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept both sides"
+	)
+
+	for _, tc := range []struct {
+		name       string
+		prior      string
+		after      string
+		checkGreen bool
+		wantLog    []string
+	}{
+		{
+			name:  "a dead retry writes nothing, so the older mechanical is not this session's attestation",
+			prior: oldMechanical,
+			after: oldMechanical,
+			// The merge this session was to make never happened: a green
+			// attestation would exempt the PR from the plane's repair ladder.
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the session left no resolution marker", "claim released, task left approved"},
+		},
+		{
+			name:       "a session that wrote prose but no marker is still a failure",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\nI could not finish.",
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the session left no resolution marker", "claim released, task left approved"},
+		},
+		{
+			name:       "a new failed marker wins over the older mechanical",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\n" + newFailed,
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the free quota was exhausted", "claim released, task left approved"},
+		},
+		{
+			name:       "a new mechanical marker is the session's own green attestation",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\n" + newMechanical,
+			checkGreen: true,
+			wantLog:    []string{"outcome: mechanical"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := conflictingFixture(t)
+			f.serveClaimOutcome(tc.prior)
+			// The stranded shape: the session died before handing the task back.
+			f.plane.serveTool("get_task", fmt.Sprintf(
+				`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":%q}}`,
+				closeOutTestTask, closeOutTestRef, tc.after))
+			d := f.supervisor(0)
+
+			lines := f.run(d)
+
+			releases := f.callsFor("release_task")
+			if len(releases) != 1 {
+				t.Fatalf("release_task calls = %d, want the one safety-net release: %v", len(releases), releases)
+			}
+			if got := releases[0].args["checkGreen"]; got != tc.checkGreen {
+				t.Errorf("checkGreen = %v, want %v (only this session's marker may classify the release): %v", got, tc.checkGreen, releases[0].args)
+			}
+			for _, want := range tc.wantLog {
+				if !strings.Contains(lines, want) {
+					t.Errorf("the log does not say %q:\n%s", want, lines)
+				}
+			}
+		})
+	}
+}
+
+// The exact CLA-884 shape: a conflict session dies without writing anything, so
+// the outcome carries no RESOLUTION marker at all. The task is still in_progress
+// and held, and the safety-net release must fire and say it handed the claim back.
+func TestConflictSessionNoMarkerStillReleasesTheStrandedClaim(t *testing.T) {
+	f := conflictingFixture(t)
+	f.plane.serveTool("get_task", fmt.Sprintf(
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"I looked at the conflict."}}`,
+		closeOutTestTask, closeOutTestRef))
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	releases := f.callsFor("release_task")
+	if len(releases) != 1 {
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
+	}
+	if got := releases[0].args["checkGreen"]; got != false {
+		t.Errorf("a no-marker session released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
+	}
+	for _, want := range []string{"the session left no resolution marker", "claim released, task left approved"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the incident-shaped log does not say %q:\n%s", want, lines)
+		}
+	}
+}
+
 func TestConflictSessionLogsAReleaseRefusedAsNotHolding(t *testing.T) {
 	f := conflictingFixture(t)
 	// The task is still in_progress and held, but the release is refused as

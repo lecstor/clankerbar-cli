@@ -9,8 +9,8 @@ import (
 
 // taskReadReleaser is a fakeReleaser that can also read the queue head and one
 // task's holder state — the shape the real mcpReleaser has since CLA-437 and
-// CLA-451. `state` answers TaskState per task id; a missing id decodes to a zero
-// TaskState ("ready", no holder, no branch), like the plane's nulls.
+// CLA-636. `state` answers TaskState per task id; a missing id decodes to a zero
+// TaskState (empty status, no holder, no branch), like the plane's nulls.
 type taskReadReleaser struct {
 	fakeReleaser
 	next     plane.NextTask

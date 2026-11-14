@@ -28,24 +28,12 @@ import (
 // the session it would have spawned is itself about to need the plane anyway.
 
 // NextTask is what the queue-head peek learned. Repo is the task's `repo`
-// field, empty when the task carries none (or there is nothing queued). The
-// custody fields describe the offer at the read; nothing in the driver routes on
-// them today, but they are part of the served shape and are decoded so a caller
-// can see what the plane offered.
+// field, empty when the task carries none (or there is nothing queued). Only the
+// identity and the repo are decoded: the peek exists to steer the spawn cwd, and
+// the offer's custody fields are read by the session that claims it, not here.
 type NextTask struct {
 	TaskID string
 	Repo   string
-	// Status is the plane's status word at the read ("ready", "in_progress", …).
-	Status string
-	// Branch is the branch name at the read. `next_task` always sends one (a
-	// synthesized name for a task with no recorded work), so hasWip — not a
-	// non-empty branch — is what distinguishes recorded WIP.
-	Branch string
-	// HasWIP reports a branch RECORDED on the task at the read.
-	HasWIP bool
-	// RequiresTakeover is the plane's own flag that this offer is abandoned
-	// work which can only be claimed with takeover: true.
-	RequiresTakeover bool
 }
 
 // TaskPeeker reads which task a FRESH phase would claim, so its repo can steer
@@ -171,7 +159,7 @@ type ReviewFindingState struct {
 }
 
 // TaskStateSource reads one task's holder state: the seam's exit-evidence and
-// review-baseline reads, and the close-out's post-claim check. Like both reads
+// review-baseline reads, and the conflict close-out's post-session read. Like both reads
 // above, it is a READ of one named task — it holds nothing and claims nothing —
 // and best-effort by contract: an error degrades the caller's decision, never a
 // failed run by itself.
@@ -204,14 +192,7 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 	if offer.Next == nil || offer.Next.ID == "" {
 		return NextTask{}, nil
 	}
-	return NextTask{
-		TaskID:           offer.Next.ID,
-		Repo:             offer.Next.Repo,
-		Status:           offer.Next.Status,
-		Branch:           offer.Next.Branch,
-		HasWIP:           offer.Next.HasWIP,
-		RequiresTakeover: offer.Next.RequiresTakeover,
-	}, nil
+	return NextTask{TaskID: offer.Next.ID, Repo: offer.Next.Repo}, nil
 }
 
 // TaskRepo calls get_task for one task and returns its `repo` field. The
@@ -245,7 +226,7 @@ func (r *mcpReleaser) TaskRepo(ctx context.Context, taskID string) (string, erro
 // noCode flag. The response is accepted in
 // both envelopes the plane has used (see TaskRepo). A field the plane sends as
 // null decodes to empty, like repo above — an unheld task reads as
-// status "ready" (or whatever it moved to) with no run and no branch, which is
+// status "ready" (or whatever it moved to) with no holder and no branch, which is
 // exactly the shape the caller's guard wants to see.
 func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, error) {
 	if taskID == "" {

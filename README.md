@@ -294,9 +294,12 @@ parsing clankerbar tool calls out of its stream, and the plane's task reads serv
 only *presence* now (CLA-509): a run id is half a bearer credential. A claim
 taken through a channel the driver cannot observe therefore cannot be resumed by
 the driver either — the recovered claim would have no credential to heartbeat
-with, to close a review round with, or to sign the next phase's writes. Phased
-runs do not depend on that observation: the driver takes the drain's claim itself
-before the first phase, so every phase resumes a claim it holds. The old CLA-451
+with, to close a review round with, or to sign the next phase's writes. A
+runner-claimed phased drain does not depend on that observation: the driver takes
+the claim itself before the first phase, so every phase resumes a claim it holds.
+A phased run on the session-claim path — any phase with a custom `prompt`, a
+blind run, or a target whose claimer is not wired — still depends on the harness
+observing the claim, and ends the sequence if it does not. The old CLA-451
 checkpoint peek, which asked `get_task` about the briefed task, was removed with
 the field it read.
 

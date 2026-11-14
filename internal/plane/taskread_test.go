@@ -64,28 +64,17 @@ func TestPeekNextTask(t *testing.T) {
 			t.Errorf("arguments = %#v, want an empty object, not nil or null", params["arguments"])
 		}
 	})
-	t.Run("takeover candidate carries the custody shape", func(t *testing.T) {
-		// The queue head is also the spawn's repo route; its custody fields are
-		// still served, and pinned here so a wire change is visible.
+	t.Run("custody fields at the read do not disturb the peek", func(t *testing.T) {
+		// The plane still serves the offer's custody fields; the peek decodes only
+		// the identity and repo it routes on, and a wire change to the rest must
+		// not break the spawn.
 		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":{"id":"t-3","ref":"CLA-3","repo":"o/r","status":"in_progress","branch":"clanker/x","hasWip":true,"requiresTakeover":true}}`))
 		next, err := mustClient(t, srv).PeekNextTask(ctx)
 		if err != nil {
 			t.Fatalf("PeekNextTask: %v", err)
 		}
-		if next.Status != "in_progress" || !next.HasWIP || !next.RequiresTakeover || next.Branch != "clanker/x" {
-			t.Errorf("next = %+v, want the takeover candidate's custody (in_progress, clanker/x, hasWip, requiresTakeover)", next)
-		}
-	})
-	t.Run("ready head has no custody", func(t *testing.T) {
-		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":{"id":"t-4","repo":"o/r","status":"ready","branch":"clanker/t-4","hasWip":false,"requiresTakeover":false}}`))
-		next, err := mustClient(t, srv).PeekNextTask(ctx)
-		if err != nil {
-			t.Fatalf("PeekNextTask: %v", err)
-		}
-		// branchView always sends a branch NAME; hasWip is the recorded flag, and
-		// only that one means work already exists.
-		if next.Status != "ready" || next.HasWIP || next.RequiresTakeover {
-			t.Errorf("next = %+v, want a ready head with no recorded WIP", next)
+		if want := (NextTask{TaskID: "t-3", Repo: "o/r"}); next != want {
+			t.Errorf("next = %+v, want %+v", next, want)
 		}
 	})
 	t.Run("empty queue", func(t *testing.T) {
@@ -180,9 +169,9 @@ func TestTaskRepo(t *testing.T) {
 	})
 }
 
-// The CLA-451/CLA-889 read of a task's holder state off get_task: whether a run
-// holds it (heldByRun), whether work is handed over (branch), and in which
-// envelope. The fields are null/false on an unheld task and must decode so.
+// The CLA-889 read of a task's holder state off get_task: whether a run holds it
+// (heldByRun), whether work is handed over (branch), and in which envelope. The
+// fields are null/false on an unheld task and must decode so.
 func TestTaskState(t *testing.T) {
 	ctx := context.Background()
 	t.Run("the production wire shape", func(t *testing.T) {
