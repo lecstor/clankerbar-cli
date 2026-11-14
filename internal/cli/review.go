@@ -198,20 +198,20 @@ connects no MCP config: the change itself is the whole subject, and the JSON is
 the whole deliverable. The reviewed repository is only read from; nothing is
 edited, committed or pushed.
 
-  --repo <path>            local git checkout (default: .)
-  --base <commit>          commit the review diffs from (required)
-  --head <commit>          commit the review diffs to (default: HEAD)
-  --method <method>        "single-pass" (or "single") or "maps-session"
-                           (default: single-pass)
-  --harness <name>         harness to run on (default: opencode)
-  --model <alias>          model to review on (empty: the harness's default)
-  --notes-model <alias>    maps-session: model for the notes turns
-  --findings-model <alias> maps-session: model for the findings turn
-  --chunk-size <n>         maps-session: map items per notes turn (default: 25)
-  --flow-max <n>           maps-session: flow-map item cap (default: 40)
-  --title <text>           optional title of the change
-  --description-file <f>   optional file describing the change
-  --json <file>            write the JSON to a file (default: stdout)
+  --repo <path>             local git checkout (default: .)
+  --base <commit>           commit the review diffs from (required)
+  --head <commit>           commit the review diffs to (default: HEAD)
+  --method <method>         "single-pass" (or "single") or "maps-session"
+                            (default: single-pass)
+  --harness <name>          harness to run on (default: opencode)
+  --model <alias>           model to review on (empty: the harness's default)
+  --notes-model <alias>     maps-session: model for the notes turns
+  --findings-model <alias>  maps-session: model for the findings turn
+  --chunk-size <n>          maps-session: map items per notes turn (default: 25)
+  --flow-max <n>            maps-session: flow-map item cap (default: 40)
+  --title <text>            optional title of the change
+  --description-file <f>    optional file describing the change
+  --json <file>             write the JSON to a file (default: stdout)
 
 The JSON carries the resolved base/head commits, the method, the model per
 stage, the findings, the omitted count, the maps-session notes and the session's
