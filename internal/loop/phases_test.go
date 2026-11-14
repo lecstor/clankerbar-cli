@@ -532,7 +532,7 @@ func TestDrainPhases_AResumedPhaseTransientExitDoesNotTickTheDeadCounters(t *tes
 	// production shape, and an unwired one would be refused before the blip
 	// this test is about could happen.
 	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: "implemented: pushed clanker/x\n"}
+		return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: "implemented: pushed clanker/x\n"}
 	}}
 	d := phaseDriverWithReleaser(t, h, three, rel)
 
@@ -734,7 +734,7 @@ func TestDrainPhases_AResumedPhaseLimitDoesNotAdvanceToTheNextPhase(t *testing.T
 	// outcome for the seam's freshness baseline (CLA-663): the wired plane is
 	// the production shape.
 	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: "implemented: pushed clanker/x\n"}
+		return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: "implemented: pushed clanker/x\n"}
 	}}
 	d := phaseDriverWithReleaser(t, h, three, rel)
 
@@ -1372,7 +1372,7 @@ func TestDrainPhases_AReloadMidDrainDoesNotReshapeTheInFlightSequence(t *testing
 			{res: checkpointed(1, 0)},             // next drain: FINAL review
 		}}
 		rel := &wiredReleaser{state: func() plane.TaskState {
-			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+			return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: outcome}
 		}}
 		d := phaseDriverWithReleaser(t, h, []config.Phase{impl, review, fix}, rel)
 		s := &fakeSalvager{out: savedOutcome()}
@@ -2466,7 +2466,7 @@ type wiredParkingReleaser struct {
 }
 
 func (w *wiredParkingReleaser) TaskState(context.Context, string) (plane.TaskState, error) {
-	return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: w.outcome}, nil
+	return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: w.outcome}, nil
 }
 
 // A dead phase on a RESUMED middle phase is not retried: the retry cannot be
@@ -2753,7 +2753,7 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 	}
 	return plane.TaskState{
 		Status:            r.status,
-		ClaimedByRun:      r.holder,
+		HeldByRun:         r.holder != "",
 		Outcome:           r.outcome,
 		DeliveryNoCode:    r.noCode,
 		Reviews:           served,
@@ -3374,7 +3374,7 @@ func TestDrainPhases_AnUnreadableBaselineRefusesBeforeTheReviewSpawns(t *testing
 		}}
 		rel := &wiredReleaser{
 			state: func() plane.TaskState {
-				return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+				return plane.TaskState{Status: "in_progress", HeldByRun: true}
 			},
 			err: func() error { return errors.New("plane blip: read timeout") },
 		}
@@ -3405,7 +3405,7 @@ func TestDrainPhases_AnUnreadableBaselineRefusesBeforeTheReviewSpawns(t *testing
 		}}
 		rel := &wiredReleaser{
 			state: func() plane.TaskState {
-				return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+				return plane.TaskState{Status: "in_progress", HeldByRun: true}
 			},
 			err: func() error { return errors.New("plane blip") },
 		}
@@ -3486,7 +3486,7 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 			{res: held(okResult(1, 0), openClaim())}, // review-only: appends its block and holds
 			{res: okResult(1, 0)},                    // no-code fix
 		}}
-		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		rel := &taskReadReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		h.onInvoke = func(i int) {
 			if i == 1 { // the review appends its block; a durable record is NOT attempted for a settled task
 				st := rel.state["t-1"]
@@ -3517,7 +3517,7 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // review reached the backlog, records nothing
 			{res: okResult(1, 0)},                                // must NEVER run
 		}}
-		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		rel := &taskReadReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		d := phaseDriverWithReleaser(t, h, phases, rel)
 
 		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
@@ -3536,7 +3536,7 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // review reached the backlog, edits the outcome without adding a block
 			{res: okResult(1, 0)},                                // must NEVER run
 		}}
-		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": {Status: "in_review", Outcome: oldBlock}}}
+		rel := &taskReadReleaser{state: map[string]plane.TaskState{"t-1": {Status: "in_review", Outcome: oldBlock}}}
 		h.onInvoke = func(i int) {
 			if i == 1 { // some other statusless edit; the old block is still the last one
 				st := rel.state["t-1"]
@@ -3586,7 +3586,7 @@ func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
 	}
 	rel := &wiredReleaser{
 		state: func() plane.TaskState {
-			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome, Reviews: reviews}
+			return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: outcome, Reviews: reviews}
 		},
 		err: func() error {
 			if blip {
@@ -4287,7 +4287,7 @@ func TestSalvage_SkipsTheReviewOnlyPhase(t *testing.T) {
 		{Name: config.FixPhaseName},
 	}
 	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+		return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: outcome}
 	}}
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)

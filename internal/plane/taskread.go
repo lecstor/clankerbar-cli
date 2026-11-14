@@ -78,9 +78,9 @@ type TaskState struct {
 
 	// DeliveryNoCode reports the task record's delivery.noCode flag: the
 	// plane's first-class "this task shipped no code" declaration. It rides
-	// the SAME get_task read as everything above — one peek mechanism
-	// (CLA-451), extended rather than duplicated (CLA-497) — so a reader of
-	// the holder state never needs a second round-trip to learn it.
+	// the SAME get_task read as everything above, extended rather than
+	// duplicated (CLA-497), so a reader of the holder state never needs a
+	// second round-trip to learn it.
 	DeliveryNoCode bool
 
 	// Outcome is the task's outcome text. The review seam reads the legacy
@@ -183,9 +183,7 @@ type TaskStateSource interface {
 // find work, which is a read and not a claim: it holds nothing, so the peek
 // cannot race a session out of work. It may hand back a stale-lease takeover
 // candidate; that is still the task the spawned session will be offered first,
-// so its repo is the right cwd to start in. The custody fields NextTask carries
-// let the caller tell that takeover candidate apart from a task nobody held at
-// spawn time (CLA-476).
+// so its repo is the right cwd to start in.
 //
 // The arguments are an EMPTY OBJECT, not nil: the plane's next_task schema is
 // `inputSchema: {}` and MCP servers reject a null `arguments` against an object

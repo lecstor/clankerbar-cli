@@ -2,7 +2,6 @@ package loop
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -630,81 +629,4 @@ func attributionOr(v, fallback string) string {
 		return fallback
 	}
 	return v
-}
-
-// peekCheckpointClaim asks the plane whether the task this phase was BRIEFED on
-// is now held, with a branch recorded, by some run of this project's key — the
-// claim a session took through a channel the driver cannot observe (CLA-451:
-// a raw API call with the same credential, a harness quirk, a renamed tool).
-// It returns that claim as a synthesized Result for the seam to gate and carry,
-// or nil when today's ending should stand.
-//
-// nil is returned — and the standard ending follows — when: the driver never
-// knew which task it briefed (empty id; nothing to ask about); the target has
-// no plane reads wired; the read fails (a plane blip degrades exactly like the
-// spawn-dir peek does); or the answer is not unambiguous custody — status
-// still "in_progress", a holding run, AND a recorded branch, all three. A task
-// that moved on (reviewed, done, released) was settled by its own session and
-// the sequence is over; a hold without a branch is the empty exit CLA-457
-// already refuses to advance on.
-//
-// CLA-476: the hold must also be NEW. `hold` is the task's custody at SPAWN
-// time (see briefedHold); a task already held-with-branch then is refused, and
-// only a task that moved into that shape during the phase is recovered. The one
-// exception is the exact task a predecessor held (hold.Exact), whose identity is
-// not a guess.
-//
-// The transition is necessary, not sufficient: a task that was `ready` at spawn
-// and is held at the end may have been claimed by a DIFFERENT run during the
-// phase. That run's branch is likewise not this phase's work, but the blind path
-// cannot tell — it never saw the claim, and the plane does not say which key
-// holds the task. Closing it needs the end-time ClaimedByRun compared against a
-// run this drain actually held (CLA-888).
-//
-// The three fields together are also the honest boundary of what this can
-// know: the plane does not expose WHICH key holds a task, so "some run of this
-// project's credential" is approximated by "held at all". The driver shares
-// one key with every session it spawns, the briefed task came from this
-// driver's own dispatch, and a wrong attribution fails safe — a foreign run's
-// id seeds a heartbeat the plane refuses, ending the drain loudly rather than
-// silently stranding work.
-func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int, phaseLabel, briefedTask string, hold briefedHold) *harness.Result {
-	if briefedTask == "" {
-		return nil
-	}
-	src, ok := t.Releaser.(plane.TaskStateSource)
-	if !ok {
-		return nil
-	}
-	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	st, err := src.TaskState(sctx, briefedTask)
-	switch {
-	case err == nil:
-	case errors.Is(err, plane.ErrNotWired):
-		return nil
-	default:
-		log.Printf("%siteration %d: %s ended without an observed claim; the plane read of %s failed (%v) — keeping today's ending rather than guessing",
-			labelOf(t), drainNum, phaseLabel, briefedTask, err)
-		return nil
-	}
-	if st.Status != "in_progress" || st.ClaimedByRun == "" || st.Branch == "" {
-		return nil
-	}
-	if !hold.Exact && hold.HeldWithBranch {
-		held := "a branch (not read at spawn)"
-		if hold.Branch != "" {
-			held = fmt.Sprintf("branch %q", hold.Branch)
-		}
-		log.Printf("%siteration %d: %s ended without an observed claim, but %s was ALREADY held with %s when the phase spawned — that hold predates the phase (a stale-lease takeover candidate or another run's work), so it is not this phase's checkpoint; keeping today's ending",
-			labelOf(t), drainNum, phaseLabel, briefedTask, held)
-		return nil
-	}
-	return &harness.Result{Claim: harness.Claim{
-		TaskID: briefedTask,
-		Ref:    st.Ref,
-		RunID:  st.ClaimedByRun,
-		HasWIP: true,
-		Branch: st.Branch,
-	}}
 }

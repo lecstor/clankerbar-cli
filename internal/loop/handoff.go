@@ -118,17 +118,13 @@ func parseHandoff(final string) (prompt string, found bool, refusal string) {
 //     so the driver holds no task/run ids - and without them the resume
 //     preamble cannot be seeded: handing the successor a brief carrying literal
 //     placeholders is worse than refusing. A marker from an unobserved claim is
-//     therefore refused even though the plain checkpoint path now CAN recover
-//     ids from the plane (CLA-451): there the successor runs a DRIVER-authored
-//     brief on the task the driver itself dispatched, while here the marker
-//     would seed a SESSION-authored prompt, and the guards against self-directed
-//     injection were sized for sessions whose claim state was observed. The
-//     refusal stays as stated, and any lease the session did take is left to
-//     expire — or, since CLA-451, handed to the next phase when the plane
-//     confirms the briefed task held with a verified branch. Otherwise the
-//     plane's expiry sweep is the path that still gets the work picked up with
-//     its context intact: it keeps a recorded branch attached as the takeover
-//     hand-off.
+//     therefore refused: the successor runs a SESSION-authored prompt, and the
+//     guards against self-directed injection were sized for sessions whose claim
+//     state was observed. The claim cannot be recovered from the plane either:
+//     get_task serves presence only, and a run id is a bearer credential no read
+//     returns (CLA-889). The lease is left to expire, and the plane's expiry
+//     sweep is the path that gets the work picked up with its context intact: it
+//     keeps a recorded branch attached as the takeover hand-off.
 func detectHandoff(drainNum int, t Target, res harness.Result) string {
 	prompt, found, refusal := parseHandoff(res.FinalMessage)
 	if !found || res.Untrusted != "" {
