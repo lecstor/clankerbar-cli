@@ -92,6 +92,32 @@ func TestWriteStopTreatsAnExistingMarkerAsPending(t *testing.T) {
 	}
 }
 
+// An adopted child is alive before its first config build, so writeStop must
+// not need one: the adopted-child STOP path opens the state dir with no
+// configured session roots. Every other stop test builds an Instance with a
+// config, so this is the nil branch the guard exists for.
+func TestWriteStopWithNoConfigWritesTheMarker(t *testing.T) {
+	_, dir := writeStopFixture(t)
+
+	var buf lockedBuffer
+	captureLog(t, &buf)
+
+	inst := &Instance{name: "adopted"}
+	if got := (&Supervisor{}).writeStop(inst, dir); got != stopWritten {
+		t.Fatalf("writeStop with no config = %v, want stopWritten", got)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "STOP")); err != nil {
+		t.Errorf("STOP after writeStop: %v, want the marker written", err)
+	}
+	if !strings.Contains(buf.String(), "STOP written to "+dir) {
+		t.Errorf("log = %q, want the write line naming %s", buf.String(), dir)
+	}
+	// A second stop with the marker in place is pending, not a failure.
+	if got := (&Supervisor{}).writeStop(inst, dir); got != stopPending {
+		t.Errorf("second writeStop = %v, want stopPending", got)
+	}
+}
+
 // A symlink planted at STOP is not a marker, whatever it points at: the daemon
 // refuses to read a control marker through one, so treating the ErrExists as
 // pending would promise a drain that never comes. The loud failure line is the

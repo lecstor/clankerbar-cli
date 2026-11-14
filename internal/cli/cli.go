@@ -71,13 +71,14 @@ Usage:
   clankerbar supervise replace  Replace the SUPERVISOR itself in place: run
                                 this from the new build after installing it at
                                 the fleet's launch path (and after the roll).
-                                The running supervisor drains every child at
-                                its next phase seam or iteration boundary and then execs the
-                                launch path, so the fleet comes back under the
-                                new supervisor; a child that never drains
-                                halts the replacement. The launchd/systemd
-                                fallback: restart the unit after the drain
-                                instead.
+                                The running supervisor hands its live children
+                                to the new image and execs the launch path at
+                                once — no child is signalled and nothing is
+                                drained. The new image adopts them by pid and
+                                rolls each older-version child onto itself at
+                                that child's own phase seam or iteration
+                                boundary; idle children come back at once. A
+                                unit restart still drains, and is the fallback.
   clankerbar version            Print the version.
   clankerbar help               Show this help.
 

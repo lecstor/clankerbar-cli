@@ -175,17 +175,20 @@ func Roll(ctx context.Context, args []string) error {
 // verifies that the fleet's launch path carries the version THIS binary runs
 // (the same pre-flight the roll performs — the replacement execs the launch
 // path, so the new build must already be installed there), then writes the
-// REPLACE marker the RUNNING supervisor honours at its next poll: drain every
-// child at its next phase seam or iteration boundary, then exec the launch path in place.
+// REPLACE marker the RUNNING supervisor honours at its next poll: it hands its
+// live children to the new image and execs the launch path in place, at once.
+// The new image adopts the children by pid and rolls each one still on the old
+// version onto itself at that child's own phase seam or iteration boundary, so
+// no session is interrupted.
 //
 // The launchd/systemd fallback (Decision 5): operators who run the supervisor
 // under an OS-level unit have a second path with the same contract — install
-// the new build at the launch path, let the fleet drain, then restart the
-// unit. Exec-in-place exists so a supervisor NOT under a unit (a terminal)
+// the new build at the launch path, then restart the unit (a unit stop still
+// drains). Exec-in-place exists so a supervisor NOT under a unit (a terminal)
 // replaces itself without a process gap; on a platform without exec(2) the
 // unit path is the only one.
 //
-// Unlike the roll, the replacement request touches no roster: the drain and
+// Unlike the roll, the replacement request touches no roster: the handoff and
 // the exec are the supervisor's own, from the fleet it holds in memory — so
 // the account key is not part of this command's wiring.
 func Replace(ctx context.Context, args []string) error {

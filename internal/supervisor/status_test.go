@@ -694,62 +694,59 @@ func TestStatusReportShutdownTransitionBeforeTheDrainEnds(t *testing.T) {
 	})
 }
 
-// A REPLACE drain is a stop the supervisor ordered, so the children it drained
-// must read as `stopped` (a planned upgrade), never `exited` (a fleet crash).
-// The exec hook keeps the supervisor alive, so the drained report stays in the
-// plane's history while the fleet respawns afterwards.
-func TestStatusReportReplaceDrainReportsStopped(t *testing.T) {
-	cacheDir := t.TempDir()
-	setHelperMode(t, "sleep")
-	plane := &fakePlane{}
-	plane.set([]RosterEntry{runEntry("daemon-one", "")})
-	srv := plane.serve(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	o := testOptions(t, cacheDir, srv)
-	o.LaunchVersion = func() (string, error) { return version.Current, nil }
-	o.VerifyTimeout = 5 * time.Second
-	rec := &execRecorder{}
-	o.ExecInPlace = rec.hook()
-	done := runSupervise(ctx, o)
-
-	state := entryStateDir(cacheDir, "daemon-one")
-	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
-
-	if err := Replace(context.Background(), o); err != nil {
-		t.Fatalf("Replace returned %v, want nil", err)
+// An adopted child is running from the first report after a replace: its pid
+// came across the exec in the handoff, its version is the one recorded for it,
+// and its `since` is the original spawn time — the console never sees a live
+// child as offline during a replace.
+func TestStatusReportAdoptedChildReportsRunning(t *testing.T) {
+	spawnedAt := time.Date(2026, 11, 14, 13, 29, 0, 0, time.UTC)
+	inst := &Instance{
+		name:         "clanker1",
+		desired:      RosterDesiredRunning,
+		cmd:          &exec.Cmd{Process: &os.Process{Pid: 4242}},
+		aliveSince:   spawnedAt,
+		childVersion: "0.25.6",
 	}
-	waitFor(t, 5*time.Second, "the exec to be invoked after the drain", func() bool {
-		return rec.len() == 1
-	})
+	d := &Supervisor{hostname: "headless", startedAt: spawnedAt.Add(time.Hour), instances: []*Instance{inst}}
+	got := d.statusInstance(inst)
+	if got.State != StatusRunning {
+		t.Errorf("adopted state = %q, want running", got.State)
+	}
+	if got.ChildVersion != "0.25.6" {
+		t.Errorf("adopted childVersion = %q, want 0.25.6", got.ChildVersion)
+	}
+	if !got.Since.Equal(spawnedAt) {
+		t.Errorf("adopted since = %v, want the original spawn time %v", got.Since, spawnedAt)
+	}
+	if text := d.fleetStatus(); !strings.Contains(text, "clanker1: running (pid 4242, version 0.25.6)") {
+		t.Errorf("fleet listing does not name the adopted pid/version:\n%s", text)
+	}
+}
 
-	var drained *statusBodyInstance
-	waitFor(t, 5*time.Second, "the replace drain reported as stopped", func() bool {
-		for _, rep := range plane.statusReports(t) {
-			if inst := runningInstance(rep, "daemon-one"); inst != nil &&
-				inst.State == StatusStopped && strings.Contains(inst.Reason, "replacing myself") {
-				drained = inst
-				return true
-			}
+// An adopted child's exit comes from wait4, not exec.Cmd, so it carries its
+// own ExitCode method. The status surface must report the real code, not the
+// generic -1 a plain error would produce.
+func TestStatusAdoptedChildExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"exit status", &adoptedExitError{code: 7, msg: "exit status 7"}, 7},
+		{"signal", &adoptedExitError{code: -1, msg: "signal: killed"}, -1},
+	} {
+		inst := &Instance{
+			name:         "clanker1",
+			desired:      RosterDesiredRunning,
+			exited:       true,
+			exitErr:      tc.err,
+			exitAt:       time.Now(),
+			childVersion: "0.25.6",
 		}
-		return false
-	})
-	if drained.NextRetryAt != nil {
-		t.Errorf("drained row carries nextRetryAt = %v; a replace never schedules a retry", *drained.NextRetryAt)
-	}
-	if drained.LastExit == nil {
-		t.Error("drained row carries no lastExit")
-	}
-
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Supervise returned %v, want nil", err)
+		got := (&Supervisor{}).statusInstance(inst)
+		if got.LastExit == nil || got.LastExit.Code != tc.want {
+			t.Errorf("%s: LastExit = %+v, want code %d", tc.name, got.LastExit, tc.want)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Supervise did not return after the stop")
 	}
 }
 

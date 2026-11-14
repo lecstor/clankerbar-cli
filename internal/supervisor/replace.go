@@ -2,12 +2,11 @@ package supervisor
 
 // Replace — phase 5c of the daemon-supervisor proposal
 // (docs/proposals/daemon-supervisor.md in the clankerbar repo): the
-// supervisor replaces ITSELF in place once its children are drained — the
-// last phase-5 step, deliberately so, because the replacement is irreducibly
-// local. The supervisor holds no work of its own (Decision 5): a fleet
-// upgrade finishes with one operation that swaps the process every child
-// respawns through, after the roll (5b) has already moved each child onto the
-// new binary one at a time.
+// supervisor replaces ITSELF in place, WITHOUT idling the fleet. The
+// supervisor holds no work of its own (Decision 5): a fleet upgrade finishes
+// with one operation that swaps the process every child respawns through,
+// after the roll (5b) has already moved each child onto the new binary one at
+// a time.
 //
 // The mechanism is exec-in-place (exec(2)): the running supervisor process
 // replaces its own image with the binary at the fleet's launch path, invoked
@@ -20,29 +19,51 @@ package supervisor
 // the running supervisor honours the marker at its next poll, and a marker a
 // supervisor starts later finds stale and discards.
 //
-// The gate the phase is named for: the replacement happens ONLY after every
-// child is drained. Each child gets a STOP marker (the same write a fleet
-// stop performs) and exits at its next phase seam or iteration boundary — an in-flight session
-// finishes — and the exec waits for all of them. The wait is bounded by
-// VerifyTimeout: a child that never drains HALTS the replacement, the
-// children that did drain are respawned (from the launch path, which carries
-// the new build), the marker is consumed so nothing re-triggers, and the
-// operator fixes the stuck child and re-runs the command. A child that fails
-// to drain is never killed and never exec'd over: a fleet that is not drained
-// keeps running, on the old supervisor.
+// The running supervisor, at its next poll:
 //
-// Scoping is the roll's (Decision 7): the drain acts on the supervisor's own
-// instances, which reconcile builds from LOCAL placements only — remote
+//  1. Writes a handoff file into its cache dir, atomically: every live child's
+//     name, pid, materialized config path, recorded version and spawn time,
+//     plus its own pid and version (adopt.go).
+//  2. Execs the launch binary AT ONCE. It writes no STOP to any child and
+//     waits for no drain. exec(2) keeps the pid, so the new image is still the
+//     children's parent and the child sessions are never interrupted.
+//  3. The new image consumes the handoff only when the supervisor pid it
+//     records is its own; a file from an earlier process is stale and
+//     discarded, exactly as a REPLACE marker is. Each live child is adopted as
+//     a running instance, not respawned, and reports `running` with its pid
+//     and version from the first status report — the console never sees a live
+//     child as offline during a replace. The new image reaps the adopted pid
+//     itself (exec.Cmd's Wait died with the old image) and feeds the ordinary
+//     exit path, so backoff and respawn are unchanged. A handoff pid that is
+//     not our child (`wait4` returns ECHILD) reads as an exit, and the next
+//     reconcile respawns it.
+//  4. Each adopted child whose recorded version is older than this image is
+//     moved onto it through the same RESTART roll the one-shot command
+//     performs, one at a time and idle children first: an idle child comes
+//     back at once, a busy one at its own phase seam or iteration boundary. A
+//     child spawned after the swap is already on the new binary.
+//
+// An exec failure is the old image continuing with its children untouched: it
+// logs the failure and removes the handoff, so no later process can adopt it.
+// The marker was already consumed, so installing/fixing the launch path and
+// re-running the command is the whole retry.
+//
+// A conflict-only session (CLA-759) is the one piece of fleet work adoption
+// cannot carry across: it is an in-process goroutine, not an instance, so
+// replacing the image would orphan the harness session it started while that
+// session holds a task claim. When one is running the replacement waits for it
+// (bounded by VerifyTimeout) before the handoff.
+//
+// Scoping is the roll's (Decision 7): the replacement acts on the supervisor's
+// own instances, which reconcile builds from LOCAL placements only — remote
 // entries never become instances, so a replacement never touches them.
 //
-// The launchd/systemd fallback (Decision 5): exec-in-place exists because the
-// supervisor may run in a plain terminal, where no unit exists to restart it.
-// Operators who run the supervisor under an OS-level unit have a second path
-// with the same contract — install the new build at the launch path, let the
-// fleet drain (a console flip of desired state, or the replacement's own
-// drain), then restart the unit, which starts the fresh supervisor from the
-// launch path. On a platform without exec(2) the unit path is the only one;
-// the marker mechanism is identical either way.
+// The launchd/systemd fallback (Decision 5) still exists, and is the only path
+// on a platform without exec(2) (replace_drain.go, behind the build tag): a
+// unit stop is a SIGTERM -> stopAll, which drains the fleet, and the unit then
+// restarts the process from the launch path. That path is no longer how a
+// VERSION swap is performed — the adopt-on-exec path above is — but a unit
+// stop still drains, exactly as it did before.
 
 import (
 	"context"
@@ -51,7 +72,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -71,11 +91,11 @@ const replaceMarkerName = "REPLACE"
 // has state on this machine at all, and writes the REPLACE marker the running
 // supervisor honours at its next poll.
 //
-// The command itself does not drain anything and does not touch the roster:
-// the drain and the exec are the supervisor's, from the fleet it holds in
-// memory. What the command owes the operator is the pre-flight — a marker for
-// a swap that never happened would drain a healthy fleet for nothing — and a
-// loud statement of what happens next.
+// The command itself touches no child and no roster: the handoff and the exec
+// are the supervisor's, from the fleet it holds in memory. What the command
+// owes the operator is the pre-flight — a marker for a swap that never
+// happened would exec over a healthy fleet for nothing — and a loud statement
+// of what happens next.
 func Replace(ctx context.Context, o Options) error {
 	launchV, err := o.launchVersion()
 	if err != nil {
@@ -100,7 +120,7 @@ func Replace(ctx context.Context, o Options) error {
 	if err := writeReplaceMarker(cacheDir, version.Current); err != nil {
 		return fmt.Errorf("supervise replace: cannot request the replacement: %w", err)
 	}
-	log.Printf("supervise replace: REPLACE marker written into %s - the running supervisor drains the fleet and replaces itself at its next poll; a supervisor that starts later discards the marker as stale", cacheDir)
+	log.Printf("supervise replace: REPLACE marker written into %s - the running supervisor hands its live children to the new image and replaces itself at its next poll; the fleet keeps running across the swap. A supervisor that starts later discards the marker as stale", cacheDir)
 	return nil
 }
 
@@ -184,10 +204,11 @@ func parseReplaceMarker(body []byte) (string, time.Time, error) {
 }
 
 // removeReplaceMarker deletes the REPLACE marker. It is consumed before the
-// drain — a drain that fails must not re-trigger on the next poll, and a
-// process killed mid-drain must not leave a marker for the next supervisor to
-// honour — and also when a marker is discarded. A failed removal is logged,
-// never fatal: the stale marker is discarded again on the next poll.
+// replacement is attempted — a refused or failed replacement must not
+// re-trigger on the next poll, and a process killed mid-swap must not leave a
+// marker for the next supervisor to honour — and also when a marker is
+// discarded. A failed removal is logged, never fatal: the stale marker is
+// discarded again on the next poll.
 func (d *Supervisor) removeReplaceMarker() {
 	path := filepath.Join(d.cacheDir, replaceMarkerName)
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -195,18 +216,16 @@ func (d *Supervisor) removeReplaceMarker() {
 	}
 }
 
-// checkReplace is the phase-5c gate, called at the top of every reconcile:
-// a REPLACE marker written after this supervisor started is honoured by
-// draining the fleet and exec'ing the launch path in place; a marker from
-// before this process began is stale and is discarded without a touch.
+// checkReplace is the phase-5c gate, called at the top of every reconcile: a
+// REPLACE marker written after this supervisor started is honoured, a marker
+// from before this process began is stale and is discarded without a touch.
 //
-// The gate's two refusals come before any drain: the launch binary must
-// report the version the marker requests (the operator's install must have
-// landed — the marker's own pre-flight checked it, and the honour-time re-
-// probe closes the gap between the write and the poll), and the fleet must
-// actually drain. A refused or failed replacement leaves the fleet running —
-// the children that drained are respawned — with the marker consumed, so the
-// operator's fix makes re-running the command the whole recovery.
+// The gate's refusals come before any swap: the launch binary must report the
+// version the marker requests (the operator's install must have landed — the
+// marker's own pre-flight checked it, and the honour-time re-probe closes the
+// gap between the write and the poll). A refused replacement leaves the fleet
+// running with the marker consumed, so the operator's fix makes re-running the
+// command the whole recovery.
 func (d *Supervisor) checkReplace() {
 	m := readReplaceMarker(d.cacheDir)
 	if m == nil {
@@ -234,149 +253,36 @@ func (d *Supervisor) checkReplace() {
 		d.removeReplaceMarker()
 		return
 	}
-
-	log.Print("replace: REPLACE honoured - writing STOP to every child; each drains at its next phase seam or iteration boundary")
 	d.removeReplaceMarker()
-	// The drain is a stop the supervisor itself ordered, so for its duration
-	// every row it reports says stopped (not exited, the crash vocabulary) —
-	// this flag, deliberately not d.stopping, whose meaning ("the supervisor
-	// is exiting") must not stick when a timed-out drain resumes the loop.
-	d.replacing = true
-	d.reportStatus()
-	stuck := d.drainForReplace()
-	d.replacing = false
-	if stuck != "" {
-		if d.ctx.Err() != nil {
-			// The fleet stop landed mid-drain: the supervisor exits instead
-			// of replacing itself, and the stop owns the children now — the
-			// marker is already consumed, so nothing re-triggers on the next
-			// supervisor.
-			log.Printf("replace: %s", stuck)
-			return
-		}
-		log.Printf("replace: %s - the fleet is not drained, so no replacement happens; the children that stopped are respawned, and once the stuck child is fixed, re-running `clankerbar supervise replace` is safe", stuck)
+	d.replaceNow()
+}
+
+// replaceByAdoption is the exec(2) path: hand the live fleet to the incoming
+// image, then replace this process at once. Nothing is signalled and nothing
+// is waited for; the new image adopts the children by pid.
+func (d *Supervisor) replaceByAdoption() {
+	if !d.waitForConflictSession() {
 		return
 	}
-	if d.ctx.Err() != nil {
-		return // the fleet stop landed mid-drain; the select loop owns the stop now
+	if d.baseCtx().Err() != nil {
+		return // the fleet stop owns the children now
 	}
-	log.Print("replace: the fleet is drained - replacing myself in place with the launch binary")
+	n, err := d.writeReplaceHandoff()
+	if err != nil {
+		log.Printf("replace: cannot write the handoff file (%v) - refusing the replacement; the fleet keeps running and re-running `clankerbar supervise replace` is safe", err)
+		d.removeReplaceHandoff()
+		return
+	}
+	log.Printf("replace: handoff written for %d live child(ren) - replacing myself in place with the launch binary; the new image adopts them and rolls each onto it at its own phase seam or iteration boundary", n)
 	if err := d.o.execSelf(); err != nil {
-		log.Printf("replace: the replacement exec failed (%v) - the supervisor keeps running and the fleet is respawned; fix the launch path and re-run `clankerbar supervise replace`", err)
+		// The hook returned (production exec never does): the old image keeps
+		// running with its children untouched, and the handoff must not be
+		// adopted by any process other than the one it was written for.
+		log.Printf("replace: the replacement exec failed (%v) - the supervisor keeps running with its children untouched; the handoff is discarded and re-running `clankerbar supervise replace` is safe", err)
+		d.removeReplaceHandoff()
 	}
-}
-
-// drainForReplace stops every live child and waits for the fleet to drain —
-// the same STOP-marker mechanics stopAll performs (each child drains at its next
-// phase seam or iteration boundary; nothing is ever killed) — bounded by VerifyTimeout so a
-// child that never drains HALTS the replacement instead of hanging it, and
-// aborted by context cancellation so the operator's stop lands as the fleet
-// stop it is.
-//
-// The returned string is empty when every child exited; otherwise it is a
-// line naming what the drain was still waiting for, which the caller logs.
-// Every exit event consumed here also marks its instance exited (the flag
-// onExit would set), because the replacement may be called off after all —
-// a timed-out drain resumes the loop, and the children that did drain must
-// read as dead so the next reconcile respawns them.
-func (d *Supervisor) drainForReplace() string {
-	timeout := d.o.VerifyTimeout
-	if timeout <= 0 {
-		timeout = defaultVerifyTimeout
-	}
-	deadline := time.Now().Add(timeout)
-	done := map[*Instance]bool{}      // child exited (event consumed) or never spawned
-	stopped := map[*Instance]bool{}   // a readable STOP marker is in place; awaiting the child's exit
-	attempted := map[*Instance]bool{} // writeStop already ran once for this child this drain
-	waitStart := time.Now()
-	lastLog := waitStart
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	// A conflict-only session is fleet work too (CLA-759): it is not a child
-	// process, so the exit loop cannot see it, and exec'ing over it would kill a
-	// session holding a task claim. Wait for it as well, within the same bound.
-	for len(done) < len(d.instances) || d.conflictBusy.Load() {
-		select {
-		case ev := <-d.exits:
-			ev.inst.mu.Lock()
-			ev.inst.exited = true
-			ev.inst.exitErr = ev.err
-			ev.inst.exitAt = ev.at
-			ev.inst.mu.Unlock()
-			done[ev.inst] = true
-			d.reportStatus()
-		case <-d.ctx.Done():
-			return "the fleet stop landed mid-drain - the children keep draining and the supervisor exits instead of replacing itself"
-		case <-tick.C:
-		}
-		if now := time.Now(); !now.Before(deadline) {
-			return fmt.Sprintf("the fleet did not drain within %s - still waiting for: %s", timeout, drainStuck(d, done))
-		}
-		if now := time.Now(); now.Sub(lastLog) >= d.o.StopLogEvery {
-			lastLog = now
-			log.Printf("replace: still waiting after %s: %s - children stop at their next phase seam or iteration boundary and a conflict-only session finishes on its own; the supervisor keeps waiting rather than killing them",
-				time.Since(waitStart).Round(time.Second), drainStuck(d, done))
-		}
-		for _, inst := range d.instances {
-			if done[inst] || stopped[inst] {
-				continue
-			}
-			inst.mu.Lock()
-			alive := inst.cmd != nil && !inst.exited
-			since := time.Since(inst.aliveSince)
-			dir := inst.stateDir
-			inst.mu.Unlock()
-			if !alive {
-				done[inst] = true
-				continue
-			}
-			if since < d.o.SettleBeforeStop {
-				continue // inside the startup window; the next tick writes it
-			}
-			if _, err := os.Lstat(dir); err != nil {
-				continue // no state dir yet; the next tick writes it
-			}
-			// writeStop both writes the marker and checks one already there,
-			// so the drain does not have to know why a STOP is present — but
-			// it only counts a marker the daemon can read as pending. One
-			// attempt per child: a failure already logged loudly, and retrying
-			// every 50ms would bury that line; the timeout bounds the wait and
-			// the "still waiting" log names the child.
-			if !attempted[inst] {
-				attempted[inst] = true
-				if d.writeStop(inst, dir) != stopFailed {
-					stopped[inst] = true
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// stuckNames lists the instances a drain is still waiting on, sorted.
-func stuckNames(d *Supervisor, done map[*Instance]bool) string {
-	var stuck []string
-	for _, inst := range d.instances {
-		if !done[inst] {
-			stuck = append(stuck, inst.name)
-		}
-	}
-	sort.Strings(stuck)
-	return strings.Join(stuck, ", ")
-}
-
-// drainStuck is stuckNames plus the conflict-only session (CLA-759) when one is
-// running: it is fleet work the exit loop cannot see, and a drain that execs
-// over it would kill a session holding a task claim.
-func drainStuck(d *Supervisor, done map[*Instance]bool) string {
-	stuck := stuckNames(d, done)
-	if !d.conflictBusy.Load() {
-		return stuck
-	}
-	if stuck == "" {
-		return "a conflict-only session"
-	}
-	return stuck + ", a conflict-only session"
+	// A nil return means the process image was replaced: nothing after this
+	// point runs in the old image.
 }
 
 // execSelf replaces the supervisor's process image in place with the binary
