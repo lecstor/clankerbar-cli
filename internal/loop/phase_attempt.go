@@ -126,6 +126,15 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	if opts.runner != nil {
 		at.inv.Prompt = r.runnerContextBlock(at) + "\n\n---\n\n" + at.inv.Prompt
 	}
+	// The maps-session method (CLA-869) turns this one review session into a
+	// sequence. It appends to the brief rather than replacing it, and a refusal
+	// here refuses the spawn: a review run against a half-built map would report
+	// on a checklist the driver could not stand behind.
+	plan, perr := r.mapsSessionPlanFor(at)
+	if perr != nil {
+		return attemptVerdict{next: attemptReturn, zeroSpend: true, err: fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), perr)}
+	}
+	r.applyMapsSession(at, plan)
 	return attemptVerdict{}
 }
 
@@ -267,6 +276,10 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 		opts.onSessionLaunch()
 	}
 	at.res, at.ierr = a.Invoke(sctx, at.inv)
+	// The notes are the maps-session method's evidence and are written to the
+	// iteration log while it is still open, before the findings turn's report is
+	// judged anywhere.
+	r.writeMapsNotes(at)
 	joined := renewer.stop()
 	// Only a session this run ended counts as lost: a cancelled parent is the
 	// operator stopping the whole run.

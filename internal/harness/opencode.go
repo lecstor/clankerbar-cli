@@ -1708,8 +1708,11 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // HonoursSessionWallClock is true and HonoursMaxTurns is false, which is the
 // whole point of the pair: this is the adapter whose CLI takes no turn flag, so
 // its phase backstop is the elapsed-time cap Invoke enforces (CLA-368).
+//
+// RunsTurnSequences is true: `run -s <session id>` continues a live session, so
+// Invocation.Turns is honoured (CLA-867).
 func (opencode) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {

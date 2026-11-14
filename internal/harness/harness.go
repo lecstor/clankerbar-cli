@@ -252,6 +252,15 @@ type Capabilities struct {
 	// that silently became wrong the moment a phase could name its own harness
 	// (CLA-366), because the question is about the harness running the PHASE.
 	HasSessionTokenCeiling bool
+
+	// RunsTurnSequences reports whether this adapter can run Invocation.Turns:
+	// follow-up messages in the SAME session the first turn created. False means
+	// a planned sequence has no meaningful execution here — the adapter refuses
+	// it up front (ErrTurnsUnsupported) rather than run only the first turn — so
+	// config.Validate refuses a review method that needs one, naming the harness,
+	// instead of letting a run reach a phase that cannot start. opencode is the
+	// adapter with session continuation today.
+	RunsTurnSequences bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
