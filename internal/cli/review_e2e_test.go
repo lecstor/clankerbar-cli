@@ -46,15 +46,18 @@ func reviewE2EStub(t *testing.T, report string) {
 	dir := t.TempDir()
 	// The adapter may export the session after the run; refusing it keeps the
 	// stream's figures and is what the harness package's own stubs do.
+	//
+	// printf, never echo: the report is Go-quoted, and dash's echo expands the
+	// \n/\", splitting one JSON event across lines on a dash-based runner.
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = session ] && [ \"$2\" = export ]; then exit 1; fi\n" +
 		fmt.Sprintf(`case "$*" in
   *"You are reviewing"*)
-    echo '{"type":"text","sessionID":"ses_live","part":{"type":"text","text":%q}}'
-    echo '{"type":"step_finish","sessionID":"ses_live","part":{"type":"step-finish","reason":"stop","tokens":{"total":30,"input":10,"output":5,"reasoning":0,"cache":{"write":0,"read":15}},"cost":0.03}}'
+    printf '%%s\n' '{"type":"text","sessionID":"ses_live","part":{"type":"text","text":%q}}'
+    printf '%%s\n' '{"type":"step_finish","sessionID":"ses_live","part":{"type":"step-finish","reason":"stop","tokens":{"total":30,"input":10,"output":5,"reasoning":0,"cache":{"write":0,"read":15}},"cost":0.03}}'
     ;;
   *)
-    echo '{"type":"text","sessionID":"ses_live","part":{"type":"text","text":"unexpected prompt"}}'
+    printf '%%s\n' '{"type":"text","sessionID":"ses_live","part":{"type":"text","text":"unexpected prompt"}}'
     ;;
 esac
 `, report)
