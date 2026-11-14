@@ -544,9 +544,14 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 				t.Errorf("%s was offered; a tool-level deny must remove it", denied)
 			}
 		}
-		// The MCP resource reads the policy keeps; a rename upstream goes red here.
+		// The MCP resource reads the policy keeps; a rename upstream goes red
+		// here. They are 2.2.x built-ins: a 2.0.32 binary has no opencode_*
+		// family at all (the same reason the two assertions below only log),
+		// so there is nothing to keep and demanding them would fail the suite
+		// on the build the fleet actually runs.
+		hasBuiltinFamily := indexOfTool(offered, "opencode_worktree_remove") >= 0 || indexOfTool(offered, "opencode_models") >= 0
 		for _, kept := range []string{"opencode_list_mcp_resources", "opencode_read_mcp_resource"} {
-			if indexOfTool(offered, kept) < 0 {
+			if hasBuiltinFamily && indexOfTool(offered, kept) < 0 {
 				t.Errorf("%s was not offered; the policy allows MCP resource reads", kept)
 			}
 		}

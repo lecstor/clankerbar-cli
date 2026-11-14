@@ -72,19 +72,21 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 		if st.end.claim != nil {
 			taskID = st.end.claim.Claim.TaskID
 		}
-		// CLA-877: a report-resume stall KEPT its claim on purpose (see
-		// settleWithoutCheckpoint), so the retry resumes that same run. It is
-		// safe at ANY phase index, unlike a normal dead retry: the objection to
-		// retrying a resumed phase is that invocationFor cannot re-seed a claim
-		// the dead handback cleared, and this claim was never cleared.
-		resumeOnly := st.end.reportResumeStalled != "" && st.end.claim != nil && st.end.claim.Claim.Held()
-		retryable := !st.last && (s.i == s.start || resumeOnly)
+		// CLA-877: a resume-only failure KEPT its claim on purpose (see
+		// settleWithoutCheckpoint), so the retry resumes that same run without a
+		// re-claim. The retry stays scoped to the phase the walk STARTED at, for
+		// the same reason the dead ladder's is: a resumed phase's briefing (the
+		// start choice, the worktree tip) comes from prepareStart, which only a
+		// re-claim runs. The incident and the trigger are the implement phase,
+		// which is always the start of a fresh claim.
+		resumeOnly := st.end.reportResumeFailed != "" && st.end.claim != nil && st.end.claim.Claim.Held()
+		retryable := !st.last && s.i == s.start
 
 		if retryable && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
 			switch {
-			case st.end.reportResumeStalled != "":
-				how = "stalled re-emitting its done report (" + st.end.reportResumeStalled + ")"
+			case st.end.reportResumeFailed != "":
+				how = "failed re-emitting its done report (" + st.end.reportResumeFailed + ")"
 			case st.end.toolLoop != "":
 				how = "was killed (" + st.end.toolLoop + "), dead"
 			}
@@ -112,7 +114,7 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			// A runner-claimed start must re-claim before the respawn when the
 			// dead phase handed the task back. The reclaim can land a DIFFERENT
 			// task when this one is gone, so the counters below follow what is
-			// actually held now, not what died. A report-resume stall handed
+			// actually held now, not what died. A report-resume failure handed
 			// nothing back: its claim is still held, and re-claiming it would be
 			// a plane round trip against a live lease (and could only be refused).
 			if s.runnerClaimed && !resumeOnly {
@@ -136,8 +138,18 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			}
 			switch {
 			case resumeOnly:
-				log.Printf("%siteration %d: the %s phase delivered its work but stalled re-emitting its done report (%s) — retrying it within the SAME claim %s, no handback and no reclaim (%d of %d)",
-					labelOf(t), drainNum, st.ph.Label(s.i), st.end.reportResumeStalled, claimLabel(st.end.claim.Claim), s.deadRetries, perTaskDeadBound)
+				// The brief was captured before this phase pushed anything. The
+				// retry's context block reads WIP/branch off it, and a re-claim
+				// would have refreshed both from the plane; do the same here so
+				// the session is told the branch already carries prior work.
+				if s.claimedTask.ID != "" {
+					s.claimedTask.HasWIP = st.end.claim.Claim.HasWIP
+					if b := st.end.claim.Claim.Branch; b != "" {
+						s.claimedTask.Branch = b
+					}
+				}
+				log.Printf("%siteration %d: the %s phase delivered its work but failed re-emitting its done report (%s) — retrying it within the SAME claim %s, no handback and no reclaim (%d of %d)",
+					labelOf(t), drainNum, st.ph.Label(s.i), st.end.reportResumeFailed, claimLabel(st.end.claim.Claim), s.deadRetries, perTaskDeadBound)
 			case st.end.toolLoop != "":
 				log.Printf("%siteration %d: the %s phase was killed (%s) — retrying it (%d of %d) before any review brief sees the task",
 					labelOf(t), drainNum, st.ph.Label(s.i), st.end.toolLoop, s.deadRetries, perTaskDeadBound)

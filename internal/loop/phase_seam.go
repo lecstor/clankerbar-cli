@@ -337,19 +337,19 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	// false, so there is nothing to release either way. The handler owns the
 	// handback for this shape, and takes it AFTER the close (see
 	// drainPhases).
-	// CLA-877: a report-resume stall is the one dead end whose claim is KEPT.
+	// CLA-877: a report-resume failure is the one dead end whose claim is KEPT.
 	// The session's own run succeeded — its commits are pushed — and only the
 	// reply that re-emits the done report went silent, so the phase retry
 	// resumes this very run. Handing the claim back here would expire the lease
 	// on pushed work and cost a reclaim before the same phase could run again.
-	resumeOnly := at.res.ReportResumeStalled != "" && at.res.Claim.Held()
+	resumeOnly := at.res.ReportResumeFailed != "" && at.res.Claim.Held()
 	// CLA-703: a retrying no-MCP attempt is not an ending — keep the claim
 	// (the retry resumes the same run) and book nothing yet. The final
 	// attempt goes through the normal handback.
 	if !panelMember && !at.retryNoMCP && !resumeOnly {
 		r.end.released = at.res.Claim.Held()
 	}
-	r.end.reportResumeStalled = at.res.ReportResumeStalled
+	r.end.reportResumeFailed = at.res.ReportResumeFailed
 	r.end.dead = at.dead
 	if r.end.empty && !r.end.noMCP && !at.retryNoMCP {
 		log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",

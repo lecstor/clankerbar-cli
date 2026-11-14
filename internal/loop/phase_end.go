@@ -70,8 +70,8 @@ type phaseEnd struct {
 	// finished with reason "unknown" and no branch was recorded on the task, so
 	// the phase produced nothing. It is a FAILED phase, not a completed one —
 	// the seam must not hand it on to the next phase's brief. The claim has
-	// already been released (a retry re-claims) EXCEPT for a report-resume stall,
-	// which kept it (reportResumeStalled); drainPhases owns the retry-once-then-
+	// already been released (a retry re-claims) EXCEPT for a report-resume failure,
+	// which kept it (reportResumeFailed); drainPhases owns the retry-once-then-
 	// park decision and its per-task budget.
 	dead bool
 
@@ -177,14 +177,15 @@ type phaseEnd struct {
 	// failed with the cause rather than with "died producing nothing".
 	toolLoop string
 
-	// reportResumeStalled is the cause when the pass's ONLY failure was the
-	// adapter's bounded re-emission of a refused done report stalling on a
-	// silent provider (CLA-877). The session's own run ended as it did — usually
-	// cleanly, with its work pushed — so the phase is retried inside the SAME
+	// reportResumeFailed is the cause when the pass's ONLY failure was the
+	// adapter's bounded re-emission of a refused done report: it stalled on a
+	// silent provider, or errored before producing a reply (CLA-877). The
+	// session's own run ended as it did — usually cleanly, with its work pushed.
+	// For the phase the walk started at, the retry then runs inside the SAME
 	// claim: settling without a checkpoint must not hand the claim back, and
-	// drainPhases must not end the lease and re-claim it for the retry. Empty
-	// for every other end.
-	reportResumeStalled string
+	// drainPhases must not end the lease and re-claim it. Empty for every other
+	// end.
+	reportResumeFailed string
 
 	// reviewCloseFailed reports that this pass's review seam gate passed far
 	// enough to find a SEALED round, but the driver's own close of that round

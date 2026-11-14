@@ -157,7 +157,7 @@ func TestRunnerClaim_ReportResumeStallRetriesInTheSameClaim(t *testing.T) {
 	// The session's own end is clean and its branch is pushed; only the report
 	// resume went silent, and the adapter says so on the marker.
 	stalled := held(okResult(1, 0), walkClaim)
-	stalled.ReportResumeStalled = "no output for 3m0s"
+	stalled.ReportResumeFailed = "no output for 3m0s"
 	retried := reported(held(okResult(1, 0), walkClaim), harness.Report{
 		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID, Branch: "clanker/walk",
 	})
@@ -190,6 +190,9 @@ func TestRunnerClaim_ReportResumeStallRetriesInTheSameClaim(t *testing.T) {
 	}
 	if !strings.Contains(h.invocations[1].Prompt, "PHASE 1") {
 		t.Errorf("the retry was not a phase-1 session: %q", h.invocations[1].Prompt)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "Resumed: the branch already carried prior work") {
+		t.Errorf("the retry's context block does not say the branch already carries the stalled phase's work: %q", h.invocations[1].Prompt)
 	}
 	if !strings.Contains(h.invocations[2].Prompt, "PHASE 2") {
 		t.Errorf("the review phase did not run after the healthy retry: %q", h.invocations[2].Prompt)

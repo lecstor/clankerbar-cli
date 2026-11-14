@@ -12,9 +12,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// safeBuffer is a console writer the idle guard can use from its timer
+// goroutine while the capture writes from the exec pipe. A plain bytes.Buffer
+// races between the two: the watchdog prints its kill line the instant it
+// fires, which is exactly while the stalled stub's last bytes are arriving.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // reportBadText is a final message whose report the test's check refuses, and
 // reportGoodText the corrected one the same check accepts.
@@ -372,6 +394,12 @@ printf '%s\n%s\n' '`+reportGoodText+`' '`+reportGoodStep+`'
 	if !strings.Contains(res.FinalMessage, "too long") {
 		t.Errorf("FinalMessage = %q, want the refused report unchanged", res.FinalMessage)
 	}
+	// CLA-877: the error is a resume-only failure too, so the runner is told to
+	// retry the phase inside the claim it holds instead of advancing on a report
+	// that never reached it.
+	if !strings.Contains(res.ReportResumeFailed, "errored") {
+		t.Errorf("ReportResumeFailed = %q, want the resume's error", res.ReportResumeFailed)
+	}
 }
 
 // CLA-877: a report resume that produces NOTHING is killed at the resume's own
@@ -406,7 +434,7 @@ case "$*" in
     ;;
 esac
 `)
-	console := &bytes.Buffer{}
+	console := &safeBuffer{}
 	start := time.Now()
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:      "Work.",
@@ -430,8 +458,8 @@ esac
 	if !strings.Contains(res.FinalMessage, "short") {
 		t.Errorf("FinalMessage = %q, want the retry's corrected report", res.FinalMessage)
 	}
-	if res.ReportResumeStalled != "" {
-		t.Errorf("ReportResumeStalled = %q after a successful retry, want none", res.ReportResumeStalled)
+	if res.ReportResumeFailed != "" {
+		t.Errorf("ReportResumeFailed = %q after a successful retry, want none", res.ReportResumeFailed)
 	}
 	if want := 500 + 300 + 900; res.Tokens != want {
 		t.Errorf("Tokens = %d, want %d (the stalled attempt's spend is charged too)", res.Tokens, want)
@@ -469,7 +497,7 @@ case "$*" in
     ;;
 esac
 `)
-	console := &bytes.Buffer{}
+	console := &safeBuffer{}
 	start := time.Now()
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:      "Work.",
@@ -486,11 +514,11 @@ esac
 	if runs := stubRuns(t, logPath); len(runs) != 3 {
 		t.Fatalf("stub ran %d times, want 3 — at most two resume attempts, never a loop:\n%v", len(runs), runs)
 	}
-	if res.ReportResumeStalled == "" {
-		t.Error("ReportResumeStalled is empty; the runner cannot tell a resume-only failure from a dead session")
+	if res.ReportResumeFailed == "" {
+		t.Error("ReportResumeFailed is empty; the runner cannot tell a resume-only failure from a dead session")
 	}
-	if !strings.Contains(res.ReportResumeStalled, "no output for") {
-		t.Errorf("ReportResumeStalled = %q, want the idle cause", res.ReportResumeStalled)
+	if !strings.Contains(res.ReportResumeFailed, "no output for") {
+		t.Errorf("ReportResumeFailed = %q, want the idle cause", res.ReportResumeFailed)
 	}
 	if res.IdleKilled != "" {
 		t.Errorf("IdleKilled = %q; the SESSION did not go silent, only its report resume did", res.IdleKilled)

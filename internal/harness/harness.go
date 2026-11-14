@@ -718,18 +718,19 @@ type Result struct {
 	// session, set after the stream is parsed, never a figure parsed out of it.
 	IdleKilled string
 
-	// ReportResumeStalled is the cause when the adapter's bounded re-emission of
-	// a refused done report stalled on a silent provider and was killed by the
-	// REPORT RESUME's own short idle bound (CLA-877). Empty for every other end.
+	// ReportResumeFailed is the cause when the adapter's bounded re-emission of
+	// a refused done report failed: it stalled on a silent provider and was
+	// killed by the REPORT RESUME's own short idle bound, or its process errored
+	// before producing a reply (CLA-877). Empty for every other end.
 	//
 	// It is deliberately separate from IdleKilled: the session's own run ended
 	// as it did (usually cleanly, with its work pushed), and only the follow-up
-	// reply that re-emits the report went silent. The adapter therefore leaves
-	// the original process outcome in place and sets this marker instead, so the
+	// reply that re-emits the report failed. The adapter therefore leaves the
+	// original process outcome in place and sets this marker instead, so the
 	// driver can tell a resume-only failure from a dead session and retry the
 	// phase inside the claim it still holds, rather than ending the lease and
 	// paying a reclaim. Like ToolLoop/IdleKilled it is the adapter's own verdict.
-	ReportResumeStalled string
+	ReportResumeFailed string
 
 	// OutputDropped is how many bytes of this session's output were NOT retained,
 	// across both streams — the ordinary cost of the rolling window, not a fault.

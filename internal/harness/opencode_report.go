@@ -113,9 +113,9 @@ func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *R
 // the steer. A resume that stalls on a silent provider earns ONE fresh attempt
 // with the same steer (CLA-877): a hang is usually transient, and the alternative
 // is losing the phase — and every finished, pushed commit in it — to a bound
-// tuned for a working session. A second stall fails closed: the report stands
-// refused, and the session's OWN end is left untouched with
-// Result.ReportResumeStalled naming what really failed.
+// tuned for a working session. A second stall, or a resume process that errors,
+// fails closed: the report stands refused, the session's OWN end is left
+// untouched, and Result.ReportResumeFailed names what really failed.
 //
 // mergeResume replaces FinalMessage with the continuation's, so a corrected
 // report is what the runner reads off this Result.
@@ -166,8 +166,13 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 		contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, reportSteerPrompt(checkErr)))
 		if contErr != nil {
 			chargeReportResume(res, contRes)
+			// The resume never ran a full reply, so the report is still the
+			// refused one while the session's own end is intact. Mark it the
+			// same way a stall is marked: the driver's recovery is a phase
+			// retry inside the held claim, not a checkpoint on a missing report.
+			res.ReportResumeFailed = "the report resume errored: " + contErr.Error()
 			if in.Console != nil {
-				fmt.Fprintf(in.Console, "!! report resume errored (%v) — leaving the report as it was\n", contErr)
+				fmt.Fprintf(in.Console, "!! report resume errored (%v) — leaving the report as it was; the session's own end stands\n", contErr)
 			}
 			return
 		}
@@ -182,7 +187,7 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 				}
 				continue
 			}
-			res.ReportResumeStalled = contRes.IdleKilled
+			res.ReportResumeFailed = contRes.IdleKilled
 			if in.Console != nil {
 				fmt.Fprintf(in.Console, "!! report resume stalled %d times (%s) — leaving the report refused; the session's own end stands\n",
 					attempt, contRes.IdleKilled)
