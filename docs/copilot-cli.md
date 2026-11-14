@@ -74,6 +74,13 @@ This is why the adapter reports `mcp_config_path` as Claude's schema: the object
 the one it reads. `${VAR}` expansion inside the file works (verified: the server
 connected with 37 tools and a real `get_backlog_summary` call succeeded).
 
+The server must be named **`clankerbar`**. The work-session allow rule
+(`--allow-tool clankerbar`), the probe's single grant and the claim observer's name
+mapping all key on that name — the same convention the claude and opencode adapters
+use. A file whose server is named something else still connects, but its tools are
+not in the appended policy, so in `-p` mode the session is denied them (fail
+closed).
+
 A workspace `.mcp.json` is auto-discovered **only once the folder is trusted**, and
 `--additional-mcp-config` is what makes the file reach the session regardless. The
 adapter never trusts a folder: trusting one also approves that directory's skills,
@@ -126,6 +133,12 @@ harness, and `budget.max_tokens` (fed by the checkpoint) is the breaker.
 All of them are `Limit.Stop` (`budget_exhausted`, or `usage_limit` for the rate-limit
 statements): the run stops cleanly and writes the `LIMIT_STOP` marker
 (`docs/limit-stop.md`) for the operator to resume after topping up.
+
+The CLI's session/weekly rate limits do state when they reset, but this adapter
+still Stops rather than supervising a wait: the metered-billing decision for
+Copilot is that the budget breaker is the control and an operator resume is the
+recovery path. If a wait path is wanted later, only the rate-limit arm of
+`DetectLimit` needs to change.
 
 The scope is the CLI's own text — stderr, non-JSON stdout lines, and error events —
 never `assistant.message` content or a tool result. That is what stops a backlog
