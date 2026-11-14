@@ -53,10 +53,10 @@ func MapsSessionFirstTurn(base string, chunk, chunks int, items string, hunksEmb
 		"so note everything you see: problems, doubts, things that look inconsistent or untested, however small. " +
 		"A note that says only \"fine\" should mean you checked and found nothing.\n\n")
 	if hunksEmbedded {
-		b.WriteString("For an `M` item: its hunk's diff is in the fenced block under the item. Read that first, " +
-			"then read the region at head with enough surrounding code to understand it. Use the tools for the " +
-			"context the hunk does not show (callers, siblings, the rest of the file), not to re-fetch the diff. " +
-			"Compare it with sibling code that does the same job elsewhere. Apply the checklist below.\n\n")
+		b.WriteString("For an `M` item: when a fenced diff block follows it, read that first, then read the region " +
+			"at head with enough surrounding code to understand it. Use the tools for the context the hunk does " +
+			"not show (callers, siblings, the rest of the file), not to re-fetch the diff. Compare it with sibling " +
+			"code that does the same job elsewhere. Apply the checklist below.\n\n")
 	} else {
 		b.WriteString("For an `M` item: read the region at head with enough surrounding code to understand it, and its " +
 			"diff. Compare it with sibling code that does the same job elsewhere. Apply the checklist below.\n\n")

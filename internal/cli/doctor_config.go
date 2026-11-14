@@ -185,8 +185,18 @@ func reviewMethodLabel(cfg *config.Config, ph config.Phase) string {
 	notes, findings := opts.StageModels(phaseModel)
 	// Same resolution the runner's plan uses (config.MapsSessionOptions.StageModels),
 	// so a preflight cannot report a findings stage the record will not name.
-	return fmt.Sprintf(" (maps-session: notes=%s, findings=%s, chunk_size=%d, flow_max=%d)",
-		stageModelLabel(notes), stageModelLabel(findings), opts.ChunkSize, opts.FlowMax)
+	return fmt.Sprintf(" (maps-session: notes=%s, findings=%s, chunk_size=%d, flow_max=%d, embed_hunks=%s)",
+		stageModelLabel(notes), stageModelLabel(findings), opts.ChunkSize, opts.FlowMax, embedHunksLabel(opts.EmbedHunks))
+}
+
+// embedHunksLabel reports whether the review will carry hunks in its prompt and
+// under which budgets (CLA-871), so the prompt size is visible before a run.
+func embedHunksLabel(o *config.EmbedHunksOptions) string {
+	if o == nil || !o.Enabled {
+		return "off"
+	}
+	r := o.Resolved()
+	return fmt.Sprintf("on(%d/%d)", r.MaxBytesPerItem, r.MaxBytesTotal)
 }
 
 // stageModelLabel prints a resolved stage model, naming the harness's own
