@@ -36,8 +36,10 @@ func init() { Register(copilot{}) }
 //     checkpoint carries the same figures, so no temp file is written.
 //
 // Billing is METERED since 2026-06-01: a monthly AI-credit allowance, then
-// per-token overage. There is no rolling window to wait out, so every limit this
-// adapter recognises is a Limit.Stop; the budget breaker is the control.
+// per-token overage. There is no rolling window to wait out, so the credit/
+// allowance exhaustion this adapter recognises is a Limit.Stop; the budget
+// breaker is the control. The CLI's session/weekly/model RATE limits are short
+// rolling windows and are retried as transient instead.
 type copilot struct{}
 
 func (copilot) Name() string { return "copilot" }
@@ -374,9 +376,13 @@ func (p *copilotParse) noteUsage(d copilotEventData) {
 	if a.TotalNanoAiu != 0 {
 		p.nanoAiu = a.TotalNanoAiu
 	}
-	p.reason = 0
-	for _, m := range a.ModelMetrics {
-		p.reason += m.Usage.ReasoningTokens
+	// Only recompute when the snapshot carries modelMetrics: a later checkpoint
+	// without them must not erase the figure an earlier one reported.
+	if len(a.ModelMetrics) > 0 {
+		p.reason = 0
+		for _, m := range a.ModelMetrics {
+			p.reason += m.Usage.ReasoningTokens
+		}
 	}
 	if td := a.TokenDetails; td != nil &&
 		td.Input.TokenCount+td.Output.TokenCount+td.CacheRead.TokenCount+td.CacheWrite.TokenCount > 0 {
@@ -445,7 +451,10 @@ func (p *copilotParse) noteResult(d copilotEventData, res *Result, console io.Wr
 		return
 	}
 	delete(p.toolNames, d.ToolCallID)
-	isError := (d.Success != nil && !*d.Success) || (len(d.Error) > 0 && string(d.Error) != "null")
+	// `error` is documented on failures; a success event that carries the JSON
+	// empty string (or null) is still a success, and treating it as an error
+	// would drop a valid claim/settle.
+	isError := (d.Success != nil && !*d.Success) || copilotErrorPayload(d.Error)
 	var content json.RawMessage
 	if d.Result != nil && d.Result.Content != "" {
 		content, _ = json.Marshal(d.Result.Content)
@@ -481,6 +490,13 @@ func (p *copilotParse) finish(res *Result) {
 	raw["ai_credits"] = float64(p.nanoAiu) / 1e9
 	raw["premium_requests"] = p.premium
 	raw["reasoning_tokens"] = p.reason
+}
+
+// copilotErrorPayload reports whether an `error` JSON field carries a real
+// error: absent/null and the empty string are not failures.
+func copilotErrorPayload(raw json.RawMessage) bool {
+	s := string(raw)
+	return len(raw) > 0 && s != "null" && s != `""`
 }
 
 // copilotErrorText collects the CLI's OWN diagnostic text: all of stderr, the
@@ -524,7 +540,7 @@ func buildCopilotErrorText(res Result) string {
 			b.WriteByte('\n')
 			b.WriteString(ev.Data.Message)
 		}
-		if len(ev.Data.Error) > 0 && string(ev.Data.Error) != "null" {
+		if copilotErrorPayload(ev.Data.Error) {
 			b.WriteByte('\n')
 			b.Write(ev.Data.Error)
 		}
@@ -532,13 +548,17 @@ func buildCopilotErrorText(res Result) string {
 	return b.String()
 }
 
-// copilotLimitRe recognises the CLI's documented exhaustion statements
-// (`copilot help billing`, `copilot help limits`): the plan's monthly credit
-// allowance running out, the session AI-credit cap, and the account-level
-// session/weekly/model rate limits.
+// copilotLimitRe recognises the CLI's documented credit/allowance exhaustion
+// statements (`copilot help billing`, `copilot help limits`): the plan's monthly
+// credit allowance running out and the session AI-credit cap.
 //
 // Deliberately NOT the bare word "usage limit" or "quota": the CLI's warning at
 // 75% of a weekly allowance contains both and is not a limit.
+//
+// Deliberately NOT the session/weekly/model RATE limits either: those are short
+// rolling windows the CLI states a reset for, the same provider blip that
+// arrives as a bare 429 - IsTransient retries them, and a Stop there would end
+// a whole run on a wait it could have taken.
 var copilotLimitRe = regexp.MustCompile(`(?i)` +
 	`plan:\s*100%\s*used` +
 	`|(?:out of|insufficient|no) (?:ai )?credits(?: left| remaining)?` +
@@ -546,18 +566,7 @@ var copilotLimitRe = regexp.MustCompile(`(?i)` +
 	`|(?:ai )?credit limit (?:reached|exceeded)` +
 	`|exceeded (?:your|the) (?:included )?(?:ai )?credits?` +
 	`|quota (?:exceeded|exhausted)` +
-	`|session limit reached` +
-	`|reached your weekly rate limit|hit your session rate limit|hit the rate limit for this model|hit your rate limit`)
-
-// copilotRateLimitRe names the window a rate-limit statement refers to, for the
-// log line only: every recognised limit is a Stop here (metered billing, no
-// window to wait out).
-var (
-	copilotWeeklyRateRe  = regexp.MustCompile(`(?i)weekly rate limit`)
-	copilotSessionRateRe = regexp.MustCompile(`(?i)session rate limit`)
-	copilotModelRateRe   = regexp.MustCompile(`(?i)rate limit for this model`)
-	copilotAnyRateRe     = regexp.MustCompile(`(?i)rate limit`)
-)
+	`|session limit reached`)
 
 func (copilot) DetectLimit(res Result) Limit {
 	text := copilotErrorText(res)
@@ -568,22 +577,7 @@ func (copilot) DetectLimit(res Result) Limit {
 	// 2026-06-01): the allowance refills monthly and overage is paid, so there is
 	// no rolling window the supervised wait could poll for. Stop cleanly and let
 	// the operator top up / resume, which is docs/limit-stop.md's flow.
-	reason := "budget_exhausted"
-	window := "monthly"
-	if copilotAnyRateRe.MatchString(text) {
-		reason = "usage_limit"
-		switch {
-		case copilotWeeklyRateRe.MatchString(text):
-			window = "weekly"
-		case copilotSessionRateRe.MatchString(text):
-			window = "session"
-		case copilotModelRateRe.MatchString(text):
-			window = "model"
-		default:
-			window = ""
-		}
-	}
-	return Limit{Limited: true, Stop: true, Reason: reason, Window: window}
+	return Limit{Limited: true, Stop: true, Reason: "budget_exhausted", Window: "monthly"}
 }
 
 // copilotTransientRe: API-level rate limits (429/too many requests) and server/
@@ -597,8 +591,8 @@ var copilotTransientRe = regexp.MustCompile(`(?i)` +
 	`|fetch failed|timed out|temporarily unavailable|try again later`)
 
 func (c copilot) IsTransient(res Result) bool {
-	// A limit statement mentions "rate limit", so the word classes overlap; a
-	// hard limit is never a blip to retry, whatever the wording.
+	// A recognised credit/allowance stop is never a blip to retry, whatever
+	// else the text says.
 	if c.DetectLimit(res).Limited {
 		return false
 	}

@@ -204,6 +204,33 @@ func TestCopilotParse_observesAClaim(t *testing.T) {
 	}
 }
 
+// A success completion carrying the JSON empty string in `error` is still a
+// success: reading that as a failure would drop a valid claim/settle.
+func TestCopilotParse_emptyErrorOnSuccessIsNotAFailure(t *testing.T) {
+	const taskID, runID = "11111111-2222-3333-4444-555555555556", "run-copilot-empty-error"
+	claimContent := `{"task":{"id":"` + taskID + `","ref":"CLA-118"},"run":{"id":"` + runID + `"}}`
+	stream := `{"type":"assistant.message","data":{"content":"","toolRequests":[{"toolCallId":"c1","name":"clankerbar-claim_task","arguments":{"taskId":"` + taskID + `"},"mcpServerName":"clankerbar","mcpToolName":"claim_task"}]}}`
+	stream += "\n" + `{"type":"tool.execution_complete","data":{"toolCallId":"c1","success":true,"error":"","result":{"content":` + jsonString(t, claimContent) + `}}}`
+	res := copilotParsed(stream)
+	if !res.Claim.Held() {
+		t.Fatalf("Claim = %+v, want held: an empty error string is not a failure", res.Claim)
+	}
+}
+
+// A later checkpoint without modelMetrics must not erase the reasoning figure
+// an earlier one reported.
+func TestCopilotParse_reasoningSurvivesACheckpointWithoutModelMetrics(t *testing.T) {
+	stream := `{"type":"session.usage_checkpoint","data":{"accountingSnapshot":{"modelMetrics":{"m1":{"usage":{"inputTokens":100,"outputTokens":10,"reasoningTokens":7}}}}}}`
+	stream += "\n" + `{"type":"session.usage_checkpoint","data":{"accountingSnapshot":{"tokenDetails":{"input":{"tokenCount":200},"output":{"tokenCount":20},"cache_read":{"tokenCount":0},"cache_write":{"tokenCount":0}}}}}`
+	res := copilotParsed(stream)
+	if got := res.Raw["reasoning_tokens"]; got != 7 {
+		t.Errorf("reasoning_tokens = %v, want 7 from the checkpoint that carried modelMetrics", got)
+	}
+	if want := 200 + 20; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d from the last checkpoint", res.Tokens, want)
+	}
+}
+
 // A REFUSED claim must not be tracked: the plane's refusal carries no ids, and a
 // half-claim is the one thing the driver must never be handed.
 func TestCopilotParse_refusedClaimIsNotTracked(t *testing.T) {
@@ -394,19 +421,19 @@ func TestCopilotDetectLimit(t *testing.T) {
 			want: true, stop: true, reason: "budget_exhausted",
 		},
 		{
-			name: "documented weekly rate limit",
+			// A short rolling window with a reset, not an exhausted allowance:
+			// the same blip IsTransient retries when it arrives as a 429, so it
+			// must not stop the run.
+			name: "documented weekly rate limit is a wait, not a stop",
 			res:  Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"message":"You've reached your weekly rate limit."}}`},
-			want: true, stop: true, reason: "usage_limit",
 		},
 		{
-			name: "documented session rate limit",
+			name: "documented session rate limit is a wait, not a stop",
 			res:  Result{Stderr: "You've hit your session rate limit."},
-			want: true, stop: true, reason: "usage_limit",
 		},
 		{
-			name: "documented per-model rate limit",
+			name: "documented per-model rate limit is a wait, not a stop",
 			res:  Result{Stderr: "You've hit the rate limit for this model."},
-			want: true, stop: true, reason: "usage_limit",
 		},
 		{
 			name: "the 75% notice is a warning, not a limit",
@@ -463,7 +490,10 @@ func TestCopilotIsTransient(t *testing.T) {
 		{"connection reset", Result{Stderr: "Error: read ECONNRESET"}, true},
 		{"socket hang up", Result{Stderr: "Error: socket hang up"}, true},
 		{"unavailable model is a real failure", Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"errorType":"query","message":"Execution failed: Model \"nope\" is not available."}}`}, false},
-		{"a recognised limit is not a blip", Result{Stderr: "You've reached your weekly rate limit."}, false},
+		{"a credit stop is not a blip", Result{Stderr: "Insufficient AI credits"}, false},
+		{"weekly rate limit is a short window", Result{Stderr: "You've reached your weekly rate limit."}, true},
+		{"session rate limit is a short window", Result{Stderr: "You've hit your session rate limit."}, true},
+		{"per-model rate limit is a short window", Result{Stderr: "You've hit the rate limit for this model."}, true},
 		{"clean run", Result{Stdout: `{"type":"assistant.message","data":{"content":"done"}}`}, false},
 		{"a task body mentioning a 500 is narration", Result{Stdout: `{"type":"assistant.message","data":{"content":"the server returned 500 earlier"}}`}, false},
 	}

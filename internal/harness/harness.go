@@ -233,7 +233,8 @@ type Capabilities struct {
 	// False means `budget.max_cost_usd` is INERT for this harness - not
 	// approximate, not late: no code path can ever reach it, because nothing
 	// feeds the number it compares against. codex exec reports tokens, not
-	// money, so that is codex today.
+	// money, and Copilot reports AI credits, so those are codex and copilot
+	// today.
 	//
 	// It is on Capabilities rather than inferred from a zero CostUSD because the
 	// two are indistinguishable at runtime: a claude session that genuinely cost
@@ -349,7 +350,7 @@ type Invocation struct {
 	// It exists because MaxTurns reaches only the claude CLI: under a harness
 	// that takes no turn flag the phase backstop is otherwise nothing at all.
 	// Only an adapter reporting Capabilities.HonoursSessionWallClock enforces
-	// it; opencode is that adapter today.
+	// it; opencode and copilot are those adapters today.
 	MaxSessionWallClock time.Duration
 
 	// MaxRepeatedToolFailures ends this session when the same tool returns the
@@ -359,7 +360,7 @@ type Invocation struct {
 	// Config.MaxRepeatedToolFailures. 0 = no check, which is also every probe.
 	//
 	// Enforced by the adapters that observe tool results as they stream: claude
-	// and opencode. codex does not, and the field is inert there.
+	// and opencode. codex and copilot do not, and the field is inert there.
 	MaxRepeatedToolFailures int
 
 	// MaxSessionIdle bounds how long a session may go without ANY stream output
@@ -370,7 +371,8 @@ type Invocation struct {
 	// instead. 0 disables the watchdog for this invocation; probes never arm it.
 	//
 	// The loop resolves it per harness from Config.SessionIdleFor and classifies
-	// an IdleKilled end as dead, like a tool-loop kill.
+	// an IdleKilled end as dead, like a tool-loop kill. Enforced by claude and
+	// opencode; inert under codex and copilot.
 	MaxSessionIdle time.Duration
 
 	// MaxToolCallDuration bounds one tool call while MaxSessionIdle's watchdog

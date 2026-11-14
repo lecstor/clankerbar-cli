@@ -490,7 +490,7 @@ func sessionRunID(res harness.Result, prev *harness.Result) string {
 //
 // Two questions have to be answered yes, and they are different ones. The
 // adapter has to be one that reports money at all — Capabilities.ReportsCost,
-// false for codex today — or there is no figure by construction. And THIS
+// false for codex and copilot today — or there is no figure by construction. And THIS
 // session has to have actually reported one: Result.CostReported, because a
 // session whose stream ended before its harness's accounting reported tokens and
 // no dollars, and a zero taken from that silence would read on the console as

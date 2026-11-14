@@ -46,7 +46,9 @@ a `cat /etc/hostname` were both refused under `--allow-tool read --allow-tool sh
 in-workdir write and shell command succeeded. An out-of-boundary path cannot prompt
 in `-p` mode, so it fails closed. A **probe** is read-only: it denies
 `write` and `shell` outright (read-only shell commands would otherwise run without
-asking) and its only grant is `clankerbar(get_backlog_summary)`.
+asking); when `mcp_config_path` is set its only grant is
+`clankerbar(get_backlog_summary)`, and without one it has no tool grants and asks
+for the bare `.` prompt.
 
 `--disable-builtin-mcps` drops the built-in GitHub MCP server. Its tools are not in
 the allow policy, so in `-p` mode they would be offered to the model and then
@@ -96,7 +98,10 @@ shared clankerbar observer claude and opencode use, mapping an MCP call
 `ClankerbarCalls` are populated and a phased config can run on this harness. The
 request/result plumbing was verified live (a real `get_backlog_summary` call was
 observed); the claim payload itself is the plane's own JSON, which the same
-observer already parses for the other two adapters.
+observer already parses for the other two adapters. The claim/settle paths are
+pinned only by synthetic event shapes and the shared observer: no captured or
+live `claim_task` round-trip exists yet, so the first real phased run's claim is
+the remaining check on this wiring.
 
 ## Usage and billing
 
@@ -121,24 +126,22 @@ harness, and `budget.max_tokens` (fed by the checkpoint) is the breaker.
 
 ## Limits
 
-`DetectLimit` recognises the CLI's documented exhaustion statements
-(`copilot help billing`, `copilot help limits`):
+`DetectLimit` recognises the CLI's documented CREDIT/ALLOWANCE exhaustion
+statements (`copilot help billing`, `copilot help limits`):
 
 - plan allowance exhausted — `Plan: 100% used, resets <date>`, "out of AI credits",
   "quota exceeded";
-- the session AI-credit cap — "Session limit reached";
-- account rate limits — "You've reached your weekly rate limit", "You've hit your
-  session rate limit", "You've hit the rate limit for this model".
+- the session AI-credit cap — "Session limit reached".
 
-All of them are `Limit.Stop` (`budget_exhausted`, or `usage_limit` for the rate-limit
-statements): the run stops cleanly and writes the `LIMIT_STOP` marker
-(`docs/limit-stop.md`) for the operator to resume after topping up.
+Both are `Limit.Stop` (`budget_exhausted`): the run stops cleanly and writes the
+`LIMIT_STOP` marker (`docs/limit-stop.md`) for the operator to resume after
+topping up.
 
-The CLI's session/weekly rate limits do state when they reset, but this adapter
-still Stops rather than supervising a wait: the metered-billing decision for
-Copilot is that the budget breaker is the control and an operator resume is the
-recovery path. If a wait path is wanted later, only the rate-limit arm of
-`DetectLimit` needs to change.
+The CLI's session/weekly/model **rate limits** are NOT a stop. They are short
+rolling windows with a stated reset — the same kind of provider blip that arrives
+as a bare 429 — so they fall through to `IsTransient` and are retried. Stopping a
+whole run on "You've hit the rate limit for this model" would end it on a wait it
+could have taken.
 
 The scope is the CLI's own text — stderr, non-JSON stdout lines, and error events —
 never `assistant.message` content or a tool result. That is what stops a backlog

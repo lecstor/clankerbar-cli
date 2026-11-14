@@ -200,8 +200,9 @@ func TestAdaptersWithoutAWallClockCapNeverReportOne(t *testing.T) {
 }
 
 // Capabilities is what doctor reads to tell an operator whether the dial they
-// set can fire at all, so the pairing is pinned rather than left to drift: the
-// harness with no turn flag is exactly the one that enforces the time cap.
+// set can fire at all, so the pairing is pinned rather than left to drift: a
+// harness with no turn flag has no per-session cap unless it enforces the wall
+// clock, and opencode and copilot are the two that do.
 func TestSessionWallClockCapabilityPerAdapter(t *testing.T) {
 	for _, tc := range []struct {
 		a          Adapter

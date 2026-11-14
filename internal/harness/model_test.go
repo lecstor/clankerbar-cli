@@ -76,11 +76,11 @@ func TestArgs_ARealModelReachesTheFlagTrimmed(t *testing.T) {
 	}
 }
 
-// The ratchet. The failure to fear is not this file's three adapters, which are
-// fixed now, but the FOURTH one: a new harness written by copying an old one from
-// before ModelArg existed, reading Model directly and reintroducing the blank
-// flag with nothing failing. Derived from the directory rather than a hand-kept
-// list, for the same reason.
+// The ratchet. The failure to fear is not the adapters already in this tree,
+// which are fixed now, but the NEXT one: a new harness written by copying an old
+// one from before ModelArg existed, reading Model directly and reintroducing the
+// blank flag with nothing failing. Derived from the directory rather than a
+// hand-kept list, for the same reason.
 func TestNoAdapterReadsTheRawModelField(t *testing.T) {
 	// Any receiver's `.Model`, but not `.ModelArg` — the trailing word boundary is
 	// what separates them. Matching on the RECEIVER NAME instead would pin nothing:

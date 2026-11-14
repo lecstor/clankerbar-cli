@@ -162,7 +162,7 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	if !conflictHarnessTakesExtraDirs(step.Harness) {
 		d.conflictSay("harness:"+slug, "conflict: %s PR #%d is CONFLICTING, but the conflict step resolves to harness %q, "+
 			"which does not translate ExtraDirs - it could not create the worktree at %s, so no session was started; "+
-			"name a harness that can (opencode) or leave the conflict block unset", label, pr, step.Harness, worktree)
+			"name a harness that can (opencode or copilot) or leave the conflict block unset", label, pr, step.Harness, worktree)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(worktree), 0o755); err != nil {
@@ -412,11 +412,13 @@ func claimIsOurs(claimedByRun, runID string) bool {
 //     (harness/opencode.go, scopeExtraDirs);
 //   - claude maps them to --add-dir (and is refused earlier by the operator's
 //     no-Claude-for-daemon-sessions rule, listed for completeness);
+//   - copilot maps them to --add-dir too, which the CLI's path verification
+//     includes among the writable roots (harness/copilot.go);
 //   - codex deliberately does NOT: its workspace-write scope is the cwd plus the
 //     operator-owned `writable_roots` in CODEX_HOME (harness/codex.go).
 func conflictHarnessTakesExtraDirs(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "opencode", "claude":
+	case "opencode", "claude", "copilot":
 		return true
 	default:
 		return false

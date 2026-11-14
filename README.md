@@ -571,8 +571,8 @@ because its turns end with a review record and nothing else; the final combined
 review-and-fix brief, and a review phase with a prompt of its own, are refused.
 The turn sequence needs a harness that can continue one session — **opencode
 today**. `Validate` refuses
-maps-session on claude or codex with a message naming the harness, and never
-silently runs only the first turn. And the maps are built in the worktree the
+maps-session on claude, codex or copilot with a message naming the harness, and
+never silently runs only the first turn. And the maps are built in the worktree the
 **runner** prepared at the reviewed tip (or a parallel panel member's own
 checkout at that tip), so the method needs a runner-prepared review. A branchless
 checkpoint with nothing to map has no such tree, and a session-claimed run has no
@@ -1799,7 +1799,7 @@ because the pause is the one time that poll and session cadences both stop:
   dollar figure, when there is one. The breakdown is what the operator's cost
   analysis reads; the dollar figure is labelled as harness-reported because on a
   subscription it is the API-rate equivalent, not what was paid, and it is
-  omitted for a harness that reports no cost at all (codex today), and for a
+  omitted for a harness that reports no cost at all (codex and copilot today), and for a
   session that reported no usage at all — the plane refuses a report carrying a
   session's cost without its usage report, so the figure rides only when the
   usage report does.
@@ -2112,8 +2112,9 @@ materially outlive the dial; a resurrection round is not started unless the
 remaining slice covers that overhead plus a minute, and a continuation is not
 started on a remaining slice under a minute.
 
-**opencode only** today — it is the harness with no turn flag, so this is its
-backstop; under claude or codex the dial is inert and `doctor` says so. Two
+**opencode and copilot** today — they are the harnesses with no turn flag, so
+this is their backstop; under claude or codex the dial is inert and `doctor` says
+so. Two
 consequences of that pairing are worth knowing before you set it. First, the
 salvage applies here: since CLA-365 opencode observes the session's task claim,
 so when a capped session ends, whatever it left uncommitted is committed and
@@ -2660,7 +2661,7 @@ dead-phase retry ladder, and a review-panel member is recorded as a failed membe
 with that cause. It is never retried as a transient failure and never stops the
 run. `0` turns the check off; unset is the default; a negative is refused.
 Enforced by the `claude` and `opencode` adapters, which see tool results as they
-stream; inert under `codex`.
+stream; inert under `codex` and `copilot`.
 
 **A session that goes silent is killed.** `session_idle` is the no-output
 watchdog: a session silent for `max_idle` is ended by the driver. Under `claude`
@@ -2670,7 +2671,8 @@ stay above its own 10-minute bash-tool ceiling. A killed session is classified
 **dead, no delivery**, exactly as a tool-loop kill is: the daemon log and the
 session's `cause` carry the idle cause (`idle: no output for 15m0s`, or
 `idle: tool call ... open for 30m0s` when the per-call cap fired). `0` disables a
-bound; enforced by the `claude` and `opencode` adapters, inert under `codex`.
+bound; enforced by the `claude` and `opencode` adapters, inert under `codex` and
+`copilot`.
 
 **And one more thing is bounded: retries taken on a failure the harness could not
 name.** `opencode`'s error surface changes between versions, so beyond the anchored
@@ -2771,11 +2773,12 @@ alternatives, in order of preference:
    run may finish, not as your spend ceiling. `doctor` warns if it is your only
    dial.
 
-   **Under `codex`, `max_cost_usd` is inert - set `max_tokens` beside it.**
-   `codex exec --json` reports tokens, not money, so the adapter never populates
-   a cost figure and no code path can reach that ceiling: it is not approximate,
-   it is absent. A codex run with cost as its *only* dial therefore has no
-   effective ceiling at all, whatever the config says. Give it `max_tokens` (or
+   **Under `codex` or `copilot`, `max_cost_usd` is inert - set `max_tokens`
+   beside it.** `codex exec --json` reports tokens, not money, and Copilot reports
+   AI credits, never dollars, so neither adapter ever populates a cost figure and
+   no code path can reach that ceiling: it is not approximate, it is absent. A
+   codex or copilot run with cost as its *only* dial therefore has no effective
+   ceiling at all, whatever the config says. Give it `max_tokens` (or
    `max_wall_clock`) alongside; `doctor` WARNs on the cost-only case rather than
    reporting a budget that cannot fire.
 
@@ -2890,7 +2893,9 @@ in-workdir write and shell command run). A probe denies `write` and `shell`
 outright. `mcp_config_path` is handed over as `--additional-mcp-config @<file>` and
 read in Claude's `mcpServers` schema (the same object), which is what gives a
 session its clankerbar tools — a workspace `.mcp.json` is only auto-loaded for a
-*trusted* folder, and this adapter never trusts one.
+*trusted* folder. The adapter adds no trust of its own, but that is not isolation:
+`config_dir` becomes `COPILOT_HOME`, and a `trustedFolders` entry there can still
+trust the workdir and load its `.mcp.json`, skills and hooks.
 Copilot reports AI credits, never money, so `budget.max_cost_usd` is inert on this
 harness and `budget.max_tokens` is the breaker; the guide is
 [`docs/copilot-cli.md`](./docs/copilot-cli.md).

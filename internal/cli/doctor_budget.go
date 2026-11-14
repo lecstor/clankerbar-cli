@@ -217,6 +217,19 @@ func checkBudget(cfg *config.Config) check {
 			"max_iterations: 0 — no session cap: the loop stops only on a STOP/HALT marker, a signal or a budget ceiling (a dry backlog idle-polls rather than exiting); set max_iterations to bound a run window")
 		guardDials = append(guardDials, "max_iterations")
 	}
+	// copilot's adapter arms neither stream guard (docs/copilot-cli.md), so an
+	// operator who sets one for a copilot phase gets no protection. Name the dial
+	// rather than let it look live; it is deliberately NOT added to guardDials,
+	// because the remedy advises setting those and this one cannot fire.
+	if runsHarness(cfg, "copilot") {
+		if cfg.MaxRepeatedToolFailures != nil && *cfg.MaxRepeatedToolFailures > 0 {
+			guardNotes = append(guardNotes, fmt.Sprintf(
+				"max_repeated_tool_failures: %d is INERT under copilot - its adapter does not arm the tool-loop guard", *cfg.MaxRepeatedToolFailures))
+		}
+		if b, ok := cfg.SessionIdle["copilot"]; ok && ((b.MaxIdle != nil && b.MaxIdle.Duration() > 0) || (b.MaxToolCall != nil && b.MaxToolCall.Duration() > 0)) {
+			guardNotes = append(guardNotes, "session_idle[copilot] is INERT - copilot's adapter arms no idle watchdog")
+		}
+	}
 
 	c.status = pass
 	if len(set) == 0 {

@@ -354,6 +354,31 @@ func TestScan_ClassifiesCodexHarness(t *testing.T) {
 	}
 }
 
+// A copilot session must be labelled harness "copilot", not fall through to
+// "claude", and its session.error envelope must reach APIErrors.
+// The claim observation rides a rendered console line on this surface, as it
+// does for claude.
+const copilotClaimThenErrorLog = `{"type":"session.start","data":{"sessionId":"s1"}}
+  · holding CLA-118 (release on exit if nothing is pushed)
+{"type":"session.error","data":{"errorType":"query","message":"Execution failed: 503 Service Unavailable"}}
+`
+
+func TestScan_ClassifiesCopilotHarnessAndItsErrors(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20261114-120000-d1-pimplement-a0-1234abcd.log": copilotClaimThenErrorLog,
+	}
+	l := byName(t, scanFixtures(t, files), "iteration-20261114-120000-d1-pimplement-a0-1234abcd.log")
+	if l.Harness != "copilot" {
+		t.Errorf("copilot fixture: Harness = %q, want %q", l.Harness, "copilot")
+	}
+	if !l.GotPastClaim {
+		t.Error("copilot fixture: GotPastClaim = false, want true from the rendered holding line")
+	}
+	if len(l.APIErrors) != 1 || !strings.Contains(l.APIErrors[0], "503 Service Unavailable") {
+		t.Errorf("copilot fixture: APIErrors = %v, want the session.error message", l.APIErrors)
+	}
+}
+
 // The CLA-584 stall is its own classification, separate from dead (the two
 // terminal step reasons are mutually exclusive), and the near-miss fixtures
 // must not land in it: an earlier stalled step followed by a normal finish, and
