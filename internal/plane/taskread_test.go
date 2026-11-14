@@ -65,9 +65,8 @@ func TestPeekNextTask(t *testing.T) {
 		}
 	})
 	t.Run("takeover candidate carries the custody shape", func(t *testing.T) {
-		// CLA-476: the seam's checkpoint peek needs the queue head's custody as
-		// the SPAWN saw it, so a stale-lease takeover candidate's pre-existing
-		// hold is never read as a hold the phase just took.
+		// The queue head is also the spawn's repo route; its custody fields are
+		// still served, and pinned here so a wire change is visible.
 		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":{"id":"t-3","ref":"CLA-3","repo":"o/r","status":"in_progress","branch":"clanker/x","hasWip":true,"requiresTakeover":true}}`))
 		next, err := mustClient(t, srv).PeekNextTask(ctx)
 		if err != nil {
@@ -181,20 +180,34 @@ func TestTaskRepo(t *testing.T) {
 	})
 }
 
-// The CLA-451 checkpoint peek reads a task's holder state off get_task: who
-// holds it (claimedByRun), whether work is handed over (branch), and in which
-// envelope. The fields are null on an unheld task and must decode to empty.
+// The CLA-451/CLA-889 read of a task's holder state off get_task: whether a run
+// holds it (heldByRun), whether work is handed over (branch), and in which
+// envelope. The fields are null/false on an unheld task and must decode so.
 func TestTaskState(t *testing.T) {
 	ctx := context.Background()
-	t.Run("wrapped envelope", func(t *testing.T) {
-		srv, got := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","ref":"CLA-451","status":"in_progress","claimedByRun":"r-9","branch":"clanker/x","outcome":"## Review\nverdict: pass"}}`))
+	t.Run("the production wire shape", func(t *testing.T) {
+		// Mirrors the plane's taskView (the full get_task shape): `heldByRun` is a
+		// PRESENCE boolean and there is NO `claimedByRun` — a run id is half a
+		// bearer credential (CLA-509). Kept whole rather than trimmed to the fields
+		// decoded here, so the shape drifting out of this fixture is visible.
+		const productionShape = `{"task":{
+			"id":"2b9a1c3d","number":889,"key":"CLA","ref":"CLA-889","title":"a task",
+			"status":"in_progress","priority":null,"schedule":null,"rank":0,"category":"bug",
+			"repo":"lecstor/clankerbar-cli","detail":"why","doneWhen":"done",
+			"outcome":"## Review\nverdict: pass","branch":"clanker/x","container":false,
+			"humanOnly":false,"heldByRun":true,"reclaimCount":0,"noProgressReleases":0,
+			"ciRepairReleases":0,
+			"delivery":{"commit":null,"pr":null,"integrationBranch":null,"mergeVerified":null,"noCode":false,"attestedByRun":null,"declaredAt":null},
+			"ciAttestation":{"check":null,"conclusion":null,"branch":null,"pr":null,"attestedByRun":null,"declaredAt":null}},
+			"reviews":{"records":[],"total":0,"counted":0}}`
+		srv, got := serve(t, http.StatusOK, mcpTextBody(t, productionShape))
 		st, err := mustClient(t, srv).TaskState(ctx, "t-1")
 		if err != nil {
 			t.Fatalf("TaskState: %v", err)
 		}
-		want := TaskState{Status: "in_progress", Ref: "CLA-451", ClaimedByRun: "r-9", Branch: "clanker/x", Outcome: "## Review\nverdict: pass"}
-		if !reflect.DeepEqual(st, want) {
-			t.Errorf("state = %+v, want %+v", st, want)
+		if st.Status != "in_progress" || st.Ref != "CLA-889" || !st.HeldByRun ||
+			st.Branch != "clanker/x" || st.Outcome != "## Review\nverdict: pass" {
+			t.Errorf("state = %+v, want the production task fields with heldByRun true", st)
 		}
 		params := got.body["params"].(map[string]any)
 		if params["name"] != "get_task" {
@@ -206,14 +219,27 @@ func TestTaskState(t *testing.T) {
 		}
 	})
 	t.Run("bare envelope", func(t *testing.T) {
-		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"status":"ready","claimedByRun":null,"branch":null}`))
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"status":"ready","heldByRun":false,"branch":null}`))
 		st, err := mustClient(t, srv).TaskState(ctx, "t-2")
 		if err != nil {
 			t.Fatalf("TaskState: %v", err)
 		}
 		want := TaskState{Status: "ready"}
 		if !reflect.DeepEqual(st, want) {
-			t.Errorf("state = %+v, want %+v — nulls decode to empty, like repo above", st, want)
+			t.Errorf("state = %+v, want %+v — nulls/false decode to empty, like repo above", st, want)
+		}
+	})
+	// A stale `claimedByRun` is not a substitute for presence: the plane stopped
+	// serving the id, and the driver must not read a hold off a field the wire no
+	// longer carries (the CLA-889 drift this test now pins).
+	t.Run("a claimedByRun alone is not a hold", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"status":"in_progress","claimedByRun":"r-1"}}`))
+		st, err := mustClient(t, srv).TaskState(ctx, "t-5")
+		if err != nil {
+			t.Fatalf("TaskState: %v", err)
+		}
+		if st.HeldByRun {
+			t.Errorf("state = %+v, want HeldByRun false: the plane serves no claimedByRun (CLA-509)", st)
 		}
 	})
 	// The delivery record rides the same response (CLA-497): noCode is the
@@ -232,12 +258,12 @@ func TestTaskState(t *testing.T) {
 		}
 	})
 	t.Run("absent and null delivery decode false", func(t *testing.T) {
-		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-4","status":"in_progress","claimedByRun":"r-1","delivery":null}}`))
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-4","status":"in_progress","heldByRun":true,"delivery":null}}`))
 		st, err := mustClient(t, srv).TaskState(ctx, "t-4")
 		if err != nil {
 			t.Fatalf("TaskState: %v", err)
 		}
-		want := TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+		want := TaskState{Status: "in_progress", HeldByRun: true}
 		if !reflect.DeepEqual(st, want) {
 			t.Errorf("state = %+v, want %+v — a null delivery is no delivery", st, want)
 		}
@@ -281,7 +307,7 @@ func TestTaskState_ReviewsDecode(t *testing.T) {
 		}
 	})
 	t.Run("sealed metadata and released findings", func(t *testing.T) {
-		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","status":"in_progress","claimedByRun":"r-1","reviews":{"records":[
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","status":"in_progress","heldByRun":true,"reviews":{"records":[
 			{"id":"rec-1","round":1,"cycle":1,"reviewerRole":"review-1","runId":"r-1","harness":"claude","model":"opus-test","branch":"clanker/x","reviewedTip":"sha1","scope":{"kind":"full-diff","base":"staging","range":"clanker/x"},"verdict":"findings","state":"sealed","counts":{"must":1,"should":2,"nit":3},"findingsTotal":6,"at":"2026-10-17T10:00:00.000Z"},
 			{"id":"rec-2","round":2,"cycle":1,"reviewerRole":"review-2","runId":"r-1","harness":"opencode","model":"kimi-k3","branch":"clanker/x","reviewedTip":"sha2","scope":{"kind":"full-diff","base":"staging","range":"clanker/x"},"verdict":"pass","state":"open","counts":{"must":0,"should":0,"nit":0},"findingsTotal":1,"at":"2026-10-17T11:00:00.000Z","findings":[
 				{"id":"2.review-2.1","severity":"should","evidenceKind":null,"evidence":null,"file":"a.go","line":7,"kind":"style","summary":"s","requiredFix":"f","raisedByModel":"kimi-k3","status":"open","fixCommit":null,"refutedReason":null,"filedTaskRef":null}]}

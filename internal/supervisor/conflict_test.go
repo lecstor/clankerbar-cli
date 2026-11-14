@@ -178,50 +178,61 @@ func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	}
 }
 
-func TestConflictSessionSafetyNetReleaseMatchesTheBareHolderUUID(t *testing.T) {
+func TestConflictSessionSafetyNetReleasesAStrandedClaim(t *testing.T) {
 	f := conflictingFixture(t)
-	// The claim hands the supervisor a run CREDENTIAL; the plane records the BARE
-	// uuid in `claimedByRun`. The safety-net release must recognise its own run
-	// across that difference (CLA-759 review 1.review-1.1) - and must NOT report the
-	// holder as "another run" when it is our own stopped one.
+	// The plane's REAL stranded shape since CLA-509: presence only, no run id. A
+	// conflict session that dies before handing the task back leaves exactly this,
+	// and the safety-net release must fire on presence alone - the supervisor
+	// signs with the credential its own claim returned.
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":%q,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
-		closeOutTestTask, closeOutTestRef, closeOutTestRunUUID))
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"branch":%q,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
+		closeOutTestTask, closeOutTestRef, closeOutTestHead))
 	d := f.supervisor(0)
 
 	lines := f.run(d)
 
 	releases := f.callsFor("release_task")
 	if len(releases) != 1 {
-		t.Fatalf("release_task calls = %d, want exactly the safety-net release (the holder is our own bare uuid): %v", len(releases), releases)
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
 	}
 	if got := releases[0].args["driver"]; got != true {
 		t.Errorf("the safety-net release does not carry the driver marker: %v", releases[0].args)
+	}
+	if got := releases[0].args["runId"]; got != closeOutTestRunCredential {
+		t.Errorf("the release signs with runId %v, want the claim's credential %q", got, closeOutTestRunCredential)
 	}
 	if got := releases[0].args["checkGreen"]; got != false {
 		t.Errorf("a failed resolution released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
 	}
 	if strings.Contains(lines, "held by another run") {
-		t.Errorf("our own stopped run was misreported as another holder:\n%s", lines)
+		t.Errorf("our own stranded claim was misreported as another holder:\n%s", lines)
+	}
+	if !strings.Contains(lines, "outcome: failed") || !strings.Contains(lines, "claim released, task left approved") {
+		t.Errorf("the failure line does not say the claim was released:\n%s", lines)
 	}
 }
 
-func TestConflictSessionLeavesAClaimAnotherRunHolds(t *testing.T) {
+func TestConflictSessionLogsAReleaseRefusedAsNotHolding(t *testing.T) {
 	f := conflictingFixture(t)
-	// A DIFFERENT run's bare uuid: the task's lease lapsed and someone else took it.
-	// Nothing of ours is signable any more, so no release may be sent under our id.
+	// The task is still in_progress and held, but the release is refused as
+	// not-holding: our lease lapsed and another run took it. The refusal is the
+	// only holder signal the plane serves now, and it must be reported as such.
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":"some-other-run","outcome":"RESOLUTION: failed\n\n- b.txt"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"RESOLUTION: failed\n\n- b.txt"}}`,
 		closeOutTestTask, closeOutTestRef))
+	f.plane.refuseTool("release_task", `{"error":{"code":"not_holding","message":"release ends a held claim, but the run holding it is already over"}}`)
 	d := f.supervisor(0)
 
 	lines := f.run(d)
 
-	if got := f.callsFor("release_task"); len(got) != 0 {
-		t.Errorf("a task held by another run was released under our id: %v", got)
+	if got := len(f.callsFor("release_task")); got != 1 {
+		t.Fatalf("release_task calls = %d, want the one refused safety-net release", got)
 	}
-	if !strings.Contains(lines, "held by another run (some-other-run)") {
-		t.Errorf("the pass does not name the other holder:\n%s", lines)
+	if !strings.Contains(lines, "held by another run") {
+		t.Errorf("a not-holding refusal was not logged as the task being held by another run:\n%s", lines)
+	}
+	if strings.Contains(lines, "claim released") {
+		t.Errorf("a refused release was reported as a hand-back:\n%s", lines)
 	}
 }
 
@@ -278,7 +289,7 @@ func TestConflictSessionMechanicalLeavesTheTaskApproved(t *testing.T) {
 func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 	f := conflictingFixture(t)
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"in_review","claimedByRun":null,"outcome":"RESOLUTION: behavioural\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept the feature's field and the base's default"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_review","heldByRun":false,"outcome":"RESOLUTION: behavioural\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept the feature's field and the base's default"}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 
@@ -297,7 +308,7 @@ func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 func TestConflictSessionFailureReleasesTheClaim(t *testing.T) {
 	f := conflictingFixture(t)
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":"run-1","outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 

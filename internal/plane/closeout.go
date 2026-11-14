@@ -58,6 +58,13 @@ type ProjectPolicy struct {
 	AuthorityIntegrate string
 }
 
+// ErrNotHolding means a hand-back ended nothing because the run that signed it
+// is not the task's holder. The plane answers `not_holding` when the task has no
+// live claim (or the holding run is already over) and `not_your_claim` when
+// another run holds it; both are the same answer to a caller checking whether its
+// claim still owns the task.
+var ErrNotHolding = errors.New("the task is not held by this run")
+
 // CloseOutTask is one approved-awaiting-merge task as the close-out needs it: the
 // identity to log and claim, and where its work is.
 type CloseOutTask struct {
@@ -235,12 +242,22 @@ func (r *mcpReleaser) ReleaseCloseOut(ctx context.Context, taskID, runID string,
 	if taskID == "" || runID == "" {
 		return errors.New("release close-out: taskId and runId are both required")
 	}
-	return r.call(ctx, "release_task", map[string]any{
+	err := r.call(ctx, "release_task", map[string]any{
 		"taskId":     taskID,
 		"runId":      runID,
 		"driver":     true,
 		"checkGreen": checkGreen,
 	})
+	if err == nil {
+		return nil
+	}
+	// The two holder refusals are one answer to the caller: this credential is
+	// not the live claim. Anything else (a transport failure, an unknown tool, a
+	// malformed call) is a release that may or may not have landed.
+	if code, _, ok := refusalCode(err); ok && (code == "not_holding" || code == "not_your_claim") {
+		return fmt.Errorf("%w: %v", ErrNotHolding, err)
+	}
+	return err
 }
 
 // CompleteCloseOut declares the delivery and closes the task done in the claim's

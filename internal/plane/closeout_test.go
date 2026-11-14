@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -133,6 +134,33 @@ func TestReleaseCloseOutSendsTheAttestationItWasGiven(t *testing.T) {
 	if args["checkGreen"] != false {
 		t.Errorf("checkGreen = %v, want false: a failed MERGE must be counted by the repair ladder", args["checkGreen"])
 	}
+}
+
+// The conflict close-out checks a claim it can no longer name. The plane's
+// get_task serves presence only (`heldByRun`), never the holder's run id, because
+// a run id is half a bearer credential (CLA-509). So the release call IS the
+// check: our own credential succeeds, and a holder refusal means the claim is no
+// longer ours to end.
+func TestReleaseCloseOutClassifiesAHolderRefusal(t *testing.T) {
+	for _, code := range []string{"not_holding", "not_your_claim"} {
+		t.Run(code, func(t *testing.T) {
+			inner := fmt.Sprintf(`{"error":{"code":%q,"message":"not yours"}}`, code)
+			srv, _ := serve(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":`+mustJSONString(inner)+`}]}}`)
+
+			err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", false)
+			if !errors.Is(err, ErrNotHolding) {
+				t.Fatalf("err = %v, want ErrNotHolding for %s", err, code)
+			}
+		})
+	}
+	t.Run("another refusal is not a holder answer", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"{\"error\":{\"code\":\"invalid_release\",\"message\":\"bad call\"}}"}]}}`)
+
+		err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", false)
+		if err == nil || errors.Is(err, ErrNotHolding) {
+			t.Fatalf("err = %v, want a non-holder refusal: only a holder answer means the claim is gone", err)
+		}
+	})
 }
 
 func TestReleaseCloseOutDoesNotRetryAnUnknownTool(t *testing.T) {

@@ -28,11 +28,10 @@ import (
 // the session it would have spawned is itself about to need the plane anyway.
 
 // NextTask is what the queue-head peek learned. Repo is the task's `repo`
-// field, empty when the task carries none (or there is nothing queued).
-//
-// Status, HasWIP, Branch and RequiresTakeover are the task's custody shape at
-// the read; the loop uses them to require a transition into a hold rather than
-// trusting a later reading (see loop's briefedHold, CLA-476).
+// field, empty when the task carries none (or there is nothing queued). The
+// custody fields describe the offer at the read; nothing in the driver routes on
+// them today, but they are part of the served shape and are decoded so a caller
+// can see what the plane offered.
 type NextTask struct {
 	TaskID string
 	Repo   string
@@ -63,15 +62,19 @@ type TaskRepoSource interface {
 }
 
 // TaskState is what a get_task read learned about WHO holds a task right now:
-// the plane's own status word, the qualified ref, the id of the run currently
-// holding it (empty when nothing does), any work-in-progress branch
-// recorded on it, and whether the record carries a declared no-code
-// delivery (CLA-497).
+// the plane's own status word, the qualified ref, whether a run holds it, any
+// work-in-progress branch recorded on it, and whether the record carries a
+// declared no-code delivery (CLA-497).
 type TaskState struct {
-	Status       string
-	Ref          string
-	ClaimedByRun string
-	Branch       string
+	Status string
+	Ref    string
+	// HeldByRun is the plane's presence-only holder flag. It serves no run id
+	// (CLA-509): a run id is half a bearer credential, so a holder learns its own
+	// full credential only from its claim response. A caller that needs to know
+	// whether ITS claim is the live one must ask the plane with that credential —
+	// a release it refuses means the claim is gone.
+	HeldByRun bool
+	Branch    string
 
 	// DeliveryNoCode reports the task record's delivery.noCode flag: the
 	// plane's first-class "this task shipped no code" declaration. It rides
@@ -167,12 +170,11 @@ type ReviewFindingState struct {
 	FiledTaskRef  string
 }
 
-// TaskStateSource reads one task's holder state, for the CLA-451 checkpoint
-// peek: when a phase ends without an observed claim, the driver asks this about
-// the task it briefed before declaring the phase empty. Like both reads above,
-// it is a READ of one named task — it holds nothing and claims nothing — and
-// best-effort by contract: an error degrades to today's ending, never to a
-// failed run.
+// TaskStateSource reads one task's holder state: the seam's exit-evidence and
+// review-baseline reads, and the close-out's post-claim check. Like both reads
+// above, it is a READ of one named task — it holds nothing and claims nothing —
+// and best-effort by contract: an error degrades the caller's decision, never a
+// failed run by itself.
 type TaskStateSource interface {
 	TaskState(ctx context.Context, taskID string) (TaskState, error)
 }
@@ -241,7 +243,7 @@ func (r *mcpReleaser) TaskRepo(ctx context.Context, taskID string) (string, erro
 }
 
 // TaskState calls get_task for one task and returns the fields naming its
-// holder: status, claimedByRun, branch and ref, plus the delivery record's
+// holder: status, heldByRun, branch and ref, plus the delivery record's
 // noCode flag. The response is accepted in
 // both envelopes the plane has used (see TaskRepo). A field the plane sends as
 // null decodes to empty, like repo above — an unheld task reads as
@@ -278,7 +280,7 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 	return TaskState{
 		Status:            wireString(w.Status),
 		Ref:               wireString(w.Ref),
-		ClaimedByRun:      wireString(w.ClaimedByRun),
+		HeldByRun:         wireBool(w.HeldByRun),
 		Branch:            wireString(w.Branch),
 		DeliveryNoCode:    w.Delivery != nil && wireBool(w.Delivery.NoCode),
 		Outcome:           wireString(w.Outcome),
@@ -291,12 +293,15 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 
 // taskHolderWire is the slice of a get_task response that names its holder.
 type taskHolderWire struct {
-	Status       any `json:"status"`
-	Ref          any `json:"ref"`
-	ClaimedByRun any `json:"claimedByRun"`
-	Branch       any `json:"branch"`
-	Outcome      any `json:"outcome"`
-	Delivery     *struct {
+	Status any `json:"status"`
+	Ref    any `json:"ref"`
+	// Presence only, never the id (CLA-509): the run id is half a bearer
+	// credential. `claimedByRun` is deliberately not decoded — older planes are
+	// not supported (docs/releases.md), so there is no shape to keep reading.
+	HeldByRun any `json:"heldByRun"`
+	Branch    any `json:"branch"`
+	Outcome   any `json:"outcome"`
+	Delivery  *struct {
 		NoCode any `json:"noCode"`
 	} `json:"delivery"`
 	// The compact `reviews` block (CLA-636): present only when the task has
@@ -478,7 +483,7 @@ func wireStrings(v any) []string {
 }
 
 // wireString narrows a decoded JSON field the plane sends as a string or null
-// (repo, status, ref, branch, claimedByRun). A non-string is treated as absent
+// (repo, status, ref, branch). A non-string is treated as absent
 // rather than an error: every field read here is descriptive, and no value one
 // can carry turns a spawn or a seam decision into a failure — resolution and
 // classification act only on real strings.
