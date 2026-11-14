@@ -64,6 +64,31 @@ func TestPeekNextTask(t *testing.T) {
 			t.Errorf("arguments = %#v, want an empty object, not nil or null", params["arguments"])
 		}
 	})
+	t.Run("takeover candidate carries the custody shape", func(t *testing.T) {
+		// CLA-476: the seam's checkpoint peek needs the queue head's custody as
+		// the SPAWN saw it, so a stale-lease takeover candidate's pre-existing
+		// hold is never read as a hold the phase just took.
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":{"id":"t-3","ref":"CLA-3","repo":"o/r","status":"in_progress","branch":"clanker/x","hasWip":true,"requiresTakeover":true}}`))
+		next, err := mustClient(t, srv).PeekNextTask(ctx)
+		if err != nil {
+			t.Fatalf("PeekNextTask: %v", err)
+		}
+		if next.Status != "in_progress" || !next.HasWIP || !next.RequiresTakeover {
+			t.Errorf("next = %+v, want the takeover candidate's custody (in_progress, hasWip, requiresTakeover)", next)
+		}
+	})
+	t.Run("ready head has no custody", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":{"id":"t-4","repo":"o/r","status":"ready","branch":"clanker/t-4","hasWip":false,"requiresTakeover":false}}`))
+		next, err := mustClient(t, srv).PeekNextTask(ctx)
+		if err != nil {
+			t.Fatalf("PeekNextTask: %v", err)
+		}
+		// branchView always sends a branch NAME; hasWip is the recorded flag, and
+		// only that one means work already exists.
+		if next.Status != "ready" || next.HasWIP || next.RequiresTakeover {
+			t.Errorf("next = %+v, want a ready head with no recorded WIP", next)
+		}
+	})
 	t.Run("empty queue", func(t *testing.T) {
 		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":null}`))
 		next, err := mustClient(t, srv).PeekNextTask(ctx)

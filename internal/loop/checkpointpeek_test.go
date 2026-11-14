@@ -84,7 +84,10 @@ func TestDrainPhases_ABlindSpotClaimIsRecoveredFromThePlaneAtTheSeam(t *testing.
 		{res: okResult(5, 0.05)},
 	}}
 	rel := &peekReleaser{
-		next: plane.NextTask{TaskID: "t-1"},
+		// CLA-476: the transition is the point. The queue head was NOT held when
+		// the phase spawned, and the plane holds it afterwards — that is the
+		// phase's own unobserved claim, whichever channel took it.
+		next: plane.NextTask{TaskID: "t-1", Status: "ready"},
 		state: map[string]plane.TaskState{
 			"t-1": {Status: "in_progress", Ref: "CLA-9", ClaimedByRun: "r-curl", Branch: "clanker/x"},
 		},
@@ -127,6 +130,76 @@ func TestDrainPhases_ABlindSpotClaimIsRecoveredFromThePlaneAtTheSeam(t *testing.
 	}
 	if strings.Join(rel.asked, ",") != "t-1" {
 		t.Errorf("the plane was asked about %v, want exactly the briefed task t-1", rel.asked)
+	}
+}
+
+// CLA-476: the peek must see a TRANSITION, not just a static reading. A fresh
+// phase's briefed task is the speculative queue head, and next_task may hand
+// back a stale-lease takeover candidate: already in_progress, held by a dead
+// run, with a branch that run pushed. That shape satisfies the held-with-branch
+// custody test and the origin evidence gate exactly like a hold this phase took,
+// so without the spawn-time snapshot the driver would keep the lease and spawn a
+// paid phase 2 on another run's in-flight work.
+func TestDrainPhases_APreExistingHeldWithBranchTaskIsNotRecovered(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	rel := &peekReleaser{
+		// The queue head was ALREADY a takeover candidate when the phase spawned.
+		next: plane.NextTask{TaskID: "t-1", Status: "in_progress", HasWIP: true, RequiresTakeover: true},
+		// …and it still reads that way after phase 1, because phase 1 never
+		// touched it. The previous clanker's pushed branch is genuinely on origin,
+		// so only the transition check can refuse this.
+		state: map[string]plane.TaskState{
+			"t-1": {Status: "in_progress", Ref: "CLA-9", ClaimedByRun: "r-previous", Branch: "clanker/x"},
+		},
+	}
+	d := blindSpotDriver(t, h, rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — a hold that predates the phase is not this phase's checkpoint, so no review may spawn on it", h.invokeCalls)
+	}
+	if strings.Join(rel.asked, ",") != "t-1" {
+		t.Errorf("the plane was asked about %v, want exactly the briefed task t-1", rel.asked)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "ALREADY held with branch") || !strings.Contains(out, "predates the phase") {
+		t.Errorf("the log does not say the hold predates the phase:\n%s", out)
+	}
+	if strings.Contains(out, "treating it as the phase checkpoint") {
+		t.Errorf("a pre-existing takeover-candidate hold was taken as the checkpoint:\n%s", out)
+	}
+	if !strings.Contains(out, "ended without holding the task") {
+		// The standard ending must still fire: the refusal is not a failure, it is
+		// exactly today's empty-seam behavior.
+		t.Errorf("the standard empty-seam line did not fire:\n%s", out)
+	}
+}
+
+// The exact resumed arm: when the briefed task is the one a predecessor HELD,
+// no transition is needed — its identity is not a guess. The shipped two-phase
+// config cannot reach this through drainPhases (phase 1 is never resumed and
+// only a non-last phase peeks), so the guard is pinned here directly.
+func TestPeekCheckpointClaim_AnExactResumedTaskNeedsNoTransition(t *testing.T) {
+	rel := &peekReleaser{state: map[string]plane.TaskState{
+		"t-9": {Status: "in_progress", Ref: "CLA-9", ClaimedByRun: "r-9", Branch: "clanker/x"},
+	}}
+	target := Target{Poller: busyPoller(), Releaser: rel}
+	d := d0(target)
+
+	claim := d.peekCheckpointClaim(context.Background(), target, 1, "phase 2", "t-9", briefedHold{Exact: true, HeldWithBranch: true})
+	if claim == nil {
+		t.Fatal("an exact resumed task was refused: the peek must attribute a hold on the task a predecessor held")
+	}
+	if claim.Claim.TaskID != "t-9" || claim.Claim.RunID != "r-9" || claim.Claim.Branch != "clanker/x" {
+		t.Errorf("claim = %+v, want the plane's t-9/r-9/clanker/x", claim.Claim)
+	}
+
+	// The same spawn-time shape on a FRESH brief (exact false) is refused.
+	if got := d.peekCheckpointClaim(context.Background(), target, 1, "phase 1", "t-9", briefedHold{HeldWithBranch: true}); got != nil {
+		t.Errorf("a fresh brief whose task was held-with-branch at spawn was recovered: %+v", got)
 	}
 }
 

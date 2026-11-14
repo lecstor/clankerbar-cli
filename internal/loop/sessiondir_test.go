@@ -121,6 +121,41 @@ func TestSessionDir_ResumePhaseReadsTheExactTask(t *testing.T) {
 	}
 }
 
+func TestSessionDir_CapturesTheBriefedTasksSpawnCustody(t *testing.T) {
+	// CLA-476: the checkpoint peek needs to know whether the briefed task was
+	// ALREADY held with a branch when the phase spawned. The queue-head read that
+	// chooses the spawn directory already answers that, so no second read is paid.
+	_, _, _, target := twoRepos(t)
+	rel := &repoReleaser{next: plane.NextTask{
+		TaskID: "t-1", Repo: "acme/repo-b",
+		Status: "in_progress", HasWIP: true, RequiresTakeover: true,
+	}}
+	target.Releaser = rel
+
+	_, briefed, _, hold, err := d0(target).sessionDir(context.Background(), target, nil)
+	if err != nil {
+		t.Fatalf("sessionDir: %v", err)
+	}
+	if briefed != "t-1" {
+		t.Errorf("briefed task = %q, want t-1", briefed)
+	}
+	if !hold.HeldWithBranch || hold.Exact {
+		t.Errorf("hold = %+v, want a fresh brief whose task was already held with branch", hold)
+	}
+
+	// A resumed phase knows the exact task: a hold on it needs no transition.
+	prev := &harness.Result{Claim: harness.Claim{TaskID: "t-9"}}
+	rel2 := &repoReleaser{taskRepo: map[string]string{"t-9": "acme/repo-b"}}
+	target.Releaser = rel2
+	_, _, _, hold, err = d0(target).sessionDir(context.Background(), target, prev)
+	if err != nil {
+		t.Fatalf("sessionDir: %v", err)
+	}
+	if !hold.Exact || hold.HeldWithBranch {
+		t.Errorf("hold = %+v, want an exact resumed brief with no queue-head custody", hold)
+	}
+}
+
 func TestSessionDir_NoRepoFallsBackToPrimaryNeverWorkdir(t *testing.T) {
 	parent, dirA, _, target := twoRepos(t)
 	target.Releaser = &repoReleaser{} // the queue head carries NO repo
