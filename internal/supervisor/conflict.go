@@ -15,9 +15,11 @@ package supervisor
 //  1. takes the plane CLAIM itself, so the claim is the lock an agent close-out
 //     and this path both race for. A refused claim means someone else has the
 //     task: no session is started.
-//  2. starts ONE session, on the fleet's IMPLEMENT harness/model unless the
-//     config's `conflict` step names its own, and logs one line with the task,
-//     the PR, the conflicting paths and the outcome.
+//  2. runs the session on the fleet's IMPLEMENT harness/model routes unless
+//     the config's `conflict` step names its own, and logs one line with the
+//     task, the PR, the conflicting paths and the outcome. An attempt that ends
+//     on a usage limit is re-run on a later route in the list (CLA-890), so a
+//     conflict can cost more than one short session.
 //  3. lets the session do the work under that claim: merge the base into the
 //     branch (never a rebase), resolve only the conflicting hunks, run the
 //     repo-wide gate, push, and hand the task back. The brief is short and lives
@@ -46,11 +48,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
@@ -68,12 +72,13 @@ const (
 	// same budget the close-out gives a non-judgement call.
 	conflictCallTimeout = closeOutCallTimeout
 
-	// maxConflictAttempts bounds how many paid sessions one task may burn in this
-	// supervisor's lifetime. A failed session leaves the task approved, so
-	// without a bound the next poll would start another, and another: the exact
-	// opposite of "the agent close-out remains the fallback". A task that keeps
-	// failing falls back to the agent close-out, which is the designed
-	// fallback — not a third paid experiment.
+	// maxConflictAttempts bounds how many conflict sessions one task may burn in
+	// this supervisor's lifetime. One session may walk the step's model list once
+	// (a quota fallback, CLA-890); that whole walk is one attempt here. A failed
+	// session leaves the task approved, so without a bound the next poll would
+	// start another, and another: the exact opposite of "the agent close-out
+	// remains the fallback". A task that keeps failing falls back to the agent
+	// close-out, which is the designed fallback — not a third paid experiment.
 	maxConflictAttempts = 2
 )
 
@@ -98,7 +103,14 @@ type ConflictRunRequest struct {
 	Paths   []string
 	Gate    string
 	Harness string
-	Model   string
+	// Model is the route this attempt runs on: the first entry of Routes, or the
+	// harness's own default when both are empty.
+	Model string
+	// Routes is the ordered model route list this attempt may fall back through
+	// (CLA-890): the conflict step's resolved list, or the suffix of it left after
+	// a quota failure. A pinned single `conflict.model` is a one-entry list, so it
+	// runs only that model.
+	Routes  []string
 	WorkDir string
 	// Worktree is the exact path the session creates its branch worktree at. The
 	// supervisor names it (rather than letting the session choose) so it can
@@ -235,7 +247,8 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		Paths:    paths,
 		Gate:     gate,
 		Harness:  step.Harness,
-		Model:    step.Model,
+		Model:    step.Model.First(),
+		Routes:   step.Model.List(),
 		WorkDir:  dir,
 		Worktree: worktree,
 
@@ -580,16 +593,126 @@ func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, re
 	if err != nil {
 		return harness.Result{}, err
 	}
-	inv, err := conflictInvocation(cfg, slug, req, step)
-	if err != nil {
-		return harness.Result{}, err
+	label := strings.TrimSpace(req.TaskRef)
+	if label == "" {
+		label = req.TaskID
 	}
-	return adapter.Invoke(ctx, inv)
+	return runConflictModelLadder(label, req, adapter, func(model string, routes []string) (harness.Result, error) {
+		inv, err := conflictInvocation(cfg, slug, conflictAttemptRequest(req, model, routes), step)
+		if err != nil {
+			return harness.Result{}, err
+		}
+		return adapter.Invoke(ctx, inv)
+	})
+}
+
+// conflictAttemptRequest is the request ONE ladder attempt runs: the conflict
+// request carrying that attempt's model and the routes still left from it. Split
+// out so a test can follow a retry all the way to the invocation it composes.
+func conflictAttemptRequest(req ConflictRunRequest, model string, routes []string) ConflictRunRequest {
+	attempt := req
+	attempt.Model, attempt.Routes = model, routes
+	return attempt
+}
+
+// conflictModelRun launches ONE conflict session pinned to model, offered the
+// model route list from model onwards.
+type conflictModelRun func(model string, routes []string) (harness.Result, error)
+
+// conflictLimitReader is the one adapter capability the model ladder needs: the
+// harness's own DetectLimit, the same classification the phase ladder's limit
+// branch reads. Narrowed to one method so the ladder is testable without a paid
+// process; harness.Adapter is the production value.
+type conflictLimitReader interface {
+	DetectLimit(harness.Result) harness.Limit
+}
+
+// runConflictModelLadder runs the conflict session on the step's first model and,
+// when an attempt ends on a usage limit while a model is left, runs the session
+// again on a later route still left (CLA-890).
+//
+// The classification is the harness's own DetectLimit — the same one the phase
+// ladder's limit branch reads — so a limit the adapter already handled by
+// switching routes mid-session never reaches here. What does reach here is the
+// death it could not resume: a session that ended before it had one, which is the
+// CLA-884 shape (the free route's quota was exhausted ~2s in, so there was no
+// session id and no route switch, and the conflicting PR waited for a human).
+//
+// A limit on the LAST model returns that attempt's result unchanged: there is
+// nowhere left to go, and the existing failure classification reports it. Every
+// attempt is logged with the model it ran on, so a quota failure names the route
+// it hit.
+//
+// It retries whether or not the attempt got as far as editing anything. The
+// retry is a FRESH session running the same brief, and that brief is idempotent
+// where work already landed: the merge reports "Already up to date", a resolved
+// tree has no conflicting hunks left, and the gate and push are unchanged. So a
+// retry after partial work costs one session and can still finish the hand-back;
+// the case it exists for did nothing at all — CLA-884's quota death, where the
+// session ended before it had an id to resume.
+func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimitReader, run conflictModelRun) (harness.Result, error) {
+	models := req.Routes
+	if len(models) == 0 {
+		// No route named at all: ONE attempt on the harness's own default. A
+		// pinned single model arrives as a one-entry list, so it never falls back.
+		models = []string{req.Model}
+	}
+	var res harness.Result
+	var err error
+	for i := 0; i < len(models); i++ {
+		model := models[i]
+		name := strings.TrimSpace(model)
+		if name == "" {
+			name = "the harness default"
+		}
+		log.Printf("conflict: %s PR %s - attempt on %s (route %d of %d)", label, req.PR, name, i+1, len(models))
+		res, err = run(model, models[i:])
+		// A stream that could not be read whole is not evidence a limit was hit:
+		// the limit event the classifier read may not be the session's last word.
+		// The phase ladder ends such an attempt unclassified, and the opencode
+		// adapter declines to act on it for the same reason — so the ladder must
+		// not turn it into a fresh paid session on the next route.
+		if res.Untrusted != "" {
+			log.Printf("conflict: %s PR %s - %s ended on a stream that could not be read whole (%s) - not classifying it as a limit",
+				label, req.PR, name, res.Untrusted)
+			return res, err
+		}
+		lim := a.DetectLimit(res)
+		if !lim.Limited {
+			// The adapter may have switched routes MID-session and finished the
+			// work on a later one; name that route too, or the attempt line reads
+			// as if the model it started on did the job.
+			if fin := strings.TrimSpace(harness.RouteFinished(res)); fin != "" && fin != name {
+				log.Printf("conflict: %s PR %s - the session finished on %s after a route switch", label, req.PR, fin)
+			}
+			return res, err
+		}
+		// The route the attempt actually ENDED on. The adapter may have switched
+		// routes mid-session already, and retrying a route it just exhausted buys
+		// nothing; skipping to the one after it keeps the ladder and the
+		// adapter's own switch from spending the same denial twice.
+		if fin := strings.TrimSpace(harness.RouteFinished(res)); fin != "" {
+			name = fin
+			if idx := slices.Index(models, fin); idx > i {
+				i = idx
+			}
+		}
+		reason := loop.LimitStopReason(lim)
+		if i == len(models)-1 {
+			log.Printf("conflict: %s PR %s - %s ended on a usage limit (%s) and it is the last model in the list",
+				label, req.PR, name, reason)
+			return res, err
+		}
+		log.Printf("conflict: %s PR %s - %s hit a usage limit (%s) - retrying the session on %s",
+			label, req.PR, name, reason, models[i+1])
+	}
+	return res, err
 }
 
 // conflictInvocation composes the invocation a conflict session runs. Split from
 // the launcher so the composition — the one part that needs no paid process — is
-// testable: the prompt, the model, the reach (ExtraDirs) and the ceilings.
+// testable: the prompt, the model and its route list, the reach (ExtraDirs) and
+// the ceilings.
 func conflictInvocation(cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Invocation, error) {
 	env, err := cfg.SessionEnv(req.Harness, slug)
 	if err != nil {
@@ -600,6 +723,7 @@ func conflictInvocation(cfg *config.Config, slug string, req ConflictRunRequest,
 	return harness.Invocation{
 		Prompt:              req.Prompt,
 		Model:               req.Model,
+		Routes:              req.Routes,
 		WorkDir:             req.WorkDir,
 		MCPConfigPath:       cfg.ResolveMCPConfig(req.Harness, project.MCPConfigPath, project.MCPConfigPaths),
 		ConfigDir:           hc.ConfigDir,
