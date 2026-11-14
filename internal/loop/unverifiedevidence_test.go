@@ -209,11 +209,11 @@ func TestDrainPhases_ASettledPlaneRecordOutranksAnUnreadableOrigin(t *testing.T)
 		{res: recorded},
 		{res: okResult(5, 0.05)},
 	}}
-	rel := &peekReleaser{
+	rel := &taskReadReleaser{
 		next:  plane.NextTask{TaskID: "t-1"},
 		state: map[string]plane.TaskState{"t-1": {Status: "in_review"}},
 	}
-	d := blindSpotDriver(t, h, rel)
+	d := taskReadDriver(t, h, rel)
 	d.newVerifier = func(string, bool) deliveryVerifier { return unreadableOriginVerifier() }
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
@@ -231,43 +231,6 @@ func TestDrainPhases_ASettledPlaneRecordOutranksAnUnreadableOrigin(t *testing.T)
 	}
 	if out := logged.String(); strings.Contains(out, "not a checkpoint") {
 		t.Errorf("form (b) did not outrank the unreadable branch check:\n%s", out)
-	}
-}
-
-// The peek path faces the same split (CLA-451): a claim recovered from the
-// plane whose branch cannot be read is an unverified checkpoint too, and its
-// log line names the unreadable origin rather than reading as a refusal.
-func TestDrainPhases_ARecoveredClaimWithAnUnreadableOriginCheckpointsUnverified(t *testing.T) {
-	logged := captureLogs(t)
-	h := &fakeAdapter{steps: []invokeStep{
-		{res: okResult(1, 0)},
-		{res: okResult(5, 0.05)},
-	}}
-	rel := &peekReleaser{
-		next:  plane.NextTask{TaskID: "t-1"},
-		state: map[string]plane.TaskState{"t-1": {Status: "in_progress", ClaimedByRun: "r-curl", Branch: "clanker/phantom"}},
-	}
-	d := blindSpotDriver(t, h, rel)
-	d.newVerifier = func(string, bool) deliveryVerifier { return unreadableOriginVerifier() }
-
-	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
-		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
-	}
-	if h.invokeCalls != 2 {
-		t.Fatalf("spawned %d sessions, want 2 — a recovered claim with an unreadable origin is an unverified checkpoint", h.invokeCalls)
-	}
-	if got := h.invocations[1].ResumeClaim.Branch; got != "clanker/phantom" {
-		t.Errorf("phase 2 ResumeClaim.Branch = %q, want the recovered branch", got)
-	}
-	if p2 := h.invocations[1].Prompt; !strings.Contains(p2, "UNVERIFIED") || strings.Contains(p2, "verified to exist on the origin remote") {
-		t.Errorf("the recovered unverified checkpoint did not get the unverified brief:\n%s", p2)
-	}
-	out := logged.String()
-	if !strings.Contains(out, "UNVERIFIED checkpoint") || !strings.Contains(out, "could not read origin") {
-		t.Errorf("the recovered checkpoint is not logged as unverified with the Unknown detail:\n%s", out)
-	}
-	if strings.Contains(out, "not treating it as a checkpoint") {
-		t.Errorf("a recovered claim with an unreadable origin was refused as a checkpoint:\n%s", out)
 	}
 }
 

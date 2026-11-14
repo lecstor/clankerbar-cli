@@ -169,7 +169,7 @@ type Session struct {
 
 	// CostUSD is the harness-reported dollar figure for this session, or nil
 	// when there is no figure to carry: the adapter never reports cost at all
-	// (Capabilities.ReportsCost false — codex today), or this session reported
+	// (Capabilities.ReportsCost false — codex and copilot today), or this session reported
 	// no usage, so a zero would claim a spend nobody measured. A harness that
 	// DID report zero is a zero here, which is why it is a pointer.
 	//

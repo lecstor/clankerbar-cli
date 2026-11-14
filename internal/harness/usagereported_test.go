@@ -129,6 +129,7 @@ func TestReportsCostPerAdapter(t *testing.T) {
 		{"claude", true, "total_cost_usd rides on the result event"},
 		{"opencode", true, "each step_finish part carries a cost sibling"},
 		{"codex", false, "codex exec --json reports tokens, never money"},
+		{"copilot", false, "the JSONL stream reports AI credits and premium requests, never money"},
 	} {
 		caps, ok := CapabilitiesOf(tc.name)
 		if !ok {

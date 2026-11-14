@@ -50,18 +50,19 @@ func TestPerPhaseHarness_SpendIsChargedToThePhasesOwnHarness(t *testing.T) {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
 
-	if got := d.spentBy["opencode"].tokens; got != 10_000 {
+	byHarness := d.targetSpendAt(0).byHarness
+	if got := byHarness["opencode"].tokens; got != 10_000 {
 		t.Errorf("opencode's ledger entry = %d tokens, want the 10,000 its own session spent", got)
 	}
-	if got := d.spentBy["claude"].tokens; got != 5_000 {
+	if got := byHarness["claude"].tokens; got != 5_000 {
 		t.Errorf("claude's ledger entry = %d tokens, want the 5,000 its own session spent", got)
 	}
 	// The failure this pins: charging d.h.Name() puts the WHOLE drain — both
 	// phases — on the run's harness, so opencode's breaker never sees a token it
 	// spent and claude's trips on spend that was never its.
-	if len(d.spentBy) != 2 {
+	if len(byHarness) != 2 {
 		t.Errorf("the drain's spend landed in %d ledger entries (%v), want one per harness — a single entry means every phase was charged to the run's harness",
-			len(d.spentBy), d.spentBy)
+			len(byHarness), byHarness)
 	}
 }
 
@@ -207,12 +208,13 @@ func TestPerPhaseHarness_SupervisedWaitChargesTheWaitingPhasesHarness(t *testing
 	implPhase := d.cfg.EffectivePhases()[0]
 	d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, d.targets[0], spend{start: time.Now()})
 
-	if got := d.spentBy["opencode"].tokens; got == 0 {
+	byHarness := d.targetSpendAt(0).byHarness
+	if got := byHarness["opencode"].tokens; got == 0 {
 		t.Fatalf("the opencode phase's probes spent nothing on opencode's ledger (%v) — a probe is a paid session on the harness that RAN it, and charging d.h bills it to claude",
-			d.spentBy)
+			byHarness)
 	}
-	if _, billed := d.spentBy["claude"]; billed {
-		t.Errorf("claude was billed for a wait on the opencode phase: %v", d.spentBy)
+	if _, billed := byHarness["claude"]; billed {
+		t.Errorf("claude was billed for a wait on the opencode phase: %v", byHarness)
 	}
 }
 

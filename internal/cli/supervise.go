@@ -5,7 +5,7 @@ package cli
 // `clankerbar supervise` alias — reconciles the machine against the plane's
 // account-scoped roster: every declared instance with `desired: running` runs
 // as a supervised child, every one with `desired: stopped` gets its STOP
-// marker and drains at its iteration boundary, and flipping desired state in
+// marker and drains at its next phase seam or iteration boundary, and flipping desired state in
 // the console lands on the machine within one poll. Since phase 2b each child
 // runs on a config the supervisor GENERATES into the child's state dir
 // (`materialized.json`) from the operator's local config and the roster entry
@@ -123,7 +123,7 @@ func Supervise(ctx context.Context, args []string) error {
 }
 
 // Roll runs the phase-5b one-shot fleet roll: every local running child is
-// restarted at its iteration boundary and verified — via its next local
+// restarted at its next phase seam or iteration boundary and verified — via its next local
 // beacon — to be reporting the version THIS binary runs, one child at a
 // time; a child that fails to come back on it halts the roll. The operator
 // installs the new build at the fleet's launch path and runs
@@ -175,17 +175,20 @@ func Roll(ctx context.Context, args []string) error {
 // verifies that the fleet's launch path carries the version THIS binary runs
 // (the same pre-flight the roll performs — the replacement execs the launch
 // path, so the new build must already be installed there), then writes the
-// REPLACE marker the RUNNING supervisor honours at its next poll: drain every
-// child at its iteration boundary, then exec the launch path in place.
+// REPLACE marker the RUNNING supervisor honours at its next poll: it hands its
+// live children to the new image and execs the launch path in place, at once.
+// The new image adopts the children by pid and rolls each one still on the old
+// version onto itself at that child's own phase seam or iteration boundary, so
+// no session is interrupted.
 //
 // The launchd/systemd fallback (Decision 5): operators who run the supervisor
 // under an OS-level unit have a second path with the same contract — install
-// the new build at the launch path, let the fleet drain, then restart the
-// unit. Exec-in-place exists so a supervisor NOT under a unit (a terminal)
+// the new build at the launch path, then restart the unit (a unit stop still
+// drains). Exec-in-place exists so a supervisor NOT under a unit (a terminal)
 // replaces itself without a process gap; on a platform without exec(2) the
 // unit path is the only one.
 //
-// Unlike the roll, the replacement request touches no roster: the drain and
+// Unlike the roll, the replacement request touches no roster: the handoff and
 // the exec are the supervisor's own, from the fleet it holds in memory — so
 // the account key is not part of this command's wiring.
 func Replace(ctx context.Context, args []string) error {

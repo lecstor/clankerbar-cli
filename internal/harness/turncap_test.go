@@ -161,6 +161,9 @@ func TestAdaptersWithoutATokenCeilingNeverReportOne(t *testing.T) {
 	if (opencode{}).TokenCeilingHit(res) {
 		t.Error("opencode reported a token ceiling hit; it never kills a session mid-stream")
 	}
+	if (copilot{}).TokenCeilingHit(res) {
+		t.Error("copilot reported a token ceiling hit; it never kills a session mid-stream")
+	}
 }
 
 // Phases gate on this, in config.Validate, so it is not merely descriptive: the
@@ -170,6 +173,7 @@ func TestCapabilitiesMatchWhatTheAdaptersActuallyDo(t *testing.T) {
 	for name, caps := range map[string]Capabilities{
 		"claude":   (claude{}).Capabilities(),
 		"opencode": (opencode{}).Capabilities(),
+		"copilot":  (copilot{}).Capabilities(),
 	} {
 		if !caps.TracksClaims {
 			t.Errorf("%s does populate Result.Claim; TracksClaims must say so or phases are refused for a harness that supports them", name)
@@ -183,6 +187,9 @@ func TestCapabilitiesMatchWhatTheAdaptersActuallyDo(t *testing.T) {
 	}
 	if (codex{}).Capabilities().TracksClaims {
 		t.Error("codex claims to track claims, but it never assigns Result.Claim — phases would stop after phase 1 on every task")
+	}
+	if (copilot{}).Capabilities().HonoursMaxTurns {
+		t.Error("copilot claims to honour max_turns, but Invocation.MaxTurns never reaches its CLI")
 	}
 }
 

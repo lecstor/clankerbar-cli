@@ -34,7 +34,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -456,11 +455,11 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		out.Since = aliveSince
 		switch {
 		case d.stopping:
-			out.Reason = "supervisor stopping - draining at its iteration boundary"
+			out.Reason = "supervisor stopping - draining at its next phase seam or iteration boundary"
 		case d.replacing:
-			out.Reason = "replacing myself - draining at the iteration boundary"
+			out.Reason = "replacing myself - draining at the next phase seam or iteration boundary"
 		case inst.stopRequested:
-			out.Reason = "stop requested - draining at its iteration boundary"
+			out.Reason = "stop requested - draining at its next phase seam or iteration boundary"
 		}
 	case d.stopping:
 		out.State = StatusStopped
@@ -468,7 +467,7 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		out.Since = exitAt
 	case d.replacing:
 		out.State = StatusStopped
-		out.Reason = "replacing myself - drained at the iteration boundary"
+		out.Reason = "replacing myself - drained at the next phase seam or iteration boundary"
 		out.Since = exitAt
 	case inst.halted:
 		out.State = StatusHalted
@@ -516,16 +515,17 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 }
 
 // statusExitCode renders a child exit for the wire: an orderly exit is 0, a
-// signal is the negative code exec reports, and anything that is not an
-// *exec.ExitError (a spawn that never became a process) is -1 rather than a
-// fabricated zero.
+// signal is the negative code exec reports, and anything that is not an exit
+// error (a spawn that never became a process) is -1 rather than a fabricated
+// zero. An adopted child's exit comes from wait4, not exec.Cmd, so it carries
+// its own ExitCode method rather than being an *exec.ExitError.
 func statusExitCode(err error) int {
 	if err == nil {
 		return 0
 	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.ExitCode()
+	var ec interface{ ExitCode() int }
+	if errors.As(err, &ec) {
+		return ec.ExitCode()
 	}
 	return -1
 }

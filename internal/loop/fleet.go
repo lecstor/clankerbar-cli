@@ -100,6 +100,10 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 //
 //   - mid-drain                -> iteration {n, taskRef, phase}
 //   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new)
+//   - budget-exhausted           -> draining, indistinguishable from a pause HERE:
+//     the wire State carries no reason field, so the console shows a project that
+//     reached its ceiling exactly as it shows one an operator paused. The log line
+//     from markBudgetExhausted is the operator's signal until a reason is carried.
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:
@@ -114,8 +118,10 @@ func (d *Driver) fleetState(ti int) fleet.State {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
 	// A scheduled pause is reported after the iteration check: a session still in
-	// flight reports its iteration, and the window holds only the NEXT spawn.
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.schedPaused {
+	// flight reports its iteration, and the window holds only the NEXT spawn. An
+	// exhausted target (CLA-480) reads the same as a paused one: alive, spawning
+	// nothing new, because its own budget has been reached.
+	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.exhaustedAt(ti) || d.schedPaused {
 		return fleet.State{Kind: fleet.StateDraining}
 	}
 	return fleet.State{Kind: fleet.StateIdle}
@@ -484,7 +490,7 @@ func sessionRunID(res harness.Result, prev *harness.Result) string {
 //
 // Two questions have to be answered yes, and they are different ones. The
 // adapter has to be one that reports money at all — Capabilities.ReportsCost,
-// false for codex today — or there is no figure by construction. And THIS
+// false for codex and copilot today — or there is no figure by construction. And THIS
 // session has to have actually reported one: Result.CostReported, because a
 // session whose stream ended before its harness's accounting reported tokens and
 // no dollars, and a zero taken from that silence would read on the console as

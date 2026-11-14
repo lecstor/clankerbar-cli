@@ -456,21 +456,13 @@ type Driver struct {
 	// binary through the registry.
 	newAdapter func(name string) (harness.Adapter, error)
 
-	// spentBy is this run's spend per harness name, for the per-harness breakers
-	// (CLA-367). It hangs off the Driver rather than riding in `spend` because it
-	// is the RUN's account: a per-harness total outlives the drain that produced
-	// it, while the drain-local accumulators threaded through `spend` do not. See
-	// charge and budgetTrip. Lazily built; a run that configures no per-harness
-	// block still fills it, which costs one map and keeps the accounting honest if
-	// a block is added mid-file.
-	spentBy map[string]harnessSpend
-
-	// stateMu serialises the run-scoped maps below. They are written by whatever
-	// goroutine a session's result is processed on: with a review panel's members
-	// running concurrently (CLA-697) that is more than one at a time, and a Go map
-	// written from two goroutines is a data race, not a lost update. Every
-	// read-modify-write of spentBy, startRefusals, deadTally and panelFailStreak
-	// holds it; nothing that calls out to the plane or a harness may hold it.
+	// stateMu serialises the run-scoped ledgers and maps below. They are written
+	// by whatever goroutine a session's result is processed on: with a review
+	// panel's members running concurrently (CLA-697) that is more than one at a
+	// time, and a Go map written from two goroutines is a data race, not a lost
+	// update. Every read-modify-write of tgtSpend, startRefusals, deadTally and
+	// panelFailStreak holds it; nothing that calls out to the plane or a harness
+	// may hold it.
 	stateMu sync.Mutex
 
 	// startRefusals counts consecutive worktree refusals per task id, so a tree
@@ -496,7 +488,7 @@ type Driver struct {
 
 	// deadTally is this run's dead-phase tally, keyed by phase label and harness
 	// name (CLA-402): how many phase sessions ran and how many of those died
-	// producing nothing. Like spentBy it is the RUN's account — the rate is
+	// producing nothing. Like tgtSpend it is the RUN's account — the rate is
 	// measured over a run, not a drain — so it hangs off the Driver and is
 	// reported from Run. Lazily built; see tallyDead and logDeadTally.
 	deadTally map[tallyKey]*phaseTally
@@ -566,13 +558,33 @@ type Driver struct {
 	rcAttemptVer []int
 	rcFails      []int
 
-	// tgtTokens / tgtCost accumulate each target's own spend for the per-target
-	// budget breaker: a stored config's budget must bite on ITS project's spend,
-	// not on a run total shared with every other target. The base budget keeps
-	// its existing run-wide duty unchanged; this breaker exists only where an
-	// overlay is actually in force.
-	tgtTokens []int
-	tgtCost   []float64
+	// tgtSpend is each target's own spend account (CLA-480): the totals the
+	// per-target budget breaker judges, and the per-harness split its stored
+	// per_harness blocks read. Charged by charge() at the two places a session's
+	// spend enters a run, so a check between drains, phases or attempts — or
+	// inside a paused wait — reads the same live ledger. Guarded by stateMu.
+	tgtSpend []targetSpend
+
+	// tgtStart is when each target's first drain began: the clock a stored
+	// budget's max_wall_clock runs on. A target polled into a daemon hours old has
+	// not thereby spent hours of its own ratified ceiling. Guarded by stateMu:
+	// Run stamps it at the first drain, and budget checks a parallel panel's
+	// members run on their own goroutines read it while they do.
+	tgtStart []time.Time
+
+	// overlayBudget marks a target whose stored run-config document SET a
+	// budget: only that target's own spend is judged by it. A document that
+	// sets no budget leaves the target in the local pool, because the README's
+	// exception is the document's budget, not its mere existence (see budget.go).
+	overlayBudget []bool
+
+	// exhausted marks a target that has reached the budget in force for it: no
+	// more sessions for it this run, while its siblings keep draining. Run stops
+	// only when every target is exhausted. budgetStopped records that a mid-drain
+	// check was the reason the current drain ended, so Run continues with the
+	// siblings rather than reading that drain's stop as a run-wide stop.
+	exhausted     []bool
+	budgetStopped []bool
 
 	// overrides are the run's flag overrides, re-applied after every overlay so
 	// an explicit --harness/--model still wins over a stored document. cli.Run
@@ -639,8 +651,11 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		rcAttempt:           make([]time.Time, n),
 		rcAttemptVer:        make([]int, n),
 		rcFails:             make([]int, n),
-		tgtTokens:           make([]int, n),
-		tgtCost:             make([]float64, n),
+		tgtSpend:            make([]targetSpend, n),
+		tgtStart:            make([]time.Time, n),
+		overlayBudget:       make([]bool, n),
+		exhausted:           make([]bool, n),
+		budgetStopped:       make([]bool, n),
 		waitGrace:           time.Minute,
 		limitBeaconInterval: 5 * time.Minute,
 		startRefusals:       make(map[string]int),

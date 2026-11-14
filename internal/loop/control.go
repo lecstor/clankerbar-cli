@@ -9,10 +9,10 @@ package loop
 //	RELOAD        re-read the config file at the iteration boundary, no exec
 //
 // They are honoured exactly where STOP is honoured: at the top of the run loop
-// (the ITERATION boundary) and inside waitOrStop (idle polls and supervised
-// limit waits). Never at a mid-drain phase seam — the run holds the task at a
-// seam — and never inside a session's lifetime for anything but RESTART_NOW,
-// whose whole point is to cut that lifetime short.
+// (the ITERATION boundary), inside waitOrStop (idle polls and supervised limit
+// waits) and — for STOP and RESTART — at a verified PHASE SEAM (CLA-879, see
+// stopAtSeamMarker). Never inside a session's lifetime for anything but
+// RESTART_NOW, whose whole point is to cut that lifetime short.
 
 import (
 	"context"

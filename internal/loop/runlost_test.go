@@ -114,8 +114,8 @@ func TestDrainPhases_RunLostEndsTheSessionAndTheDrain(t *testing.T) {
 	}
 	// Nothing is owed a handback: the claim is not this run's to give back, and
 	// posting it `ready` (or expiring it) would act on someone else's task.
-	if len(rel.calls) != 0 || len(rel.driverCalls) != 0 || len(rel.expireCalls) != 0 {
-		t.Fatalf("handback calls = release %v, driver %v, expire %v; want none", rel.calls, rel.driverCalls, rel.expireCalls)
+	if len(rel.calls) != 0 || len(rel.expireCalls) != 0 {
+		t.Fatalf("handback calls = release %v, expire %v; want none", rel.calls, rel.expireCalls)
 	}
 	// Nor is anything salvaged: the worktree belongs to a task this run no longer
 	// holds, so committing or pushing from it is exactly what the plane forbade.

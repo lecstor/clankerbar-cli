@@ -460,9 +460,9 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"{closeRound: <the round the append returned>}) — then do NOT open a PR, do NOT move the task to " +
 	"in_review, and do NOT change its status. End holding the task. The driver spawns another fix against " +
 	"the released findings, or parks the task at the round cap.\n\n" +
-	"If NO MUST remains open: carry the hand-over in ONE call, AFTER confirming the branch is pushed (push " +
-	"any fix commit that is still local) and opening a PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder +
-	") if none exists for the branch: submit_for_review(taskId, runId, closeRound: <the round the append " +
+	"If NO MUST remains open: FIRST confirm the branch is pushed (push any fix commit that is still local) and " +
+	"open a PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for the branch." +
+	worktreeReclaimStep + " THEN carry the hand-over in ONE call: submit_for_review(taskId, runId, closeRound: <the round the append " +
 	"returned>, risk: { touches: [...] }). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
 	"the task leaves in_progress this run can no longer close the round. Do NOT send an outcome in that call: " +
 	"your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), and the fix " +

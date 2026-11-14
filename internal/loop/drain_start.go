@@ -47,7 +47,7 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 			labelOf(s.t), s.drainNum, claimLabel(claim))
 		return startAbort
 	}
-	checkout, _, repo, err := s.d.sessionDir(ctx, s.t, s.carried)
+	checkout, repo, err := s.d.sessionDir(ctx, s.t, s.carried)
 	if err != nil {
 		log.Printf("%siteration %d: %s: the task's checkout could not be resolved (%v) — handing the claim back",
 			labelOf(s.t), s.drainNum, claimLabel(claim), err)

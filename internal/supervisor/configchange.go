@@ -16,7 +16,7 @@ package supervisor
 // difference means the operator's declared intent (a base-config edit, or a
 // roster edit — projects, a permitted override) no longer matches what the
 // child runs: the file is rewritten and ONE graceful RESTART is queued, which
-// the daemon honours at its iteration boundary and re-execs in place onto the
+// the daemon honours at its next phase seam or iteration boundary and re-execs in place onto the
 // new file.
 //
 // Byte-exact comparison is what keeps this from becoming a restart loop: one
@@ -60,7 +60,7 @@ const supervisorRestartBodyPrefix = "supervisor: effective config changed at "
 // refreshMaterialized applies an effective-config change to one RUNNING child:
 // when the config built at this reconcile no longer serializes to the bytes of
 // the child's generated file, it rewrites that file and queues one graceful
-// RESTART so the edit lands at the child's next iteration boundary.
+// RESTART so the edit lands at the child's next phase seam or iteration boundary.
 //
 // It is deliberately conservative about what it will touch:
 //
@@ -79,7 +79,7 @@ const supervisorRestartBodyPrefix = "supervisor: effective config changed at "
 //   - Never through a file it cannot read: the generated file is a cache (safe
 //     to delete while the child runs), so an absent or untrusted file is left
 //     for the next spawn rather than treated as evidence of an edit.
-//   - Never RESTART_NOW: an edit applies at the iteration boundary, never
+//   - Never RESTART_NOW: an edit applies at the next phase seam or iteration boundary, never
 //     mid-session.
 func (d *Supervisor) refreshMaterialized(inst *Instance) {
 	inst.mu.Lock()
@@ -173,7 +173,7 @@ func (d *Supervisor) refreshMaterialized(inst *Instance) {
 	// the restart the operator's switch consumed, so the change is never lost.
 	if st.Exists(loop.MarkerRestart) || st.Exists(loop.MarkerRestartNow) {
 		inst.configRestartPending = false
-		log.Printf("%s: effective config changed - %s; its restart is already queued and lands at its iteration boundary", inst.name, rewriteClause(changed, path))
+		log.Printf("%s: effective config changed - %s; its restart is already queued and lands at its next phase seam or iteration boundary", inst.name, rewriteClause(changed, path))
 		return
 	}
 	// STOP/HALT again, now that the file has actually been replaced: the check
@@ -184,7 +184,7 @@ func (d *Supervisor) refreshMaterialized(inst *Instance) {
 		d.withdrawQueuedRestart(inst, dir, cfg)
 		return
 	}
-	// Never RESTART_NOW: an edit applies at the iteration boundary, never
+	// Never RESTART_NOW: an edit applies at the next phase seam or iteration boundary, never
 	// mid-session.
 	body := []byte(fmt.Sprintf("%s%s\n", supervisorRestartBodyPrefix, time.Now().UTC().Format(time.RFC3339)))
 	switch err := st.WriteFile(loop.MarkerRestart, body); {
@@ -199,15 +199,15 @@ func (d *Supervisor) refreshMaterialized(inst *Instance) {
 		}
 		inst.configRestartPending = false
 		if changed {
-			log.Printf("%s: effective config changed - rewrote %s and queued a restart at its iteration boundary", inst.name, path)
+			log.Printf("%s: effective config changed - rewrote %s and queued a restart at its next phase seam or iteration boundary", inst.name, path)
 		} else {
-			log.Printf("%s: effective config changed - queued the restart an earlier failed write could not, for its next iteration boundary", inst.name)
+			log.Printf("%s: effective config changed - queued the restart an earlier failed write could not, for its next phase seam or iteration boundary", inst.name)
 		}
 	case errors.Is(err, statedir.ErrExists):
 		// A marker landed between the check and this write (ctl, a roll): one
 		// pending request is enough, and the rewrite above still rides it.
 		inst.configRestartPending = false
-		log.Printf("%s: effective config changed - %s; its restart is already queued and lands at its iteration boundary", inst.name, rewriteClause(changed, path))
+		log.Printf("%s: effective config changed - %s; its restart is already queued and lands at its next phase seam or iteration boundary", inst.name, rewriteClause(changed, path))
 	default:
 		// The edit is IN the file but no restart will pick it up, and the next
 		// reconcile's byte comparison cannot see that. Keep the intent here so

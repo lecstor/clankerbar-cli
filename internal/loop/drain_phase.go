@@ -23,9 +23,11 @@ import (
 // placeholders in this phase's prompt. nil for the first phase, which has no run
 // to resume and claims one of its own.
 //
-// prior carries the run's ceilings down into the drain, because the budget breaker
-// in Run only runs BETWEEN drains and every wait in here happens inside one — see
-// the check at the top of the loop, and waitPastBudget.
+// prior carries the run's start and this target's index down into the drain: the
+// start is the run's clock (which a local-file budget and waitPastBudget measure
+// on), and the index names the target's ledger. The ceilings themselves live on
+// the Driver (see charge and budgetStop), so every wait inside the drain reads the
+// same live account the between-drains breaker does.
 // phaseIdx is this phase's 0-based position in the sequence, carried only so a
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
@@ -98,11 +100,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// cwd-scoped grant, hits the wall this replaces. The same directory then
 	// serves every retry: the task does not change between attempts.
 	//
-	// The second value is the task this phase was briefed on (CLA-451): exact for
-	// a resumed phase, the spawn-time queue-head peek for a fresh one. Held onto
-	// here because the seam needs it AFTER the session ends — it is the one task
-	// the driver can ask the plane about when the stream carried no claim state.
-	spawnDir, briefedTask, briefedRepo, serr := d.sessionDir(ctx, t, prev)
+	// The second value is the task's repo identity (CLA-437), used for the
+	// pr_base override; the first is the spawn directory.
+	spawnDir, briefedRepo, serr := d.sessionDir(ctx, t, prev)
 	if serr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
 	}
@@ -134,7 +134,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	r := &phaseRun{
 		d: d, t: t, tc: tc, ti: ti, drainNum: drainNum, phaseIdx: phaseIdx, tag: tag, ph: ph,
 		last: last, prev: prev, prior: prior, phases: phases, panel: panel, opts: opts,
-		shape: shape, a: a, spawnDir: spawnDir, prBase: prBase, briefedTask: briefedTask,
+		shape: shape, a: a, spawnDir: spawnDir, prBase: prBase,
 		fixGrading: fixGrading, verifyDigest: verifyDigest, review: review, end: end,
 		// From the CAPTURED sequence, so a handoff successor (whose ph.Prompt is
 		// the predecessor's successor text) still expects its phase's report.

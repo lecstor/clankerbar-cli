@@ -389,11 +389,12 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 
 	// Claim BEFORE merging: the claim is the lock that keeps an agent close-out and
 	// this path from both integrating the same PR.
-	runID, err := client.ClaimCloseOut(ctx, task.ID)
+	claim, err := client.ClaimCloseOut(ctx, task.ID)
 	if err != nil {
 		d.closeOutSay(key, "close-out: %s PR #%d is clean but the claim was refused (%v) - leaving it to whoever holds it", label, state.Number, err)
 		return
 	}
+	runID := claim.RunID
 
 	// From here on the claim is ours, so every failure has to hand it back: a task
 	// left claimed by a run that has stopped is a task nobody is working.

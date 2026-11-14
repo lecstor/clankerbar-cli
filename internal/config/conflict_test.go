@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -106,8 +108,8 @@ func TestConflictStepDefaultsToTheImplementStep(t *testing.T) {
 	if step.Harness != "opencode" {
 		t.Errorf("harness = %q, want the implement phase's opencode", step.Harness)
 	}
-	if step.Model != "cheap-model" {
-		t.Errorf("model = %q, want the implement phase's tiered cheap-model", step.Model)
+	if got := step.Model.First(); got != "cheap-model" {
+		t.Errorf("model = %q, want the implement phase's tiered cheap-model", got)
 	}
 }
 
@@ -124,15 +126,15 @@ func TestConflictStepHonoursItsOwnBlock(t *testing.T) {
 	}
 	// A different harness is a different dialect: its own default model, never
 	// the run-wide alias the other harness serves.
-	if step.Model != "codex-model" {
-		t.Errorf("model = %q, want codex's own codex-model (not the run-wide run-model)", step.Model)
+	if got := step.Model.First(); got != "codex-model" {
+		t.Errorf("model = %q, want codex's own codex-model (not the run-wide run-model)", got)
 	}
 	if step.MaxTurns != 25 {
 		t.Errorf("max turns = %d, want the block's 25", step.MaxTurns)
 	}
 
-	c.Conflict.Model = "pinned-model"
-	if got := c.ConflictStep().Model; got != "pinned-model" {
+	c.Conflict.Model = ModelRoutes{"pinned-model"}
+	if got := c.ConflictStep().Model.First(); got != "pinned-model" {
 		t.Errorf("model = %q, want the block's own pinned-model to win", got)
 	}
 }
@@ -187,6 +189,81 @@ func TestConflictResolutionReadsTheSessionMarker(t *testing.T) {
 	}
 }
 
+// The brief copies the stored outcome verbatim and appends, so a re-offered task
+// carries older markers ABOVE the newest one: the LAST marker is the current
+// session's (CLA-889).
+func TestConflictResolutionReadsTheLastMarker(t *testing.T) {
+	outcome := "RESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\nRESOLUTION: failed\n\n- the base moved again"
+	kind, detail, ok := ConflictResolution(outcome)
+	if !ok {
+		t.Fatal("ConflictResolution found no marker in a two-marker outcome")
+	}
+	if kind != ConflictResolutionFailed || detail != "the base moved again" {
+		t.Errorf("kind/detail = %q/%q, want the LAST marker's failed/the base moved again", kind, detail)
+	}
+}
+
+// ConflictResolutionSince is the conflict path's classification: it reads only
+// what the session appended to the outcome it was handed at the claim. An
+// unchanged outcome wrote nothing, so an older attempt's marker must not classify
+// the release (CLA-889).
+func TestConflictResolutionSinceReadsOnlyTheSessionsWrite(t *testing.T) {
+	const (
+		oldMechanical = "the reviewed evidence\n\nRESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass"
+		oldFailed     = "the reviewed evidence\n\nRESOLUTION: failed\n\n- an earlier attempt"
+	)
+	cases := []struct {
+		name    string
+		prior   string
+		current string
+		kind    string
+		detail  string
+		ok      bool
+	}{
+		{
+			name:    "unchanged outcome has no marker",
+			prior:   oldMechanical,
+			current: oldMechanical,
+		},
+		{
+			name:    "unchanged apart from trailing whitespace has no marker",
+			prior:   oldMechanical,
+			current: oldMechanical + "\n\n",
+		},
+		{
+			name:    "an appended failure is this session's",
+			prior:   oldMechanical,
+			current: oldMechanical + "\n\nRESOLUTION: failed\n\n- the free quota was exhausted",
+			kind:    ConflictResolutionFailed,
+			detail:  "the free quota was exhausted",
+			ok:      true,
+		},
+		{
+			name:    "an appended mechanical over an older failure is green",
+			prior:   oldFailed,
+			current: oldFailed + "\n\nRESOLUTION: mechanical",
+			kind:    ConflictResolutionMechanical,
+			ok:      true,
+		},
+		{
+			name:    "a session that replaced the outcome is classified on what it wrote",
+			prior:   oldMechanical,
+			current: "RESOLUTION: behavioural\n\n- a.txt: kept the feature",
+			kind:    ConflictResolutionBehavioural,
+			detail:  "a.txt: kept the feature",
+			ok:      true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, detail, ok := ConflictResolutionSince(tc.prior, tc.current)
+			if ok != tc.ok || kind != tc.kind || detail != tc.detail {
+				t.Errorf("ConflictResolutionSince = (%q, %q, %v), want (%q, %q, %v)", kind, detail, ok, tc.kind, tc.detail, tc.ok)
+			}
+		})
+	}
+}
+
 func TestValidateHoldsTheConflictStepToTheHarnessRules(t *testing.T) {
 	t.Run("unknown harness", func(t *testing.T) {
 		c := defaults()
@@ -234,5 +311,121 @@ func TestConflictHarnessIsSpawned(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("SpawnedHarnesses() = %v, want the conflict step's codex (the supervisor really starts a session there)", c.SpawnedHarnesses())
+	}
+}
+
+// CLA-890: the conflict session inherits the implement step's WHOLE route list,
+// not just its first entry. The free route's quota being exhausted is exactly
+// what the second entry is for, and resolving only the first left the conflict
+// session with nowhere to go.
+func TestConflictStepInheritsTheWholeImplementModelList(t *testing.T) {
+	const free, paid = "opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"
+	for _, tc := range []struct {
+		name      string
+		configure func(*Config)
+	}{
+		{
+			name: "the harness block's own list",
+			configure: func(c *Config) {
+				c.Conflict = nil // no conflict block at all
+				c.Harness = "opencode"
+				c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{free, paid}}}
+				c.Phases = []Phase{{Name: ImplementPhaseName}}
+			},
+		},
+		{
+			name: "the implement phase's tier route list",
+			configure: func(c *Config) {
+				c.Conflict = nil // no conflict block at all
+				c.Harness = "opencode"
+				c.Harnesses = map[string]HarnessConfig{"opencode": {
+					Models: map[string]ModelRoutes{"flash": {free, paid}},
+				}}
+				c.Phases = []Phase{{Name: ImplementPhaseName, Tier: "flash"}}
+			},
+		},
+		{
+			name: "a conflict block that names no model",
+			configure: func(c *Config) {
+				c.Harness = "opencode"
+				c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{free, paid}}}
+				c.Phases = []Phase{{Name: ImplementPhaseName}}
+				c.Conflict = &ConflictStep{MaxTurns: 40}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := defaults()
+			tc.configure(c)
+
+			step := c.ConflictStep()
+			if got := step.Model.List(); !slices.Equal(got, []string{free, paid}) {
+				t.Errorf("conflict models = %v, want the implement step's whole list [%s %s]", got, free, paid)
+			}
+			if got := step.Model.First(); got != free {
+				t.Errorf("first conflict model = %q, want the free route %q", got, free)
+			}
+		})
+	}
+}
+
+// A pinned single `conflict.model` is a one-entry list: it must run only that
+// model, with no inherited fallback hiding behind it.
+func TestConflictStepPinnedModelIsTheOnlyRoute(t *testing.T) {
+	c := defaults()
+	c.Harness = "opencode"
+	c.Model = "run-model"
+	c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{"free", "paid"}}}
+	c.Phases = []Phase{{Name: ImplementPhaseName}}
+	c.Conflict = &ConflictStep{Model: ModelRoutes{"pinned"}}
+
+	if got := c.ConflictStep().Model.List(); !slices.Equal(got, []string{"pinned"}) {
+		t.Errorf("conflict models = %v, want only the pinned model", got)
+	}
+}
+
+// A conflict step on ANOTHER harness inherits that harness's list: the aliases
+// are dialect-specific, so falling back to the implement step's would name a
+// model that harness does not serve.
+func TestConflictStepOnAnotherHarnessInheritsItsWholeList(t *testing.T) {
+	c := defaults()
+	c.Harness = "opencode"
+	c.Harnesses = map[string]HarnessConfig{
+		"codex": {Model: ModelRoutes{"codex-free", "codex-paid"}},
+	}
+	c.Conflict = &ConflictStep{Harness: "codex"}
+
+	if got := c.ConflictStep().Model.List(); !slices.Equal(got, []string{"codex-free", "codex-paid"}) {
+		t.Errorf("conflict models = %v, want codex's whole list", got)
+	}
+}
+
+// The model field's wire form must not move for the shapes that existed before it
+// carried a route list. Config.Identity() hashes the marshalled config, and a
+// changed identity makes every running supervisor treat its config as edited and
+// restart its children: an upgrade must not do that on its own.
+func TestConflictStepModelKeepsItsWireForm(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		step   ConflictStep
+		want   string
+		absent string
+	}{
+		{"one pinned alias marshals as the historical string", ConflictStep{Model: ModelRoutes{"alias"}}, `"model":"alias"`, ""},
+		{"no model is omitted", ConflictStep{MaxTurns: 40}, `"max_turns":40`, "model"},
+		{"several routes use the array form", ConflictStep{Model: ModelRoutes{"free", "paid"}}, `"model":["free","paid"]`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.step)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !strings.Contains(string(b), tc.want) {
+				t.Errorf("marshalled conflict step = %s, want it to carry %s", b, tc.want)
+			}
+			if tc.absent != "" && strings.Contains(string(b), tc.absent) {
+				t.Errorf("marshalled conflict step = %s, want no %q key at all", b, tc.absent)
+			}
+		})
 	}
 }

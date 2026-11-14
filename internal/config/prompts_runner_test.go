@@ -470,3 +470,30 @@ func TestRunnerFixGradingRulePointsAtTheReport(t *testing.T) {
 		}
 	}
 }
+
+// CLA-536: the runner's final phases open the PR and hand the task over
+// themselves, so they must reclaim the tree too. The live 3-phase sequence ends
+// at the runner fix brief and the 4-phase one at the runner verify brief, and no
+// session after either may touch the tree - a missing reclaim leaks every
+// worktree the drain creates.
+func TestRunnerFinalPhaseBriefsReclaimTheWorktree(t *testing.T) {
+	for _, tc := range []struct{ name, brief, push, pr, finalCall string }{
+		{"fix", RunnerFixBrief(), "COMMIT and PUSH the fixes", "open a PR targeting the repo's PR base branch", DoneMarker},
+		{"verify", RunnerVerifyBrief(), "confirm the branch is pushed", "open a PR targeting the repo's PR base branch", DoneMarker},
+	} {
+		assertReclaimSequence(t, "runner "+tc.name, tc.brief, tc.push, tc.pr, tc.finalCall)
+	}
+
+	// A phase with a session after it must not reclaim: implement's review phase
+	// still works in the tree, the review-only gate hands to fix, and fix-verify
+	// hands to the verification round.
+	for name, brief := range map[string]string{
+		"implement":   RunnerImplementBrief(),
+		"review-only": RunnerReviewOnlyBrief(),
+		"fix-verify":  RunnerFixVerifyBrief(),
+	} {
+		if strings.Contains(brief, worktreeReclaimStep) {
+			t.Errorf("the runner %s brief reclaims a tree a later phase still works in:\n%s", name, brief)
+		}
+	}
+}

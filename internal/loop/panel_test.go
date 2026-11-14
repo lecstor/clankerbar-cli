@@ -842,7 +842,7 @@ func TestDrainPhases_ReviewPanelOnABranchlessTaskRunsOneReviewer(t *testing.T) {
 		{res: held(okResult(1, 0), openClaim())}, // review-1: appends its block and holds
 		{res: okResult(1, 0)},                    // the fix
 	}}
-	rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+	rel := &taskReadReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 	h.onInvoke = func(i int) {
 		if i == 1 {
 			st := rel.state["t-1"]
@@ -889,7 +889,7 @@ func TestDrainPhases_BranchlessPanelChoosesARequiredSeatOverTheTrialSeat(t *test
 		{res: held(okResult(1, 0), openClaim())}, // review-2 (REQUIRED): appends its block and holds
 		{res: okResult(1, 0)},                    // the fix
 	}}
-	rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+	rel := &taskReadReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 	h.onInvoke = func(i int) {
 		if i == 1 { // the REQUIRED seat's invocation: it writes the legacy block
 			st := rel.state["t-1"]
@@ -1412,7 +1412,7 @@ func TestDrainPhases_BranchlessPanelWithNoRecordEndsWithoutAFix(t *testing.T) {
 			{res: okResult(1, 0)},                                // would be the fix
 			{res: okResult(1, 0)},
 		}}
-		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		rel := &taskReadReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		d := panelDriver(t, h, rel, members, panelPhases())
 		_, _, stop, err := drainPhasesOnce(t, d)
 		return h, stop, err

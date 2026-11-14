@@ -363,21 +363,15 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
 // they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
-// 2 and 3). It also returns the id of the task the phase is BRIEFED on — exact
-// for a resumed phase (the predecessor's claim), best-effort for a fresh one
-// (the queue-head peek, the same read the session is about to make). The seam's
-// checkpoint peek reads it after the phase ends (CLA-451); empty means the
-// driver never knew which task to ask about, and the peek is skipped.
-//
-// Which task that is depends on the phase. A RESUMED phase (prev carries a held
-// claim) knows its exact task, so its repo is read straight off the plane with
-// get_task. A FRESH phase has claimed nothing yet — the claim happens inside the
-// session — so the driver peeks at next_task, the same queue-head read the
-// session is about to make, and starts in that task's repo. The peek cannot race
-// a session out of work (it holds nothing), and if another clanker does claim the
-// peeked task first, the spawned session claims elsewhere and still works: the
-// permission policy covers every declared repo regardless of cwd, which is what
-// makes a best-effort cwd safe rather than load-bearing.
+// 2 and 3). Which task that is depends on the phase. A RESUMED phase (prev
+// carries a held claim) knows its exact task, so its repo is read straight off
+// the plane with get_task. A FRESH phase has claimed nothing yet — the claim
+// happens inside the session — so the driver peeks at next_task, the same
+// queue-head read the session is about to make, and starts in that task's repo.
+// The peek cannot race a session out of work (it holds nothing), and if another
+// clanker does claim the peeked task first, the spawned session claims elsewhere
+// and still works: the permission policy covers every declared repo regardless
+// of cwd, which is what makes a best-effort cwd safe rather than load-bearing.
 //
 // Resolution then runs config.ResolveCheckout over what the target declared:
 // explicit repos entries, then the workdir-is-the-checkout convention, then
@@ -395,38 +389,34 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 // caller can key the pr_base override by it (CLA-608) without a second plane
 // read; "" is the same best-effort empty the checkout resolution already
 // tolerates, and means only "no override can match".
-func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, string, string, error) {
-	repo := ""
-	briefed := ""
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (dir, repo string, err error) {
 	if prev != nil && prev.Claim.Held() {
-		briefed = prev.Claim.TaskID
 		if src, ok := t.Releaser.(plane.TaskRepoSource); ok {
-			r, err := src.TaskRepo(ctx, prev.Claim.TaskID)
+			r, rerr := src.TaskRepo(ctx, prev.Claim.TaskID)
 			switch {
-			case err == nil:
+			case rerr == nil:
 				repo = r
-			case errors.Is(err, plane.ErrNotWired):
+			case errors.Is(rerr, plane.ErrNotWired):
 				// No plane endpoint/key: nothing to read, the fallback chain runs.
 			default:
-				log.Printf("%scould not read the repo of resumed task %s (%v) — falling back to the primary repo", labelOf(t), claimLabel(prev.Claim), err)
+				log.Printf("%scould not read the repo of resumed task %s (%v) — falling back to the primary repo", labelOf(t), claimLabel(prev.Claim), rerr)
 			}
 		}
 	} else if peeker, ok := t.Releaser.(plane.TaskPeeker); ok {
-		next, err := peeker.PeekNextTask(ctx)
+		next, perr := peeker.PeekNextTask(ctx)
 		switch {
-		case err == nil:
-			briefed = next.TaskID
+		case perr == nil:
 			repo = next.Repo
 			if next.Repo != "" {
 				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
 			}
-		case errors.Is(err, plane.ErrNotWired):
+		case errors.Is(perr, plane.ErrNotWired):
 		default:
-			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), err)
+			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), perr)
 		}
 	}
-	dir, err := d.checkoutFor(t, repo)
-	return dir, briefed, repo, err
+	dir, err = d.checkoutFor(t, repo)
+	return dir, repo, err
 }
 
 // checkoutFor resolves a repo identity to the local checkout this target runs

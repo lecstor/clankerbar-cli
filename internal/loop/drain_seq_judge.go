@@ -308,6 +308,15 @@ func (s *drainSeq) judgeVerifyGate(ctx context.Context, st *seqStep) seqNext {
 		localRounds := s.verifyRoundsRun + 1
 		capHit := st.end.verifyCounted >= config.ReviewRoundCap || localRounds >= config.ReviewRoundCap
 		if reason == "" && !capHit && fixIdx >= 0 && st.end.checkpoint && s.carried != nil {
+			// CLA-879: the rewind spawns the fix phase on the same verified
+			// checkpoint, so it is a phase seam too: a STOP or RESTART dropped
+			// during the verification round must act here, not after the fix
+			// round it would otherwise start. The start table may resume at
+			// verify instead of fix (open MUSTs not at the tip), so the log
+			// names "a later phase" rather than promising the fix.
+			if s.stopAtSeamMarker(ctx, st, fixIdx, "a later phase") {
+				return seqBreak
+			}
 			for _, id := range st.end.verifyResolvedIDs {
 				s.verifyResolved[id] = true
 			}
@@ -393,21 +402,21 @@ func (s *drainSeq) payOwedWaits(ctx context.Context) {
 	// same stated-reset handling — the difference is only that there is no
 	// session left to re-run when it lifts, so the drain returns and Run polls
 	// again. waitPastBudget is consulted first, exactly as on the first-phase
-	// path: a reset beyond the run's remaining ceiling is not worth sleeping
-	// through, so the run stops and says when to start a fresh one.
+	// path: a reset beyond the remaining ceiling is not worth sleeping through,
+	// so this account stops draining and says when to start a fresh one.
 	if s.limitWait != nil {
-		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
+		remaining, bounded := tc.Budget.Remaining(d.budgetElapsed(s.ti, time.Since(prior.start)))
 		if until, over := waitPastBudget(s.limitWait.lim.ResetAt, remaining, bounded); over {
-			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
+			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this ceiling; not waiting, so start a fresh run after the reset",
 				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
+			d.exhaustForWait(s.ti, "the stated reset is past the remaining budget")
 			s.stop = true
 		} else {
 			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
 				drainNum, resetSuffix(s.limitWait.lim.ResetAt))
 			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, t, spend{
-				start:  prior.start,
-				tokens: prior.tokens + s.tokens,
-				cost:   prior.cost + s.cost,
+				start: prior.start,
+				ti:    s.ti,
 			})
 			s.tokens += ptokens
 			s.cost += pcost

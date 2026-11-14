@@ -269,6 +269,14 @@ walk:
 		if st.panelMember && st.end.reviewRound > 0 {
 			s.panelRound = st.end.reviewRound
 		}
+		// CLA-879: STOP and RESTART act HERE, on the seam a verified checkpoint
+		// has just opened, rather than waiting for the whole sequence to finish.
+		// Reaching this point means this phase checkpointed and the next one is
+		// about to spawn on the held claim; no marker means the walk advances
+		// exactly as it always did.
+		if s.stopAtSeamMarker(ctx, st, s.i+1, "") {
+			break walk
+		}
 		s.i++
 	}
 
@@ -285,14 +293,18 @@ walk:
 // It is what a config with no `phases` gets, and it is kept as its own entry
 // point because that is the shape every existing test drives.
 //
+// ti is the target's index, taken explicitly rather than from prior: a caller
+// that passes spend{start: ...} without a ti must not have its spend silently
+// booked to target 0 and judged by target 0's stored budget.
+//
 // The phase comes from EffectivePhases, not an inline literal, so the unphased
 // path carries the same resolution every other path does — the top-level or
 // default turn cap (CLA-343), which is precisely what the inline zero-value
 // version failed to do.
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	phases := d.targetCfg(t).EffectivePhases()
 	ph := phases[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior, phases, panelState{}, phaseRunOpts{})
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, ti, 0, "", ph, true, nil, t, prior, phases, panelState{}, phaseRunOpts{})
 	return tokens, cost, stop, err
 }
 
@@ -315,15 +327,6 @@ type phaseRunOpts struct {
 	// round's close. A member must not close it itself: its siblings may still be
 	// recording, and the close is what releases the findings they must not see.
 	panelParallel bool
-
-	// panelSpend, when non-nil, is this member's handle on its panel's shared
-	// spend ledger (CLA-697 review finding 1.review-1.1). Every attempt's counted
-	// spend is published to it the moment the ladder counts it, and the ladder's
-	// pre-spawn budget check measures the run's totals PLUS the siblings' counted
-	// spend. Without it each member compared the same prior snapshot plus its own
-	// local spend against a run-wide ceiling none of them could see the others
-	// approaching. Nil for every caller that is not a parallel panel member.
-	panelSpend *panelSpendHandle
 
 	// onSessionLaunch, when non-nil, is called immediately before the adapter is
 	// invoked — the first moment this phase's session launch has actually BEGUN —

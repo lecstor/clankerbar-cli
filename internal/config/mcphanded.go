@@ -34,7 +34,8 @@ const MCPConfigNone = "none"
 //     convention and is refused here rather than passed as OPENCODE_CONFIG;
 //     any other path passes verbatim, because the operator named that file
 //     themselves and doctor still reports on its shape.
-//   - claude (MCPConfigClaudeJSON): everything passes, exactly as before.
+//   - claude and copilot (MCPConfigClaudeJSON): everything passes, exactly as
+//     before - copilot reads the same `mcpServers` object.
 //
 // An unknown harness returns the path unchanged: Validate refuses those long
 // before this runs, and refusing to guess beats inventing policy here.

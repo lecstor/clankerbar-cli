@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -85,18 +86,51 @@ func TestConflictStandDownStartsOneConflictSession(t *testing.T) {
 	if call.req.Harness != "opencode" || call.req.Model != "implement-model" {
 		t.Errorf("the session runs on %s/%s, want the implement step opencode/implement-model", call.req.Harness, call.req.Model)
 	}
-	if call.step.Harness != "opencode" || call.step.Model != "implement-model" {
+	if call.step.Harness != "opencode" || call.step.Model.First() != "implement-model" {
 		t.Errorf("the resolved step = %+v, want the implement step", call.step)
+	}
+	if !slices.Equal(call.req.Routes, []string{"implement-model"}) {
+		t.Errorf("session routes = %v, want the implement step's route list", call.req.Routes)
 	}
 	if !strings.Contains(lines, "outcome: mechanical") {
 		t.Errorf("the pass did not log the session's outcome:\n%s", lines)
 	}
 }
 
+// CLA-890: an unset conflict block inherits the implement step's WHOLE model
+// route list — the free route first and its paid twin behind it — so a quota on
+// the first has somewhere to fall back to.
+func TestConflictSessionInheritsTheImplementStepsWholeModelList(t *testing.T) {
+	f := conflictingFixture(t)
+	d := f.supervisor(0)
+	cfg := d.instances[0].cfg
+	cfg.Model = ""
+	cfg.Harnesses = map[string]config.HarnessConfig{
+		"opencode": {Model: config.ModelRoutes{"opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"}},
+	}
+
+	f.run(d)
+
+	calls := f.conflictCalls()
+	if len(calls) != 1 {
+		t.Fatalf("conflict sessions = %d, want one", len(calls))
+	}
+	want := []string{"opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"}
+	if !slices.Equal(calls[0].step.Model.List(), want) {
+		t.Errorf("resolved conflict models = %v, want the implement step's whole list %v", calls[0].step.Model.List(), want)
+	}
+	if !slices.Equal(calls[0].req.Routes, want) {
+		t.Errorf("session routes = %v, want the whole list %v", calls[0].req.Routes, want)
+	}
+	if calls[0].req.Model != want[0] {
+		t.Errorf("session starts on %q, want the first route %q", calls[0].req.Model, want[0])
+	}
+}
+
 func TestConflictSessionUsesItsOwnStep(t *testing.T) {
 	f := conflictingFixture(t)
 	d := f.supervisor(0)
-	d.instances[0].cfg.Conflict = &config.ConflictStep{Model: "gpt-x", MaxTurns: 40}
+	d.instances[0].cfg.Conflict = &config.ConflictStep{Model: config.ModelRoutes{"gpt-x"}, MaxTurns: 40}
 
 	f.run(d)
 
@@ -117,7 +151,7 @@ func TestConflictSessionRefusesAHarnessThatCannotTakeExtraDirs(t *testing.T) {
 	d := f.supervisor(0)
 	// codex deliberately does not translate Invocation.ExtraDirs, so it could not
 	// create the worktree the brief names - a paid session that fails at step 2.
-	d.instances[0].cfg.Conflict = &config.ConflictStep{Harness: "codex", Model: "gpt-x"}
+	d.instances[0].cfg.Conflict = &config.ConflictStep{Harness: "codex", Model: config.ModelRoutes{"gpt-x"}}
 
 	lines := f.run(d)
 
@@ -129,6 +163,25 @@ func TestConflictSessionRefusesAHarnessThatCannotTakeExtraDirs(t *testing.T) {
 	}
 	if !strings.Contains(lines, "does not translate ExtraDirs") {
 		t.Errorf("the stand-down does not name the grant the harness cannot take:\n%s", lines)
+	}
+}
+
+// The allowlist is inverted on purpose: a harness that translates ExtraDirs into
+// a writable root has to be named deliberately, and copilot's --add-dir is one.
+func TestConflictHarnessExtraDirAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		harness string
+		want    bool
+	}{
+		{"opencode", true},
+		{"claude", true},
+		{"copilot", true},
+		{"codex", false},
+		{"", false},
+	} {
+		if got := conflictHarnessTakesExtraDirs(tc.harness); got != tc.want {
+			t.Errorf("conflictHarnessTakesExtraDirs(%q) = %v, want %v", tc.harness, got, tc.want)
+		}
 	}
 }
 
@@ -178,50 +231,174 @@ func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	}
 }
 
-func TestConflictSessionSafetyNetReleaseMatchesTheBareHolderUUID(t *testing.T) {
+func TestConflictSessionSafetyNetReleasesAStrandedClaim(t *testing.T) {
 	f := conflictingFixture(t)
-	// The claim hands the supervisor a run CREDENTIAL; the plane records the BARE
-	// uuid in `claimedByRun`. The safety-net release must recognise its own run
-	// across that difference (CLA-759 review 1.review-1.1) - and must NOT report the
-	// holder as "another run" when it is our own stopped one.
+	// The plane's REAL stranded shape since CLA-509: presence only, no run id. A
+	// conflict session that dies before handing the task back leaves exactly this,
+	// and the safety-net release must fire on presence alone - the supervisor
+	// signs with the credential its own claim returned.
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":%q,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
-		closeOutTestTask, closeOutTestRef, closeOutTestRunUUID))
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"branch":%q,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
+		closeOutTestTask, closeOutTestRef, closeOutTestHead))
 	d := f.supervisor(0)
 
 	lines := f.run(d)
 
 	releases := f.callsFor("release_task")
 	if len(releases) != 1 {
-		t.Fatalf("release_task calls = %d, want exactly the safety-net release (the holder is our own bare uuid): %v", len(releases), releases)
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
 	}
 	if got := releases[0].args["driver"]; got != true {
 		t.Errorf("the safety-net release does not carry the driver marker: %v", releases[0].args)
+	}
+	if got := releases[0].args["runId"]; got != closeOutTestRunCredential {
+		t.Errorf("the release signs with runId %v, want the claim's credential %q", got, closeOutTestRunCredential)
 	}
 	if got := releases[0].args["checkGreen"]; got != false {
 		t.Errorf("a failed resolution released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
 	}
 	if strings.Contains(lines, "held by another run") {
-		t.Errorf("our own stopped run was misreported as another holder:\n%s", lines)
+		t.Errorf("our own stranded claim was misreported as another holder:\n%s", lines)
+	}
+	if !strings.Contains(lines, "outcome: failed") || !strings.Contains(lines, "claim released, task left approved") {
+		t.Errorf("the failure line does not say the claim was released:\n%s", lines)
 	}
 }
 
-func TestConflictSessionLeavesAClaimAnotherRunHolds(t *testing.T) {
+// serveClaimOutcome rewrites the claim response so the conflict path takes the
+// given outcome as its pre-session baseline. The plane serves the task view
+// (outcome included) beside the run credential at the claim, and that view is the
+// only copy of the pre-session text a holder can get (CLA-509).
+func (f *closeOutFixture) serveClaimOutcome(outcome string) {
+	f.plane.serveTool("claim_task", fmt.Sprintf(
+		`{"task":{"id":%q,"outcome":%q},"run":{"id":%q}}`,
+		closeOutTestTask, outcome, closeOutTestRunCredential))
+}
+
+// CLA-889: the brief tells the session to copy the stored outcome verbatim and
+// append its block, so a re-offered task carries older attempts' markers ABOVE
+// this session's. The safety-net release classifies only what THIS session wrote:
+// an unchanged outcome is "no marker" (never an older attempt's attestation), and
+// a changed one is read on its LAST marker.
+func TestConflictSessionClassifiesOnlyThisSessionsWrite(t *testing.T) {
+	const (
+		oldMechanical = "The reviewed evidence.\n\nRESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept both sides"
+		newFailed     = "RESOLUTION: failed\n\n- the free quota was exhausted before the merge"
+		newMechanical = "RESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept both sides"
+	)
+
+	for _, tc := range []struct {
+		name       string
+		prior      string
+		after      string
+		checkGreen bool
+		wantLog    []string
+	}{
+		{
+			name:  "a dead retry writes nothing, so the older mechanical is not this session's attestation",
+			prior: oldMechanical,
+			after: oldMechanical,
+			// The merge this session was to make never happened: a green
+			// attestation would exempt the PR from the plane's repair ladder.
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the session left no resolution marker", "claim released, task left approved"},
+		},
+		{
+			name:       "a session that wrote prose but no marker is still a failure",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\nI could not finish.",
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the session left no resolution marker", "claim released, task left approved"},
+		},
+		{
+			name:       "a new failed marker wins over the older mechanical",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\n" + newFailed,
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the free quota was exhausted", "claim released, task left approved"},
+		},
+		{
+			name:       "a new mechanical marker is the session's own green attestation",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\n" + newMechanical,
+			checkGreen: true,
+			wantLog:    []string{"outcome: mechanical"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := conflictingFixture(t)
+			f.serveClaimOutcome(tc.prior)
+			// The stranded shape: the session died before handing the task back.
+			f.plane.serveTool("get_task", fmt.Sprintf(
+				`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":%q}}`,
+				closeOutTestTask, closeOutTestRef, tc.after))
+			d := f.supervisor(0)
+
+			lines := f.run(d)
+
+			releases := f.callsFor("release_task")
+			if len(releases) != 1 {
+				t.Fatalf("release_task calls = %d, want the one safety-net release: %v", len(releases), releases)
+			}
+			if got := releases[0].args["checkGreen"]; got != tc.checkGreen {
+				t.Errorf("checkGreen = %v, want %v (only this session's marker may classify the release): %v", got, tc.checkGreen, releases[0].args)
+			}
+			for _, want := range tc.wantLog {
+				if !strings.Contains(lines, want) {
+					t.Errorf("the log does not say %q:\n%s", want, lines)
+				}
+			}
+		})
+	}
+}
+
+// The exact CLA-884 shape: a conflict session dies without writing anything, so
+// the outcome carries no RESOLUTION marker at all. The task is still in_progress
+// and held, and the safety-net release must fire and say it handed the claim back.
+func TestConflictSessionNoMarkerStillReleasesTheStrandedClaim(t *testing.T) {
 	f := conflictingFixture(t)
-	// A DIFFERENT run's bare uuid: the task's lease lapsed and someone else took it.
-	// Nothing of ours is signable any more, so no release may be sent under our id.
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":"some-other-run","outcome":"RESOLUTION: failed\n\n- b.txt"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"I looked at the conflict."}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 
 	lines := f.run(d)
 
-	if got := f.callsFor("release_task"); len(got) != 0 {
-		t.Errorf("a task held by another run was released under our id: %v", got)
+	releases := f.callsFor("release_task")
+	if len(releases) != 1 {
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
 	}
-	if !strings.Contains(lines, "held by another run (some-other-run)") {
-		t.Errorf("the pass does not name the other holder:\n%s", lines)
+	if got := releases[0].args["checkGreen"]; got != false {
+		t.Errorf("a no-marker session released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
+	}
+	for _, want := range []string{"the session left no resolution marker", "claim released, task left approved"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the incident-shaped log does not say %q:\n%s", want, lines)
+		}
+	}
+}
+
+func TestConflictSessionLogsAReleaseRefusedAsNotHolding(t *testing.T) {
+	f := conflictingFixture(t)
+	// The task is still in_progress and held, but the release is refused as
+	// not-holding: our lease lapsed and another run took it. The refusal is the
+	// only holder signal the plane serves now, and it must be reported as such.
+	f.plane.serveTool("get_task", fmt.Sprintf(
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"RESOLUTION: failed\n\n- b.txt"}}`,
+		closeOutTestTask, closeOutTestRef))
+	f.plane.refuseTool("release_task", `{"error":{"code":"not_holding","message":"release ends a held claim, but the run holding it is already over"}}`)
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := len(f.callsFor("release_task")); got != 1 {
+		t.Fatalf("release_task calls = %d, want the one refused safety-net release", got)
+	}
+	if !strings.Contains(lines, "held by another run") {
+		t.Errorf("a not-holding refusal was not logged as the task being held by another run:\n%s", lines)
+	}
+	if strings.Contains(lines, "claim released") {
+		t.Errorf("a refused release was reported as a hand-back:\n%s", lines)
 	}
 }
 
@@ -278,7 +455,7 @@ func TestConflictSessionMechanicalLeavesTheTaskApproved(t *testing.T) {
 func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 	f := conflictingFixture(t)
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"in_review","claimedByRun":null,"outcome":"RESOLUTION: behavioural\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept the feature's field and the base's default"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_review","heldByRun":false,"outcome":"RESOLUTION: behavioural\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept the feature's field and the base's default"}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 
@@ -297,7 +474,7 @@ func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 func TestConflictSessionFailureReleasesTheClaim(t *testing.T) {
 	f := conflictingFixture(t)
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":"run-1","outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 
@@ -363,10 +540,11 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 		// Not .mcp.json: that name is gated out of opencode's hand-off (CLA-318).
 		Projects: []config.Project{{Slug: "acme", MCPConfigPath: "/fleet/acme/opencode-mcp.json"}},
 	}
-	step := config.ConflictStep{Harness: "opencode", Model: "conflict-model", MaxTurns: 40}
+	step := config.ConflictStep{Harness: "opencode", Model: config.ModelRoutes{"conflict-model"}, MaxTurns: 40}
 	req := ConflictRunRequest{
 		Harness:  "opencode",
 		Model:    "conflict-model",
+		Routes:   []string{"conflict-model"},
 		WorkDir:  "/fleet/acme/widgets",
 		Worktree: "/fleet/acme/worktrees/conflict-t1",
 		Prompt:   "the brief",
@@ -378,6 +556,9 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 	}
 	if inv.Prompt != "the brief" || inv.Model != "conflict-model" || inv.WorkDir != "/fleet/acme/widgets" {
 		t.Errorf("invocation = %+v, want the request's prompt/model/workdir", inv)
+	}
+	if !slices.Equal(inv.Routes, []string{"conflict-model"}) {
+		t.Errorf("invocation routes = %v, want the step's route list handed to the adapter", inv.Routes)
 	}
 	if inv.MCPConfigPath != "/fleet/acme/opencode-mcp.json" {
 		t.Errorf("MCP config = %q, want the project's own file", inv.MCPConfigPath)
@@ -562,5 +743,267 @@ func TestConflictSessionSkippedWhenTheConflictIsStale(t *testing.T) {
 	}
 	if !strings.Contains(lines, "the conflict state is stale, so no conflict session was started") {
 		t.Errorf("the pass does not say why no session was started:\n%s", lines)
+	}
+}
+
+// conflictQuotaEvent is the CLA-884 shape: opencode's terminal provider error
+// event for the exhausted free route. The REAL opencode adapter classifies it
+// below, so the ladder is pinned to the same scan the phase path uses rather
+// than to a test-private notion of "quota".
+const conflictQuotaEvent = `{"type":"error","error":{"type":"provider.quota","message":"Free usage limit reached"}}`
+
+// conflictLimitScan is the ladder's one adapter dependency, answered by the real
+// opencode adapter.
+type conflictLimitScan struct{}
+
+func (conflictLimitScan) DetectLimit(res harness.Result) harness.Limit {
+	a, err := harness.Get("opencode")
+	if err != nil {
+		panic(err)
+	}
+	return a.DetectLimit(res)
+}
+
+// TestConflictModelLadderFallsBackOnAUsageLimit is CLA-890's bar: a conflict
+// session whose first model ends on a quota result is re-run on the next model in
+// the list. The retry is offered only the routes still left, so the adapter's own
+// mid-session switch cannot be handed a route behind the one it is on.
+func TestConflictModelLadderFallsBackOnAUsageLimit(t *testing.T) {
+	req := ConflictRunRequest{
+		PR:     "#12",
+		Model:  "opencode/deepseek-v4.1-flash-free",
+		Routes: []string{"opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"},
+	}
+	var ran []string
+	var offered [][]string
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	res, err := runConflictModelLadder("CLA-2", req, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		offered = append(offered, routes)
+		if model == req.Routes[0] {
+			return harness.Result{ExitCode: 1, Stdout: conflictQuotaEvent}, nil
+		}
+		return harness.Result{FinalMessage: "conflict CLA-2: mechanical"}, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if want := []string{req.Routes[0], req.Routes[1]}; !slices.Equal(ran, want) {
+		t.Errorf("models run = %v, want the free route then its paid twin %v", ran, want)
+	}
+	if len(offered) != 2 || !slices.Equal(offered[0], req.Routes) {
+		t.Errorf("attempt route lists = %v, want the first offered the whole list", offered)
+	}
+	if len(offered) != 2 || !slices.Equal(offered[1], []string{req.Routes[1]}) {
+		t.Errorf("attempt route lists = %v, want the retry offered only the routes still left", offered)
+	}
+	if res.FinalMessage != "conflict CLA-2: mechanical" {
+		t.Errorf("final result = %+v, want the second model's clean session", res)
+	}
+	for _, want := range []string{
+		"attempt on " + req.Routes[0] + " (route 1 of 2)",
+		"attempt on " + req.Routes[1] + " (route 2 of 2)",
+		req.Routes[0] + " hit a usage limit",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("the attempt log does not say %q:\n%s", want, buf.String())
+		}
+	}
+}
+
+// A pinned single `conflict.model` must run only that model: when it is the last
+// model in the list there is no fallback, and the limit stands for the failure
+// classification that already exists.
+func TestConflictModelLadderStopsAtAPinnedSingleModel(t *testing.T) {
+	req := ConflictRunRequest{PR: "#12", Model: "opencode-go/paid", Routes: []string{"opencode-go/paid"}}
+	var ran []string
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	res, err := runConflictModelLadder("CLA-2", req, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		return harness.Result{ExitCode: 1, Stdout: conflictQuotaEvent}, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if !slices.Equal(ran, []string{"opencode-go/paid"}) {
+		t.Errorf("models run = %v, want only the pinned model", ran)
+	}
+	if lim := (conflictLimitScan{}).DetectLimit(res); !lim.Limited {
+		t.Errorf("the ladder returned %+v, want the pinned model's limited result unchanged", res)
+	}
+	if !strings.Contains(buf.String(), "it is the last model in the list") {
+		t.Errorf("the ladder did not say the pinned model was the last one:\n%s", buf.String())
+	}
+}
+
+// A clean attempt ends the ladder: the second model is not a retry budget, only
+// a fallback for a limit.
+func TestConflictModelLadderKeepsAFirstModelsCleanResult(t *testing.T) {
+	req := ConflictRunRequest{PR: "#12", Model: "free", Routes: []string{"free", "paid"}}
+	var ran []string
+
+	res, err := runConflictModelLadder("CLA-2", req, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		return harness.Result{FinalMessage: "conflict CLA-2: mechanical"}, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if !slices.Equal(ran, []string{"free"}) {
+		t.Errorf("models run = %v, want one clean attempt", ran)
+	}
+	if res.FinalMessage != "conflict CLA-2: mechanical" {
+		t.Errorf("result = %+v, want the clean first attempt", res)
+	}
+}
+
+// No model anywhere is ONE attempt on the harness's own default, not zero.
+func TestConflictModelLadderRunsOnceOnTheHarnessDefault(t *testing.T) {
+	var ran []string
+	if _, err := runConflictModelLadder("CLA-2", ConflictRunRequest{PR: "#12"}, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		return harness.Result{}, nil
+	}); err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if !slices.Equal(ran, []string{""}) {
+		t.Errorf("models run = %v, want one attempt with no model named", ran)
+	}
+}
+
+// The adapter may have switched routes mid-session and hit the limit on a LATER
+// one. The ladder then skips past the route that actually ended the session,
+// rather than re-running a route just proven exhausted.
+func TestConflictModelLadderSkipsTheRouteTheSessionEndedOn(t *testing.T) {
+	const free, paid, third = "free", "paid", "third"
+	req := ConflictRunRequest{PR: "#12", Model: free, Routes: []string{free, paid, third}}
+	var ran []string
+	var offered [][]string
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	res, err := runConflictModelLadder("CLA-2", req, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		offered = append(offered, routes)
+		if model == free {
+			return harness.Result{ExitCode: 1, Stdout: conflictQuotaEvent, Raw: map[string]any{
+				harness.RouteFinishedKey: paid,
+			}}, nil
+		}
+		return harness.Result{FinalMessage: "conflict CLA-2: mechanical"}, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if want := []string{free, third}; !slices.Equal(ran, want) {
+		t.Errorf("models run = %v, want %v (the paid route the session already exhausted is skipped)", ran, want)
+	}
+	if len(offered) != 2 || !slices.Equal(offered[1], []string{third}) {
+		t.Errorf("attempt route lists = %v, want the retry offered only %q", offered, third)
+	}
+	if res.FinalMessage != "conflict CLA-2: mechanical" {
+		t.Errorf("final result = %+v, want the third route's clean session", res)
+	}
+	if !strings.Contains(buf.String(), paid+" hit a usage limit") {
+		t.Errorf("the attempt log does not name the route that hit the limit:\n%s", buf.String())
+	}
+}
+
+// An UNTRUSTED stream is not evidence of a limit: the phase ladder ends such an
+// attempt unclassified and the adapter declines to switch routes on it (CLA-262),
+// so the ladder must not start a paid session on the next route either.
+func TestConflictModelLadderDoesNotRetryAnUntrustedStream(t *testing.T) {
+	req := ConflictRunRequest{PR: "#12", Model: "free", Routes: []string{"free", "paid"}}
+	var ran []string
+
+	untrusted := harness.Result{
+		ExitCode:  1,
+		Stdout:    conflictQuotaEvent,
+		Untrusted: "a stdout line overran the capture",
+	}
+	if lim := (conflictLimitScan{}).DetectLimit(untrusted); !lim.Limited {
+		t.Fatalf("the fixture is not classified as a usage limit (%+v), so this test would pass vacuously", lim)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	res, err := runConflictModelLadder("CLA-2", req, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		return untrusted, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if !slices.Equal(ran, []string{"free"}) {
+		t.Errorf("models run = %v, want one attempt: a stream with a hole in it is not proof of a limit", ran)
+	}
+	if res.Untrusted != untrusted.Untrusted {
+		t.Errorf("result = %+v, want the untrusted attempt returned unchanged", res)
+	}
+	if !strings.Contains(buf.String(), "could not be read whole") {
+		t.Errorf("the attempt log does not say why the stream was not classified:\n%s", buf.String())
+	}
+}
+
+// The ladder hands each attempt its own model and the routes still left; a retry
+// must reach the adapter as an invocation on that model, not the first one.
+func TestConflictAttemptCarriesTheRetryModelIntoTheInvocation(t *testing.T) {
+	const free, paid = "opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"
+	cfg := &config.Config{Harness: "opencode", Model: "run-model", MaxTurns: 150}
+	step := config.ConflictStep{Harness: "opencode", Model: config.ModelRoutes{free, paid}, MaxTurns: 40}
+	req := ConflictRunRequest{Harness: "opencode", Model: free, Routes: []string{free, paid}, WorkDir: "/fleet/acme/widgets"}
+
+	inv, err := conflictInvocation(cfg, "acme", conflictAttemptRequest(req, paid, []string{paid}), step)
+	if err != nil {
+		t.Fatalf("conflictInvocation: %v", err)
+	}
+	if inv.Model != paid {
+		t.Errorf("invocation model = %q, want the retry's %q", inv.Model, paid)
+	}
+	if !slices.Equal(inv.Routes, []string{paid}) {
+		t.Errorf("invocation routes = %v, want only the route still left", inv.Routes)
+	}
+}
+
+// The adapter's own mid-session switch can finish the job: the ladder must not
+// retry then, and the log must name the route that actually did the work rather
+// than only the one the attempt started on.
+func TestConflictModelLadderNamesTheRouteASwitchFinishedOn(t *testing.T) {
+	const free, paid = "free", "paid"
+	var ran []string
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	res, err := runConflictModelLadder("CLA-2", ConflictRunRequest{PR: "#12", Model: free, Routes: []string{free, paid}}, conflictLimitScan{}, func(model string, routes []string) (harness.Result, error) {
+		ran = append(ran, model)
+		return harness.Result{Raw: map[string]any{
+			harness.RouteFinishedKey: paid,
+		}}, nil
+	})
+	if err != nil {
+		t.Fatalf("ladder: %v", err)
+	}
+	if !slices.Equal(ran, []string{free}) {
+		t.Errorf("models run = %v, want one attempt: the switch already finished the session", ran)
+	}
+	if got := (conflictLimitScan{}).DetectLimit(res); got.Limited {
+		t.Errorf("the ladder returned a limited result for a clean finish: %+v", got)
+	}
+	if !strings.Contains(buf.String(), "finished on "+paid) {
+		t.Errorf("the attempt log does not name the route the switch finished on:\n%s", buf.String())
 	}
 }

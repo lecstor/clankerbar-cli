@@ -35,10 +35,10 @@ import (
 )
 
 // closeOutTestRunCredential is what a real `claim_task` answers with: the run
-// CREDENTIAL `<uuid>.<secret>`, never a bare uuid. The plane's own records
-// (`claimedByRun`) hold the bare uuid, so the fixture pins BOTH shapes apart on
-// purpose — comparing the two as strings is the defect CLA-759 review 1.review-1.1
-// found, and a fixture that served a bare id hid it.
+// CREDENTIAL `<uuid>.<secret>`, never a bare uuid. get_task serves presence only
+// (`heldByRun`) since CLA-509 — it never carries a run id at all — so the fixture
+// pins the claim credential the supervisor must sign with apart from the boolean
+// the plane reports.
 const closeOutTestRunUUID = "run-1"
 
 const closeOutTestRunCredential = closeOutTestRunUUID + ".s3cr3t-session-credential"
@@ -344,10 +344,11 @@ func (f *closeOutFixture) servePlane(t *testing.T, authority string) {
 	// The post-session read (CLA-759): the default is the hand-back the conflict
 	// brief asks for, so a test that does not care about the classification gets
 	// the ordinary mechanical outcome. A test overrides this payload to drive
-	// the behavioural, failed and still-held cases. `claimedByRun` is NULL here
-	// because the session released its claim, exactly as the brief asks.
+	// the behavioural, failed and still-held cases. `heldByRun` is FALSE here
+	// because the session released its claim, exactly as the brief asks — and the
+	// wire shape is presence only, never a run id (CLA-509).
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":null,"branch":%q,"outcome":"RESOLUTION: mechanical\n\n**Tests**\n- `+closeOutTestBase+`: pass\n\n- a.txt: kept both sides\n- b.txt: kept both sides"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"approved","heldByRun":false,"branch":%q,"outcome":"RESOLUTION: mechanical\n\n**Tests**\n- `+closeOutTestBase+`: pass\n\n- a.txt: kept both sides\n- b.txt: kept both sides"}}`,
 		closeOutTestTask, closeOutTestRef, closeOutTestHead))
 	srv := f.plane.serve(t)
 	f.srv = srv.URL

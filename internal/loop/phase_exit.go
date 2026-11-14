@@ -82,7 +82,7 @@ func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) atte
 		// either (recordPassSpend runs only where the loop counts an attempt),
 		// so the record says "unknown" instead of publishing a FLOOR from a
 		// stream with a hole in it as if it were a report.
-		utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), at.logPath, at.res, r.tokens, r.cost)
+		utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, r.ti, drainNum, tc.HarnessFor(ph), at.logPath, at.res, r.tokens, r.cost)
 		return attemptVerdict{next: attemptReturn, spendOverride: true, tokens: utokens, cost: ucost, stop: ustop, err: uerr}
 	}
 
@@ -103,12 +103,11 @@ func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) atte
 func (r *phaseRun) countTrustedSpend(at *phaseAttempt) {
 	r.tokens += at.res.Tokens
 	r.cost += at.res.CostUSD
-	r.publishSpend()
 	// The pass's own session entry takes the same figures, in the same breath
 	// (CLA-691): every attempt the loop counts is money the record attributes
 	// to the pass, and none it refuses is.
 	recordPassSpend(r.end.session, r.a, &r.pass, &at.res)
-	r.d.charge(r.tc.HarnessFor(r.ph), at.res.Tokens, at.res.CostUSD)
+	r.d.charge(r.ti, r.tc.HarnessFor(r.ph), at.res.Tokens, at.res.CostUSD)
 }
 
 // handleUsageLimit waits out a rolling usage limit and re-runs the session, or
@@ -187,31 +186,27 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		// and stop on the very next check — having spent the night waiting for
 		// headroom it then declines to use. Stop now and say when the quota
 		// returns, so the operator can start a fresh run against it.
-		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
+		remaining, bounded := tc.Budget.Remaining(d.budgetElapsed(r.ti, time.Since(prior.start)))
 		if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
-			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset (log: %s)",
+			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this ceiling; not waiting, so start a fresh run after the reset (log: %s)",
 				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), at.logPath)
+			d.exhaustForWait(r.ti, "the stated reset is past the remaining budget")
 			return attemptVerdict{next: attemptReturn, stop: true}
 		}
-		// The wait's own probe spend lands in the SAME accumulator as the
-		// sessions', so it reaches the breaker at the top of this loop, the one in
-		// Run between drains, and the iteration's cost line — rather than a
-		// separate figure nothing is measured against (CLA-287).
+		// The wait's own probe spend lands in the SAME account as the sessions'
+		// (charge, inside the wait), so it reaches the breaker at the top of this
+		// loop, the between-iterations sweep, and the iteration's cost line —
+		// rather than a separate figure nothing is measured against (CLA-287).
 		// Probed on the harness that hit the limit, in that harness's own
 		// session shape: a usage limit is a property of one provider's account,
 		// so probing the run's default harness would answer a question nobody
-		// asked, and spend on it. The panel AGGREGATE rides `sofar` too (see
-		// above): a sibling's counted spend counts against the same ceiling
-		// this wait's probes are about to spend under.
-		waitTokens, waitCost := r.sofar()
+		// asked, and spend on it.
 		ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, t, spend{
-			start:  prior.start,
-			tokens: waitTokens,
-			cost:   waitCost,
+			start: prior.start,
+			ti:    r.ti,
 		})
 		r.tokens += ptokens
 		r.cost += pcost
-		r.publishSpend()
 		if pstop {
 			return attemptVerdict{next: attemptReturn, stop: true}
 		}

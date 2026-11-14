@@ -44,8 +44,8 @@ import (
 //     flag the terminal tools require to close such a task, read off the plane's
 //     record. It counts whether or not the session still holds the lease.
 //
-// Forms (b) and (c) are read through the SAME single-task plane peek CLA-451
-// introduced (planeExitRecord below), not a second implementation. The bounds
+// Forms (b) and (c) are read through the SAME single-task get_task read
+// (planeExitRecord below), not a second implementation. The bounds
 // CLA-457 set stay absolute: held-ness alone is still nothing (status
 // in_progress proves only that someone holds the lease), and a session that
 // claimed, recorded no branch, and left the task sitting in `ready` is STILL
@@ -254,16 +254,16 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 // branch-independent exit-evidence forms (CLA-497): the task having LEFT
 // `ready` (in_review / done / parked / blocked — its own session settled it),
 // or a DECLARED no-code delivery (the plane's first-class "this shipped no
-// code"). It is the SAME single-task get_task read CLA-451's checkpoint peek
-// uses — plane.TaskStateSource, extended with the delivery flag — not a second
-// implementation of the peek.
+// code"). It is the SAME single-task get_task read that supplies the seam's
+// exit evidence — plane.TaskStateSource — not a second implementation of the
+// read.
 //
 // Best-effort like every plane read: ok is false with an EMPTY why whenever
 // the read cannot answer at all (no claimed task id, no wired reader, a plane
 // blip), and the gate then judges on branch evidence alone, byte-for-byte as
 // before this read existed. A read that ANSWERS but shows no evidence returns
 // the reason the gate will log — the difference between "nothing happened"
-// (task still ready or merely held) and a peek that never ran.
+// (task still ready or merely held) and a read that never ran.
 //
 // The bounds are load-bearing: status "in_progress" proves only that SOMEONE
 // holds the lease — held-ness alone was CLA-457's original false positive and

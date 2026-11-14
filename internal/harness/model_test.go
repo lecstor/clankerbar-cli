@@ -17,11 +17,11 @@ import (
 // with a blank argument, which is why each case below asserts the flag is gone
 // rather than that its value is empty.
 //
-// The three-entry list is hand-kept because an argv builder is an unexported
+// The entry list is hand-kept because an argv builder is an unexported
 // per-adapter func, not part of the Adapter interface, so there is nothing to
-// derive it from. A FOURTH adapter is therefore not exercised here - it is caught
-// by TestNoAdapterReadsTheRawModelField below, which is derived from the
-// directory. The two are a pair; neither covers the new-adapter case alone.
+// derive it from. A new adapter is therefore not exercised here - it is caught by
+// TestNoAdapterReadsTheRawModelField below, which is derived from the directory.
+// The two are a pair; neither covers the new-adapter case alone.
 func TestArgs_ABlankModelEmitsNoModelFlag(t *testing.T) {
 	adapters := []struct {
 		name string
@@ -31,6 +31,7 @@ func TestArgs_ABlankModelEmitsNoModelFlag(t *testing.T) {
 		{"claude", claudeArgs, "--model"},
 		{"codex", codexArgs, "-m"},
 		{"opencode", opencodeArgs, "--model"},
+		{"copilot", copilotArgs, "--model"},
 	}
 
 	for _, a := range adapters {
@@ -55,6 +56,7 @@ func TestArgs_ARealModelReachesTheFlagTrimmed(t *testing.T) {
 		{"claude", claudeArgs, "--model"},
 		{"codex", codexArgs, "-m"},
 		{"opencode", opencodeArgs, "--model"},
+		{"copilot", copilotArgs, "--model"},
 	}
 
 	for _, a := range adapters {
@@ -74,11 +76,11 @@ func TestArgs_ARealModelReachesTheFlagTrimmed(t *testing.T) {
 	}
 }
 
-// The ratchet. The failure to fear is not this file's three adapters, which are
-// fixed now, but the FOURTH one: a new harness written by copying an old one from
-// before ModelArg existed, reading Model directly and reintroducing the blank
-// flag with nothing failing. Derived from the directory rather than a hand-kept
-// list, for the same reason.
+// The ratchet. The failure to fear is not the adapters already in this tree,
+// which are fixed now, but the NEXT one: a new harness written by copying an old
+// one from before ModelArg existed, reading Model directly and reintroducing the
+// blank flag with nothing failing. Derived from the directory rather than a
+// hand-kept list, for the same reason.
 func TestNoAdapterReadsTheRawModelField(t *testing.T) {
 	// Any receiver's `.Model`, but not `.ModelArg` — the trailing word boundary is
 	// what separates them. Matching on the RECEIVER NAME instead would pin nothing:
