@@ -195,3 +195,91 @@ func TestTruncate(t *testing.T) {
 		t.Errorf("truncate(short) = %q", got)
 	}
 }
+
+// TestChangeEntries_PairsItemsWithRawHunks (CLA-871): the entry list is the
+// change map with each item's file and the hunk's own lines kept, so a caller
+// can embed the diff without running git again.
+func TestChangeEntries_PairsItemsWithRawHunks(t *testing.T) {
+	diff := `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -10,3 +10,3 @@ export function alpha() {
+ export function alpha() {
+-  return 1
++  return 2
+ }
+@@ -40,3 +40,7 @@ export function gamma() {
+ export function gamma() {
+   return 1
+ }
++
++export function beta() {
++  return 2
++}
+diff --git a/b.ts b/b.ts
+--- a/b.ts
++++ b/b.ts
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+`
+	items := ChangeMap(diff, Unlimited)
+	entries := ChangeEntries(diff, Unlimited)
+	if len(entries) != len(items) || len(entries) != 3 {
+		t.Fatalf("entries = %d, items = %d, want 3 each", len(entries), len(items))
+	}
+	for i, e := range entries {
+		if e.Text != items[i] {
+			t.Errorf("entry %d text = %q, want the change map's %q", i, e.Text, items[i])
+		}
+		if !strings.HasPrefix(e.Hunk, "@@ ") {
+			t.Errorf("entry %d hunk does not start at its @@ header: %q", i, e.Hunk)
+		}
+	}
+	if entries[0].Path != "a.ts" || entries[2].Path != "b.ts" {
+		t.Errorf("paths = %q / %q, want a.ts / b.ts", entries[0].Path, entries[2].Path)
+	}
+	for _, want := range []string{"@@ -10,3 +10,3 @@", "-  return 1", "+  return 2", " }"} {
+		if !strings.Contains(entries[0].Hunk, want) {
+			t.Errorf("the first hunk is missing %q:\n%s", want, entries[0].Hunk)
+		}
+	}
+	if strings.Contains(entries[0].Hunk, "@@ -40") {
+		t.Errorf("the first entry carries the second hunk too:\n%s", entries[0].Hunk)
+	}
+
+	// A merged per-file item carries every hunk of that file, joined.
+	merged := ChangeEntries(diff, 2)
+	if len(merged) != 2 {
+		t.Fatalf("merged entries = %d, want one per file", len(merged))
+	}
+	if !strings.Contains(merged[0].Hunk, "@@ -10,3 +10,3 @@") || !strings.Contains(merged[0].Hunk, "@@ -40,3 +40,7 @@") {
+		t.Errorf("the merged a.ts entry does not carry both hunks:\n%s", merged[0].Hunk)
+	}
+}
+
+// TestChangeEntriesQuotedPath (CLA-871): a header git quoted decodes to the real
+// repo path, and the item a reviewer is sent to renders that path, not git's
+// escaped form.
+func TestChangeEntriesQuotedPath(t *testing.T) {
+	diff := `diff --git "a/caf\303\251.ts" "b/caf\303\251.ts"
+index 1111111..2222222 100644
+--- "a/caf\303\251.ts"
++++ "b/caf\303\251.ts"
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+`
+	entries := ChangeEntries(diff, Unlimited)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v, want one", entries)
+	}
+	if entries[0].Path != "café.ts" {
+		t.Errorf("Path = %q, want café.ts", entries[0].Path)
+	}
+	if !strings.Contains(entries[0].Text, "café.ts:1-2") || strings.Contains(entries[0].Text, `\303`) {
+		t.Errorf("the item does not name the real repo path: %q", entries[0].Text)
+	}
+}

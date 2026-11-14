@@ -21,7 +21,8 @@ func TestReviewMethod_ParsesBothSpellings(t *testing.T) {
 		"phases": [
 			{"name": "implement"},
 			{"name": "review", "review_method": "maps-session",
-			 "maps_session": {"chunk_size": 10, "notes_model": "opencode-go/strong", "findings_model": "opencode-go/cheap", "flow_max": 7}},
+			 "maps_session": {"chunk_size": 10, "notes_model": "opencode-go/strong", "findings_model": "opencode-go/cheap", "flow_max": 7,
+			                  "embed_hunks": {"enabled": true, "max_bytes_per_item": 1024, "max_bytes_total": 4096}}},
 			{"name": "fix"}
 		]
 	}`)
@@ -36,6 +37,13 @@ func TestReviewMethod_ParsesBothSpellings(t *testing.T) {
 	}
 	if got.NotesModel != "opencode-go/strong" || got.FindingsModel != "opencode-go/cheap" {
 		t.Errorf("stage models = %q / %q, want the configured pair", got.NotesModel, got.FindingsModel)
+	}
+	if got.EmbedHunks == nil {
+		t.Fatalf("embed_hunks did not parse onto the phase")
+	}
+	if !got.EmbedHunks.Enabled || got.EmbedHunks.MaxBytesPerItem != 1024 || got.EmbedHunks.MaxBytesTotal != 4096 {
+		t.Errorf("embed_hunks = %d / %d enabled=%v, want the configured 1024 / 4096 profile",
+			got.EmbedHunks.MaxBytesPerItem, got.EmbedHunks.MaxBytesTotal, got.EmbedHunks.Enabled)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want the opencode maps-session review accepted", err)
@@ -86,6 +94,9 @@ func TestMapsSessionOptions_Defaults(t *testing.T) {
 	if got.NotesModel != "" || got.FindingsModel != "" {
 		t.Errorf("stage models = %q / %q, want empty (inherit the phase's model)", got.NotesModel, got.FindingsModel)
 	}
+	if got.EmbedHunks != nil {
+		t.Errorf("EmbedHunks = %+v, want nil (hunk embedding off by default)", got.EmbedHunks)
+	}
 
 	// A partial block fills only the knobs it leaves zero, and whitespace is not
 	// a model name.
@@ -96,6 +107,17 @@ func TestMapsSessionOptions_Defaults(t *testing.T) {
 	}
 	if got.NotesModel != "" {
 		t.Errorf("NotesModel = %q, want whitespace trimmed to empty", got.NotesModel)
+	}
+
+	// A bare enable is a complete profile: the budgets take their defaults.
+	enabled := Phase{MapsSession: &MapsSessionOptions{EmbedHunks: &EmbedHunksOptions{Enabled: true}}}
+	eh := enabled.MapsSessionDefaults().EmbedHunks
+	if eh == nil || !eh.Enabled || eh.MaxBytesPerItem != DefaultMapsSessionHunkBytesPerItem || eh.MaxBytesTotal != DefaultMapsSessionHunkBytesTotal {
+		t.Errorf("bare enable = %+v, want the default 4096 / 61440 budgets", eh)
+	}
+	if DefaultMapsSessionHunkBytesPerItem != 4096 || DefaultMapsSessionHunkBytesTotal != 61440 {
+		t.Errorf("hunk defaults = %d / %d, want 4096 / 61440",
+			DefaultMapsSessionHunkBytesPerItem, DefaultMapsSessionHunkBytesTotal)
 	}
 }
 
@@ -181,6 +203,38 @@ func TestReviewMethod_ValidateRefusals(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "flow_max must be positive") {
 			t.Fatalf("Validate() = %v, want a negative-flow_max refusal", err)
+		}
+	})
+	t.Run("negative per-item hunk budget", func(t *testing.T) {
+		cfg := mapsSessionConfig(t, `{
+			"harness": "opencode",
+			"phases": [{"name": "implement"}, {"name": "review", "review_method": "maps-session",
+			            "maps_session": {"embed_hunks": {"enabled": true, "max_bytes_per_item": -1}}}, {"name": "fix"}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "max_bytes_per_item must be positive") {
+			t.Fatalf("Validate() = %v, want a negative per-item hunk budget refusal", err)
+		}
+	})
+	t.Run("negative total hunk budget", func(t *testing.T) {
+		cfg := mapsSessionConfig(t, `{
+			"harness": "opencode",
+			"phases": [{"name": "implement"}, {"name": "review", "review_method": "maps-session",
+			            "maps_session": {"embed_hunks": {"enabled": true, "max_bytes_total": -1}}}, {"name": "fix"}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "max_bytes_total must be positive") {
+			t.Fatalf("Validate() = %v, want a negative total hunk budget refusal", err)
+		}
+	})
+	t.Run("disabled budgets are inert", func(t *testing.T) {
+		cfg := mapsSessionConfig(t, `{
+			"harness": "opencode",
+			"phases": [{"name": "implement"}, {"name": "review", "review_method": "maps-session",
+			            "maps_session": {"embed_hunks": {"enabled": false, "max_bytes_per_item": -1}}}, {"name": "fix"}]
+		}`)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want a disabled embedding block's budgets left inert", err)
 		}
 	})
 	t.Run("explicit single-pass is the default, not a refusal", func(t *testing.T) {
@@ -295,7 +349,8 @@ func TestReviewMethod_StoredDocumentCarriesTheKnobs(t *testing.T) {
 		Phases: []RunConfigPhase{
 			{Name: "implement"},
 			{Name: "review", ReviewMethod: ReviewMethodMapsSession,
-				MapsSession: &MapsSessionOptions{ChunkSize: 7, FindingsModel: "opencode-go/cheap"}},
+				MapsSession: &MapsSessionOptions{ChunkSize: 7, FindingsModel: "opencode-go/cheap",
+					EmbedHunks: &EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 512, MaxBytesTotal: 2048}}},
 			{Name: "fix"},
 		},
 		ReviewPanel: []RunConfigPanelMember{
@@ -309,17 +364,25 @@ func TestReviewMethod_StoredDocumentCarriesTheKnobs(t *testing.T) {
 	if !base.Phases[1].UsesMapsSession() {
 		t.Fatalf("the stored review phase lost its method: %#v", base.Phases[1])
 	}
-	if got := base.Phases[1].MapsSessionDefaults(); got.ChunkSize != 7 || got.FindingsModel != "opencode-go/cheap" {
+	got := base.Phases[1].MapsSessionDefaults()
+	if got.ChunkSize != 7 || got.FindingsModel != "opencode-go/cheap" {
 		t.Errorf("stored options = %+v, want chunk_size 7 / findings opencode-go/cheap", got)
+	}
+	if got.EmbedHunks == nil || !got.EmbedHunks.Enabled || got.EmbedHunks.MaxBytesPerItem != 512 || got.EmbedHunks.MaxBytesTotal != 2048 {
+		t.Errorf("stored embed_hunks = %+v, want enabled 512 / 2048", got.EmbedHunks)
 	}
 	if got := base.ReviewPanel[1].ReviewMethod; got != ReviewMethodSinglePass {
 		t.Errorf("stored member method = %q, want single-pass", got)
 	}
-	// A clone must not alias the stored block.
+	// A clone must not alias the stored block, including the nested options.
 	clone := base.Clone()
 	clone.Phases[1].MapsSession.ChunkSize = 99
+	clone.Phases[1].MapsSession.EmbedHunks.MaxBytesPerItem = 1
 	if base.Phases[1].MapsSession.ChunkSize != 7 {
 		t.Error("a clone shares the base config's maps_session block")
+	}
+	if base.Phases[1].MapsSession.EmbedHunks.MaxBytesPerItem != 512 {
+		t.Error("a clone shares the base config's embed_hunks block")
 	}
 }
 

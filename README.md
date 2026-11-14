@@ -505,8 +505,9 @@ the sequence and fails the phase with no record written.
 
 The options: `chunk_size` (items per notes turn, default 25), `flow_max` (the
 flow map's item cap, default 40), `notes_model` and `findings_model` (each
-stage's model; empty inherits the phase's own). The per-stage models exist so a
-stronger note-taker can feed a cheaper findings writer, or the reverse — the
+stage's model; empty inherits the phase's own), and `embed_hunks` (below). The
+per-stage models exist so a stronger note-taker can feed a cheaper findings
+writer, or the reverse — the
 choice is yours, and the runner never picks one. One edge: if the phase names no
 model at all and only `notes_model` is set, the findings turn runs on the notes
 model too, because a live session cannot return to a harness's own default
@@ -515,6 +516,47 @@ is the one that produced the findings. A stage model is a single route, not the
 phase's route list: setting `notes_model` or `findings_model` drops the ordered
 model fallback for the session, so a usage limit on a per-stage model ends the
 phase rather than switching to the paid route.
+
+**Embedded hunks (optional, off by default).** A step-heavy model spends much
+of a maps-session review fetching the code it was asked about: on a two-file,
+100-line PR, DeepSeek Flash made 74 reads, 53 greps and 21 globs for four map
+items. `maps_session.embed_hunks` puts each `M` item's hunk in the prompt, so a
+tool call is context (callers, siblings, the rest of a file) rather than the
+diff the item already names:
+
+```json
+"maps_session": {
+  "chunk_size": 25,
+  "embed_hunks": { "enabled": true }
+}
+```
+
+The item is followed by a fenced `diff` block carrying the hunk's own lines
+from the same `<merge-base>..<tip>` diff. `max_bytes_per_item` (default 4096)
+caps one item's hunk: over it the hunk is cut at a line boundary and a marker
+names the exact `git diff <merge-base>..HEAD -- <file>` command for the rest.
+`max_bytes_total` (default 61440, about 15k tokens) caps the whole map: once
+the next hunk would pass it, that item and every later one stay plain, and a
+single note in that chunk says embedding stopped. There is a practical ceiling
+above the schema's: the whole prompt reaches opencode as ONE argv string, and
+Linux caps a single argument at 128 KiB (`MAX_ARG_STRLEN`). At the defaults a
+worst-case first turn is ~80 KB, so a `max_bytes_total` much past the default
+fails the spawn with `E2BIG` instead of growing the prompt. The defaults cover
+the benchmarked 100-line PR's hunks nearly whole while leaving the brief, the
+checklist and the notes room in the window; both budgets count the hunk text,
+not the fences.
+
+The hunk is untrusted repository content in the prompt, so it cannot break out:
+the fence is at least three backticks and longer than any backtick run in the
+hunk, and a hunk line whose content is exactly the done marker is embedded
+with a backslash after its diff prefix, so neither copying it whole nor
+stripping the prefix yields a marker the done-report parser accepts. With
+`enabled: false` (or no `embed_hunks` key at all) the items are byte for byte
+what the method produced before.
+
+`clankerbar review run` (CLA-870) does not exist in this build yet; when it
+lands it should expose `embed_hunks` as a flag, since that command's whole
+point is a one-off review profile.
 
 **Two requirements, both refused rather than degraded.** The method applies to
 the review-only gate — the built-in `review` phase with a phase after it —
@@ -538,8 +580,8 @@ hold the measured 17-18 minutes and ~100 model steps without change; if you set 
 per-phase `max_wall_clock`, give a maps-session review at least about 30 minutes.
 `clankerbar doctor` prints the method and each stage's resolved model beside the
 reviewer — `review: single reviewer (opencode/model) (maps-session:
-notes=..., findings=..., chunk_size=25, flow_max=40)` — so the spend is visible
-before the run.
+notes=..., findings=..., chunk_size=25, flow_max=40, embed_hunks=off)` — so the
+spend and the prompt's embedded-diff budget are visible before the run.
 
 `propose-config` refuses to store these keys today: the plane's stored-run-config
 schema does not accept `review_method` or `maps_session` yet, and the refusal
