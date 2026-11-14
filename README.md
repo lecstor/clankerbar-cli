@@ -506,8 +506,8 @@ the sequence and fails the phase with no record written.
 The options: `chunk_size` (items per notes turn, default 25), `flow_max` (the
 flow map's item cap, default 40), `notes_model` and `findings_model` (each
 stage's model; empty inherits the phase's own), and `embed_hunks` (below). The
-per-stage models exist so a
-stronger note-taker can feed a cheaper findings writer, or the reverse — the
+per-stage models exist so a stronger note-taker can feed a cheaper findings
+writer, or the reverse — the
 choice is yours, and the runner never picks one. One edge: if the phase names no
 model at all and only `notes_model` is set, the findings turn runs on the notes
 model too, because a live session cannot return to a harness's own default
