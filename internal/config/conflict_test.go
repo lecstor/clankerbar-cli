@@ -187,6 +187,81 @@ func TestConflictResolutionReadsTheSessionMarker(t *testing.T) {
 	}
 }
 
+// The brief copies the stored outcome verbatim and appends, so a re-offered task
+// carries older markers ABOVE the newest one: the LAST marker is the current
+// session's (CLA-889).
+func TestConflictResolutionReadsTheLastMarker(t *testing.T) {
+	outcome := "RESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\nRESOLUTION: failed\n\n- the base moved again"
+	kind, detail, ok := ConflictResolution(outcome)
+	if !ok {
+		t.Fatal("ConflictResolution found no marker in a two-marker outcome")
+	}
+	if kind != ConflictResolutionFailed || detail != "the base moved again" {
+		t.Errorf("kind/detail = %q/%q, want the LAST marker's failed/the base moved again", kind, detail)
+	}
+}
+
+// ConflictResolutionSince is the conflict path's classification: it reads only
+// what the session appended to the outcome it was handed at the claim. An
+// unchanged outcome wrote nothing, so an older attempt's marker must not classify
+// the release (CLA-889).
+func TestConflictResolutionSinceReadsOnlyTheSessionsWrite(t *testing.T) {
+	const (
+		oldMechanical = "the reviewed evidence\n\nRESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass"
+		oldFailed     = "the reviewed evidence\n\nRESOLUTION: failed\n\n- an earlier attempt"
+	)
+	cases := []struct {
+		name    string
+		prior   string
+		current string
+		kind    string
+		detail  string
+		ok      bool
+	}{
+		{
+			name:    "unchanged outcome has no marker",
+			prior:   oldMechanical,
+			current: oldMechanical,
+		},
+		{
+			name:    "unchanged apart from trailing whitespace has no marker",
+			prior:   oldMechanical,
+			current: oldMechanical + "\n\n",
+		},
+		{
+			name:    "an appended failure is this session's",
+			prior:   oldMechanical,
+			current: oldMechanical + "\n\nRESOLUTION: failed\n\n- the free quota was exhausted",
+			kind:    ConflictResolutionFailed,
+			detail:  "the free quota was exhausted",
+			ok:      true,
+		},
+		{
+			name:    "an appended mechanical over an older failure is green",
+			prior:   oldFailed,
+			current: oldFailed + "\n\nRESOLUTION: mechanical",
+			kind:    ConflictResolutionMechanical,
+			ok:      true,
+		},
+		{
+			name:    "a session that replaced the outcome is classified on what it wrote",
+			prior:   oldMechanical,
+			current: "RESOLUTION: behavioural\n\n- a.txt: kept the feature",
+			kind:    ConflictResolutionBehavioural,
+			detail:  "a.txt: kept the feature",
+			ok:      true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, detail, ok := ConflictResolutionSince(tc.prior, tc.current)
+			if ok != tc.ok || kind != tc.kind || detail != tc.detail {
+				t.Errorf("ConflictResolutionSince = (%q, %q, %v), want (%q, %q, %v)", kind, detail, ok, tc.kind, tc.detail, tc.ok)
+			}
+		})
+	}
+}
+
 func TestValidateHoldsTheConflictStepToTheHarnessRules(t *testing.T) {
 	t.Run("unknown harness", func(t *testing.T) {
 		c := defaults()

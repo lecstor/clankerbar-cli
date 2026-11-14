@@ -139,12 +139,13 @@ const (
 // ConflictResolutionMarker is the exact line prefix the brief prescribes.
 const ConflictResolutionMarker = "RESOLUTION: "
 
-// ConflictResolution reads the marker the conflict session wrote into the task's
-// outcome. It returns the kind, the first explanatory line after the marker (the
-// note for a behavioural resolution, the reason for a failure) and whether a
-// marker was found at all. Total and forgiving: the outcome is written by a
-// model, so a marker among prose is found line by line rather than required to
-// be the whole outcome.
+// ConflictResolution reads the LAST resolution marker in outcome. It returns the
+// kind, the first explanatory line after that marker (the note for a behavioural
+// resolution, the reason for a failure) and whether a marker was found at all.
+// The brief tells a session to copy the stored outcome verbatim and APPEND its
+// block, so the newest marker is the last one. Total and forgiving: the outcome
+// is written by a model, so a marker among prose is found line by line rather
+// than required to be the whole outcome.
 func ConflictResolution(outcome string) (kind, detail string, ok bool) {
 	lines := strings.Split(outcome, "\n")
 	for i, raw := range lines {
@@ -152,12 +153,13 @@ func ConflictResolution(outcome string) (kind, detail string, ok bool) {
 		if !strings.HasPrefix(line, ConflictResolutionMarker) {
 			continue
 		}
-		kind = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, ConflictResolutionMarker)))
-		switch kind {
+		k := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, ConflictResolutionMarker)))
+		switch k {
 		case ConflictResolutionMechanical, ConflictResolutionBehavioural, ConflictResolutionFailed:
 		default:
 			continue
 		}
+		kind, detail, ok = k, "", true
 		inTests := false
 		for _, after := range lines[i+1:] {
 			after = strings.TrimSpace(after)
@@ -181,9 +183,29 @@ func ConflictResolution(outcome string) (kind, detail string, ok bool) {
 			detail = after
 			break
 		}
-		return kind, detail, true
 	}
-	return "", "", false
+	return kind, detail, ok
+}
+
+// ConflictResolutionSince reads the marker THIS session appended, given the
+// outcome the claim response served BEFORE the session (prior) and the outcome
+// served after it (current). An unchanged outcome means the session wrote
+// nothing, and therefore left no marker — the accumulated text's older markers
+// belong to earlier attempts and must not classify this one (CLA-889). Otherwise
+// the session's own text is the suffix it appended to the stored outcome, and the
+// LAST marker in it wins.
+//
+// Total and forgiving like ConflictResolution: a session that replaced the
+// stored outcome instead of appending to it is classified on what it wrote.
+func ConflictResolutionSince(prior, current string) (kind, detail string, ok bool) {
+	if strings.TrimSpace(current) == strings.TrimSpace(prior) {
+		return "", "", false
+	}
+	fresh := current
+	if p := strings.TrimRight(prior, " \t\r\n"); p != "" && strings.HasPrefix(current, p) {
+		fresh = current[len(p):]
+	}
+	return ConflictResolution(fresh)
 }
 
 // ConflictBriefInput is everything one conflict-only session's brief names. Every

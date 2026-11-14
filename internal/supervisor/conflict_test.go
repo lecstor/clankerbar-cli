@@ -178,50 +178,174 @@ func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	}
 }
 
-func TestConflictSessionSafetyNetReleaseMatchesTheBareHolderUUID(t *testing.T) {
+func TestConflictSessionSafetyNetReleasesAStrandedClaim(t *testing.T) {
 	f := conflictingFixture(t)
-	// The claim hands the supervisor a run CREDENTIAL; the plane records the BARE
-	// uuid in `claimedByRun`. The safety-net release must recognise its own run
-	// across that difference (CLA-759 review 1.review-1.1) - and must NOT report the
-	// holder as "another run" when it is our own stopped one.
+	// The plane's REAL stranded shape since CLA-509: presence only, no run id. A
+	// conflict session that dies before handing the task back leaves exactly this,
+	// and the safety-net release must fire on presence alone - the supervisor
+	// signs with the credential its own claim returned.
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":%q,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
-		closeOutTestTask, closeOutTestRef, closeOutTestRunUUID))
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"branch":%q,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
+		closeOutTestTask, closeOutTestRef, closeOutTestHead))
 	d := f.supervisor(0)
 
 	lines := f.run(d)
 
 	releases := f.callsFor("release_task")
 	if len(releases) != 1 {
-		t.Fatalf("release_task calls = %d, want exactly the safety-net release (the holder is our own bare uuid): %v", len(releases), releases)
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
 	}
 	if got := releases[0].args["driver"]; got != true {
 		t.Errorf("the safety-net release does not carry the driver marker: %v", releases[0].args)
+	}
+	if got := releases[0].args["runId"]; got != closeOutTestRunCredential {
+		t.Errorf("the release signs with runId %v, want the claim's credential %q", got, closeOutTestRunCredential)
 	}
 	if got := releases[0].args["checkGreen"]; got != false {
 		t.Errorf("a failed resolution released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
 	}
 	if strings.Contains(lines, "held by another run") {
-		t.Errorf("our own stopped run was misreported as another holder:\n%s", lines)
+		t.Errorf("our own stranded claim was misreported as another holder:\n%s", lines)
+	}
+	if !strings.Contains(lines, "outcome: failed") || !strings.Contains(lines, "claim released, task left approved") {
+		t.Errorf("the failure line does not say the claim was released:\n%s", lines)
 	}
 }
 
-func TestConflictSessionLeavesAClaimAnotherRunHolds(t *testing.T) {
+// serveClaimOutcome rewrites the claim response so the conflict path takes the
+// given outcome as its pre-session baseline. The plane serves the task view
+// (outcome included) beside the run credential at the claim, and that view is the
+// only copy of the pre-session text a holder can get (CLA-509).
+func (f *closeOutFixture) serveClaimOutcome(outcome string) {
+	f.plane.serveTool("claim_task", fmt.Sprintf(
+		`{"task":{"id":%q,"outcome":%q},"run":{"id":%q}}`,
+		closeOutTestTask, outcome, closeOutTestRunCredential))
+}
+
+// CLA-889: the brief tells the session to copy the stored outcome verbatim and
+// append its block, so a re-offered task carries older attempts' markers ABOVE
+// this session's. The safety-net release classifies only what THIS session wrote:
+// an unchanged outcome is "no marker" (never an older attempt's attestation), and
+// a changed one is read on its LAST marker.
+func TestConflictSessionClassifiesOnlyThisSessionsWrite(t *testing.T) {
+	const (
+		oldMechanical = "The reviewed evidence.\n\nRESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept both sides"
+		newFailed     = "RESOLUTION: failed\n\n- the free quota was exhausted before the merge"
+		newMechanical = "RESOLUTION: mechanical\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept both sides"
+	)
+
+	for _, tc := range []struct {
+		name       string
+		prior      string
+		after      string
+		checkGreen bool
+		wantLog    []string
+	}{
+		{
+			name:  "a dead retry writes nothing, so the older mechanical is not this session's attestation",
+			prior: oldMechanical,
+			after: oldMechanical,
+			// The merge this session was to make never happened: a green
+			// attestation would exempt the PR from the plane's repair ladder.
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the session left no resolution marker", "claim released, task left approved"},
+		},
+		{
+			name:       "a session that wrote prose but no marker is still a failure",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\nI could not finish.",
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the session left no resolution marker", "claim released, task left approved"},
+		},
+		{
+			name:       "a new failed marker wins over the older mechanical",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\n" + newFailed,
+			checkGreen: false,
+			wantLog:    []string{"outcome: failed", "the free quota was exhausted", "claim released, task left approved"},
+		},
+		{
+			name:       "a new mechanical marker is the session's own green attestation",
+			prior:      oldMechanical,
+			after:      oldMechanical + "\n\n" + newMechanical,
+			checkGreen: true,
+			wantLog:    []string{"outcome: mechanical"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := conflictingFixture(t)
+			f.serveClaimOutcome(tc.prior)
+			// The stranded shape: the session died before handing the task back.
+			f.plane.serveTool("get_task", fmt.Sprintf(
+				`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":%q}}`,
+				closeOutTestTask, closeOutTestRef, tc.after))
+			d := f.supervisor(0)
+
+			lines := f.run(d)
+
+			releases := f.callsFor("release_task")
+			if len(releases) != 1 {
+				t.Fatalf("release_task calls = %d, want the one safety-net release: %v", len(releases), releases)
+			}
+			if got := releases[0].args["checkGreen"]; got != tc.checkGreen {
+				t.Errorf("checkGreen = %v, want %v (only this session's marker may classify the release): %v", got, tc.checkGreen, releases[0].args)
+			}
+			for _, want := range tc.wantLog {
+				if !strings.Contains(lines, want) {
+					t.Errorf("the log does not say %q:\n%s", want, lines)
+				}
+			}
+		})
+	}
+}
+
+// The exact CLA-884 shape: a conflict session dies without writing anything, so
+// the outcome carries no RESOLUTION marker at all. The task is still in_progress
+// and held, and the safety-net release must fire and say it handed the claim back.
+func TestConflictSessionNoMarkerStillReleasesTheStrandedClaim(t *testing.T) {
 	f := conflictingFixture(t)
-	// A DIFFERENT run's bare uuid: the task's lease lapsed and someone else took it.
-	// Nothing of ours is signable any more, so no release may be sent under our id.
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":"some-other-run","outcome":"RESOLUTION: failed\n\n- b.txt"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"I looked at the conflict."}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 
 	lines := f.run(d)
 
-	if got := f.callsFor("release_task"); len(got) != 0 {
-		t.Errorf("a task held by another run was released under our id: %v", got)
+	releases := f.callsFor("release_task")
+	if len(releases) != 1 {
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
 	}
-	if !strings.Contains(lines, "held by another run (some-other-run)") {
-		t.Errorf("the pass does not name the other holder:\n%s", lines)
+	if got := releases[0].args["checkGreen"]; got != false {
+		t.Errorf("a no-marker session released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
+	}
+	for _, want := range []string{"the session left no resolution marker", "claim released, task left approved"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the incident-shaped log does not say %q:\n%s", want, lines)
+		}
+	}
+}
+
+func TestConflictSessionLogsAReleaseRefusedAsNotHolding(t *testing.T) {
+	f := conflictingFixture(t)
+	// The task is still in_progress and held, but the release is refused as
+	// not-holding: our lease lapsed and another run took it. The refusal is the
+	// only holder signal the plane serves now, and it must be reported as such.
+	f.plane.serveTool("get_task", fmt.Sprintf(
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"RESOLUTION: failed\n\n- b.txt"}}`,
+		closeOutTestTask, closeOutTestRef))
+	f.plane.refuseTool("release_task", `{"error":{"code":"not_holding","message":"release ends a held claim, but the run holding it is already over"}}`)
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := len(f.callsFor("release_task")); got != 1 {
+		t.Fatalf("release_task calls = %d, want the one refused safety-net release", got)
+	}
+	if !strings.Contains(lines, "held by another run") {
+		t.Errorf("a not-holding refusal was not logged as the task being held by another run:\n%s", lines)
+	}
+	if strings.Contains(lines, "claim released") {
+		t.Errorf("a refused release was reported as a hand-back:\n%s", lines)
 	}
 }
 
@@ -278,7 +402,7 @@ func TestConflictSessionMechanicalLeavesTheTaskApproved(t *testing.T) {
 func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 	f := conflictingFixture(t)
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"in_review","claimedByRun":null,"outcome":"RESOLUTION: behavioural\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept the feature's field and the base's default"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_review","heldByRun":false,"outcome":"RESOLUTION: behavioural\n\n**Tests**\n- go test ./...: pass\n\n- a.txt: kept the feature's field and the base's default"}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 
@@ -297,7 +421,7 @@ func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 func TestConflictSessionFailureReleasesTheClaim(t *testing.T) {
 	f := conflictingFixture(t)
 	f.plane.serveTool("get_task", fmt.Sprintf(
-		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":"run-1","outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
+		`{"task":{"id":%q,"ref":%q,"status":"in_progress","heldByRun":true,"outcome":"RESOLUTION: failed\n\n- b.txt cannot be resolved without guessing"}}`,
 		closeOutTestTask, closeOutTestRef))
 	d := f.supervisor(0)
 

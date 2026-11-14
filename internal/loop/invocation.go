@@ -361,56 +361,17 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 	}, nil
 }
 
-// briefedHold is the custody shape of the task a phase was briefed on, read at
-// SPAWN time. The checkpoint peek (CLA-476) requires a TRANSITION into
-// held-with-branch: a task already in that shape before the session starts is a
-// stale-lease takeover candidate or another run's live work, and a phase that
-// claimed nothing observable must not be credited with it and hand phase 2
-// another run's in-flight branch to review.
-type briefedHold struct {
-	// Exact is true when the briefed task is the one a predecessor held (or the
-	// runner itself claimed), so the peek may attribute a hold on it without a
-	// transition.
-	Exact bool
-	// HeldWithBranch is true when the spawn-time read already showed the task
-	// held, with a branch recorded — the shape `next_task` reports for a
-	// stale-lease takeover candidate.
-	HeldWithBranch bool
-	// Branch is the branch recorded at that read, kept for the refusal's log
-	// line. Empty for a resumed phase (whose claim names its own branch).
-	Branch string
-}
-
-// heldWithBranchAtSpawn derives the spawn-time custody from a queue-head read.
-// `requiresTakeover` is authoritative on its own: the plane computes it only for
-// an `in_progress` task whose lease expired with WIP recorded. The status+hasWip
-// pair reads the same shape without relying on the flag, so a plane answer that
-// omits it still yields the refusal.
-func heldWithBranchAtSpawn(next plane.NextTask) briefedHold {
-	return briefedHold{
-		HeldWithBranch: next.RequiresTakeover || (next.Status == "in_progress" && next.HasWIP),
-		Branch:         next.Branch,
-	}
-}
-
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
 // they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
-// 2 and 3). It also returns the id of the task the phase is BRIEFED on — exact
-// for a resumed phase (the predecessor's claim), best-effort for a fresh one
-// (the queue-head peek, the same read the session is about to make) — and, for
-// a fresh phase, that task's custody AT SPAWN, which the seam's checkpoint peek
-// needs to demand a transition rather than a static hold (CLA-476). An empty id
-// means the driver never knew which task to ask about, and the peek is skipped.
-//
-// Which task that is depends on the phase. A RESUMED phase (prev carries a held
-// claim) knows its exact task, so its repo is read straight off the plane with
-// get_task. A FRESH phase has claimed nothing yet — the claim happens inside the
-// session — so the driver peeks at next_task, the same queue-head read the
-// session is about to make, and starts in that task's repo. The peek cannot race
-// a session out of work (it holds nothing), and if another clanker does claim the
-// peeked task first, the spawned session claims elsewhere and still works: the
-// permission policy covers every declared repo regardless of cwd, which is what
-// makes a best-effort cwd safe rather than load-bearing.
+// 2 and 3). Which task that is depends on the phase. A RESUMED phase (prev
+// carries a held claim) knows its exact task, so its repo is read straight off
+// the plane with get_task. A FRESH phase has claimed nothing yet — the claim
+// happens inside the session — so the driver peeks at next_task, the same
+// queue-head read the session is about to make, and starts in that task's repo.
+// The peek cannot race a session out of work (it holds nothing), and if another
+// clanker does claim the peeked task first, the spawned session claims elsewhere
+// and still works: the permission policy covers every declared repo regardless
+// of cwd, which is what makes a best-effort cwd safe rather than load-bearing.
 //
 // Resolution then runs config.ResolveCheckout over what the target declared:
 // explicit repos entries, then the workdir-is-the-checkout convention, then
@@ -428,10 +389,8 @@ func heldWithBranchAtSpawn(next plane.NextTask) briefedHold {
 // caller can key the pr_base override by it (CLA-608) without a second plane
 // read; "" is the same best-effort empty the checkout resolution already
 // tolerates, and means only "no override can match".
-func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (dir, briefed, repo string, hold briefedHold, err error) {
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (dir, repo string, err error) {
 	if prev != nil && prev.Claim.Held() {
-		briefed = prev.Claim.TaskID
-		hold.Exact = true
 		if src, ok := t.Releaser.(plane.TaskRepoSource); ok {
 			r, rerr := src.TaskRepo(ctx, prev.Claim.TaskID)
 			switch {
@@ -447,9 +406,7 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		next, perr := peeker.PeekNextTask(ctx)
 		switch {
 		case perr == nil:
-			briefed = next.TaskID
 			repo = next.Repo
-			hold = heldWithBranchAtSpawn(next)
 			if next.Repo != "" {
 				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
 			}
@@ -459,7 +416,7 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		}
 	}
 	dir, err = d.checkoutFor(t, repo)
-	return dir, briefed, repo, hold, err
+	return dir, repo, err
 }
 
 // checkoutFor resolves a repo identity to the local checkout this target runs

@@ -289,25 +289,20 @@ boundary too. Two other consequences worth knowing:
   alone, so with no phase after it every task would stop half-finished, forever,
   with nothing in the logs reading as an error.
 
-The seam also survives a blind spot in how claims are observed (CLA-451). The
-driver learns a session's claim by parsing clankerbar tool calls out of its
-stream; a session that claimed through another channel — a raw API call with the
-same key, a future harness quirk, a renamed tool — ends its implement phase
-holding a task the driver never saw it take, and used to end the sequence there:
-no review phase, no lease renewal, and pushed work stranded behind an expiring
-lease until a takeover recovered it at a reclaim's cost. Now, before declaring a
-checkpointable phase empty, the driver asks the plane about the one task it can
-name — the task it dispatched: if that task is held with a branch recorded and
-that branch verifies on the origin remote (the same evidence gate every
-checkpoint passes), the driver treats it as the checkpoint and resumes the run
-by heartbeat in the next phase, exactly as after an observed claim. The hold
-must also be new: a task that already read held-with-a-branch when the phase
-spawned — a stale-lease takeover candidate offered as the queue head, or another
-run's live work — is not accepted as this phase's checkpoint (CLA-476). The
-other guards are unchanged: an unreadable stream is never filled in from the
-plane, a session that died producing nothing is never promoted by a plane
-answer, an observed claim always wins over a peeked one, and a failed peek keeps
-today's ending.
+The seam no longer recovers a claim the driver never observed. The driver learns
+a session's claim — and the run credential every later write signs with — by
+parsing clankerbar tool calls out of its stream, and the plane's task reads serve
+only *presence* now (CLA-509): a run id is half a bearer credential. A claim
+taken through a channel the driver cannot observe therefore cannot be resumed by
+the driver either — the recovered claim would have no credential to heartbeat
+with, to close a review round with, or to sign the next phase's writes. A
+runner-claimed phased drain does not depend on that observation: the driver takes
+the claim itself before the first phase, so every phase resumes a claim it holds.
+A phased run on the session-claim path — any phase with a custom `prompt`, a
+blind run, or a target whose claimer is not wired — still depends on the harness
+observing the claim, and ends the sequence if it does not. The old CLA-451
+checkpoint peek, which asked `get_task` about the briefed task, was removed with
+the field it read.
 
 The saving is **still unmeasured**: a phased run has now happened, but it is not
 comparable evidence - its implement phase reached the checkpoint over an

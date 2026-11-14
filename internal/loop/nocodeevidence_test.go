@@ -36,11 +36,11 @@ func TestDrainPhases_ANoCodeSessionThatSettledTheTaskCheckpoints(t *testing.T) {
 				{res: held(okResult(1, 0), openClaim())},
 				{res: okResult(5, 0.05)},
 			}}
-			rel := &peekReleaser{
+			rel := &taskReadReleaser{
 				next:  plane.NextTask{TaskID: "t-1"},
 				state: map[string]plane.TaskState{"t-1": {Status: status}},
 			}
-			d := blindSpotDriver(t, h, rel)
+			d := taskReadDriver(t, h, rel)
 
 			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -88,13 +88,13 @@ func TestDrainPhases_ADeclaredNoCodeDeliveryCountsAsEvidence(t *testing.T) {
 		{res: held(okResult(1, 0), openClaim())}, // still-held clean exit, NO branch
 		{res: okResult(5, 0.05)},
 	}}
-	rel := &peekReleaser{
+	rel := &taskReadReleaser{
 		next: plane.NextTask{TaskID: "t-1"},
 		state: map[string]plane.TaskState{
-			"t-1": {Status: "in_progress", ClaimedByRun: "r-1", DeliveryNoCode: true},
+			"t-1": {Status: "in_progress", HeldByRun: true, DeliveryNoCode: true},
 		},
 	}
-	d := blindSpotDriver(t, h, rel)
+	d := taskReadDriver(t, h, rel)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -127,11 +127,11 @@ func TestDrainPhases_ASettledPlaneRecordOutranksAFailedBranchCheck(t *testing.T)
 		{res: recorded},
 		{res: okResult(5, 0.05)},
 	}}
-	rel := &peekReleaser{
+	rel := &taskReadReleaser{
 		next:  plane.NextTask{TaskID: "t-1"},
 		state: map[string]plane.TaskState{"t-1": {Status: "in_review"}},
 	}
-	d := blindSpotDriver(t, h, rel)
+	d := taskReadDriver(t, h, rel)
 	d.newVerifier = func(string, bool) deliveryVerifier {
 		return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
 			Kind: delivery.BranchPushed, Status: delivery.Fail, Detail: `branch "clanker/unpushed" is NOT on origin`,
@@ -173,7 +173,7 @@ func TestDrainPhases_SilentEOTStillReadsEmptyEvenWithThePlaneWired(t *testing.T)
 		state plane.TaskState
 	}{
 		{"still ready (released or never claimed)", plane.TaskState{Status: "ready"}},
-		{"held with nothing declared", plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}},
+		{"held with nothing declared", plane.TaskState{Status: "in_progress", HeldByRun: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureLogs(t)
@@ -183,11 +183,11 @@ func TestDrainPhases_SilentEOTStillReadsEmptyEvenWithThePlaneWired(t *testing.T)
 				return held(ok, openClaim())
 			}
 			h := &fakeAdapter{steps: []invokeStep{{res: empty()}, {res: empty()}}}
-			rel := &peekReleaser{
+			rel := &taskReadReleaser{
 				next:  plane.NextTask{TaskID: "t-1"},
 				state: map[string]plane.TaskState{"t-1": tc.state},
 			}
-			d := blindSpotDriver(t, h, rel)
+			d := taskReadDriver(t, h, rel)
 
 			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -230,14 +230,14 @@ func TestDrainPhases_AVerifiedBranchCheckpointsWithoutAskingThePlane(t *testing.
 		{res: checkpointed(1, 0)},
 		{res: okResult(5, 0.05)},
 	}}
-	rel := &peekReleaser{
+	rel := &taskReadReleaser{
 		next: plane.NextTask{TaskID: "t-1"},
 		state: map[string]plane.TaskState{
 			// Would NOT be evidence if asked — proving it was not asked.
 			"t-1": {Status: "ready"},
 		},
 	}
-	d := blindSpotDriver(t, h, rel)
+	d := taskReadDriver(t, h, rel)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -267,11 +267,11 @@ func TestDrainPhases_AFailedPlaneReadDegradesToBranchOnlyEvidence(t *testing.T) 
 		{res: held(okResult(1, 0), openClaim())},
 		{res: held(okResult(1, 0), openClaim())},
 	}}
-	rel := &peekReleaser{
+	rel := &taskReadReleaser{
 		next:     plane.NextTask{TaskID: "t-1"},
 		stateErr: errors.New("plane 503"),
 	}
-	d := blindSpotDriver(t, h, rel)
+	d := taskReadDriver(t, h, rel)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -300,11 +300,11 @@ func TestDrainPhases_AHandoffDuringNoCodeReviewCarriesTheNoCodeTerminalStep(t *t
 		{res: handoffResult("Record reviewed: the settlement is honest; verifying the outcome next.")},
 		{res: okResult(1, 0)},
 	}}
-	rel := &peekReleaser{
+	rel := &taskReadReleaser{
 		next:  plane.NextTask{TaskID: "t-1"},
 		state: map[string]plane.TaskState{"t-1": {Status: "in_review"}},
 	}
-	d := blindSpotDriver(t, h, rel)
+	d := taskReadDriver(t, h, rel)
 
 	if _, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)

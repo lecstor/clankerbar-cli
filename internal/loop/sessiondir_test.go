@@ -85,15 +85,12 @@ func TestSessionDir_FreshPhaseResolvesTheQueueHead(t *testing.T) {
 	rel := &repoReleaser{next: plane.NextTask{TaskID: "t-1", Repo: "acme/repo-b"}}
 	target.Releaser = rel
 
-	dir, briefed, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil {
 		t.Fatalf("sessionDir: %v", err)
 	}
 	if dir != dirB {
 		t.Errorf("sessionDir = %s, want the queue head's checkout %s", dir, dirB)
-	}
-	if briefed != "t-1" {
-		t.Errorf("briefed task = %q, want the queue head t-1 (CLA-451's seam peek reads it)", briefed)
 	}
 	if rel.peeks != 1 || len(rel.repoLookups) != 0 {
 		t.Errorf("a fresh phase peeks next_task (%d peeks, %d get_task lookups), never get_task", rel.peeks, len(rel.repoLookups))
@@ -106,72 +103,15 @@ func TestSessionDir_ResumePhaseReadsTheExactTask(t *testing.T) {
 	rel := &repoReleaser{taskRepo: map[string]string{"t-9": "acme/repo-b"}}
 	target.Releaser = rel
 
-	dir, briefed, _, _, err := d0(target).sessionDir(context.Background(), target, prev)
+	dir, _, err := d0(target).sessionDir(context.Background(), target, prev)
 	if err != nil {
 		t.Fatalf("sessionDir: %v", err)
 	}
 	if dir != dirB {
 		t.Errorf("sessionDir = %s, want the resumed task's own checkout %s", dir, dirB)
 	}
-	if briefed != "t-9" {
-		t.Errorf("briefed task = %q, want the resumed t-9 exactly (the peek is for phases that claim for themselves)", briefed)
-	}
 	if rel.peeks != 0 || len(rel.repoLookups) != 1 || rel.repoLookups[0] != "t-9" {
 		t.Errorf("a resumed phase reads get_task(%v), never peeks (%d)", rel.repoLookups, rel.peeks)
-	}
-}
-
-func TestSessionDir_CapturesTheBriefedTasksSpawnCustody(t *testing.T) {
-	// The seam's peek needs the spawn-time custody (CLA-476); the queue-head read
-	// that chooses the spawn directory already answers it, so no second read is paid.
-	_, _, _, target := twoRepos(t)
-	rel := &repoReleaser{next: plane.NextTask{
-		TaskID: "t-1", Repo: "acme/repo-b", Status: "in_progress", Branch: "clanker/x", HasWIP: true, RequiresTakeover: true,
-	}}
-	target.Releaser = rel
-
-	_, briefed, _, hold, err := d0(target).sessionDir(context.Background(), target, nil)
-	if err != nil {
-		t.Fatalf("sessionDir: %v", err)
-	}
-	if briefed != "t-1" {
-		t.Errorf("briefed task = %q, want t-1", briefed)
-	}
-	if !hold.HeldWithBranch || hold.Exact || hold.Branch != "clanker/x" {
-		t.Errorf("hold = %+v, want a fresh brief whose task was already held with branch clanker/x", hold)
-	}
-
-	// A resumed phase knows the exact task: a hold on it needs no transition.
-	prev := &harness.Result{Claim: harness.Claim{TaskID: "t-9"}}
-	rel2 := &repoReleaser{taskRepo: map[string]string{"t-9": "acme/repo-b"}}
-	target.Releaser = rel2
-	_, _, _, hold, err = d0(target).sessionDir(context.Background(), target, prev)
-	if err != nil {
-		t.Fatalf("sessionDir: %v", err)
-	}
-	if !hold.Exact || hold.HeldWithBranch {
-		t.Errorf("hold = %+v, want an exact resumed brief with no queue-head custody", hold)
-	}
-}
-
-// The fallback arm of the spawn-time custody: a plane that omits requiresTakeover
-// must still yield the refusal from status+hasWip.
-func TestHeldWithBranchAtSpawn_FallbackWithoutTheTakeoverFlag(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		next plane.NextTask
-		want bool
-	}{
-		{"in_progress with WIP, flag absent", plane.NextTask{Status: "in_progress", HasWIP: true}, true},
-		{"in_progress without WIP", plane.NextTask{Status: "in_progress"}, false},
-		{"ready with WIP", plane.NextTask{Status: "ready", HasWIP: true}, false},
-		{"takeover flag alone", plane.NextTask{RequiresTakeover: true}, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := heldWithBranchAtSpawn(tc.next).HeldWithBranch; got != tc.want {
-				t.Errorf("HeldWithBranch = %v, want %v for %+v", got, tc.want, tc.next)
-			}
-		})
 	}
 }
 
@@ -179,7 +119,7 @@ func TestSessionDir_NoRepoFallsBackToPrimaryNeverWorkdir(t *testing.T) {
 	parent, dirA, _, target := twoRepos(t)
 	target.Releaser = &repoReleaser{} // the queue head carries NO repo
 
-	dir, _, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil {
 		t.Fatalf("sessionDir: %v", err)
 	}
@@ -192,7 +132,7 @@ func TestSessionDir_LegacyWhenNothingConfigured(t *testing.T) {
 	d := New(fastCfg(), nil, nil)
 	target := Target{Poller: busyPoller(), WorkDir: "/repos/parent", Releaser: &fakeReleaser{}}
 
-	dir, _, _, _, err := d.sessionDir(context.Background(), target, nil)
+	dir, _, err := d.sessionDir(context.Background(), target, nil)
 	if err != nil || dir != "" {
 		t.Errorf("got (%q, %v); with nothing declared resolution has no opinion and the spawn keeps its legacy workdir", dir, err)
 	}
@@ -203,7 +143,7 @@ func TestSessionDir_LookupFailureDegradesThenRefusesAmbiguity(t *testing.T) {
 	// A peek blip is degradation: no identity is known, so the fallback chain runs.
 	rel := &repoReleaser{peekErr: errors.New("plane 503")}
 	target.Releaser = rel
-	dir, _, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil {
 		t.Fatalf("with a resolvable primary a peek blip must degrade, not fail: %v", err)
 	}
@@ -218,7 +158,7 @@ func TestSessionDir_LookupFailureDegradesThenRefusesAmbiguity(t *testing.T) {
 		Repos:    map[string]string{"acme/a": "/repos/a", "acme/b": "/repos/b"},
 		Releaser: &repoReleaser{peekErr: errors.New("plane 503")},
 	}
-	if _, _, _, _, err := d0(amb).sessionDir(context.Background(), amb, nil); !errors.Is(err, config.ErrRepoNotFound) {
+	if _, _, err := d0(amb).sessionDir(context.Background(), amb, nil); !errors.Is(err, config.ErrRepoNotFound) {
 		t.Errorf("err = %v, want ErrRepoNotFound for an ambiguous config that cannot even learn the task", err)
 	}
 }
@@ -227,7 +167,7 @@ func TestSessionDir_UnknownRepoIsLoud(t *testing.T) {
 	_, _, _, target := twoRepos(t)
 	target.Releaser = &repoReleaser{next: plane.NextTask{TaskID: "t-2", Repo: "other/nowhere"}}
 
-	_, _, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	_, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if !errors.Is(err, config.ErrRepoNotFound) || !strings.Contains(err.Error(), "repo_not_found") {
 		t.Fatalf("err = %v, want the literal repo_not_found failure", err)
 	}
@@ -449,7 +389,7 @@ func TestSessionDirRefusesACheckoutOutsideTheProjectRoot(t *testing.T) {
 		ProjectRoot: true,
 		Releaser:    &repoReleaser{},
 	}
-	dir, _, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err == nil {
 		t.Fatalf("sessionDir = %q; want a refusal for a checkout outside the project root %q", dir, project)
 	}
@@ -459,7 +399,7 @@ func TestSessionDirRefusesACheckoutOutsideTheProjectRoot(t *testing.T) {
 
 	// The managed checkout inside the root still resolves.
 	target.Repos = map[string]string{"acme/repo-a": inside}
-	dir, _, _, _, err = d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, err = d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil || dir != inside {
 		t.Errorf("sessionDir = %q (%v), want the in-root checkout %q", dir, err, inside)
 	}
@@ -468,7 +408,7 @@ func TestSessionDirRefusesACheckoutOutsideTheProjectRoot(t *testing.T) {
 	// exactly as before CLA-678: no containment is inferred.
 	target.Repos = map[string]string{"acme/repo-a": outside}
 	target.ProjectRoot = false
-	dir, _, _, _, err = d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, err = d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil || dir != outside {
 		t.Errorf("sessionDir = %q (%v), want the declared checkout %q when project_root is off", dir, err, outside)
 	}

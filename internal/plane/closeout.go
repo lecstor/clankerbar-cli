@@ -26,27 +26,37 @@ type CloseOutAPI interface {
 	// ApprovedForCloseOut lists the project's approved-awaiting-merge tasks.
 	ApprovedForCloseOut(ctx context.Context) (CloseOutQueue, error)
 
-	// ClaimCloseOut claims one approved task through the close-out door and
-	// returns the run id the rest of the close-out signs with. A refusal (the
-	// task moved, another clanker holds it, the dial says the operator
-	// integrates) is an error and means STOP.
-	ClaimCloseOut(ctx context.Context, taskID string) (string, error)
+	// ClaimCloseOut claims one approved task through the close-out door. It
+	// returns the run credential the rest of the close-out signs with, and the
+	// task's outcome as the claim response served it — the baseline a conflict
+	// session appends to, since the plane re-serves no holder id after the claim
+	// (CLA-509). A refusal (the task moved, another clanker holds it, the dial
+	// says the operator integrates) is an error and means STOP.
+	ClaimCloseOut(ctx context.Context, taskID string) (CloseOutClaim, error)
 
 	// ReleaseCloseOut hands a claim back with the task still approved, so the
 	// agent close-out remains the fallback. checkGreen attests whether the PR's
 	// checks were green at the hand-back: true when the failure was NOT the merge
 	// itself (a post-merge plane write, say), false when the merge is what failed —
 	// the plane's CI-repair ladder is what bounds a green-but-unmergeable PR.
+	//
+	// The plane's holder refusals — `not_holding` when no live claim holds the
+	// task, `not_your_claim` when another run does — come back wrapped in
+	// ErrNotHolding. That refusal is how a caller checks, with its own
+	// credential, whether its claim is still the live one: the plane serves no
+	// holder id to compare against (CLA-509).
 	ReleaseCloseOut(ctx context.Context, taskID, runID string, checkGreen bool) error
 
 	// CompleteCloseOut records the delivery and closes the task done, in the
 	// claim's run.
 	CompleteCloseOut(ctx context.Context, taskID, runID string, d CloseOutDelivery) error
 
-	// TaskState reads one task's holder state (get_task): the status, the run
-	// holding it and the outcome text. The close-out uses it to tell what a
-	// conflict-only session left behind — it hands the task back itself, so the
-	// supervisor verifies the hand-back rather than assuming it (CLA-759).
+	// TaskState reads one task's holder state (get_task): the status, whether a
+	// run holds it and the outcome text. The conflict close-out uses it AFTER a
+	// session to tell what that session left behind. There is no holder id to
+	// compare against (CLA-509), so the release call is the check: signing one
+	// with our own claim succeeds while the claim is ours, and its ErrNotHolding
+	// refusal means it is not.
 	TaskState(ctx context.Context, taskID string) (TaskState, error)
 }
 
@@ -56,6 +66,23 @@ type ProjectPolicy struct {
 	// AuthorityIntegrate is "clanker" when an approved task is the fleet's to
 	// merge, "human" when it is the operator's.
 	AuthorityIntegrate string
+}
+
+// ErrNotHolding means a hand-back ended nothing because the run that signed it
+// is not the task's holder. The plane answers `not_holding` when the task has no
+// live claim (or the holding run is already over) and `not_your_claim` when
+// another run holds it; both are the same answer to a caller checking whether its
+// claim still owns the task.
+var ErrNotHolding = errors.New("the task is not held by this run")
+
+// CloseOutClaim is what ClaimCloseOut learned: the run credential every later
+// close-out call signs with, and the task's outcome at the claim. The outcome is
+// the CONFLICT path's baseline — the brief tells the session to copy that text
+// verbatim and append its RESOLUTION block, so a post-session read identical to
+// it means this session wrote nothing (CLA-889).
+type CloseOutClaim struct {
+	RunID   string
+	Outcome string
 }
 
 // CloseOutTask is one approved-awaiting-merge task as the close-out needs it: the
@@ -109,8 +136,8 @@ func (coNotWired) ProjectPolicy(context.Context) (ProjectPolicy, error) {
 func (coNotWired) ApprovedForCloseOut(context.Context) (CloseOutQueue, error) {
 	return CloseOutQueue{}, ErrNotWired
 }
-func (coNotWired) ClaimCloseOut(context.Context, string) (string, error) {
-	return "", ErrNotWired
+func (coNotWired) ClaimCloseOut(context.Context, string) (CloseOutClaim, error) {
+	return CloseOutClaim{}, ErrNotWired
 }
 func (coNotWired) ReleaseCloseOut(context.Context, string, string, bool) error { return ErrNotWired }
 func (coNotWired) CompleteCloseOut(context.Context, string, string, CloseOutDelivery) error {
@@ -188,29 +215,34 @@ func (r *mcpReleaser) ApprovedForCloseOut(ctx context.Context) (CloseOutQueue, e
 // close-out and this path from both integrating the same PR; a refusal is the
 // "someone else has it" answer and the caller stops.
 //
-// The returned id is the run CREDENTIAL (`<uuid>.<secret>`), not a bare uuid: every
-// later call in this close-out signs with it, exactly as a session's run id does.
-func (r *mcpReleaser) ClaimCloseOut(ctx context.Context, taskID string) (string, error) {
+// The returned RunID is the run CREDENTIAL (`<uuid>.<secret>`), not a bare uuid:
+// every later call in this close-out signs with it, exactly as a session's run id
+// does. The outcome rides the same response's task view, so the conflict path has
+// its pre-session baseline with no second read.
+func (r *mcpReleaser) ClaimCloseOut(ctx context.Context, taskID string) (CloseOutClaim, error) {
 	if taskID == "" {
-		return "", errors.New("claim close-out: taskId is required")
+		return CloseOutClaim{}, errors.New("claim close-out: taskId is required")
 	}
 	text, err := r.callText(ctx, "claim_task", map[string]any{"taskId": taskID})
 	if err != nil {
-		return "", err
+		return CloseOutClaim{}, err
 	}
 	var payload struct {
+		Task struct {
+			Outcome any `json:"outcome"`
+		} `json:"task"`
 		Run struct {
 			ID string `json:"id"`
 		} `json:"run"`
 	}
 	if err := json.Unmarshal(text, &payload); err != nil {
-		return "", fmt.Errorf("claim_task: decode result: %w", err)
+		return CloseOutClaim{}, fmt.Errorf("claim_task: decode result: %w", err)
 	}
 	runID := strings.TrimSpace(payload.Run.ID)
 	if runID == "" {
-		return "", errors.New("claim_task: the plane returned no run id, so nothing can be signed")
+		return CloseOutClaim{}, errors.New("claim_task: the plane returned no run id, so nothing can be signed")
 	}
-	return runID, nil
+	return CloseOutClaim{RunID: runID, Outcome: wireString(payload.Task.Outcome)}, nil
 }
 
 // ReleaseCloseOut hands a close-out claim back, leaving the task APPROVED (the
@@ -235,12 +267,22 @@ func (r *mcpReleaser) ReleaseCloseOut(ctx context.Context, taskID, runID string,
 	if taskID == "" || runID == "" {
 		return errors.New("release close-out: taskId and runId are both required")
 	}
-	return r.call(ctx, "release_task", map[string]any{
+	err := r.call(ctx, "release_task", map[string]any{
 		"taskId":     taskID,
 		"runId":      runID,
 		"driver":     true,
 		"checkGreen": checkGreen,
 	})
+	if err == nil {
+		return nil
+	}
+	// The two holder refusals are one answer to the caller: this credential is
+	// not the live claim. Anything else (a transport failure, an unknown tool, a
+	// malformed call) is a release that may or may not have landed.
+	if code, _, ok := refusalCode(err); ok && (code == "not_holding" || code == "not_your_claim") {
+		return fmt.Errorf("%w: %v", ErrNotHolding, err)
+	}
+	return err
 }
 
 // CompleteCloseOut declares the delivery and closes the task done in the claim's

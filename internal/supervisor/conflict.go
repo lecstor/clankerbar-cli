@@ -105,6 +105,12 @@ type ConflictRunRequest struct {
 	// grant that directory into the session's permission scope.
 	Worktree string
 	Prompt   string
+	// PriorOutcome is the task's outcome as the CLAIM response served it, before
+	// the session ran. The brief tells the session to copy it verbatim and append
+	// its block, so the post-session read is classified only on what this session
+	// added: an unchanged outcome is "no marker", never an older attempt's
+	// attestation (CLA-889).
+	PriorOutcome string
 }
 
 // startConflictSession takes the claim for one CONFLICTING approved task and
@@ -210,7 +216,7 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	// "a task already claimed is skipped" true rather than hopeful: an agent
 	// close-out that won the race leaves this claim refused, and no session is
 	// started. It is also the run id every call the session makes signs with.
-	runID, err := client.ClaimCloseOut(ctx, task.ID)
+	claim, err := client.ClaimCloseOut(ctx, task.ID)
 	if err != nil {
 		d.conflictSay("claimed:"+task.ID, "conflict: %s PR #%d is CONFLICTING but the claim was refused (%v) - "+
 			"no conflict session; the task stays with whoever holds it", label, pr, err)
@@ -221,7 +227,7 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	req := ConflictRunRequest{
 		TaskID:   task.ID,
 		TaskRef:  task.Ref,
-		RunID:    runID,
+		RunID:    claim.RunID,
 		Branch:   task.Branch,
 		Base:     base,
 		PR:       fmt.Sprintf("#%d", pr),
@@ -232,6 +238,8 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		Model:    step.Model,
 		WorkDir:  dir,
 		Worktree: worktree,
+
+		PriorOutcome: claim.Outcome,
 	}
 	req.Prompt = config.ConflictBrief(config.ConflictBriefInput{
 		TaskID:   req.TaskID,
@@ -310,7 +318,11 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 		return
 	}
 
-	kind, detail, marked := config.ConflictResolution(st.Outcome)
+	// Classify only what THIS session wrote: the brief appends its block to the
+	// stored outcome, so an outcome still identical to the claim-time baseline
+	// carries older attempts' markers only, and none of them describes this
+	// session (CLA-889).
+	kind, detail, marked := config.ConflictResolutionSince(req.PriorOutcome, st.Outcome)
 	if strings.EqualFold(st.Status, "in_review") {
 		note := strings.TrimSpace(detail)
 		if note == "" {
@@ -329,16 +341,15 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 		return
 	}
 
-	// Still held by the run this supervisor took: the session did not hand it
-	// back. Release it, run or no run, and classify by the marker the session
-	// left (a mechanical resolution whose release call failed is still
-	// mechanical; a session that left no marker is a failure).
+	// When the task still reads in_progress and held, the session did not hand it
+	// back: release it and classify by the marker IT left (a mechanical resolution
+	// whose release call failed is still mechanical; a session that wrote nothing is
+	// a failure).
 	//
-	// The comparison is between run IDENTITIES, not the ids as strings: the claim
-	// hands this supervisor the run CREDENTIAL (`<uuid>.<secret>`) while the
-	// plane's `claimedByRun` holds the bare uuid, so comparing the raw strings
-	// never matched - the release never fired, and our own dead run was
-	// misreported as "another run".
+	// The plane serves PRESENCE only (CLA-509), so there is no holder id to compare
+	// against ours. The release call is the check instead: signing it with our own
+	// claim succeeds when the claim is still ours, and the plane's holder refusal
+	// means it is not — another run took the task, or our run is already over.
 	//
 	// The release attests green ONLY for a mechanical resolution, whose merge
 	// really landed. A failed session's merge never happened, and a session that
@@ -346,19 +357,27 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 	// plane's CI-repair ladder counts and bounds the PR (standing decision
 	// 047d3dad rule 1) — the same rule the brief's FAILED hand-back spells out.
 	checkGreen := marked && kind == config.ConflictResolutionMechanical
-	if claimIsOurs(st.ClaimedByRun, req.RunID) {
-		if rerr := client.ReleaseCloseOut(ctx, req.TaskID, req.RunID, checkGreen); rerr != nil {
+	handback := "the claim is not held"
+	if strings.EqualFold(st.Status, "approved") {
+		handback = "the claim was already released, task left approved"
+	}
+	if strings.EqualFold(st.Status, "in_progress") && st.HeldByRun {
+		rerr := client.ReleaseCloseOut(ctx, req.TaskID, req.RunID, checkGreen)
+		switch {
+		case rerr == nil:
+			handback = "claim released, task left approved"
+		case errors.Is(rerr, plane.ErrNotHolding):
+			// Our claim is gone. Nothing of ours is signed any more, and the new
+			// holder owns the outcome; say so rather than claiming a status we no
+			// longer control.
+			log.Printf("conflict: %s PR %s - outcome: failed - the task is now held by another run, so the conflict session's result cannot be recorded (%v) - %s",
+				label, req.PR, rerr, conflictFailureReason(res, runErr, detail))
+			return
+		default:
 			log.Printf("conflict: %s PR %s - outcome: failed - the claim could not be released (%v); its lease must expire - %s",
 				label, req.PR, rerr, conflictFailureReason(res, runErr, detail))
 			return
 		}
-	} else if held := strings.TrimSpace(st.ClaimedByRun); held != "" {
-		// Our lease lapsed and another run took the task. Nothing of ours is
-		// signed any more, and the new holder owns the outcome; say so rather
-		// than claiming a status we can no longer see.
-		log.Printf("conflict: %s PR %s - outcome: failed - the task is now held by another run (%s); the conflict session's result cannot be recorded",
-			label, req.PR, held)
-		return
 	}
 
 	switch {
@@ -366,39 +385,17 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 		log.Printf("conflict: %s PR %s - outcome: mechanical - conflicting paths: %s - task left approved for the close-out",
 			label, req.PR, conflictPaths(req.Paths))
 	case marked && kind == config.ConflictResolutionFailed:
-		log.Printf("conflict: %s PR %s - outcome: failed - %s - conflicting paths: %s - claim released, task left approved",
-			label, req.PR, conflictFailureReason(res, runErr, detail), conflictPaths(req.Paths))
+		log.Printf("conflict: %s PR %s - outcome: failed - %s - conflicting paths: %s - %s",
+			label, req.PR, conflictFailureReason(res, runErr, detail), conflictPaths(req.Paths), handback)
 	default:
 		// No marker at all: the session did not follow step 7. A run that ended
 		// cleanly still may have pushed nothing; say so rather than calling it
-		// mechanical by default, which would claim a review it never had.
-		log.Printf("conflict: %s PR %s - outcome: failed - the session left no resolution marker - %s",
-			label, req.PR, conflictFailureReason(res, runErr, detail))
+		// mechanical by default, which would claim a review it never had. The
+		// hand-back is named here too, because this is exactly the shape a session
+		// that died leaves behind (CLA-884).
+		log.Printf("conflict: %s PR %s - outcome: failed - the session left no resolution marker - %s - %s",
+			label, req.PR, conflictFailureReason(res, runErr, detail), handback)
 	}
-}
-
-// conflictRunUUID is a run id's identity: the part before the first dot. A claim
-// hands the supervisor the run CREDENTIAL (`<uuid>.<secret>`), while the plane's
-// records — `claimedByRun` above all — hold the BARE uuid, so two ids name the
-// same run exactly when their uuids match. Mirrors internal/loop's runUUID, which
-// is the same split the plane makes (parseRunCredential); a bare id is its own
-// uuid.
-func conflictRunUUID(id string) string {
-	id = strings.TrimSpace(id)
-	if i := strings.IndexByte(id, '.'); i >= 0 {
-		return id[:i]
-	}
-	return id
-}
-
-// claimIsOurs reports whether the task's recorded holder is the run this
-// supervisor claimed under. Both sides are compared as run IDENTITIES: comparing
-// the strings was a real defect (CLA-759 review 1.review-1.1), because the claim
-// returns a credential and the plane records the bare uuid, so it never matched
-// and the safety-net release never fired.
-func claimIsOurs(claimedByRun, runID string) bool {
-	mine := conflictRunUUID(runID)
-	return mine != "" && conflictRunUUID(claimedByRun) == mine
 }
 
 // conflictHarnessTakesExtraDirs reports whether a harness translates
