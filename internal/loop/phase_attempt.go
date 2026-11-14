@@ -85,7 +85,7 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 	// refuses an existing path either way; this stops it turning into a denial
 	// of the log itself.
-	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner)
+	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
 	if at.ierr != nil {
 		// The session env refused to resolve (a failing or empty-output
 		// fromCommand, an unreadable @path file — the error names the
@@ -126,6 +126,15 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	if opts.runner != nil {
 		at.inv.Prompt = r.runnerContextBlock(at) + "\n\n---\n\n" + at.inv.Prompt
 	}
+	// The maps-session method (CLA-869) turns this one review session into a
+	// sequence. It appends to the brief rather than replacing it, and a refusal
+	// here refuses the spawn: a review run against a half-built map would report
+	// on a checklist the driver could not stand behind.
+	plan, perr := r.mapsSessionPlanFor(at)
+	if perr != nil {
+		return attemptVerdict{next: attemptReturn, zeroSpend: true, err: fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), perr)}
+	}
+	r.applyMapsSession(at, plan)
 	return attemptVerdict{}
 }
 
@@ -267,6 +276,10 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 		opts.onSessionLaunch()
 	}
 	at.res, at.ierr = a.Invoke(sctx, at.inv)
+	// The notes are the maps-session method's evidence and are written to the
+	// iteration log while it is still open, before the findings turn's report is
+	// judged anywhere.
+	r.writeMapsNotes(at)
 	joined := renewer.stop()
 	// Only a session this run ended counts as lost: a cancelled parent is the
 	// operator stopping the whole run.
@@ -401,7 +414,12 @@ func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	// wall-clock kill can land mid-turn, but a cap is an orderly end with its
 	// own marker — retrying it would re-spend against the same cap and parking
 	// it would read a doing-its-job backstop as a silent death.
-	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
+	// CLA-877: a report-resume failure is a resume-only failure and rides the same
+	// retry ladder, but under a different claim disposition: the session's own
+	// run is not what failed, so the claim is KEPT and the retry resumes it
+	// rather than settling, expiring the lease and re-claiming.
+	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
+		(deadPhase(at.res) || at.toolLoop != "" || at.res.ReportResumeFailed != "")
 }
 
 // openPhaseEnd books the exit into the dead-phase tally and starts the

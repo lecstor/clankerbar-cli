@@ -86,6 +86,13 @@ type RunConfigPhase struct {
 	Tier         string   `json:"tier"`
 	Model        string   `json:"model"`
 	Harness      string   `json:"harness"`
+	// ReviewMethod and MapsSession are this build's review-method knobs. They
+	// are decoded so a plane whose stored schema learns them needs no second
+	// change here; RunConfigDocument refuses to EXPORT them until that happens
+	// (the v1 schema refuses unknown phase keys), so today they can only arrive
+	// from a hand-written document the plane accepted.
+	ReviewMethod string              `json:"review_method"`
+	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
 // RunConfigPanelMember is one stored review-panel member, mapped onto
@@ -97,11 +104,13 @@ type RunConfigPhase struct {
 // stored document must stay a trial seat when the overlay applies it, or every
 // fleet applying that pipeline would silently promote it to a required reviewer.
 type RunConfigPanelMember struct {
-	Name     string `json:"name"`
-	Harness  string `json:"harness"`
-	Model    string `json:"model"`
-	Tier     string `json:"tier"`
-	Optional bool   `json:"optional,omitempty"`
+	Name         string              `json:"name"`
+	Harness      string              `json:"harness"`
+	Model        string              `json:"model"`
+	Tier         string              `json:"tier"`
+	Optional     bool                `json:"optional,omitempty"`
+	ReviewMethod string              `json:"review_method"`
+	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
@@ -242,7 +251,29 @@ func (c *Config) Clone() *Config {
 	// panel must never reach the base config the driver shares across targets,
 	// and an overlay on a clone must never alias the base (CLA-598).
 	cp.Phases = append([]Phase(nil), c.Phases...)
+	for i := range cp.Phases {
+		cp.Phases[i].MapsSession = cloneMapsSession(cp.Phases[i].MapsSession)
+	}
 	cp.ReviewPanel = append([]ReviewPanelMember(nil), c.ReviewPanel...)
+	for i := range cp.ReviewPanel {
+		cp.ReviewPanel[i].MapsSession = cloneMapsSession(cp.ReviewPanel[i].MapsSession)
+	}
+	return &cp
+}
+
+// cloneMapsSession copies a maps-session options block so a clone's phases never
+// alias the base config's. The block is read-only today, but the pipeline
+// replacement and the panel expansion both hand pointers around, and a future
+// write through one must not reach the config every target shares.
+func cloneMapsSession(o *MapsSessionOptions) *MapsSessionOptions {
+	if o == nil {
+		return nil
+	}
+	cp := *o
+	if cp.EmbedHunks != nil {
+		e := *cp.EmbedHunks
+		cp.EmbedHunks = &e
+	}
 	return &cp
 }
 
@@ -323,6 +354,8 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 					Tier:         p.Tier,
 					Model:        planeRoutes(p.Model),
 					Harness:      p.Harness,
+					ReviewMethod: p.ReviewMethod,
+					MapsSession:  cloneMapsSession(p.MapsSession),
 				}
 			}
 			c.Phases = phases
@@ -332,7 +365,8 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		} else {
 			panel := make([]ReviewPanelMember, len(doc.ReviewPanel))
 			for i, m := range doc.ReviewPanel {
-				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: planeRoutes(m.Model), Tier: m.Tier, Optional: m.Optional}
+				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: planeRoutes(m.Model), Tier: m.Tier, Optional: m.Optional,
+					ReviewMethod: m.ReviewMethod, MapsSession: cloneMapsSession(m.MapsSession)}
 			}
 			c.ReviewPanel = panel
 		}
@@ -575,6 +609,36 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 					"`$schema_version` (currently v%d) move in step, or remove `optional` from the member",
 					i, RunConfigSchemaVersion)
 			}
+		}
+	}
+	// CLA-869: the v1 stored-run-config schema refuses unknown PHASE keys too, so
+	// `review_method` and `maps_session` are keys the plane would reject at
+	// ratification. Refuse to export them rather than silently dropping them:
+	// a dropped method is every machine running a single-pass review while this
+	// config says maps-session — the config and the run disagreeing with nothing
+	// said. The two sides move in lockstep, exactly as the trial seat above: the
+	// day the plane's schema learns the keys and bumps `$schema_version`, this
+	// build's RunConfigSchemaVersion moves in step and this gate lifts.
+	for i, ph := range c.Phases {
+		if ph.ReviewMethod != "" || ph.MapsSession != nil {
+			return nil, fmt.Errorf("cannot propose this config: `phases[%d].review_method` / `.maps_session` are "+
+				"review-method keys the plane's stored-run-config schema does not accept yet (it refuses unknown "+
+				"phase keys), so the document would be refused at ratification — and emitting it without them "+
+				"would run every machine's review single-pass while this config asks for the maps-session "+
+				"method. Keep the method local until the plane's schema and this build's `$schema_version` "+
+				"(currently v%d) move in step, or leave `review_method` at the single-pass default",
+				i, RunConfigSchemaVersion)
+		}
+	}
+	for i, m := range c.ReviewPanel {
+		if m.ReviewMethod != "" || m.MapsSession != nil {
+			return nil, fmt.Errorf("cannot propose this config: `review_panel[%d].review_method` / `.maps_session` "+
+				"are review-method keys the plane's stored-run-config schema does not accept yet (it refuses "+
+				"unknown panel keys), so the document would be refused at ratification — and emitting the member "+
+				"without them would run its review single-pass while this config asks for maps-session. Keep the "+
+				"method local until the plane's schema and this build's `$schema_version` (currently v%d) move in "+
+				"step, or leave the member's method at the review phase's own",
+				i, RunConfigSchemaVersion)
 		}
 	}
 	pipeline := map[string]any{}

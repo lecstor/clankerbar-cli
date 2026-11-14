@@ -144,9 +144,10 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 				r.end.emptyWhy = "stopped on a usage limit (no reset to wait for) before recording"
 				return attemptVerdict{next: attemptReturn}
 			}
+			line := limitStopLine(lim, limitStopRoute(at.res, at.inv.Model), limitStopMessage(a, at.res))
 			log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
-				drainNum, limitReason(lim), at.logPath)
-			d.writeLimitStop(lim)
+				drainNum, line, at.logPath)
+			d.writeLimitStop(line)
 			return attemptVerdict{next: attemptReturn, stop: true}
 		}
 		log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))

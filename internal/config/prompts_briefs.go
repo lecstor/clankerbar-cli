@@ -59,7 +59,7 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 	"branch is there, work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already " +
 	"the main checkout sitting on that branch is not a decision to commit where you are, it is this failure mode. Read " +
-	"the diff on that branch. Then run the adversarial review gate, fix what it finds, and re-verify SCOPED to " +
+	"the diff on that branch (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder + "). Then run the adversarial review gate, fix what it finds, and re-verify SCOPED to " +
 	"those fixes: brief the follow-up reviewer with the findings you fixed, by name, and point it at the fix " +
 	"commits (or, if not yet committed, the fix diff) and the regression surface they touch - not at the whole " +
 	"diff, whose full pass already happened. A full second pass is the exception you state a reason for (a fix " +
@@ -172,7 +172,7 @@ const reviewHandoffUnverifiedCheck = " FIRST establish the tip yourself, before 
 var reviewOnlyBriefWorktreeAndGate = " Work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
 	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
-	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
+	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhaseBasePlaceholder +
 	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate." + reviewGateScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
@@ -230,7 +230,7 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"the worktree for branch " + PhaseBranchPlaceholder + " recorded on the task, and never commit to the " +
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout " +
 	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
-	"against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
+	"against the PR base (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
 	"the adversarial review gate." + reviewGateScope +
 	"REVIEW ONLY: do not edit, create or delete a source " +
 	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +

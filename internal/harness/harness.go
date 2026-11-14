@@ -252,6 +252,15 @@ type Capabilities struct {
 	// that silently became wrong the moment a phase could name its own harness
 	// (CLA-366), because the question is about the harness running the PHASE.
 	HasSessionTokenCeiling bool
+
+	// RunsTurnSequences reports whether this adapter can run Invocation.Turns:
+	// follow-up messages in the SAME session the first turn created. False means
+	// a planned sequence has no meaningful execution here — the adapter refuses
+	// it up front (ErrTurnsUnsupported) rather than run only the first turn — so
+	// config.Validate refuses a review method that needs one, naming the harness,
+	// instead of letting a run reach a phase that cannot start. opencode is the
+	// adapter with session continuation today.
+	RunsTurnSequences bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -389,6 +398,15 @@ type Invocation struct {
 	// closed on the bad report as before.
 	CheckReport func(finalMessage string) error
 
+	// AllowUnclaimed runs this session without a clankerbar claim. A runner
+	// phase is seeded with ResumeClaim and holds one throughout; a STANDALONE
+	// caller (clankerbar review run) neither claims nor consumes the report into
+	// plane records, so the adapter's resume guards must not treat the absent
+	// claim as an end. It covers BOTH uses of that guard: the one report
+	// re-emit, and the later turns of a multi-turn sequence, which would
+	// otherwise stop after the first one with "claim_not_held".
+	AllowUnclaimed bool
+
 	// OnClaim, when non-nil, is called by the adapter's parser the moment it
 	// observes the session's clankerbar claim state change: a claim_task whose
 	// result carried both ids (the tracked claim), and a settle of that claim.
@@ -400,6 +418,19 @@ type Invocation struct {
 	// so there is nothing to announce. Called on the parser's goroutine;
 	// implementations must not block.
 	OnClaim func(Claim)
+
+	// Turns is an optional ordered list of follow-up turns to run in the SAME
+	// session as the first turn (Prompt/Model): each is sent as a continuation
+	// of the session the first turn created, so later turns reuse everything the
+	// earlier ones read. Empty - every invocation before this field existed -
+	// means one turn, byte-for-byte the previous behaviour.
+	//
+	// Only an adapter that can continue a live session may honour it; one that
+	// cannot must REFUSE an invocation with Turns rather than silently drop the
+	// later turns, because a half-run sequence is a wrong answer, not a shorter
+	// one. opencode is the adapter with that capability today (claude and codex
+	// refuse it with ErrTurnsUnsupported).
+	Turns []Turn
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -611,6 +642,32 @@ type Result struct {
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
 
+	// TurnMessages is the final message of EACH turn of a multi-turn invocation,
+	// in order: TurnMessages[0] is the first turn's (Invocation.Prompt) and the
+	// last entry is the same text FinalMessage carries. It exists so the caller
+	// can put a notes turn's answer in the iteration log without confusing it
+	// with the findings turn that followed it.
+	//
+	// Empty for a single-turn invocation (the pre-Turns shape), and shorter than
+	// the planned sequence when a turn ended it early - len(TurnMessages) is how
+	// many turns actually ran.
+	TurnMessages []string
+
+	// TurnStopped is the 1-based index of the turn whose end stopped a
+	// multi-turn sequence, counting the first (Invocation.Prompt) turn as 1. It
+	// is 0 when every planned turn ran, which is also the only value a
+	// single-turn invocation can have.
+	TurnStopped int
+
+	// TurnStopReason names why the sequence stopped: "usage_limit",
+	// "output_cap_stall", "quiet_death", "claim_not_held", "untrusted_stream",
+	// "tool_loop", "idle_killed", "nonzero_exit", "cancelled", "no_session",
+	// "wall_clock" or "run_error" (the last also returns the run error). Empty
+	// when no turn stopped the sequence. The vocabulary is the same one the
+	// adapter's own resume guards use, so a caller can name the end without
+	// re-diagnosing it.
+	TurnStopReason string
+
 	// Usage is this session's token accounting normalised across harnesses (see
 	// TokenUsage's own comment for the buckets and the per-adapter mapping). It is
 	// the durable, repriceable form of what Tokens only totals, and it rides the
@@ -678,6 +735,22 @@ type Result struct {
 	// its reader stopped at the trip. Like ToolLoop it is a verdict about the
 	// session, set after the stream is parsed, never a figure parsed out of it.
 	IdleKilled string
+
+	// ReportResumeFailed is the cause when the adapter's bounded re-emission of
+	// a refused done report failed: it stalled on a silent provider and was
+	// killed by the REPORT RESUME's own short idle bound, its process errored
+	// before producing a reply, its reply was still not a report the runner could
+	// apply, or the phase's wall clock left no room to resume at all (CLA-877).
+	// Empty for every other end.
+	//
+	// It is deliberately separate from IdleKilled: the session's own run ended
+	// as it did (usually cleanly, with its work pushed), and only the follow-up
+	// reply that re-emits the report failed. The adapter therefore leaves the
+	// original process outcome in place and sets this marker instead, so the
+	// driver can tell a resume-only failure from a dead session and retry the
+	// phase inside the claim it still holds, rather than ending the lease and
+	// paying a reclaim. Like ToolLoop/IdleKilled it is the adapter's own verdict.
+	ReportResumeFailed string
 
 	// OutputDropped is how many bytes of this session's output were NOT retained,
 	// across both streams — the ordinary cost of the rolling window, not a fault.

@@ -65,6 +65,8 @@ func run(args []string) int {
 			err = cli.Upload(ctx, args[2:])
 		case "deck":
 			err = cli.Deck(ctx, args[2:])
+		case "review":
+			err = cli.Review(ctx, args[2:])
 		case "supervise":
 			// The explicit alias of the bare invocation, so scripts and
 			// `--help` can name the supervisor.

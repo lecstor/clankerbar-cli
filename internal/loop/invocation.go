@@ -16,6 +16,21 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
+// diffBase is the commit a brief's `git diff` starts from: the runner's
+// merge-base SHA when worktree prep computed one, else origin/<prBase> (git
+// computes the merge-base itself, and the prep fetch refreshed the ref). Empty
+// only when no PR base is known: the placeholder then stays standing, as any
+// other placeholder does when its fact is absent.
+func diffBase(prBase, baseSHA string) string {
+	if baseSHA != "" {
+		return baseSHA
+	}
+	if prBase != "" {
+		return "origin/" + prBase
+	}
+	return ""
+}
+
 // invocationFor builds the invocation for one PHASE: the target's invocation,
 // carrying this phase's prompt and turn cap, with the previous phase's claim
 // substituted into the prompt's placeholders.
@@ -51,12 +66,18 @@ import (
 // swaps the shipped briefs for the ones that assume the runner already holds the
 // claim, and names the branch a fresh claim has not recorded yet.
 //
+// baseSHA is the runner's prep merge-base when this spawn has no runner briefing
+// to carry it (a parallel panel member), so the member's brief still diffs from
+// the commit the runner computed rather than the origin/<prBase> fallback. A
+// runner briefing's own baseSHA wins when there is one: the prep fact is the
+// same value, and the briefing is what the context block reads.
+//
 // phases is the sequence as CAPTURED when the drain started, and supplies every
 // positional/attribution fact here — the "PHASE i of N" total and the previous
 // phase's harness/model. A RELOAD applied inside a wait swaps the live config
 // under an in-flight sequence (CLA-664), and the sequence must keep its own
 // shape and attribution until the next drain.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing) (harness.Invocation, error) {
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing, baseSHA string) (harness.Invocation, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
@@ -248,6 +269,15 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	if prBase != "" {
 		repl = append(repl, config.PhasePRBasePlaceholder, prBase)
 	}
+	// {{baseSha}} is the one diff base: the runner's merge-base SHA when its
+	// worktree prep computed one, else origin/<prBase>. Filled for every phase,
+	// runner-claimed or not, because it needs no claim - only the repo's base.
+	if runner != nil {
+		baseSHA = runner.baseSHA
+	}
+	if base := diffBase(prBase, baseSHA); base != "" {
+		repl = append(repl, config.PhaseBasePlaceholder, base)
+	}
 	if prev != nil && prev.Claim.Held() {
 		branch := verifiedBranch(prev)
 		if branch == "" && runner != nil && (inv.Prompt == config.RunnerImplementBrief() || inv.Prompt == config.RunnerCloseOutBrief()) {
@@ -395,26 +425,34 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), err)
 		}
 	}
+	dir, err := d.checkoutFor(t, repo)
+	return dir, briefed, repo, err
+}
+
+// checkoutFor resolves a repo identity to the local checkout this target runs
+// the project in. It is sessionDir's resolution without the task read, for the
+// pre-claim worktree check, which knows the identity from the offer already.
+//
+// With the per-project layout declared, the session must START inside the
+// project root its permission scope is bounded to. ResolveCheckout prefers an
+// explicit `repos` path, so a stale override pointing at a developer checkout
+// would otherwise run the session outside the project and hand that path to the
+// policy (CLA-678 review round 2, finding 3). The materialized config already
+// rewrites the overrides; this is the driver-side refusal that holds even for a
+// config that adopted the layout by hand.
+func (d *Driver) checkoutFor(t Target, repo string) (string, error) {
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
 	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
 	if err != nil {
-		return dir, briefed, repo, err
+		return dir, err
 	}
-	// With the per-project layout declared, the session must START inside the
-	// project root its permission scope is bounded to. ResolveCheckout prefers
-	// an explicit `repos` path, so a stale override pointing at a developer
-	// checkout would otherwise run the session outside the project and hand
-	// that path to the policy (CLA-678 review round 2, finding 3). The
-	// materialized config already rewrites the overrides; this is the
-	// driver-side refusal that holds even for a config that adopted the layout
-	// by hand.
 	if t.ProjectRoot && dir != "" && !insideProjectRoot(workdir, dir) {
-		return dir, briefed, repo, fmt.Errorf("repo checkout %s resolves outside the project root %s - refusing to start the session outside its declared scope", dir, workdir)
+		return dir, fmt.Errorf("repo checkout %s resolves outside the project root %s - refusing to start the session outside its declared scope", dir, workdir)
 	}
-	return dir, briefed, repo, nil
+	return dir, nil
 }
 
 // extraDirsFor lists the directories a session's permission policy must cover

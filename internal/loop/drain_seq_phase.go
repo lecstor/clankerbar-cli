@@ -201,7 +201,10 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 	st.phaseResumed = s.carried != nil
 	opts := phaseRunOpts{taskDir: s.taskDir}
 	if s.runnerClaimed && s.carried != nil {
-		opts.runner = &runnerBriefing{task: s.claimedTask, runID: s.carried.Claim.RunID, start: s.i == s.start}
+		// baseSHA is the START prep's fact, and every later phase's diff needs
+		// it: the walk prepared the tree once, at the start, and this is how a
+		// review resumed at a later index still diffs from the merge-base.
+		opts.runner = &runnerBriefing{task: s.claimedTask, runID: s.carried.Claim.RunID, start: s.i == s.start, baseSHA: s.prep.BaseSHA}
 		if opts.runner.start {
 			opts.runner.prep = s.prep
 			opts.runner.closeOut = s.closeOut

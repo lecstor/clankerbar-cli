@@ -455,6 +455,212 @@ bounded by the sessions running alongside it, at most `cap - 1`. `clankerbar
 doctor` prints the resolved panel, with each member's harness and model, so an
 overnight run's review spend is visible before it happens.
 
+### The maps-session review method: notes first, findings after
+
+The shipped review is one session: read the diff, write the record. Setting
+`review_method: "maps-session"` on a review phase — or on one `review_panel`
+member — replaces that session's shape with the maps+notes technique measured
+for CLA-864. It is opt-in per phase and per member; with no `review_method`, the
+single-pass review is byte for byte what it was.
+
+```json
+"phases": [
+  { "name": "implement" },
+  {
+    "name": "review",
+    "harness": "opencode",
+    "review_method": "maps-session",
+    "maps_session": {
+      "chunk_size": 25,
+      "notes_model": "opencode-go/gpt-6-luna",
+      "findings_model": ""
+    }
+  },
+  { "name": "fix" }
+]
+```
+
+The reason is measured, not aesthetic. On ReviewBench's TypeScript dev split
+(judged by Claude Sonnet 5) the technique took Opus 5.5 from 59.9% to 76.8%
+grounded F1 and Sonnet 5.5 from 62.2% to 70.4%; DeepSeek V4.1 Flash on
+opencode-go scored 67.9-70.9% with the best precision of any configuration
+(86-88%) at about $0.09 a PR. The cost is time: about 17-18 minutes and up to
+~100 model steps for a Flash review.
+
+**How the phase runs.** The driver maps `<merge-base>..<tip>` in the task
+worktree into items: one `M` item per changed region (no cap, because a missed
+region is missed entirely), then one `F` item per changed definition with its
+uses from `git grep` (capped at `flow_max`, with the overflow summarised
+unnumbered). It numbers them `M1..` then `F1..` and chunks them at `chunk_size`:
+a change with no items still gets one chunk saying so. Turn 1 is the ordinary
+review brief plus the first chunk; one follow-up turn carries each remaining
+chunk; the final turn asks for findings built from the notes. That is ceil(items
+/ chunk_size) notes turns plus one findings turn, all in ONE opencode session, so
+every later turn sees everything the earlier ones read. Every notes turn's reply
+is written to the iteration log under its turn and chunk heading — it is the
+evidence a later missed-finding analysis reads, and it is never sent to the
+plane. The findings turn's done report goes through exactly the check, resume and
+record path a single-pass review's report does, and a turn that ends badly stops
+the sequence and fails the phase with no record written.
+
+The options: `chunk_size` (items per notes turn, default 25), `flow_max` (the
+flow map's item cap, default 40), `notes_model` and `findings_model` (each
+stage's model; empty inherits the phase's own), and `embed_hunks` (below). The
+per-stage models exist so a stronger note-taker can feed a cheaper findings
+writer, or the reverse — the
+choice is yours, and the runner never picks one. One edge: if the phase names no
+model at all and only `notes_model` is set, the findings turn runs on the notes
+model too, because a live session cannot return to a harness's own default
+mid-conversation — and `doctor` and the review record name that model, since it
+is the one that produced the findings. A stage model is a single route, not the
+phase's route list: setting `notes_model` or `findings_model` drops the ordered
+model fallback for the session, so a usage limit on a per-stage model ends the
+phase rather than switching to the paid route.
+
+**Embedded hunks (optional, off by default).** A step-heavy model spends much
+of a maps-session review fetching the code it was asked about: on a two-file,
+100-line PR, DeepSeek Flash made 74 reads, 53 greps and 21 globs for four map
+items. `maps_session.embed_hunks` puts each `M` item's hunk in the prompt, so a
+tool call is context (callers, siblings, the rest of a file) rather than the
+diff the item already names:
+
+```json
+"maps_session": {
+  "chunk_size": 25,
+  "embed_hunks": { "enabled": true }
+}
+```
+
+The item is followed by a fenced `diff` block carrying the hunk's own lines
+from the same `<merge-base>..<tip>` diff. `max_bytes_per_item` (default 4096)
+caps one item's hunk: over it the hunk is cut at a line boundary and a marker
+names the exact `git diff <merge-base>..HEAD -- <file>` command for the rest.
+`max_bytes_total` (default 61440, about 15k tokens) caps the whole map: once
+the next hunk would pass it, that item and every later one stay plain, and a
+single note in that chunk says embedding stopped. There is a practical ceiling
+above the schema's: the whole prompt reaches opencode as ONE argv string, and
+Linux caps a single argument at 128 KiB (`MAX_ARG_STRLEN`). At the defaults a
+worst-case first turn is ~80 KB, so a `max_bytes_total` much past the default
+fails the spawn with `E2BIG` instead of growing the prompt. The defaults cover
+the benchmarked 100-line PR's hunks nearly whole while leaving the brief, the
+checklist and the notes room in the window; both budgets count the hunk text,
+not the fences.
+
+The hunk is untrusted repository content in the prompt, so it cannot break out:
+the fence is at least three backticks and longer than any backtick run in the
+hunk, and a hunk line whose content is exactly the done marker is embedded
+with a backslash after its diff prefix, so neither copying it whole nor
+stripping the prefix yields a marker the done-report parser accepts. With
+`enabled: false` (or no `embed_hunks` key at all) the items are byte for byte
+what the method produced before.
+
+`clankerbar review run` (CLA-870) does not exist in this build yet; when it
+lands it should expose `embed_hunks` as a flag, since that command's whole
+point is a one-off review profile.
+
+**Two requirements, both refused rather than degraded.** The method applies to
+the review-only gate — the built-in `review` phase with a phase after it —
+because its turns end with a review record and nothing else; the final combined
+review-and-fix brief, and a review phase with a prompt of its own, are refused.
+The turn sequence needs a harness that can continue one session — **opencode
+today**. `Validate` refuses
+maps-session on claude or codex with a message naming the harness, and never
+silently runs only the first turn. And the maps are built in the worktree the
+**runner** prepared at the reviewed tip (or a parallel panel member's own
+checkout at that tip), so the method needs a runner-prepared review. A branchless
+checkpoint with nothing to map has no such tree, and a session-claimed run has no
+runner-owned worktree at all; both are refused before anything spawns rather
+than reviewing a map of the wrong tree.
+
+**Limits, and what was not changed.** A maps-session review is one phase
+session, so the existing bounds apply: the turn cap defaults to 400 (opencode
+takes no turn flag, so it is not the binding cap there), the per-session token
+ceiling floor is 150M, and `max_wall_clock` is **off by default**. Those defaults
+hold the measured 17-18 minutes and ~100 model steps without change; if you set a
+per-phase `max_wall_clock`, give a maps-session review at least about 30 minutes.
+`clankerbar doctor` prints the method and each stage's resolved model beside the
+reviewer — `review: single reviewer (opencode/model) (maps-session:
+notes=..., findings=..., chunk_size=25, flow_max=40, embed_hunks=off)` — so the
+spend and the prompt's embedded-diff budget are visible before the run.
+
+`propose-config` refuses to store these keys today: the plane's stored-run-config
+schema does not accept `review_method` or `maps_session` yet, and the refusal
+says so rather than silently dropping the method (which would run every machine
+single-pass while your config asks for maps-session). The method is local-file
+only until the plane's schema and this build's `$schema_version` move together.
+
+### Standalone review: `clankerbar review run`
+
+`clankerbar review run --repo <checkout> --base <commit> [--head <commit>]` runs
+the driver's own review over one local change and prints the findings as JSON.
+It is the same review the `review` phase runs — the same brief substance, gate
+scope and MUST bar, the maps-session planner when asked for it, and the same
+done report read by the same validator — with the task removed: no claim, no
+plane record and no MCP config, so the session cannot touch your backlog. The
+reviewed repository is only read from: the session runs in a temporary detached
+worktree at `--head`, and that worktree is removed on success and on failure.
+
+Use it to score the driver against ReviewBench (or an eval of your own), or to
+point the same review at any local base..head by hand.
+
+```console
+clankerbar review run --repo ~/dev/project --base origin/staging
+clankerbar review run --base 1a2b3c4 --head 5d6e7f8 \
+  --method maps-session --model opencode-go/gpt-6-luna --json review.json
+```
+
+Flags: `--repo` (default `.`), `--base` (required), `--head` (default `HEAD`),
+`--method` (`single-pass` or its `single` shorthand, the default, or
+`maps-session`), `--harness` (default `opencode`; maps-session needs a harness
+that can continue one session), `--model`, and for maps-session
+`--notes-model`, `--findings-model`, `--chunk-size` (default 25) and
+`--flow-max` (default 40). `--title` and `--description-file` give the reviewer
+the context a task body would otherwise carry. The maps knobs are refused with
+`--method single-pass` rather than silently ignored. `--json <file>` writes the
+report to a file; without it the JSON goes to stdout and human lines to stderr.
+
+`--embed-hunks` is **not accepted yet**: the embedded-hunk map lands with
+CLA-871 (`maps_session.embed_hunks`), so passing it today fails as an unknown
+flag. An eval harness should leave it out until that method option is in the
+build rather than passing a flag this command would have to fake.
+
+The JSON document:
+
+```json
+{
+  "base": "<resolved base commit>",
+  "head": "<resolved head commit>",
+  "method": "single-pass | maps-session",
+  "models": { "review": "..." },
+  "findings": [ { "severity": "must", "summary": "...", "file": "...", "line": 1 } ],
+  "omitted": 0,
+  "notes_turns": [],
+  "usage": {
+    "input": 0, "output": 0, "reasoning": 0,
+    "cache_read": 0, "cache_write": 0, "cost_usd": 0
+  },
+  "time_ms": 0,
+  "turns": 1
+}
+```
+
+For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead.
+`base` and `head` are the full commit SHAs git resolved, never the flag values.
+`findings` uses the review record's own shape (`severity`, `summary`,
+`evidenceKind`, `evidence`, `file`, `line`, `kind`, `requiredFix`), and
+`notes_turns` carries the map method's per-chunk notes — the evidence a
+missed-finding analysis reads, never findings. `turns` counts the review's own
+turns — one for single-pass, and a maps-session's notes chunks plus its findings
+turn. It does not count the harness's one report re-emit or a stall/interrupt
+resume, which are recovery, not review; an eval that wants session length should
+read `usage` and `time_ms` instead.
+
+The exit contract: a session that ends without a valid done report fails the
+command, after the harness's one re-emit, with the parse error named. The JSON
+the run did produce is still written when there is one, so a failed eval keeps
+its evidence. A failed `git worktree remove` also exits non-zero, with the
+report.
+
 ### Session-initiated handoff: a boundary the session chooses
 
 Phases cut at two fixed, driver-chosen points. A session can also choose its own

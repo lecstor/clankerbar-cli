@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -106,6 +107,7 @@ type fakeCall struct {
 
 // fakeRequest is what one chat request carried, for assertions.
 type fakeRequest struct {
+	Model       string   // the model id the request asked for
 	Tools       []string // tool names offered
 	ToolResults []string // tool-result message contents, raw
 	User        []string // user message contents, raw
@@ -129,6 +131,10 @@ type fakeOpenAI struct {
 	rounds         [][]fakeCall
 	delay          time.Duration
 	malformedTurns int
+	// stallChunks sends the opening role chunk and then NOTHING, holding the
+	// response open until the client aborts. It is the silent-stream shape the
+	// CLA-868 incident saw: no error, no bytes, no tokens.
+	stallChunks bool
 
 	hit       atomic.Int64
 	toolTurns atomic.Int64
@@ -155,6 +161,7 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.hit.Add(1)
 	var body struct {
+		Model string `json:"model"`
 		Tools []struct {
 			Function struct {
 				Name string `json:"name"`
@@ -167,7 +174,7 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} `json:"messages"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
-	var rec fakeRequest
+	rec := fakeRequest{Model: body.Model}
 	turns := 0
 	for _, t := range body.Tools {
 		rec.Tools = append(rec.Tools, t.Function.Name)
@@ -216,6 +223,13 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	usage := map[string]any{"prompt_tokens": fakePromptTokens, "completion_tokens": fakeCompletionTokens, "total_tokens": fakeRequestTokens}
 	chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	if f.stallChunks {
+		// Headers and one chunk arrived; the stream now goes silent. The client
+		// aborts its read when the adapter's chunkTimeout fires, which cancels
+		// this request.
+		<-r.Context().Done()
+		return
+	}
 	if f.malformedTurns > 0 && len(rec.Tools) > 0 && int(f.toolTurns.Add(1)) <= f.malformedTurns {
 		// The #43622 shape, byte-for-byte what drained on 2026-10-19: a complete
 		// answer with every finish_reason null, then [DONE]. The AI SDK raises
@@ -385,6 +399,20 @@ func requireHit(t *testing.T, f *fakeOpenAI) {
 	}
 }
 
+// streamTypes lists the event types on a retained stdout, for a diagnostic.
+func streamTypes(stdout string) []string {
+	var out []string
+	for _, line := range strings.Split(stdout, "\n") {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) == nil && ev.Type != "" {
+			out = append(out, ev.Type)
+		}
+	}
+	return out
+}
+
 // toolEvents returns the tool_use parts on a Result's retained stdout.
 func toolEvents(res Result) []opencodePart {
 	var out []opencodePart
@@ -516,9 +544,14 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 				t.Errorf("%s was offered; a tool-level deny must remove it", denied)
 			}
 		}
-		// The MCP resource reads the policy keeps; a rename upstream goes red here.
+		// The MCP resource reads the policy keeps; a rename upstream goes red
+		// here. They are 2.2.x built-ins: a 2.0.32 binary has no opencode_*
+		// family at all (the same reason the two assertions below only log),
+		// so there is nothing to keep and demanding them would fail the suite
+		// on the build the fleet actually runs.
+		hasBuiltinFamily := indexOfTool(offered, "opencode_worktree_remove") >= 0 || indexOfTool(offered, "opencode_models") >= 0
 		for _, kept := range []string{"opencode_list_mcp_resources", "opencode_read_mcp_resource"} {
-			if indexOfTool(offered, kept) < 0 {
+			if hasBuiltinFamily && indexOfTool(offered, kept) < 0 {
 				t.Errorf("%s was not offered; the policy allows MCP resource reads", kept)
 			}
 		}
@@ -919,6 +952,122 @@ func TestOpencodeConformance_resume(t *testing.T) {
 	}
 }
 
+// Two planned turns in ONE session, the second on a DIFFERENT model. This pins
+// both halves of CLA-867 against the real binary:
+//
+//   - `-s <sid>` continues the same session, so the second turn reuses what the
+//     first read;
+//   - `-m <other model>` on the CONTINUED run really reaches the other model:
+//     the fake provider records the model id each request named, the session
+//     export records a `model-switched` message, and that turn is charged at
+//     the second model's own rates.
+//
+// Prompt caching is per model, so the switched turn pays full input once; that
+// is accepted (no cache reads are asserted). Verified on opencode 2.0.32 and
+// 2.2.7.
+func TestOpencodeConformance_turns(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	doc := fakeConfigDoc(srv.URL)
+	models := doc["provider"].(map[string]any)["fake"].(map[string]any)["models"].(map[string]any)
+	models["fake-model-2"] = map[string]any{
+		"name": "Fake Model Two",
+		"cost": map[string]any{"input": 7, "output": 31},
+	}
+	in := iso.invocation("Reply with exactly: ONE", t.TempDir(), writeJSON(t, doc))
+	in.Model = "fake/fake-model"
+	// A runner phase is seeded with the live claim; the sequence refuses to run
+	// a later turn under no lease, so the session needs one to continue.
+	in.ResumeClaim = Claim{TaskID: "T-9", Ref: "CLA-867", RunID: "run-1"}
+	in.Turns = []Turn{{Prompt: "Reply with exactly: TWO", Model: "fake/fake-model-2"}}
+	res := invokeConformance(t, in)
+	requireHit(t, fake)
+	requireV2Record(t, iso, res)
+
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0 (stderr %.300s)", res.ExitCode, res.Stderr)
+	}
+	if want := []string{"OK", "OK"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q (one message per turn)", res.TurnMessages, want)
+	}
+	if res.FinalMessage != "OK" {
+		t.Errorf("FinalMessage = %q, want the final turn's OK", res.FinalMessage)
+	}
+	if res.TurnStopped != 0 || res.TurnStopReason != "" {
+		t.Errorf("TurnStopped = %d (%q), want 0: both turns ran", res.TurnStopped, res.TurnStopReason)
+	}
+
+	// The switched turn reached the OTHER model. The request that carries the
+	// second prompt is the continued run's.
+	reqs := fake.requests()
+	var secondTurn *fakeRequest
+	for i := range reqs {
+		for _, u := range reqs[i].User {
+			if strings.Contains(u, "TWO") {
+				secondTurn = &reqs[i]
+			}
+		}
+	}
+	if secondTurn == nil {
+		t.Fatalf("no request carried the second turn's prompt; requests: %+v", reqs)
+	}
+	if secondTurn.Model != "fake-model-2" {
+		t.Errorf("the continued turn's request named model %q, want fake-model-2 - -m was not honoured on the resumed session", secondTurn.Model)
+	}
+	// The first turn ran on the invocation's model, so the switch is a change
+	// rather than a single model throughout.
+	sawFirstModel := false
+	for _, r := range reqs {
+		if r.Model == "fake-model" {
+			sawFirstModel = true
+		}
+	}
+	if !sawFirstModel {
+		t.Errorf("no request named the first turn's model; requests: %+v", reqs)
+	}
+
+	// Usage sums across both turns: title generation + first answer + second
+	// answer are three requests.
+	if want := 3 * fakeRequestTokens; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d summed across both turns", res.Tokens, want)
+	}
+	fakeSecondTurnCost := (fakePromptTokens*7 + fakeCompletionTokens*31) / 1e6
+	if want := 2*fakeRequestCost + fakeSecondTurnCost; res.CostUSD < want*0.999 || res.CostUSD > want*1.001 {
+		t.Errorf("CostUSD = %v, want %v (the switched turn at the second model's rates)", res.CostUSD, want)
+	}
+
+	// The session itself holds both turns, and records the model switch: the
+	// resumed turn was not a second session.
+	sid, _ := res.Raw[opencodeSessionIDKey].(string)
+	if sid == "" {
+		t.Fatal("no session id on the result")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+	exported, err := (opencode{}).exportSession(ctx, in, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistants, switched := 0, false
+	for _, m := range exported.Messages {
+		switch m.Type {
+		case "assistant":
+			assistants++
+		case "model-switched":
+			switched = true
+		}
+	}
+	if assistants != 2 {
+		t.Errorf("session holds %d assistant messages, want 2 (both turns)", assistants)
+	}
+	if !switched {
+		t.Errorf("the session records no model-switched message; the export shows the switch was not a model change")
+	}
+}
+
 // Typed errors and how the adapter classifies them.
 func TestOpencodeConformance_errors(t *testing.T) {
 	requireOpencodeConformance(t)
@@ -1043,6 +1192,46 @@ func TestOpencodeConformance_recoveredProviderError(t *testing.T) {
 		t.Error("DetectLimit fired on a recovered provider.invalid-output event")
 	}
 	t.Logf("exit=%d %s-event recovered=%d final=%q usage_reported=%v tokens=%d", res.ExitCode, errKind, RecoveredErrors(res), res.FinalMessage, res.UsageReported, res.Tokens)
+}
+
+// CLA-877: a provider stream that goes silent must ERROR at the adapter's
+// chunkTimeout, not hang until the phase idle watchdog kills the session. Pins
+// the whole chain against the real binary: the adapter's materialised config
+// carries `providers.<id>.settings.chunkTimeout` (2.0.32 accepts the pin), and
+// opencode really aborts the stalled SSE read. The production bound is five
+// minutes; the test shrinks it so the proof costs seconds.
+func TestOpencodeConformance_chunkTimeout(t *testing.T) {
+	requireOpencodeConformance(t)
+	old := opencodeProviderChunkTimeout
+	opencodeProviderChunkTimeout = 1500 * time.Millisecond
+	t.Cleanup(func() { opencodeProviderChunkTimeout = old })
+
+	fake := &fakeOpenAI{stallChunks: true}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	in := iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, fakeConfigDoc(srv.URL)))
+	// Naming the model route is what lets the adapter name the provider whose
+	// stream it pins; the fake config resolves the same model object.
+	in.Model = "fake/fake-model"
+	start := time.Now()
+	res := invokeConformance(t, in)
+	elapsed := time.Since(start)
+	requireHit(t, fake)
+	if elapsed > 30*time.Second {
+		t.Fatalf("the stalled session took %s — the adapter's chunkTimeout did not end it (context bound %s)",
+			elapsed, conformanceTimeout)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("ExitCode = 0 for a stream that never finished; the chunk timeout must error, not look like a clean end (final %.200q)", res.FinalMessage)
+	}
+	diag := strings.ToLower((opencode{}).Diagnostic(res))
+	if !strings.Contains(diag, "timed out") && !strings.Contains(diag, "timeout") {
+		t.Errorf("the diagnostic does not name the stream timeout: %.600q", diag)
+	}
+	t.Logf("stalled stream ended in %s: provider hits=%d transport events=%d exit=%d error_type=%v diagnostic=%.300q",
+		elapsed, fake.hit.Load(), strings.Count(res.Stdout, "provider.transport"), res.ExitCode, res.Raw[OpencodeErrorTypeKey], diag)
+	t.Logf("STREAM TYPES: %s", strings.Join(streamTypes(res.Stdout), " "))
 }
 
 // The content layer is merged after OPENCODE_CONFIG. The adapter's permission

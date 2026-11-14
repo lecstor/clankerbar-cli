@@ -107,6 +107,22 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Never resurrect a probe: a probe IS the liveness check.
 		return res, nil
 	}
+	if len(in.Turns) > 0 {
+		// A planned multi-turn session (CLA-867): the follow-up turns run in
+		// this same session before any recovery pass, because a turn that ends
+		// badly must stop the sequence rather than be resumed behind the
+		// caller's back. A completed sequence hands back the FINAL turn's
+		// invocation: everything below judges the turn that actually ended the
+		// session, never the first one's model or route list.
+		var completed bool
+		in, completed, err = o.runTurns(ctx, in, &res, deadline)
+		if err != nil {
+			return res, err
+		}
+		if !completed {
+			return res, nil
+		}
+	}
 	if res.ToolLoop != "" || res.IdleKilled != "" {
 		// CLA-739 / the idle watchdog: killed for a cause of the adapter's own.
 		// Neither recovery below applies - a stall resume or a resurrection
@@ -293,6 +309,12 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// Last, so it judges the merged result of every recovery above and resumes
 	// on the route that finished. One resume; a second refusal is the runner's.
 	o.resumeBadReport(ctx, in, &res, deadline)
+	if len(res.TurnMessages) > 0 {
+		// The recovery passes above resume the FINAL turn, so its message is
+		// whatever the session said last: the per-turn record may not keep the
+		// pre-recovery text beside a corrected FinalMessage.
+		res.TurnMessages[len(res.TurnMessages)-1] = res.FinalMessage
+	}
 	return res, nil
 }
 
@@ -759,6 +781,9 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 	doc["agent"] = agents
 	delete(doc, "agents")
 	delete(doc, "default_agent")
+	// CLA-877: a hung provider stream must ERROR, not stay silent until the
+	// phase idle watchdog kills the whole session. See opencode_timeout.go.
+	opencodeProviderTimeouts(in, doc)
 	return json.Marshal(doc)
 }
 
@@ -1592,6 +1617,7 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit
 	`|"message": ?"transport` +
 	`|transport (error|failure|reset|dropped)|transport (is )?clos(ed|ing)|transport-level` +
 	`|stream (error|failed|closed|reset|ended|disconnected|interrupted)` +
+	`|timed out waiting for response data|sse read timed out` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
@@ -1686,8 +1712,11 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // HonoursSessionWallClock is true and HonoursMaxTurns is false, which is the
 // whole point of the pair: this is the adapter whose CLI takes no turn flag, so
 // its phase backstop is the elapsed-time cap Invoke enforces (CLA-368).
+//
+// RunsTurnSequences is true: `run -s <session id>` continues a live session, so
+// Invocation.Turns is honoured (CLA-867).
 func (opencode) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {

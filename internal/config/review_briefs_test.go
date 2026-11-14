@@ -11,15 +11,15 @@ import (
 // CLA-702 review 1.review-3.1: the doneWhen requires the verified panel member
 // brief and the single reviewer's two briefs to be UNCHANGED, and a seam check
 // cannot establish that — an edit anywhere else in an eleven-kilobyte brief
-// would pass it. The goldens are those briefs' fully resolved text as it stood
-// on the branch's base (origin/staging at 3dedf26, which this branch left them
-// byte-identical to); any unintended change anywhere in them fails here.
+// would pass it. The goldens are those briefs' fully resolved text as CLA-702
+// pinned it; any unintended change anywhere in them fails here.
 //
-// The panel member's UNVERIFIED brief is deliberately not pinned: this task
-// rewrites exactly that one. A deliberate change to a shared fragment these
-// briefs embed (the gate scope, the record shape, the handoff guidance) means
-// updating the matching goldens by hand — that friction is the point, because
-// it is the only way an edit elsewhere in the brief cannot slip through.
+// A deliberate change to a shared fragment these briefs embed (the gate scope,
+// the record shape, the handoff guidance, or CLA-865's {{baseSha}} diff line)
+// means updating the matching goldens by hand — that friction is the point,
+// because it is the only way an edit elsewhere in the brief cannot slip through.
+// The panel member's UNVERIFIED brief is deliberately not pinned: CLA-702
+// rewrites exactly that one.
 func TestReviewBriefsUnchangedByTheUnverifiedSplit(t *testing.T) {
 	for _, tc := range []struct{ name, brief, golden string }{
 		{"the single reviewer's verified brief", reviewOnlyBrief, "single-reviewer-verified.txt"},

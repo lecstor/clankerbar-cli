@@ -103,6 +103,9 @@ func (c codex) env(in Invocation) []string {
 }
 
 func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	if err := refuseTurns("codex", in); err != nil {
+		return Result{}, err
+	}
 	cmd := exec.CommandContext(ctx, "codex", codexArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
