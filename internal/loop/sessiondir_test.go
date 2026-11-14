@@ -257,7 +257,7 @@ func TestDrainSpawnsInResolvedCheckoutAndSalvagesThere(t *testing.T) {
 		return noopVerifier{}
 	}
 
-	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); err != nil || stop {
+	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); err != nil || stop {
 		t.Fatalf("stop=%v err=%v", stop, err)
 	}
 	if h.invokeCalls != 1 {
@@ -291,7 +291,7 @@ func TestDrainRepoNotFoundFailsBeforeSpawning(t *testing.T) {
 	d := NewMulti(fastCfg(), h, []Target{target})
 	openTestStateDir(t, d)
 
-	_, _, _, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	_, _, _, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 	if !errors.Is(err, config.ErrRepoNotFound) || !strings.Contains(err.Error(), "repo_not_found") {
 		t.Fatalf("err = %v, want the literal repo_not_found failure", err)
 	}

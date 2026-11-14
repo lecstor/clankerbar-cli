@@ -23,9 +23,11 @@ import (
 // placeholders in this phase's prompt. nil for the first phase, which has no run
 // to resume and claims one of its own.
 //
-// prior carries the run's ceilings down into the drain, because the budget breaker
-// in Run only runs BETWEEN drains and every wait in here happens inside one — see
-// the check at the top of the loop, and waitPastBudget.
+// prior carries the run's start and this target's index down into the drain: the
+// start is the run's clock (which a local-file budget and waitPastBudget measure
+// on), and the index names the target's ledger. The ceilings themselves live on
+// the Driver (see charge and budgetStop), so every wait inside the drain reads the
+// same live account the between-drains breaker does.
 // phaseIdx is this phase's 0-based position in the sequence, carried only so a
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.

@@ -36,7 +36,7 @@ func TestInvocationCarriesComposedSessionEnv(t *testing.T) {
 		return "tok-123", nil
 	}
 
-	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); err != nil || stop {
+	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); err != nil || stop {
 		t.Fatalf("drainWithRetries: stop=%v err=%v", stop, err)
 	}
 	if len(h.invocations) == 0 {

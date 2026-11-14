@@ -83,7 +83,8 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 // and stop=true if the loop should stop (STOP marker, context cancel, or a budget
 // ceiling reached during the wait).
 //
-// sofar is everything the run has spent, including this drain's attempts. The
+// sofar carries the run's start and the target index: the run's clock (which a
+// local-file budget runs on) and whose ledger the probes are charged to. The
 // breaker is consulted HERE and not only by the caller, because this loop does not
 // return to the caller while the limit persists: it waits, probes, and waits again
 // for as long as it takes. Without this, the one shape the task names — a drain
@@ -91,11 +92,12 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 // the shape codex always produces, since it states no reset for waitPastBudget to
 // measure (CLA-258).
 //
-// The probes are themselves paid sessions, so their spend is added to `sofar` as it
-// accrues and returned to the caller for the run's accumulator. A breaker that can
-// only be tripped by spend it can SEE was blind to exactly the spend this loop
-// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
-// and this is the one loop with no other way out (CLA-287).
+// The probes are themselves paid sessions, so each one is charged to the target's
+// ledger by charge() as it lands, and returned to the caller for the iteration's
+// accumulator. A breaker that can only be tripped by spend it can SEE was blind to
+// exactly the spend this loop generates: a week-long cap polled every 30 minutes is
+// ~336 unaccounted sessions, and this is the one loop with no other way out
+// (CLA-287).
 //
 // While it waits it speaks: a `limited` presence beacon on entry and again at
 // limitBeaconInterval while the pause lasts (CLA-728). A wait can be hours, and
@@ -190,9 +192,12 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	nextProbe := time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 
 	for {
-		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
-			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
-				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
+		// The target's own account (CLA-480): charge() books this wait's probes as
+		// they land, so a stored overlay's budget is judged on its project's spend
+		// and a local-file budget on the projects it governs.
+		if v := d.budgetStop(sofar.ti, time.Since(sofar.start)); v.dim != "" {
+			log.Printf("budget reached while paused: %s — ending the wait rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
+				v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 			return tokens, cost, true
 		}
 		// waitOrStopHalt stays the sleep, so STOP / RESTART / RELOAD - and, in
@@ -254,7 +259,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// with tc.HarnessFor), so its spend is booked under that same name —
 		// keying on the base harness would bill an overlay-redirected phase to
 		// the wrong per-harness account (CLA-410).
-		d.charge(tc.HarnessFor(ph), got.Tokens, got.CostUSD)
+		d.charge(sofar.ti, tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true
@@ -266,6 +271,12 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 			// ceiling there is nothing to protect, so it waits on as before.
 			if errors.Is(err, harness.ErrUntrusted) && tc.Budget.CountsSpendFor(tc.HarnessFor(ph)) {
+				// The ceiling this breaks may be the target's own stored budget, in
+				// which case only that project stops draining and the siblings keep
+				// going (CLA-480); the local pool keeps the daemon-wide stop.
+				if d.exhaustUnmeasurable(sofar.ti, fmt.Sprintf("the pause probe's spend cannot be read (%v)", err)) {
+					return tokens, cost, true
+				}
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
 				return tokens, cost, true
 			}

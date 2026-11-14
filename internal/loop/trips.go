@@ -4,104 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"maps"
-	"slices"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
-
-// spend is what the run had already consumed when this drain began, plus when it
-// began — the budget breaker's whole view, handed down from Run.
-//
-// It is handed down because the ceilings are CUMULATIVE across the run while a
-// drain only sees its own attempts, and because a drain can wait for hours
-// (supervised wait, transient backoff) without ever returning to the breaker
-// between drains. Measuring a mid-drain decision against this drain's spend alone
-// would let a run walk past a ceiling it had already reached.
-type spend struct {
-	start  time.Time
-	tokens int
-	cost   float64
-}
-
-// harnessSpend is one harness's accumulated spend across a run, for the
-// per-harness breakers (config.Budget.PerHarness, CLA-367).
-type harnessSpend struct {
-	tokens int
-	cost   float64
-}
-
-// charge books a session's spend against the harness that ran it, in the ledger
-// the per-harness breakers read.
-//
-// It is charged at the two places a session's spend enters a run — a drain
-// attempt's result and a supervised wait's probe — which are the same two places
-// the run-wide accumulators are added to, so the two accounts cannot drift. The
-// run-wide ones stay exactly where they were, threaded through the drain as
-// locals: the global dials have to keep behaving byte for byte as they always
-// have, so this ledger is additive rather than a replacement for them.
-//
-// An UNTRUSTED session is charged to neither, for the reason endUntrustedDrain
-// gives: a figure parsed out of a stream with a hole in it is not a measurement.
-//
-// The key is the phase's harness NAME AS THE CONFIG SPELLS IT (HarnessFor), never
-// the adapter's own Name(). The two agree in production - an adapter is fetched
-// from the registry by that same key - but only one of them is the currency the
-// breaker spends: budgetTrip looks these keys up in Budget.PerHarness, which the
-// operator keyed by config name. An adapter whose Name() diverged would silently
-// disable its own per-harness ceiling rather than failing, so the ledger asks the
-// config what a session IS and asks the adapter only behavioural questions.
-//
-// A run's phases can each name their own harness (CLA-366), so the caller charges
-// the PHASE's harness, not the run's: on a mixed sequence the two call sites split
-// the run's spend across one entry per harness, and on a single-harness run they
-// both land on the same key and it tracks the run total exactly as before. That is
-// the whole reason the ledger is keyed by name — passing d.h.Name() from a phase
-// running on some other harness would bill opencode's tokens to claude's breaker,
-// which is precisely the mis-accounting the per-harness ceilings exist to prevent.
-func (d *Driver) charge(harnessName string, tokens int, cost float64) {
-	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-	if d.spentBy == nil {
-		d.spentBy = make(map[string]harnessSpend)
-	}
-	s := d.spentBy[harnessName]
-	s.tokens += tokens
-	s.cost += cost
-	d.spentBy[harnessName] = s
-}
-
-// budgetTrip names the ceiling that has stopped this run, or "" if none has: the
-// run-wide dials first, measured against the run totals the caller threads down,
-// then each harness's own block against that harness's own spend.
-//
-// Any trip stops the whole run, so the order only decides which ceiling gets
-// named in the log, and the global dials are named first because a config that
-// sets both wants the run-wide promise reported as the one that was broken.
-// Harnesses are consulted in name order so a run with two blocks reports the same
-// dial every time rather than whichever the map yielded first.
-func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) string {
-	if dim := d.cfg.Budget.ExceededBy(tokens, cost, elapsed); dim != "" {
-		return dim
-	}
-	d.stateMu.Lock()
-	spent := maps.Clone(d.spentBy)
-	d.stateMu.Unlock()
-	for _, name := range slices.Sorted(maps.Keys(spent)) {
-		s := spent[name]
-		if dim := d.cfg.Budget.ExceededByHarness(name, s.tokens, s.cost); dim != "" {
-			// That harness's OWN totals ride along, because every caller prints
-			// the RUN's figures after the reason: in a mixed-harness run two
-			// dollar figures on one line read as a contradiction, which is the
-			// defect Budget.ExceededBy's doc comment exists to prevent, one level
-			// down.
-			return fmt.Sprintf("%s (%s so far: tokens=%d cost=$%.2f)", dim, name, s.tokens, s.cost)
-		}
-	}
-	return ""
-}
 
 // deadReason renders the finish reason a dead phase was classified on, for a log
 // line. The classification fired on FinishReasonUnknown, so a nil claim — a

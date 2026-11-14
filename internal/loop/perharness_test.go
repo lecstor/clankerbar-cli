@@ -111,8 +111,8 @@ func TestBudgetTrip_MixedHarnessLedger(t *testing.T) {
 
 	t.Run("neither side over: nothing trips", func(t *testing.T) {
 		d := newDriver()
-		d.charge("claude", 60_000_000, 0)
-		d.charge("opencode", 900_000, 1.5)
+		d.charge(0, "claude", 60_000_000, 0)
+		d.charge(0, "opencode", 900_000, 1.5)
 		if dim := d.budgetTrip(60_900_000, 1.5, time.Minute); dim != "" {
 			t.Errorf("budgetTrip = %q, want no trip", dim)
 		}
@@ -120,8 +120,8 @@ func TestBudgetTrip_MixedHarnessLedger(t *testing.T) {
 
 	t.Run("the metered side trips on its dollars", func(t *testing.T) {
 		d := newDriver()
-		d.charge("claude", 60_000_000, 0)
-		d.charge("opencode", 900_000, 2.5)
+		d.charge(0, "claude", 60_000_000, 0)
+		d.charge(0, "opencode", 900_000, 2.5)
 		dim := d.budgetTrip(60_900_000, 2.5, time.Minute)
 		if !strings.Contains(dim, "opencode cost") {
 			t.Errorf("budgetTrip = %q, want the opencode cost ceiling named", dim)
@@ -130,8 +130,8 @@ func TestBudgetTrip_MixedHarnessLedger(t *testing.T) {
 
 	t.Run("the claude side trips on its tokens", func(t *testing.T) {
 		d := newDriver()
-		d.charge("claude", 80_000_000, 0)
-		d.charge("opencode", 900_000, 1.0)
+		d.charge(0, "claude", 80_000_000, 0)
+		d.charge(0, "opencode", 900_000, 1.0)
 		dim := d.budgetTrip(80_900_000, 1.0, time.Minute)
 		if !strings.Contains(dim, "claude tokens") {
 			t.Errorf("budgetTrip = %q, want the claude token ceiling named", dim)
@@ -144,7 +144,7 @@ func TestBudgetTrip_MixedHarnessLedger(t *testing.T) {
 		// nothing. This is the failure the split exists to prevent — the reason
 		// the opencode config carried no breaker at all before.
 		d := newDriver()
-		d.charge("opencode", 200_000_000, 0.5)
+		d.charge(0, "opencode", 200_000_000, 0.5)
 		if dim := d.budgetTrip(200_000_000, 0.5, time.Minute); dim != "" {
 			t.Errorf("budgetTrip = %q, want no trip: opencode's spend is not claude's", dim)
 		}
@@ -153,7 +153,7 @@ func TestBudgetTrip_MixedHarnessLedger(t *testing.T) {
 	t.Run("a global dial is still reported first, over everything", func(t *testing.T) {
 		d := newDriver()
 		d.cfg.Budget.MaxWallClock = config.Duration(time.Nanosecond)
-		d.charge("opencode", 0, 2.5)
+		d.charge(0, "opencode", 0, 2.5)
 		if dim := d.budgetTrip(0, 2.5, time.Hour); !strings.Contains(dim, "wall clock") {
 			t.Errorf("budgetTrip = %q, want the run-wide dial named when it is the one broken", dim)
 		}
@@ -166,12 +166,12 @@ func TestPerHarnessLedgerCountsSessionsAndProbes(t *testing.T) {
 	cfg := fastCfg()
 	cfg.Harness = "opencode"
 	d := New(cfg, &fakeAdapter{name: "opencode"}, busyPoller())
-	d.charge("opencode", 10, 0.25)
-	d.charge("opencode", 5, 0.75)
-	if got := d.spentBy["opencode"]; got.tokens != 15 || got.cost != 1.0 {
+	d.charge(0, "opencode", 10, 0.25)
+	d.charge(0, "opencode", 5, 0.75)
+	if got := d.targetSpendAt(0).byHarness["opencode"]; got.tokens != 15 || got.cost != 1.0 {
 		t.Errorf("ledger = %+v, want tokens=15 cost=1", got)
 	}
-	if _, ok := d.spentBy["claude"]; ok {
+	if _, ok := d.targetSpendAt(0).byHarness["claude"]; ok {
 		t.Error("a harness that never ran must not appear in the ledger")
 	}
 }
@@ -344,22 +344,26 @@ func TestDrainMidDrain_PerHarnessBlockStopsTheRetryLadder(t *testing.T) {
 	}
 }
 
-// A run-wide figure printed after a per-harness reason reads as a contradiction
-// in a mixed-harness run ("opencode cost $2.05 >= $2.00 ... cost=$4.50"), so the
-// tripped harness's own totals ride along with the reason.
-func TestBudgetTrip_NamesTheTrippedHarnessesOwnSpend(t *testing.T) {
+// A per-harness reason names the harness whose block tripped, but the FIGURES
+// belong to the account and every caller prints them once. Appending the harness
+// totals to the reason as well put two different token/$ pairs on one line
+// (CLA-480 review 1.review-1.13).
+func TestBudgetTrip_NamesTheHarnessAndLeavesTheFiguresToTheCaller(t *testing.T) {
 	cfg := fastCfg()
 	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
 		"opencode": {MaxCostUSD: 2},
 	}}
 	d := New(cfg, &fakeAdapter{}, busyPoller())
-	d.charge("claude", 60_000_000, 0)
-	d.charge("opencode", 900_000, 2.5)
+	d.charge(0, "claude", 60_000_000, 0)
+	d.charge(0, "opencode", 900_000, 2.5)
 
 	dim := d.budgetTrip(60_900_000, 2.5, time.Minute)
-	for _, want := range []string{"opencode cost", "opencode so far", "tokens=900000", "cost=$2.50"} {
-		if !strings.Contains(dim, want) {
-			t.Errorf("budgetTrip = %q, want it to carry %q", dim, want)
+	if !strings.Contains(dim, "opencode cost") {
+		t.Errorf("budgetTrip = %q, want it to name the harness whose block tripped", dim)
+	}
+	for _, unwanted := range []string{"so far", "tokens=900000", "cost=$2.50"} {
+		if strings.Contains(dim, unwanted) {
+			t.Errorf("budgetTrip = %q carries the harness's own totals too (%q); the caller prints the account's figures exactly once", dim, unwanted)
 		}
 	}
 }

@@ -206,7 +206,7 @@ func TestDrainWithRetries_StopLimitMarkerNamesTheRouteAndMessage(t *testing.T) {
 	}}
 	d := New(fastCfg(), realClassifyFake{&fakeAdapter{steps: []invokeStep{{res: res}}}}, &fakePoller{})
 	openTestStateDir(t, d)
-	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); !stop {
+	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); !stop {
 		t.Fatal("stop = false, want the Stop-class limit to end the run")
 	}
 	present, reason := d.readMarker(LimitStopName)
@@ -223,7 +223,7 @@ func TestDrainWithRetries_StopLimitMarkerNamesTheConfiguredModel(t *testing.T) {
 	res := harness.Result{ExitCode: 1, Stdout: limitStop402}
 	d := New(cfg, realClassifyFake{&fakeAdapter{steps: []invokeStep{{res: res}}}}, &fakePoller{})
 	openTestStateDir(t, d)
-	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); !stop {
+	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); !stop {
 		t.Fatal("stop = false, want the Stop-class limit to end the run")
 	}
 	present, reason := d.readMarker(LimitStopName)

@@ -19,7 +19,7 @@ import (
 // the spawn itself, and how the session's exit is classified.
 
 // checkBreakers is the two bounds that stop the ladder spawning another paid
-// session: the run-wide budget breaker, and the zero-spend attempt bound.
+// session: the budget in force for the target, and the zero-spend attempt bound.
 func (r *phaseRun) checkBreakers(ctx context.Context) attemptVerdict {
 	d := r.d
 	drainNum := r.drainNum
@@ -32,10 +32,14 @@ func (r *phaseRun) checkBreakers(ctx context.Context) attemptVerdict {
 	// an operator is least likely to have set. A drain that re-spawns a paid
 	// session on a loop is the expensive failure this stops, whatever put it
 	// there (CLA-258).
-	spentTokens, spentCost := r.sofar()
-	if dim := d.budgetTrip(spentTokens, spentCost, time.Since(prior.start)); dim != "" {
-		log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-			drainNum, dim, spentTokens, spentCost, time.Since(prior.start).Round(time.Second))
+	//
+	// The account is the TARGET's, not the run's (CLA-480): a stored overlay's
+	// budget is judged on its own project's spend, and a local-file budget on
+	// the projects it still governs. charge() books every counted attempt, so
+	// the ledger already carries this drain's spend without threading it down.
+	if v := d.budgetStop(r.ti, time.Since(prior.start)); v.dim != "" {
+		log.Printf("iteration %d: budget reached mid-drain: %s — ending this drain (tokens=%d cost=$%.2f elapsed=%s)",
+			drainNum, v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 		return attemptVerdict{next: attemptReturn, stop: true}
 	}
 

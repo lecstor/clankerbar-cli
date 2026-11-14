@@ -655,55 +655,6 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 	requireOneFleetRecord(t, ff)
 }
 
-// --- CLA-697, review round 1: the fix delta --------------------------------
-
-// TestPanelSpendLedgerAggregatesPeers pins the ledger's arithmetic: a member's
-// published total is what its SIBLINGS see, never itself (its own accumulator
-// already carries that), and a republish REPLACES the total rather than adding
-// to it — the member publishes its running accumulator, not a delta.
-func TestPanelSpendLedgerAggregatesPeers(t *testing.T) {
-	ledger := newPanelSpend()
-	one := &panelSpendHandle{ledger: ledger, self: ledger.join()}
-	two := &panelSpendHandle{ledger: ledger, self: ledger.join()}
-
-	if tokens, cost := one.peers(); tokens != 0 || cost != 0 {
-		t.Fatalf("a ledger with nothing published reports (%d, %v), want zero", tokens, cost)
-	}
-	one.publish(120, 0.60)
-	if tokens, cost := two.peers(); tokens != 120 || cost != 0.60 {
-		t.Errorf("the sibling's published spend reads (%d, %v), want (120, 0.6)", tokens, cost)
-	}
-	if tokens, cost := one.peers(); tokens != 0 || cost != 0 {
-		t.Errorf("a member must not count its own spend as a peer's: (%d, %v)", tokens, cost)
-	}
-	one.publish(200, 0.90)
-	two.publish(50, 0.25)
-	if tokens, cost := one.peers(); tokens != 50 || cost != 0.25 {
-		t.Errorf("the other member's republished total reads (%d, %v), want (50, 0.25)", tokens, cost)
-	}
-}
-
-// TestPanelSpendLedgerIsConcurrencySafe hammers the ledger from many goroutines:
-// the members really do publish from separate goroutines at once (CLA-697), and
-// the ledger's whole job is to make that safe. Run under -race it is the check
-// that matters; without it, it still pins that nothing panics or deadlocks.
-func TestPanelSpendLedgerIsConcurrencySafe(t *testing.T) {
-	ledger := newPanelSpend()
-	var wg sync.WaitGroup
-	for k := 0; k < 8; k++ {
-		wg.Add(1)
-		go func(k int) {
-			defer wg.Done()
-			h := &panelSpendHandle{ledger: ledger, self: ledger.join()}
-			for i := 1; i <= 50; i++ {
-				h.publish(k*i, float64(k)*0.1)
-				h.peers()
-			}
-		}(k)
-	}
-	wg.Wait()
-}
-
 // TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling is
 // review finding 1.review-1.1's fix, end to end. With cap 2 over three members,
 // the third member waits on the concurrency slot until a sibling has ENDED; by

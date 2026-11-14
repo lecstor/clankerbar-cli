@@ -244,7 +244,8 @@ the lease is left to lapse into a takeover with its branch recorded — but the
 **run** does not: it waits the limit out holding no lease, probing exactly as
 it would have inside the phase, and carries on polling when the cap lifts.
 Only a hard stop (`lim.Stop`, credit exhausted) — or a reset landing past the
-run's remaining `budget.max_wall_clock` — ends the daemon there.
+remaining `budget.max_wall_clock` in force for that project — ends that account's
+draining there; it ends the daemon only when every project is exhausted.
 
 A transient server/network blip on a resumed phase ends its sequence for the
 same lease reason — the backoff ladder would walk past the 30-minute lease —
@@ -449,13 +450,14 @@ the one round the plane derives (`max(existing round) + 1` when nothing is
 sealed — deterministic for simultaneous first writers). Membership therefore
 needs no per-(task, phase) leases; what it needs is what ships here: a private
 checkout per member and a join that closes the round before the fix. The cap is
-also the budget breaker's granularity: the members share one run-wide ceiling,
-so each member publishes the spend it has counted to a shared panel ledger the
-moment its attempt ladder counts it, and every member's pre-spawn budget check
-measures the panel's **aggregate** — a member that starts after a sibling has
-already paid (the cap staggers them) sees that money against the ceiling. What
-no check can see is spend still in flight, so the residual overshoot stays
-bounded by the sessions running alongside it, at most `cap - 1`. `clankerbar
+also the budget breaker's granularity: members share the **target's account**, not
+a panel-only one — every attempt a member counts is charged to the driver's
+per-target ledger by `charge()`, and each member's pre-spawn budget check measures
+that live total — so a member that starts after a sibling has already paid (the
+cap staggers them) sees that money against the ceiling in force for the target
+(its stored budget, or the local pool). What no check can see is spend still in
+flight, so the residual overshoot stays bounded by the sessions running alongside
+it, at most `cap - 1`. `clankerbar
 doctor` prints the resolved panel, with each member's harness and model, so an
 overnight run's review spend is visible before it happens.
 
@@ -2547,6 +2549,14 @@ re-reads and re-overlays before spawning again. A document that fails local
 validation keeps the previous config and says so loudly. Flags still outrank the
 stored document: `--model` on the command line wins over a ratified value.
 
+A stored `budget` — including `per_harness` — governs **that project's own
+sessions**, and its wall clock is measured on the project's own clock. A ratified
+ceiling looser than this file's is therefore the one in force for that project
+(otherwise a stored ceiling could only ever tighten), and a trip **exhausts that
+project only**: its siblings keep draining, and the daemon stops when every
+project has reached its ceiling. Projects with no stored budget (no document, or
+one that sets none) share this file's budget as one instance-wide pool.
+
 Import today's file as the starting point with:
 
 ```sh
@@ -2593,7 +2603,11 @@ Per entry: `slug` (required, the `<slug>` in `/mcp/<slug>`), `workdir`, and
 optionally `mcp_config_path` (defaults to `<workdir>/.mcp.json`). Budgets,
 `max_iterations`, and the control markers (`STOP`/`HALT` plus the
 `ctl restart`/`reload` family) stay **instance-global** — one
-operator, one spend pool; the console pause is per project. With no `projects`
+operator, one spend pool; the console pause is per project. The one exception is
+a project whose **stored run-config document** sets a `budget` (see *Execution
+config from the plane*): that project's ceilings are judged on its own spend and
+a trip exhausts only that project, so a looser ceiling can be ratified for one
+project without loosening the pool for the others. With no `projects`
 list, the top-level fields drive a single project exactly as before.
 
 ### Resilience
@@ -2782,7 +2796,9 @@ alternatives, in order of preference:
    name, counted over **only that harness's own sessions** and measured in the
    unit that harness understands - tokens for `claude`, dollars for a metered
    backend. **Any block that trips stops the whole run**: these are circuit
-   breakers, not per-harness quotas.
+   breakers, not per-harness quotas. (When the block comes from a project's
+   stored run-config document, "the whole run" is that project — see *Execution
+   config from the plane*; the local file's block is the instance-wide pool.)
 
    A token ceiling in a block derives the per-session runaway detector
    (`max_session_tokens`) exactly as the run-wide `max_tokens` does, so moving a

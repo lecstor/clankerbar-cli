@@ -42,6 +42,16 @@ func (d *Driver) targetCfg(t Target) *config.Config {
 	return d.cfg
 }
 
+// overlayBudgetAt reports whether target i is judged by a stored budget of its
+// own. A stored document that sets no budget leaves the target in the local
+// pool: the README's exception is the document's BUDGET, not its mere existence,
+// and applying a model-only document must not quietly split the instance-wide
+// pool into one-per-project ceilings. Set at applyRunConfig time from
+// doc.Budget != nil.
+func (d *Driver) overlayBudgetAt(i int) bool {
+	return i >= 0 && i < len(d.overlayBudget) && d.overlayBudget[i]
+}
+
 // checkRunConfigVersion applies the boundary rule for one polled target: a
 // version other than the one the current effective config was built from (or
 // any version at all, before the first fetch) triggers a refetch-and-overlay.
@@ -61,6 +71,7 @@ func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, ve
 			log.Printf("%srun-config: nothing stored on the plane - the local file rules", d.prefix(i))
 			d.targets[i].Cfg = nil
 		}
+		d.overlayBudget[i] = false
 		d.rcVersions[i] = 0
 		d.rcAttempt[i] = time.Time{}
 		d.rcAttemptVer[i] = 0
@@ -89,6 +100,7 @@ func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, ve
 				log.Printf("%srun-config: nothing stored on the plane - the local file rules", d.prefix(i))
 				d.targets[i].Cfg = nil
 			}
+			d.overlayBudget[i] = false
 			d.rcVersions[i] = version
 			d.rcAttempt[i] = time.Time{}
 			d.rcAttemptVer[i] = 0
@@ -196,6 +208,7 @@ func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 			log.Printf("%srun-config v%d: document sets nothing consumable - the local file rules", d.prefix(i), st.Version)
 			d.targets[i].Cfg = nil
 		}
+		d.overlayBudget[i] = false
 		d.rcVersions[i] = st.Version
 		return
 	}
@@ -223,5 +236,6 @@ func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 	}
 	log.Printf("%srun-config v%d applied%s - pipeline/harness/model/tiers/budget/escalation now follow the plane", d.prefix(i), st.Version, was)
 	t.Cfg = eff
+	d.overlayBudget[i] = doc.Budget != nil
 	d.rcVersions[i] = st.Version
 }
