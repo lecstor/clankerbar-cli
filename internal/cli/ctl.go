@@ -168,7 +168,7 @@ func effectLines(action string, now bool) []string {
 		}
 	case action == "restart":
 		return []string{
-			"the running daemon lets its in-flight session finish, then re-executes at the next iteration boundary",
+			"the running daemon lets its in-flight session finish, then re-executes at the next phase seam or iteration boundary",
 			limit,
 		}
 	default:

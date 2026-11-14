@@ -112,7 +112,7 @@ func TestStatusReportBodyPerState(t *testing.T) {
 				cmd: &exec.Cmd{}, aliveSince: aliveSince, childVersion: "0.16.0", stopRequested: true,
 			},
 			want: statusBodyInstance{
-				Name: "clanker1", State: StatusRunning, Reason: "stop requested - draining at its iteration boundary",
+				Name: "clanker1", State: StatusRunning, Reason: "stop requested - draining at its next phase seam or iteration boundary",
 				Since: statusTime(aliveSince), ChildVersion: "0.16.0",
 			},
 		},
@@ -127,7 +127,7 @@ func TestStatusReportBodyPerState(t *testing.T) {
 				cmd: &exec.Cmd{}, aliveSince: aliveSince, childVersion: "0.16.0",
 			},
 			want: statusBodyInstance{
-				Name: "clanker1", State: StatusRunning, Reason: "replacing myself - draining at the iteration boundary",
+				Name: "clanker1", State: StatusRunning, Reason: "replacing myself - draining at the next phase seam or iteration boundary",
 				Since: statusTime(aliveSince), ChildVersion: "0.16.0",
 			},
 		},
@@ -139,7 +139,7 @@ func TestStatusReportBodyPerState(t *testing.T) {
 				exited: true, childVersion: "0.16.0", exitErr: crash, exitAt: exitAt,
 			},
 			want: statusBodyInstance{
-				Name: "clanker1", State: StatusStopped, Reason: "replacing myself - drained at the iteration boundary",
+				Name: "clanker1", State: StatusStopped, Reason: "replacing myself - drained at the next phase seam or iteration boundary",
 				Since: statusTime(exitAt), ChildVersion: "0.16.0",
 				LastExit: &statusBodyExit{Code: 3, At: statusTime(exitAt)},
 			},

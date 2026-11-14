@@ -80,7 +80,7 @@ func TestWriteStopTreatsAnExistingMarkerAsPending(t *testing.T) {
 	if strings.Contains(got, "stop it by hand") {
 		t.Errorf("log = %q, must not tell the operator to stop the child by hand when a STOP is already pending", got)
 	}
-	if strings.Contains(got, "draining at its iteration boundary") {
+	if strings.Contains(got, "draining at") {
 		t.Errorf("log = %q, must not assert a marker of unknown provenance will drain the child", got)
 	}
 	body, err := os.ReadFile(stopPath)

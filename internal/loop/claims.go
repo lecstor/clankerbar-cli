@@ -88,6 +88,17 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 // or a release the plane refused, is still live and a fresh session would only be
 // refused); the other callers ignore it.
 func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) bool {
+	_, queued := d.handBackClaim(ctx, t, res, countUndeclared)
+	return queued
+}
+
+// handBackClaim is releaseHeldClaim with the two outcomes split: handed says
+// the claim was actually let go (back in the ready queue, or its lease ended on
+// pushed work), queued says it specifically returned to the ready queue. Only
+// the phase seam reads handed — it must drop the drain's carried claim when the
+// handback landed, but keep it for the deferred retry when it did not, and
+// releaseHeldClaim's bool cannot tell those apart on the pushed-work path.
+func (d *Driver) handBackClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) (handed, queued bool) {
 	// A stream read only in part tells us which calls we SAW, never which the
 	// session made: the settle that released the task may simply be in the bytes
 	// that never arrived. Handing the task back on that reading posts `ready` over
@@ -99,10 +110,11 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%ssession appeared to end holding %s, but its output could not be read whole — leaving the lease to expire rather than releasing a task that may already be settled",
 				labelOf(t), res.Claim.TaskID)
 		}
-		return false
+		return false, false
 	}
 	if !res.Claim.Held() {
-		return false
+		// Nothing is held, so nothing is owed: the handback is complete.
+		return true, false
 	}
 	if !res.Claim.Releasable() {
 		// CLA-708: the claim has pushed work, so Release is forbidden — it would
@@ -146,10 +158,10 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
 				labelOf(t), res.Claim.TaskID)
 		}
-		return false
+		return ended, false
 	}
 	if t.Releaser == nil {
-		return false
+		return false, false
 	}
 	// A stalled session is named by its cause on THIS path too (CLA-584), not
 	// only on the held-with-work branch above: a stall that never pushed a
@@ -169,16 +181,16 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		if !errors.Is(err, plane.ErrNotWired) {
 			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
 		}
-		return false
+		return false, false
 	}
 	d.clearCurrentClaim()
 	if stalled {
 		log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s; handed it back to the queue for another clanker",
 			labelOf(t), stallReason, claimLabel(res.Claim))
-		return true
+		return true, true
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
-	return true
+	return true, true
 }
 
 // expireHeldClaim ends a dead session's lease on a task whose pushed work must
