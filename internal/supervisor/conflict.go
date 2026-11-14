@@ -633,6 +633,14 @@ type conflictLimitReader interface {
 // nowhere left to go, and the existing failure classification reports it. Every
 // attempt is logged with the model it ran on, so a quota failure names the route
 // it hit.
+//
+// It retries whether or not the attempt got as far as editing anything. The
+// retry is a FRESH session running the same brief, and that brief is idempotent
+// where work already landed: the merge reports "Already up to date", a resolved
+// tree has no conflicting hunks left, and the gate and push are unchanged. So a
+// retry after partial work costs one session and can still finish the hand-back;
+// the case it exists for did nothing at all — CLA-884's quota death, where the
+// session ended before it had an id to resume.
 func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimitReader, run conflictModelRun) (harness.Result, error) {
 	models := req.Routes
 	if len(models) == 0 {
@@ -670,7 +678,7 @@ func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimi
 				label, req.PR, name, reason)
 			return res, err
 		}
-		log.Printf("conflict: %s PR %s - %s hit a usage limit (%s) before the resolution ran - retrying the session on %s",
+		log.Printf("conflict: %s PR %s - %s hit a usage limit (%s) - retrying the session on %s",
 			label, req.PR, name, reason, models[i+1])
 	}
 	return res, err

@@ -341,6 +341,15 @@ func TestConflictStepInheritsTheWholeImplementModelList(t *testing.T) {
 				c.Phases = []Phase{{Name: ImplementPhaseName, Tier: "flash"}}
 			},
 		},
+		{
+			name: "a conflict block that names no model",
+			configure: func(c *Config) {
+				c.Harness = "opencode"
+				c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{free, paid}}}
+				c.Phases = []Phase{{Name: ImplementPhaseName}}
+				c.Conflict = &ConflictStep{MaxTurns: 40}
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := defaults()

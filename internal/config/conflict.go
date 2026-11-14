@@ -70,10 +70,6 @@ func (c *Config) ConflictStep() ConflictStep {
 	}
 	implHarness, implRoutes := c.implementStep()
 	step.Harness = strings.TrimSpace(step.Harness)
-	// The routes are trimmed and de-duplicated here rather than left to the
-	// launcher: every consumer (the log line, the spawn, the fallback ladder)
-	// reads this one answer.
-	step.Model = ModelRoutes(step.Model.List())
 	if step.Harness == "" {
 		step.Harness = implHarness
 	}
@@ -83,9 +79,13 @@ func (c *Config) ConflictStep() ConflictStep {
 		} else {
 			// A different harness is a different dialect with its own default
 			// model; another harness's alias would be a name it does not serve.
-			step.Model = ModelRoutes(c.SessionFor(step.Harness).Model.List())
+			step.Model = c.SessionFor(step.Harness).Model
 		}
 	}
+	// The routes are trimmed and de-duplicated in ONE place, on the way out, so
+	// every consumer (the log line, the spawn, the fallback ladder) reads the
+	// same answer whether the block pinned them or they were inherited.
+	step.Model = ModelRoutes(step.Model.List())
 	if step.MaxTurns <= 0 {
 		step.MaxTurns = c.MaxTurns
 	}

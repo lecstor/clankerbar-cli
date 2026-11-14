@@ -1123,8 +1123,8 @@ whole route list, not just its first entry. `model` takes the same ordered route
 list a phase does, and an attempt that ends on a usage limit or an exhausted
 quota is retried on the next route, exactly as a phase falls back; a single
 pinned model runs only that model. Each attempt is logged with the model it ran
-on, so a quota failure names the route it hit. The
-brief is narrow: create a worktree of the branch, merge the PR's base into it (a
+on, so a quota failure names the route it hit. The brief is narrow: create a
+worktree of the branch, merge the PR's base into it (a
 merge, **never** a rebase — the branch is already pushed), resolve **only** the
 conflicting hunks, run the repo-wide gate (`go test ./...` when the checkout has
 a `go.mod`, `pnpm test` when it has a `package.json`, else the repo's own
