@@ -3,7 +3,7 @@
 // `clankerbar supervise` — reconciles the machine against the plane's
 // account-scoped roster: every entry with `desired: running` has a supervised
 // child up, every entry with `desired: stopped` has its stop marker written and
-// drains at its iteration boundary, and flipping desired state in the console
+// drains at its next phase seam or iteration boundary, and flipping desired state in the console
 // lands on the machine within one poll, with no operator command.
 //
 // The supervisor deliberately invents nothing. Each child is
@@ -27,7 +27,7 @@
 //
 // Stopping a child means writing the STOP marker into its state dir, the same
 // marker `clankerbar ctl stop` writes, never killing the process: the daemon
-// drains at its iteration boundary and exits by itself. No new daemon-side
+// drains at its next phase seam or iteration boundary and exits by itself. No new daemon-side
 // control mechanism exists — the supervisor is a translator, not a second
 // control plane. The one rule the supervisor adds is the restart decision: a
 // child that exits for any reason other than a stop it was told about is
@@ -202,7 +202,7 @@ type Options struct {
 	// beacon to report the target version before halting the roll — and, since
 	// phase 5c, how long the replace waits for the whole fleet to drain before
 	// halting the replacement. 0 = defaultVerifyTimeout. A drain finishes at
-	// the child's iteration boundary, so the wait must be generous; the cap
+	// the child's next phase seam or iteration boundary, so the wait must be generous; the cap
 	// exists so a child that never comes back halts the roll — or a child that
 	// never drains halts the replacement — instead of hanging it.
 	VerifyTimeout time.Duration
@@ -462,7 +462,7 @@ type Supervisor struct {
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
 // fleet-wide stop: every child gets a STOP marker in its own state dir, each
-// drains at its iteration boundary (possibly taking a while — an in-flight
+// drains at its next phase seam or iteration boundary (possibly taking a while — an in-flight
 // session finishes), and Supervise waits for all of them before returning.
 //
 // The first reconcile happens before the select loop; the plane is polled
@@ -962,7 +962,7 @@ func (d *Supervisor) ensureRunning(inst *Instance) {
 // ensureStopped brings one instance to its desired stopped state: STOP is
 // written exactly once per live child (past the settle window, so the marker
 // cannot be eaten by the child's startup consumption — CLA-491), and the
-// child drains at its iteration boundary. Idempotent: a STOP already written
+// child drains at its next phase seam or iteration boundary. Idempotent: a STOP already written
 // writes nothing more.
 func (d *Supervisor) ensureStopped(inst *Instance) {
 	// A retry scheduled before the stop will never fire: respawnDue refuses to
@@ -1443,7 +1443,7 @@ func (d *Supervisor) stopAll() error {
 		select {
 		case ev := <-d.exits:
 			// A child that exits during the drain may still hold its claim: the
-			// STOP marker only takes effect at an iteration boundary, and a
+			// STOP marker only takes effect at a phase seam or iteration boundary, and a
 			// daemon killed (or still settling) in the meantime leaves its
 			// CURRENT_CLAIM behind. onExit would have handed it back, but this
 			// loop is what consumes an exit once the fleet stop has begun, so
@@ -1478,7 +1478,7 @@ func (d *Supervisor) stopAll() error {
 					}
 				}
 				sort.Strings(stuck)
-				log.Printf("stop still waiting for %d instance(s) after %s (no exit in %s): %s - they stop at their iteration boundary; the supervisor keeps waiting rather than killing them",
+				log.Printf("stop still waiting for %d instance(s) after %s (no exit in %s): %s - they stop at their next phase seam or iteration boundary; the supervisor keeps waiting rather than killing them",
 					len(stuck), time.Since(waitStart).Round(time.Second), quiet.Round(time.Second), strings.Join(stuck, ", "))
 			}
 		}
@@ -1547,7 +1547,7 @@ const (
 //
 // A readable regular STOP already sitting in the state dir is not a failed
 // write: it is left untouched (its body records who asked first) and the daemon
-// picks it up at its next iteration boundary, so the line says only that —
+// picks it up at its next phase seam or iteration boundary, so the line says only that —
 // never that this child will drain, which the supervisor cannot know about a
 // marker of unknown provenance. The occupancy alone proves nothing, though:
 // WriteFile also reports ErrExists for a symlink or a directory at the name, and
@@ -1576,7 +1576,7 @@ func (d *Supervisor) writeStop(inst *Instance, dir string) stopOutcome {
 			// pending would tell the operator a child is draining while it
 			// keeps running. The safe read is the only proof that counts.
 			if existing, rerr := st.ReadFile("STOP"); rerr == nil {
-				log.Printf("%s: STOP already present in %s%s - left in place for the daemon to read at its next iteration boundary", inst.name, dir, markerRequestedBy(existing))
+				log.Printf("%s: STOP already present in %s%s - left in place for the daemon to read at its next phase seam or iteration boundary", inst.name, dir, markerRequestedBy(existing))
 				return stopPending
 			}
 			// Occupied by something the daemon will not read (a symlink, a
@@ -1586,7 +1586,7 @@ func (d *Supervisor) writeStop(inst *Instance, dir string) stopOutcome {
 		log.Printf("%s: cannot write STOP into %s: %v - the child keeps running; stop it by hand", inst.name, dir, err)
 		return stopFailed
 	}
-	log.Printf("%s: STOP written to %s - draining at its iteration boundary", inst.name, dir)
+	log.Printf("%s: STOP written to %s - draining at its next phase seam or iteration boundary", inst.name, dir)
 	return stopWritten
 }
 

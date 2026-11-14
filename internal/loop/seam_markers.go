@@ -5,47 +5,36 @@ import (
 	"log"
 )
 
-// Seam control (CLA-879). STOP and RESTART are honoured at a VERIFIED PHASE
-// SEAM, not only between iterations: one iteration runs a task's WHOLE phase
-// sequence, so a marker dropped while a four-phase sequence was in flight used to
-// wait for implement -> review -> fix -> verify to finish (one real drain ran 2h+
-// and was SIGKILLed by systemd's TimeoutStopSec 2.5 minutes into verify). The
-// seam is always available: each phase checkpoints and pushes, and a later claim
-// resumes at the next phase from `phasesDone`.
+// STOP and RESTART act at a VERIFIED PHASE SEAM as well as between iterations
+// (CLA-879). Releasing a checkpointed claim at the seam lets the next claim
+// resume at the following phase from `phasesDone`, so a stop or roll waits one
+// phase session instead of a whole task sequence.
 //
-// The seam is a safe place to let go. The phase has already ended, its checkpoint
-// is recorded and verified, and the run holds no live session — so there is no
-// kill, no salvage and no lost work: releasing the claim hands the task to the
-// next claim, which resumes the next phase from the checkpoint exactly as this
-// daemon would have.
-//
-// Deliberately NOT read here:
-//   - RELOAD and RESTART_NOW keep their existing boundaries. RESTART_NOW's whole
-//     point is to cut a LIVE session short, and its watcher owns that; with no
-//     session in flight it acts as a plain restart at the iteration boundary.
-//   - HALT keeps its iteration-boundary and supervised-wait reads: it is the
-//     operator's note and is left in place for the next start to report.
-//   - PROJECT PAUSE (the console `sum.Paused` flag and `scheduledPause`) must
-//     never stop a sequence. A pause only gates NEW claims; the task in flight
-//     runs every remaining phase to the end. Pausing is how the operator gets
-//     in-flight tasks completed (decision 6019ea26-1464-43a3-a152-3271510b8b42),
-//     so pausing must not behave like a soft stop.
-//
-// It is the phase twin of checkMarkers (run.go), which reads the same markers at
-// the iteration boundary.
-func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx int) bool {
+// A seam is only safe where the resume mechanism actually exists: a
+// runner-claimed drain whose checkpoint is verified. PROJECT PAUSE is
+// deliberately not read here — it gates new claims and lets the in-flight task
+// finish every phase (decision 6019ea26-1464-43a3-a152-3271510b8b42). RELOAD,
+// RESTART_NOW and HALT keep their existing boundaries.
+func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx int, nextPhase string) bool {
 	d := s.d
-	// Only a VERIFIED checkpoint is a resumable seam, and only when a next phase
-	// would actually spawn on the held claim. A phase that ended without one keeps
-	// today's handling: drainPhases has already ended the walk above (nothing for
-	// a successor to resume), and the marker lands at the iteration boundary or
-	// the next wait exactly as before.
-	if d.state == nil || s.carried == nil || !st.end.checkpoint || nextIdx < 0 || nextIdx >= len(s.phases) {
+	// Only a runner-claimed sequence writes `phasesDone`, and only a checkpoint
+	// with a next phase would resume anywhere. Everything else keeps today's
+	// iteration-boundary handling.
+	if d.state == nil || s.carried == nil || !s.runnerClaimed || !st.end.checkpoint ||
+		nextIdx < 0 || nextIdx >= len(s.phases) {
 		return false
 	}
-	// Read-then-remove is not atomic, and controlMu is the lock every other
-	// marker consumer takes (CLA-697). Held only for the marker read: the claim
-	// release below can reach the plane and must not block another consumer.
+	// Verified checkpoints only. The CLA-576 unverified form writes no
+	// `phasesDone` marker (markPhaseDone skips it), and a HANDOFF checkpoint
+	// writes none either — markPhaseDone cannot know yet whether the handoff
+	// will be accepted, so it skips them all. Acting on either would let the
+	// next claim re-run this phase instead of resuming the next.
+	if s.carried.CheckpointUnverified || st.end.handoff != "" {
+		return false
+	}
+	// Read-then-remove is not atomic; controlMu serialises it against a
+	// concurrent waitOrStop consumer of the same markers. Held only for the
+	// read — the claim release below reaches the plane and must not block it.
 	d.controlMu.Lock()
 	var marker, msg string
 	if present, m := d.readMarker("STOP"); present {
@@ -61,19 +50,27 @@ func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx in
 	}
 
 	// Release exactly as the RESTART_NOW path does, through the drain's own
-	// handback: a held claim with no pushed work goes straight back to the queue;
-	// one with pushed work has its lease ended so the takeover hand-off survives.
-	// There is no session to kill — the phase has ended.
+	// handback: a held claim with no pushed work goes straight back to the
+	// queue; one with pushed work has its lease ended so the takeover hand-off
+	// survives. There is no session to kill — the phase has already ended.
 	ref := claimLabel(s.carried.Claim)
-	released := d.releaseHeldClaim(ctx, s.t, *s.carried, false)
-	s.carried = nil
+	pushed := !s.carried.Claim.Releasable()
+	handed, _ := d.handBackClaim(ctx, s.t, *s.carried, false)
+	// A FAILED handback keeps the claim: the deferred handback at the end of the
+	// drain is a free retry before the daemon exits.
+	if handed {
+		s.carried = nil
+	}
 	if marker == MarkerRestart {
 		d.restartRequested.Store(true)
 	}
 	s.stop = true
 
 	after := s.phases[s.i].Label(s.i)
-	next := s.phases[nextIdx].Label(nextIdx)
+	next := nextPhase
+	if next == "" {
+		next = s.phases[nextIdx].Label(nextIdx)
+	}
 	note := ""
 	if msg != "" {
 		note = " (" + msg + ")"
@@ -82,12 +79,16 @@ func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx in
 	if marker == MarkerRestart {
 		action = "re-executing"
 	}
-	if released {
-		log.Printf("%siteration %d: %s at the phase seam after %s%s — released %s; %s, and the next phase (%s) resumes from its checkpoint on the next claim",
+	if handed {
+		log.Printf("%siteration %d: %s at the phase seam after %s%s — released %s; %s, and the next claim resumes at %s from its checkpoint",
 			labelOf(s.t), s.drainNum, marker, after, note, ref, action, next)
 	} else {
-		log.Printf("%siteration %d: %s at the phase seam after %s%s — could not hand %s back, so its lease will end on its own (pushed work keeps the takeover hand-off); %s, and the next phase (%s) resumes from its checkpoint on the next claim",
-			labelOf(s.t), s.drainNum, marker, after, note, ref, action, next)
+		tail := ""
+		if pushed {
+			tail = " (pushed work keeps the takeover hand-off)"
+		}
+		log.Printf("%siteration %d: %s at the phase seam after %s%s — could not hand %s back, so its lease will end on its own%s; %s, and the next claim resumes at %s from its checkpoint",
+			labelOf(s.t), s.drainNum, marker, after, note, ref, tail, action, next)
 	}
 	return true
 }

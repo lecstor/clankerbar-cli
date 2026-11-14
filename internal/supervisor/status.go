@@ -456,11 +456,11 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		out.Since = aliveSince
 		switch {
 		case d.stopping:
-			out.Reason = "supervisor stopping - draining at its iteration boundary"
+			out.Reason = "supervisor stopping - draining at its next phase seam or iteration boundary"
 		case d.replacing:
-			out.Reason = "replacing myself - draining at the iteration boundary"
+			out.Reason = "replacing myself - draining at the next phase seam or iteration boundary"
 		case inst.stopRequested:
-			out.Reason = "stop requested - draining at its iteration boundary"
+			out.Reason = "stop requested - draining at its next phase seam or iteration boundary"
 		}
 	case d.stopping:
 		out.State = StatusStopped
@@ -468,7 +468,7 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		out.Since = exitAt
 	case d.replacing:
 		out.State = StatusStopped
-		out.Reason = "replacing myself - drained at the iteration boundary"
+		out.Reason = "replacing myself - drained at the next phase seam or iteration boundary"
 		out.Since = exitAt
 	case inst.halted:
 		out.State = StatusHalted

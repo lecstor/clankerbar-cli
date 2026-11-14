@@ -526,7 +526,7 @@ func TestReconcileConfigEditQueuesOneRestart(t *testing.T) {
 	// boundary was queued.
 	logText := buf.String()
 	if !strings.Contains(logText, "daemon-one: effective config changed") ||
-		!strings.Contains(logText, "queued a restart at its iteration boundary") {
+		!strings.Contains(logText, "queued a restart at its next phase seam or iteration boundary") {
 		t.Fatalf("the queued restart was not logged naming the child:\n%s", logText)
 	}
 

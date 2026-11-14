@@ -274,7 +274,7 @@ walk:
 		// Reaching this point means this phase checkpointed and the next one is
 		// about to spawn on the held claim; no marker means the walk advances
 		// exactly as it always did.
-		if s.stopAtSeamMarker(ctx, st, s.i+1) {
+		if s.stopAtSeamMarker(ctx, st, s.i+1, "") {
 			break walk
 		}
 		s.i++

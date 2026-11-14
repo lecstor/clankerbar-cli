@@ -22,7 +22,7 @@ package supervisor
 //
 // The gate the phase is named for: the replacement happens ONLY after every
 // child is drained. Each child gets a STOP marker (the same write a fleet
-// stop performs) and exits at its iteration boundary — an in-flight session
+// stop performs) and exits at its next phase seam or iteration boundary — an in-flight session
 // finishes — and the exec waits for all of them. The wait is bounded by
 // VerifyTimeout: a child that never drains HALTS the replacement, the
 // children that did drain are respawned (from the launch path, which carries
@@ -235,7 +235,7 @@ func (d *Supervisor) checkReplace() {
 		return
 	}
 
-	log.Print("replace: REPLACE honoured - writing STOP to every child; each drains at its iteration boundary")
+	log.Print("replace: REPLACE honoured - writing STOP to every child; each drains at its next phase seam or iteration boundary")
 	d.removeReplaceMarker()
 	// The drain is a stop the supervisor itself ordered, so for its duration
 	// every row it reports says stopped (not exited, the crash vocabulary) —
@@ -267,8 +267,8 @@ func (d *Supervisor) checkReplace() {
 }
 
 // drainForReplace stops every live child and waits for the fleet to drain —
-// the same STOP-marker mechanics stopAll performs (each child drains at its
-// iteration boundary; nothing is ever killed) — bounded by VerifyTimeout so a
+// the same STOP-marker mechanics stopAll performs (each child drains at its next
+// phase seam or iteration boundary; nothing is ever killed) — bounded by VerifyTimeout so a
 // child that never drains HALTS the replacement instead of hanging it, and
 // aborted by context cancellation so the operator's stop lands as the fleet
 // stop it is.
@@ -314,7 +314,7 @@ func (d *Supervisor) drainForReplace() string {
 		}
 		if now := time.Now(); now.Sub(lastLog) >= d.o.StopLogEvery {
 			lastLog = now
-			log.Printf("replace: still waiting after %s: %s - children stop at their iteration boundary and a conflict-only session finishes on its own; the supervisor keeps waiting rather than killing them",
+			log.Printf("replace: still waiting after %s: %s - children stop at their next phase seam or iteration boundary and a conflict-only session finishes on its own; the supervisor keeps waiting rather than killing them",
 				time.Since(waitStart).Round(time.Second), drainStuck(d, done))
 		}
 		for _, inst := range d.instances {

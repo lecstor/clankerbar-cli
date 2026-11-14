@@ -5,7 +5,7 @@ package cli
 // `clankerbar supervise` alias — reconciles the machine against the plane's
 // account-scoped roster: every declared instance with `desired: running` runs
 // as a supervised child, every one with `desired: stopped` gets its STOP
-// marker and drains at its iteration boundary, and flipping desired state in
+// marker and drains at its next phase seam or iteration boundary, and flipping desired state in
 // the console lands on the machine within one poll. Since phase 2b each child
 // runs on a config the supervisor GENERATES into the child's state dir
 // (`materialized.json`) from the operator's local config and the roster entry
@@ -123,7 +123,7 @@ func Supervise(ctx context.Context, args []string) error {
 }
 
 // Roll runs the phase-5b one-shot fleet roll: every local running child is
-// restarted at its iteration boundary and verified — via its next local
+// restarted at its next phase seam or iteration boundary and verified — via its next local
 // beacon — to be reporting the version THIS binary runs, one child at a
 // time; a child that fails to come back on it halts the roll. The operator
 // installs the new build at the fleet's launch path and runs
@@ -176,7 +176,7 @@ func Roll(ctx context.Context, args []string) error {
 // (the same pre-flight the roll performs — the replacement execs the launch
 // path, so the new build must already be installed there), then writes the
 // REPLACE marker the RUNNING supervisor honours at its next poll: drain every
-// child at its iteration boundary, then exec the launch path in place.
+// child at its next phase seam or iteration boundary, then exec the launch path in place.
 //
 // The launchd/systemd fallback (Decision 5): operators who run the supervisor
 // under an OS-level unit have a second path with the same contract — install

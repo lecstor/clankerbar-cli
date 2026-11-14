@@ -8,7 +8,7 @@ package supervisor
 // binary, after the operator installed it at the fleet's launch path.
 //
 // Per child, one at a time: the roll writes the RESTART marker into its state
-// dir (the daemon drains at its iteration boundary, never mid-session), then
+// dir (the daemon drains at its next phase seam or iteration boundary, never mid-session), then
 // waits for the child's NEXT LOCAL BEACON to report the target version — the
 // version THIS binary was built as — before touching the next child. The
 // beacon is the daemon's own self-report (its version.Current, written beside
@@ -51,7 +51,7 @@ import (
 
 const (
 	// defaultVerifyTimeout bounds ONE child's drain-and-come-back. A drain
-	// finishes at the child's iteration boundary and can legitimately take
+	// finishes at the child's next phase seam or iteration boundary and can legitimately take
 	// minutes (an in-flight session completes), so the wait is generous; the
 	// cap exists so a child that never comes back halts the roll instead of
 	// hanging it. The roll is one-shot — a timed-out child is safe to retry.
@@ -68,8 +68,8 @@ const (
 	rollPollInterval = 250 * time.Millisecond
 )
 
-// Roll runs one fleet roll: every local running child is restarted at its
-// iteration boundary and verified to report the target version — this
+// Roll runs one fleet roll: every local running child is restarted at its next
+// phase seam or iteration boundary and verified to report the target version — this
 // binary's own — via its next local beacon, one child at a time, halting on
 // the first child that fails to come back. Children already on the target
 // version are skipped.
@@ -162,7 +162,7 @@ func Roll(ctx context.Context, o Options) error {
 		if cur != nil {
 			before = cur.Version
 		}
-		log.Printf("roll: rolling %s (was %s) - writing RESTART; it drains at its iteration boundary, then comes back on %s", e.Name, before, target)
+		log.Printf("roll: rolling %s (was %s) - writing RESTART; it drains at its next phase seam or iteration boundary, then comes back on %s", e.Name, before, target)
 		if err := writeRestartMarker(dir, e.Name); err != nil {
 			return fmt.Errorf("roll: %s: %w - halting the roll (%d child(ren) already rolled)", e.Name, err, rolled)
 		}
@@ -226,8 +226,8 @@ func fetchRoster(ctx context.Context, o Options, cacheDir string) ([]RosterEntry
 }
 
 // writeRestartMarker drops a RESTART marker into one child's state dir — the
-// same marker `clankerbar ctl restart` writes, honoured at the daemon's
-// iteration boundary. The dir must already exist (the caller gates on it): a
+// same marker `clankerbar ctl restart` writes, honoured at the daemon's next
+// phase seam or iteration boundary. The dir must already exist (the caller gates on it): a
 // marker written into a dir the supervisor created for a child that never
 // started would sit until a spawn and then re-exec a child that was never
 // asked to roll. A marker already present is one pending request too many and
@@ -283,11 +283,11 @@ func waitForNextBeacon(ctx context.Context, dir, name, target string, timeout ti
 			if b := readLocalBeacon(dir); b != nil {
 				last = fmt.Sprintf("%s (at %s)", b.Version, b.At.UTC().Format(time.RFC3339))
 			}
-			return fmt.Errorf("%s did not come back on %s within %s (last beacon: %s) - halting the roll; its session drains at the iteration boundary, so re-running the roll after fixing it is safe", name, target, timeout, last)
+			return fmt.Errorf("%s did not come back on %s within %s (last beacon: %s) - halting the roll; its session drains at the next phase seam or iteration boundary, so re-running the roll after fixing it is safe", name, target, timeout, last)
 		}
 		if now.Sub(lastLog) >= defaultRollLogEvery {
 			lastLog = now
-			log.Printf("roll: still waiting for %s to come back on %s (since %s) - its in-flight session finishes at its iteration boundary", name, target, start.UTC().Format(time.RFC3339))
+			log.Printf("roll: still waiting for %s to come back on %s (since %s) - its in-flight session finishes at its next phase seam or iteration boundary", name, target, start.UTC().Format(time.RFC3339))
 		}
 		select {
 		case <-ctx.Done():

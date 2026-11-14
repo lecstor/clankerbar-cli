@@ -1,26 +1,10 @@
 package loop
 
-// CLA-879: STOP and RESTART are honoured at a VERIFIED phase seam, not only
-// between iterations. One iteration runs a task's whole phase sequence, so a
-// marker dropped during phase 1 used to wait for implement -> review -> fix ->
-// verify to finish (one real drain ran 2h+ and was SIGKILLed by systemd's
-// TimeoutStopSec 2.5 minutes into verify). At a seam the phase has already
-// ended, so the runner releases the held claim and stops (STOP) or re-execs
-// (RESTART) without killing anything, and the next claim resumes the next phase
-// from the checkpoint.
-//
-// The behaviours pinned here:
-//  1. STOP mid-sequence: phase 2 never spawns, the claim is released, the
-//     marker is consumed and the daemon stops.
-//  2. RESTART mid-sequence: the same release, with the re-exec path taken.
-//  3. A phase ending WITHOUT a verified checkpoint keeps today's handling: the
-//     marker is not consumed at the seam (the walk has already ended for want
-//     of anything to resume) and lands at the iteration boundary as before.
-//  4. No marker: the sequence runs every phase on the one claim, exactly as
-//     before.
-//  5. The verification round's open-MUST rewind to the fix phase is a seam too.
-//  6. A project pause (console flag or scheduled window) is NOT a seam stop:
-//     every remaining phase runs (decision 6019ea26).
+// CLA-879: STOP and RESTART act at a VERIFIED phase seam as well as between
+// iterations, so a drain waits one phase session instead of a whole task
+// sequence. The seam requires the resume mechanism (a runner-claimed drain
+// writes `phasesDone`) and a verified checkpoint; these tests pin those guards,
+// the handback, and everything that must keep today's behaviour.
 
 import (
 	"context"
@@ -28,9 +12,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
+
+// seamBrief is the task a seam fixture claims. newStartFixture grants the claim
+// with run "run-"+ID; seamClaim mirrors it.
+func seamBrief(ref string) plane.TaskBrief {
+	return plane.TaskBrief{ID: walkClaimTaskID, Ref: ref, Branch: "clanker/11111111-seam"}
+}
+
+// seamClaim is the claim the runner plants for seamBrief.
+func seamClaim(b plane.TaskBrief) harness.Claim {
+	return harness.Claim{TaskID: b.ID, Ref: b.Ref, RunID: "run-" + b.ID}
+}
+
+// seamCheckpoint is a phase result that resumes claim and reaches its verified
+// checkpoint: a clean exit still holding the task, with a branch recorded.
+func seamCheckpoint(claim harness.Claim) harness.Result {
+	return reported(held(okResult(1, 0), claim), harness.Report{
+		TaskID: claim.TaskID, Ref: claim.Ref, RunID: claim.RunID, Branch: "clanker/seam-work",
+	})
+}
 
 // runPhaseDriver drives the driver through Run, which is where the daemon-level
 // consequence lives: STOP ends the run and RESTART leaves the re-exec flag set.
@@ -53,33 +57,37 @@ func TestRun_StopAndRestartActAtThePhaseSeam(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := &fakeAdapter{steps: []invokeStep{
-				{res: checkpointed(1, 0)},
-				{res: checkpointed(1, 0)}, // a second phase would land here; it must not
-			}}
-			d := phaseDriverWithReleaser(t, h, twoPhases(), &fakeReleaser{})
-			rel := d.targets[0].Releaser.(*fakeReleaser)
-			d.cfg.MaxIterations = 10 // generous: the marker, not the ceiling, ends this run
+			brief := seamBrief("CLA-879")
+			claim := seamClaim(brief)
+			f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+				{res: seamCheckpoint(claim)},
+				{res: seamCheckpoint(claim)}, // a second phase would land here; it must not
+			})
+			f.d.cfg.MaxIterations = 10 // generous: the marker, not the ceiling, ends this run
 			logs := captureLogs(t)
-			h.onInvoke = func(call int) {
+			f.h.onInvoke = func(call int) {
 				if call == 0 {
-					writeMarker(t, d.state.Path(), tc.marker, "dropped mid-sequence")
+					writeMarker(t, f.d.state.Path(), tc.marker, "dropped mid-sequence")
 				}
 			}
 
-			if err := runPhaseDriver(t, d); err != nil {
+			if err := runPhaseDriver(t, f.d); err != nil {
 				t.Fatalf("Run returned error: %v; log was:\n%s", err, logs.String())
 			}
-			if h.invokeCalls != 1 {
-				t.Fatalf("spawned %d sessions, want 1 — the %s must take effect at the seam, before phase 2 spawns", h.invokeCalls, tc.marker)
+			if f.h.invokeCalls != 1 {
+				t.Fatalf("spawned %d sessions, want 1 — the %s must take effect at the seam, before phase 2 spawns", f.h.invokeCalls, tc.marker)
 			}
-			if got := d.RestartRequested(); got != tc.wantRestart {
+			if got := f.d.RestartRequested(); got != tc.wantRestart {
 				t.Errorf("RestartRequested = %t, want %t", got, tc.wantRestart)
 			}
-			if len(rel.calls) != 1 || rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
-				t.Errorf("the held claim was not released at the seam: releaser saw %v, want exactly [{t-1 r-1}]", rel.calls)
+			if len(f.rel.calls) != 1 || f.rel.calls[0] != (releaseCall{claim.TaskID, claim.RunID}) {
+				t.Errorf("the held claim was not released at the seam: releaser saw %v, want exactly [{%s %s}]",
+					f.rel.calls, claim.TaskID, claim.RunID)
 			}
-			markerAbsent(t, d.state.Path(), tc.marker)
+			if len(f.rel.expireCalls) != 0 {
+				t.Errorf("a claim with no pushed work must be released, not expired: %v", f.rel.expireCalls)
+			}
+			markerAbsent(t, f.d.state.Path(), tc.marker)
 			out := logs.String()
 			if !strings.Contains(out, tc.wantLine) {
 				t.Errorf("the log must name the seam it acted on (%q); log was:\n%s", tc.wantLine, out)
@@ -90,7 +98,51 @@ func TestRun_StopAndRestartActAtThePhaseSeam(t *testing.T) {
 			if strings.Contains(out, "undeclared hand-offs this run") {
 				t.Errorf("a seam stop was counted as an undeclared hand-off; log was:\n%s", out)
 			}
+			// The resume marker was written BEFORE the release: that is what
+			// makes the next claim start at the following phase.
+			wantDone := phaseDoneCall{claim.TaskID, claim.RunID, config.ImplementPhaseName, testCheckpointTip}
+			if len(f.rel.done) != 1 || f.rel.done[0] != wantDone {
+				t.Errorf("RecordPhaseDone = %+v, want exactly [%+v] — the seam must write the marker it promises", f.rel.done, wantDone)
+			}
 		})
+	}
+}
+
+// TestRun_SeamHandsPushedWorkBackByEndingTheLease: a checkpoint means the phase
+// pushed, so the handback must end the lease rather than post `ready` over the
+// branch — that is what preserves the takeover hand-off.
+func TestRun_SeamHandsPushedWorkBackByEndingTheLease(t *testing.T) {
+	brief := seamBrief("CLA-884")
+	claim := seamClaim(brief)
+	pushed := claim
+	pushed.HasWIP = true
+	pushed.Branch = "clanker/11111111-work"
+	f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+		{res: seamCheckpoint(pushed)},
+		{res: seamCheckpoint(pushed)}, // must not land
+	})
+	f.d.cfg.MaxIterations = 10
+	logs := captureLogs(t)
+	f.h.onInvoke = func(call int) {
+		if call == 0 {
+			writeMarker(t, f.d.state.Path(), "STOP", "dropped mid-sequence")
+		}
+	}
+
+	if err := runPhaseDriver(t, f.d); err != nil {
+		t.Fatalf("Run returned error: %v; log was:\n%s", err, logs.String())
+	}
+	if f.h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — the STOP must act before phase 2", f.h.invokeCalls)
+	}
+	if len(f.rel.calls) != 0 {
+		t.Errorf("Release was called %v on a claim with pushed work — that posts ready over the branch and drops the takeover hand-off", f.rel.calls)
+	}
+	if len(f.rel.expireCalls) != 1 || f.rel.expireCalls[0] != (releaseCall{claim.TaskID, claim.RunID}) {
+		t.Errorf("ExpireLease = %v, want exactly [{%s %s}]", f.rel.expireCalls, claim.TaskID, claim.RunID)
+	}
+	if out := logs.String(); !strings.Contains(out, "STOP at the phase seam after implement") {
+		t.Errorf("the seam action was not logged; log was:\n%s", out)
 	}
 }
 
@@ -100,14 +152,54 @@ func TestRun_StopAndRestartActAtThePhaseSeam(t *testing.T) {
 // iteration boundary (or Run's task-boundary read), which is today's route to
 // the stop.
 func TestDrainPhases_NoCheckpointKeepsTodaysHandling(t *testing.T) {
-	settled := harness.Claim{TaskID: "t-1", RunID: "r-1", Settled: true}
-	h := &fakeAdapter{steps: []invokeStep{
+	brief := seamBrief("CLA-881")
+	claim := seamClaim(brief)
+	settled := claim
+	settled.Settled = true
+	f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
 		// The session settled the task itself: a clean exit holding nothing,
 		// so there is no checkpoint and nothing for a successor to resume.
 		{res: held(okResult(1, 0), settled)},
-		{res: okResult(1, 0)}, // phase 2 would land here; it must not
+		{res: seamCheckpoint(claim)}, // phase 2 would land here; it must not
+	})
+	logs := captureLogs(t)
+	f.h.onInvoke = func(call int) {
+		if call == 0 {
+			writeMarker(t, f.d.state.Path(), "STOP", "dropped mid-sequence")
+		}
+	}
+
+	_, _, stop, err := drainPhasesOnce(t, f.d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("the seam must not act on a marker when no verified checkpoint opened it")
+	}
+	if f.h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — a phase with no checkpoint has no successor to resume", f.h.invokeCalls)
+	}
+	if !markerPresent(t, f.d.state.Path(), "STOP") {
+		t.Error("the seam consumed a STOP with no verified checkpoint; the marker must keep today's handling (the iteration boundary)")
+	}
+	if len(f.rel.calls) != 0 || len(f.rel.expireCalls) != 0 {
+		t.Errorf("a settled claim owes no handback: Release=%v ExpireLease=%v", f.rel.calls, f.rel.expireCalls)
+	}
+	if out := logs.String(); strings.Contains(out, "at the phase seam") {
+		t.Errorf("no seam line may be logged without a verified checkpoint; log was:\n%s", out)
+	}
+}
+
+// TestDrainPhases_SessionClaimedSequenceKeepsTheIterationBoundary: a drain the
+// runner did not claim writes no `phasesDone` marker, so a seam stop would make
+// the next claim re-run phase 1. It must keep today's iteration-boundary
+// handling: the sequence runs, and the marker waits for the boundary.
+func TestDrainPhases_SessionClaimedSequenceKeepsTheIterationBoundary(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: held(okResult(1, 0), openClaim())},
 	}}
-	d, rel := phaseDriver(t, h, twoPhases())
+	d, _ := phaseDriver(t, h, twoPhases()) // no TaskClaimer: the session claims
 	logs := captureLogs(t)
 	h.onInvoke = func(call int) {
 		if call == 0 {
@@ -116,23 +208,119 @@ func TestDrainPhases_NoCheckpointKeepsTodaysHandling(t *testing.T) {
 	}
 
 	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — without a runner-written resume marker the sequence must keep its iteration-boundary handling", h.invokeCalls)
+	}
+	if !markerPresent(t, d.state.Path(), "STOP") {
+		t.Error("the seam consumed a STOP on a session-claimed drain, where the next claim would re-run phase 1")
+	}
+	if out := logs.String(); strings.Contains(out, "at the phase seam") {
+		t.Errorf("a session-claimed drain must not act at the phase seam; log was:\n%s", out)
+	}
+}
+
+// TestDrainPhases_UnverifiedCheckpointKeepsTodaysHandling: a CLA-576 checkpoint
+// whose branch the origin check could not verify writes no `phasesDone` marker,
+// so the next claim would re-run this phase instead of resuming the next — the
+// seam must leave the marker for the iteration boundary.
+func TestDrainPhases_UnverifiedCheckpointKeepsTodaysHandling(t *testing.T) {
+	brief := seamBrief("CLA-882")
+	claim := seamClaim(brief)
+	// The session recorded a branch, but the verifier cannot read origin.
+	recorded := harness.Claim{TaskID: claim.TaskID, Ref: claim.Ref, RunID: claim.RunID, HasWIP: true, Branch: "clanker/x"}
+	unverified := reported(held(okResult(1, 0), recorded), harness.Report{
+		TaskID: recorded.TaskID, Ref: recorded.Ref, RunID: recorded.RunID, Branch: recorded.Branch,
+	})
+	f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+		{res: unverified},
+		{res: seamCheckpoint(claim)}, // the review phase still spawns on the held claim
+	})
+	f.d.newVerifier = func(string, bool) deliveryVerifier { return unreadableOriginVerifier() }
+	logs := captureLogs(t)
+	f.h.onInvoke = func(call int) {
+		if call == 0 {
+			writeMarker(t, f.d.state.Path(), "STOP", "dropped mid-sequence")
+		}
+	}
+
+	_, _, stop, err := drainPhasesOnce(t, f.d)
 	if err != nil {
 		t.Fatalf("drainPhases: %v", err)
 	}
 	if stop {
-		t.Error("the seam must not act on a marker when no verified checkpoint opened it")
+		t.Error("the seam must not act on an unverified checkpoint")
 	}
-	if h.invokeCalls != 1 {
-		t.Fatalf("spawned %d sessions, want 1 — a phase with no checkpoint has no successor to resume", h.invokeCalls)
+	if f.h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — an unverified checkpoint still advances to the review phase on the held claim", f.h.invokeCalls)
 	}
-	if !markerPresent(t, d.state.Path(), "STOP") {
-		t.Error("the seam consumed a STOP with no verified checkpoint; the marker must keep today's handling (the iteration boundary)")
-	}
-	if len(rel.calls) != 0 {
-		t.Errorf("a settled claim owes no handback; releaser saw %v", rel.calls)
+	if !markerPresent(t, f.d.state.Path(), "STOP") {
+		t.Error("the seam consumed the STOP; an unverified checkpoint must keep today's iteration-boundary handling")
 	}
 	if out := logs.String(); strings.Contains(out, "at the phase seam") {
 		t.Errorf("no seam line may be logged without a verified checkpoint; log was:\n%s", out)
+	}
+	// markPhaseDone skips the unverified checkpoint, which is exactly why the
+	// seam must not release there: there is no marker for the next claim.
+	if len(f.rel.done) != 0 {
+		t.Errorf("RecordPhaseDone = %+v, want none for an unverified checkpoint", f.rel.done)
+	}
+	if got := f.h.invocations[1].ResumeClaim; got.TaskID != claim.TaskID || got.RunID != claim.RunID {
+		t.Errorf("the review phase did not resume the held claim: %+v", got)
+	}
+}
+
+// TestStopAtSeamMarker_RefusesAnUnresumableCheckpoint drives the guard directly
+// for the handoff-only form, which the refusal ladder above never lets reach the
+// seam: it must not consume the marker or release the claim either.
+func TestStopAtSeamMarker_RefusesAnUnresumableCheckpoint(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*drainSeq, *seqStep)
+	}{
+		{
+			name: "a CLA-576 unverified checkpoint",
+			mutate: func(s *drainSeq, _ *seqStep) {
+				s.carried.CheckpointUnverified = true
+			},
+		},
+		{
+			name: "a handoff checkpoint with no branch evidence",
+			mutate: func(_ *drainSeq, st *seqStep) {
+				st.end.branch = ""
+				st.end.handoff = "carry on with the tests"
+			},
+		},
+		{
+			name: "a handoff checkpoint WITH branch evidence",
+			mutate: func(_ *drainSeq, st *seqStep) {
+				st.end.handoff = "carry on with the tests"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, rel := phaseDriver(t, &fakeAdapter{}, twoPhases())
+			s := &drainSeq{
+				d: d, t: d.targets[0], phases: twoPhases(), runnerClaimed: true, i: 0,
+				carried: &harness.Result{Claim: openClaim()},
+			}
+			st := &seqStep{end: phaseEnd{checkpoint: true, branch: "clanker/x"}}
+			writeMarker(t, d.state.Path(), "STOP", "dropped mid-sequence")
+			tc.mutate(s, st)
+
+			if s.stopAtSeamMarker(context.Background(), st, 1, "") {
+				t.Error("the seam acted on a checkpoint with nothing for the next claim to resume")
+			}
+			if !markerPresent(t, d.state.Path(), "STOP") {
+				t.Error("the seam consumed the STOP")
+			}
+			if len(rel.calls) != 0 || len(rel.expireCalls) != 0 {
+				t.Errorf("the seam handed the claim back: Release=%v ExpireLease=%v", rel.calls, rel.expireCalls)
+			}
+		})
 	}
 }
 
@@ -140,24 +328,31 @@ func TestDrainPhases_NoCheckpointKeepsTodaysHandling(t *testing.T) {
 // invisible when no marker is there. Every phase spawns, the claim survives the
 // seam, and the only handback is the drain's ordinary one at the end.
 func TestDrainPhases_NoMarkerStillRunsTheSequenceOnOneClaim(t *testing.T) {
-	h := &fakeAdapter{steps: []invokeStep{
-		{res: checkpointed(1, 0)},
-		{res: held(okResult(1, 0), openClaim())},
-	}}
-	d, rel := phaseDriver(t, h, twoPhases())
+	brief := seamBrief("CLA-880")
+	claim := seamClaim(brief)
+	f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+		{res: seamCheckpoint(claim)},
+		{res: held(okResult(1, 0), claim)},
+	})
 	logs := captureLogs(t)
 	var invokesAtRelease []int
-	rel.onCall = func() { invokesAtRelease = append(invokesAtRelease, h.invokeCalls) }
+	f.rel.onCall = func() { invokesAtRelease = append(invokesAtRelease, f.h.invokeCalls) }
 
-	_, _, stop, err := drainPhasesOnce(t, d)
+	_, _, stop, err := drainPhasesOnce(t, f.d)
 	if err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
-	if h.invokeCalls != 2 {
-		t.Fatalf("spawned %d sessions, want 2 — a sequence with no marker runs every phase", h.invokeCalls)
+	if f.h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — a sequence with no marker runs every phase", f.h.invokeCalls)
 	}
-	if len(rel.calls) != 1 || len(invokesAtRelease) != 1 || invokesAtRelease[0] != 2 {
-		t.Errorf("releases = %v (at invokes %v), want exactly one after both phases — the claim must survive the seam", rel.calls, invokesAtRelease)
+	if len(f.rel.calls) != 1 || len(invokesAtRelease) != 1 || invokesAtRelease[0] != 2 {
+		t.Errorf("releases = %v (at invokes %v), want exactly one after both phases — the claim must survive the seam", f.rel.calls, invokesAtRelease)
+	}
+	// The implement checkpoint is the only phase marker: the review position
+	// ended without one.
+	wantDone := phaseDoneCall{claim.TaskID, claim.RunID, config.ImplementPhaseName, testCheckpointTip}
+	if len(f.rel.done) != 1 || f.rel.done[0] != wantDone {
+		t.Errorf("RecordPhaseDone = %+v, want exactly [%+v]", f.rel.done, wantDone)
 	}
 	if out := logs.String(); strings.Contains(out, "at the phase seam") {
 		t.Errorf("no marker, but a seam action was logged; log was:\n%s", out)
@@ -170,23 +365,24 @@ func TestDrainPhases_NoMarkerStillRunsTheSequenceOnOneClaim(t *testing.T) {
 // held claim. Pausing is how the operator gets in-flight tasks completed.
 func TestDrainPhases_PauseDoesNotStopAtThePhaseSeam(t *testing.T) {
 	t.Run("console pause flag", func(t *testing.T) {
-		h := &fakeAdapter{steps: []invokeStep{
-			{res: checkpointed(1, 0)},
-			{res: held(okResult(1, 0), openClaim())},
-		}}
-		d, _ := phaseDriver(t, h, twoPhases())
+		brief := seamBrief("CLA-885")
+		claim := seamClaim(brief)
+		f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+			{res: seamCheckpoint(claim)},
+			{res: held(okResult(1, 0), claim)},
+		})
 		logs := captureLogs(t)
-		h.onInvoke = func(call int) {
+		f.h.onInvoke = func(call int) {
 			if call == 0 {
-				d.paused[0] = true // a console poll flipped mid-sequence
+				f.d.paused[0] = true // a console poll flipped mid-sequence
 			}
 		}
-		_, _, stop, err := drainPhasesOnce(t, d)
+		_, _, stop, err := drainPhasesOnce(t, f.d)
 		if err != nil || stop {
 			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 		}
-		if h.invokeCalls != 2 {
-			t.Errorf("a console pause stopped the sequence after %d session(s); every remaining phase must run on the held claim", h.invokeCalls)
+		if f.h.invokeCalls != 2 {
+			t.Errorf("a console pause stopped the sequence after %d session(s); every remaining phase must run on the held claim", f.h.invokeCalls)
 		}
 		if out := logs.String(); strings.Contains(out, "at the phase seam") {
 			t.Errorf("a pause must not be read at the phase seam; log was:\n%s", out)
@@ -194,27 +390,28 @@ func TestDrainPhases_PauseDoesNotStopAtThePhaseSeam(t *testing.T) {
 	})
 
 	t.Run("scheduled pause window opens mid-sequence", func(t *testing.T) {
-		h := &fakeAdapter{steps: []invokeStep{
-			{res: checkpointed(1, 0)},
-			{res: held(okResult(1, 0), openClaim())},
-		}}
-		d, _ := phaseDriver(t, h, twoPhases())
+		brief := seamBrief("CLA-886")
+		claim := seamClaim(brief)
+		f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+			{res: seamCheckpoint(claim)},
+			{res: held(okResult(1, 0), claim)},
+		})
 		logs := captureLogs(t)
 		// peakSchedule is mon-fri 11:00-14:00 Australia/Brisbane; flip the
 		// clock into it from inside phase 1.
-		d.cfg.PauseWindows = peakSchedule(t)
+		f.d.cfg.PauseWindows = peakSchedule(t)
 		inside := brisbaneAt(t, 9, 12, 0)
-		h.onInvoke = func(call int) {
+		f.h.onInvoke = func(call int) {
 			if call == 0 {
-				d.now = func() time.Time { return inside }
+				f.d.now = func() time.Time { return inside }
 			}
 		}
-		_, _, stop, err := drainPhasesOnce(t, d)
+		_, _, stop, err := drainPhasesOnce(t, f.d)
 		if err != nil || stop {
 			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 		}
-		if h.invokeCalls != 2 {
-			t.Errorf("a scheduled pause window stopped the sequence after %d session(s); every remaining phase must run on the held claim", h.invokeCalls)
+		if f.h.invokeCalls != 2 {
+			t.Errorf("a scheduled pause window stopped the sequence after %d session(s); every remaining phase must run on the held claim", f.h.invokeCalls)
 		}
 		if out := logs.String(); strings.Contains(out, "at the phase seam") {
 			t.Errorf("a pause window must not be read at the phase seam; log was:\n%s", out)
@@ -222,33 +419,61 @@ func TestDrainPhases_PauseDoesNotStopAtThePhaseSeam(t *testing.T) {
 	})
 }
 
+// seamVerifyReleaser is reviewReleaser plus the plane's TaskClaimer: the verify
+// seam only fires on a runner-claimed drain, so its fixture has to be able to
+// claim (and is what proves the phaseDone marker exists on this path).
+type seamVerifyReleaser struct {
+	*reviewReleaser
+	offer   plane.Offer
+	claimFn func() (plane.ClaimedTask, error)
+}
+
+func (r *seamVerifyReleaser) NextOffer(context.Context) (plane.Offer, error) {
+	o := r.offer
+	r.offer = plane.Offer{}
+	return o, nil
+}
+
+func (r *seamVerifyReleaser) ClaimTask(context.Context, string, bool) (plane.ClaimedTask, error) {
+	return r.claimFn()
+}
+
 // TestDrainPhases_StopAtAVerifySeamStopsBeforeTheFixRound: the verification
 // round's open-MUST rewind is a phase seam too. A STOP dropped during verify
 // must stop before the fix round it would have spawned, not after that round
 // (and the verify it would then owe) has run.
 func TestDrainPhases_StopAtAVerifySeamStopsBeforeTheFixRound(t *testing.T) {
-	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	brief := seamBrief("CLA-883")
+	claim := seamClaim(brief)
+	inner := &reviewReleaser{status: "in_progress", holder: claim.RunID, outcome: "implemented: pushed the branch\n"}
+	rel := &seamVerifyReleaser{
+		reviewReleaser: inner,
+		offer:          plane.Offer{Next: &brief},
+		claimFn: func() (plane.ClaimedTask, error) {
+			return plane.ClaimedTask{Task: brief, RunID: claim.RunID}, nil
+		},
+	}
 	h := &fakeAdapter{steps: []invokeStep{
-		{res: checkpointed(10, 0.10)}, // implement
-		{res: checkpointed(5, 0.50)},  // review
-		{res: checkpointed(5, 0.05)},  // fix
-		{res: checkpointed(5, 0.05)},  // verify: leaves a MUST open, so a fix would respawn
-		{res: checkpointed(5, 0.05)},  // the respawned fix would land here
+		{res: seamCheckpoint(claim)}, // implement
+		{res: seamCheckpoint(claim)}, // review
+		{res: seamCheckpoint(claim)}, // fix
+		{res: seamCheckpoint(claim)}, // verify: leaves a MUST open, so a fix would respawn
+		{res: seamCheckpoint(claim)}, // the respawned fix would land here
 	}}
 	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
 	logs := captureLogs(t)
 	h.onInvoke = func(i int) {
 		switch i {
 		case 1: // the review raises the MUST the verifier will adjudicate
-			rel.records = append(rel.records, plane.ReviewRecordState{
-				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+			inner.records = append(inner.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: claim.RunID, ReviewedTip: testCheckpointTip, State: "sealed",
 				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
 			})
-			rel.openMusts = []string{"1.review-1.1"}
+			inner.openMusts = []string{"1.review-1.1"}
 		case 3: // the verify round leaves it open, and the operator drops STOP
-			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
-			rel.counted = 2
-			rel.openMusts = []string{"1.review-1.1"}
+			inner.records = append(inner.records, recordFor(2, "review-2", claim.RunID, testCheckpointTip, "sealed"))
+			inner.counted = 2
+			inner.openMusts = []string{"1.review-1.1"}
 			writeMarker(t, d.state.Path(), "STOP", "dropped during verify")
 		}
 	}
@@ -263,8 +488,8 @@ func TestDrainPhases_StopAtAVerifySeamStopsBeforeTheFixRound(t *testing.T) {
 	if h.invokeCalls != 4 {
 		t.Fatalf("spawned %d sessions, want 4 — the fix round after verify must not spawn", h.invokeCalls)
 	}
-	if len(rel.calls) != 1 || rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
-		t.Errorf("the held claim must be released at the verify seam: releaser saw %v", rel.calls)
+	if len(inner.calls) != 1 || inner.calls[0] != (releaseCall{claim.TaskID, claim.RunID}) {
+		t.Errorf("the held claim must be released at the verify seam: releaser saw %v", inner.calls)
 	}
 	markerAbsent(t, d.state.Path(), "STOP")
 	if out := logs.String(); !strings.Contains(out, "STOP at the phase seam after verify") {
