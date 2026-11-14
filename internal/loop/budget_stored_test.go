@@ -13,6 +13,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
@@ -132,6 +133,51 @@ func TestRun_OneTargetBudgetTripLeavesTheOtherDraining(t *testing.T) {
 	}
 	if out := logs.String(); strings.Contains(out, "every project's budget is exhausted") {
 		t.Errorf("alpha's trip was reported as a run-wide stop while beta still had budget:\n%s", out)
+	}
+}
+
+// The same scope on the MID-drain path: when a retry loop's next pre-spawn check
+// finds this target over its ceiling, the drain ends but the sibling keeps
+// draining. This is the path the naive fix misses (the drain itself returns
+// stop), so it is pinned separately from the between-drains sweep above.
+func TestRun_MidDrainBudgetTripLeavesTheOtherDraining(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 4
+	h := &fakeAdapter{name: "claude", steps: []invokeStep{
+		{res: okResult(0, 0)}, // beta's first drain
+		// alpha's session spends past its stored ceiling and ends transient, so
+		// the retry ladder comes back through the pre-spawn breaker and trips.
+		{res: harness.Result{ExitCode: 1, Tokens: 100, Raw: map[string]any{"kind": "transient"}}},
+	}}
+	targets := []Target{
+		{Name: "alpha", WorkDir: "/repos/alpha", Poller: &fakePoller{sum: backlog.Summary{Claimable: 1, RunConfigVersion: 1}},
+			RCfg: &fakeRCfg{docs: map[int]string{1: `{"budget":{"max_tokens":10}}`}}},
+		{Name: "beta", WorkDir: "/repos/beta", Poller: &fakePoller{sum: backlog.Summary{Claimable: 1}}},
+	}
+	logs := captureLogs(t)
+	d := NewMulti(cfg, h, targets)
+	openTestStateDir(t, d)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	alpha, beta := 0, 0
+	for _, inv := range h.invocations {
+		switch inv.WorkDir {
+		case "/repos/alpha":
+			alpha++
+		case "/repos/beta":
+			beta++
+		}
+	}
+	if alpha != 1 || beta != 3 {
+		t.Errorf("drains alpha=%d beta=%d, want 1 and 3 - a mid-drain trip on alpha must not end the run (max-iterations 4)", alpha, beta)
+	}
+	if out := logs.String(); !strings.Contains(out, "budget exhausted mid-drain") {
+		t.Errorf("the mid-drain trip was not reported as this project's:\n%s", out)
 	}
 }
 
