@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -132,8 +133,7 @@ func TestCopilotParse_empty(t *testing.T) {
 // silent budget under-count.
 func TestCopilotParse_streamSplitMidEvent(t *testing.T) {
 	stream := copilotSmokeStream(t)
-	var res Result
-	res = newSessionResult(Invocation{})
+	res := newSessionResult(Invocation{})
 	var p copilotParse
 	sink := newLineSink(func(line []byte) { p.line(line, &res, io.Discard) })
 	for i := 0; i < len(stream); i += 7 {
@@ -213,27 +213,16 @@ func TestCopilotParse_settlingCallSettlesTheClaim(t *testing.T) {
 
 func jsonString(t *testing.T, s string) string {
 	t.Helper()
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\n':
-			b.WriteString(`\n`)
-		default:
-			b.WriteRune(r)
-		}
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal %q: %v", s, err)
 	}
-	b.WriteByte('"')
-	return b.String()
+	return string(b)
 }
 
-// everyFlag returns the argv positions of flag, so a test can assert a flag is
+// flagPositions returns the argv positions of flag, so a test can assert a flag is
 // absent without matching a prompt that merely contains its text.
-func everyFlag(args []string, flag string) []int {
+func flagPositions(args []string, flag string) []int {
 	var at []int
 	for i, a := range args {
 		if a == flag {
@@ -264,7 +253,7 @@ func TestCopilotArgs(t *testing.T) {
 	// The fail-closed posture: the four grants, each as its own flag/value pair.
 	for _, rule := range []string{"read", "write", "shell", "clankerbar"} {
 		found := false
-		for _, i := range everyFlag(args, "--allow-tool") {
+		for _, i := range flagPositions(args, "--allow-tool") {
 			if i+1 < len(args) && args[i+1] == rule {
 				found = true
 			}
@@ -275,7 +264,7 @@ func TestCopilotArgs(t *testing.T) {
 	}
 	for _, dir := range in.ExtraDirs {
 		found := false
-		for _, i := range everyFlag(args, "--add-dir") {
+		for _, i := range flagPositions(args, "--add-dir") {
 			if i+1 < len(args) && args[i+1] == dir {
 				found = true
 			}
@@ -288,7 +277,7 @@ func TestCopilotArgs(t *testing.T) {
 		t.Errorf("args %q: the prompt must be the VALUE of a trailing -p", joined)
 	}
 	for _, never := range []string{"--allow-all", "--allow-all-tools", "--allow-all-paths", "--allow-all-urls", "--yolo"} {
-		if len(everyFlag(args, never)) > 0 {
+		if len(flagPositions(args, never)) > 0 {
 			t.Errorf("args %q carries %s, which would defeat the fail-closed posture", joined, never)
 		}
 	}
@@ -299,7 +288,7 @@ func TestCopilotArgs(t *testing.T) {
 func TestCopilotArgs_blankModelEmitsNoFlag(t *testing.T) {
 	for _, blank := range []string{"", " ", "\t", "  \n "} {
 		args := copilotArgs(Invocation{Prompt: "work", Model: blank})
-		if len(everyFlag(args, "--model")) > 0 {
+		if len(flagPositions(args, "--model")) > 0 {
 			t.Errorf("args %q for model %q: --model must be absent", strings.Join(args, " "), blank)
 		}
 	}
@@ -312,7 +301,7 @@ func TestCopilotProbeIsReadOnly(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, denied := range []string{"write", "shell"} {
 		found := false
-		for _, i := range everyFlag(args, "--deny-tool") {
+		for _, i := range flagPositions(args, "--deny-tool") {
 			if i+1 < len(args) && args[i+1] == denied {
 				found = true
 			}
@@ -321,7 +310,7 @@ func TestCopilotProbeIsReadOnly(t *testing.T) {
 			t.Errorf("probe args %q: missing --deny-tool %s", joined, denied)
 		}
 	}
-	for _, i := range everyFlag(args, "--allow-tool") {
+	for _, i := range flagPositions(args, "--allow-tool") {
 		if i+1 < len(args) && args[i+1] != "clankerbar(get_backlog_summary)" {
 			t.Errorf("probe args %q: only the read-only clankerbar tool may be allowed, got %q", joined, args[i+1])
 		}
@@ -341,7 +330,7 @@ func TestCopilotProbeWithoutMCPIsJustAPing(t *testing.T) {
 	if !strings.HasSuffix(strings.Join(args, " "), "-p .") {
 		t.Errorf("args %q: want the bare '.' probe prompt", strings.Join(args, " "))
 	}
-	for _, i := range everyFlag(args, "--allow-tool") {
+	for _, i := range flagPositions(args, "--allow-tool") {
 		t.Errorf("args %q: a probe without an MCP config granted %q", strings.Join(args, " "), args[i+1])
 	}
 }
@@ -503,6 +492,34 @@ func TestCopilotEnvPinsCopilotHome(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("env %v does not carry COPILOT_HOME from ConfigDir", env)
+	}
+}
+
+// An ambient COPILOT_ALLOW_ALL=true would approve every tool AND trust the
+// folder - skills, plugins, MCP servers and hooks included - so it must not
+// survive into a session, and neither must the probabilistic assisted judge. A
+// config-declared value does not reopen them either.
+func TestCopilotEnvClosesTheAmbientApprovalShortcuts(t *testing.T) {
+	t.Setenv("COPILOT_ALLOW_ALL", "true")
+	t.Setenv("COPILOT_ASSISTED_APPROVAL", "true")
+	env := (copilot{}).env(Invocation{
+		WorkDir: t.TempDir(),
+		Env:     []string{"COPILOT_ALLOW_ALL=true", "COPILOT_ASSISTED_APPROVAL=true"},
+	})
+	for _, key := range []string{"COPILOT_ALLOW_ALL", "COPILOT_ASSISTED_APPROVAL"} {
+		values := []string{}
+		for _, e := range env {
+			if k, v, ok := strings.Cut(e, "="); ok && k == key {
+				values = append(values, v)
+			}
+		}
+		if len(values) != 1 {
+			t.Errorf("%s appears %d times (%v), want exactly one: a duplicate leaves the inherited value in force", key, len(values), values)
+			continue
+		}
+		if values[0] != "false" {
+			t.Errorf("%s = %q, want false", key, values[0])
+		}
 	}
 }
 

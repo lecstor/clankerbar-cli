@@ -2884,11 +2884,13 @@ New harnesses are a small adapter (`internal/harness`). Contributions welcome.
 **`copilot` is driven headless with a pinned, fail-closed policy.** `copilot -p`
 denies any tool request it would otherwise prompt for, so the adapter grants only
 `read`, `write`, `shell` and the `clankerbar` MCP server for a working session; the
-file boundary is the CLI's own path verification (workdir, temp, `--add-dir`). A
-probe denies `write` and `shell` outright. `mcp_config_path` is handed over as
-`--additional-mcp-config @<file>` and read in Claude's `mcpServers` schema (the same
-object), which is what gives a session its clankerbar tools — a workspace `.mcp.json`
-is only auto-loaded for a *trusted* folder, and this adapter never trusts one.
+file boundary is the CLI's own path verification (workdir, temp, `--add-dir`), which
+also gates paths inside shell commands (verified: `cat /etc/hostname` denied while an
+in-workdir write and shell command run). A probe denies `write` and `shell`
+outright. `mcp_config_path` is handed over as `--additional-mcp-config @<file>` and
+read in Claude's `mcpServers` schema (the same object), which is what gives a
+session its clankerbar tools — a workspace `.mcp.json` is only auto-loaded for a
+*trusted* folder, and this adapter never trusts one.
 Copilot reports AI credits, never money, so `budget.max_cost_usd` is inert on this
 harness and `budget.max_tokens` is the breaker; the guide is
 [`docs/copilot-cli.md`](./docs/copilot-cli.md).

@@ -104,10 +104,36 @@ func copilotArgs(in Invocation) []string {
 // adapter (CLA-441) and COPILOT_HOME as the config-dir override.
 func (c copilot) env(in Invocation) []string {
 	env := append(pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir), in.Env...)
+	// The ambient approval shortcuts are pinned OFF, and REPLACED rather than
+	// appended. COPILOT_ALLOW_ALL=true approves every tool AND trusts the folder,
+	// which loads its skills, plugins, MCP servers and hooks; the assisted judge
+	// is probabilistic and not a boundary. The posture is the closed --allow-tool
+	// set, not whatever the operator's shell exports.
+	env = overrideEnv(env, "COPILOT_ALLOW_ALL=false", "COPILOT_ASSISTED_APPROVAL=false")
 	if in.ConfigDir != "" {
-		env = append(env, "COPILOT_HOME="+in.ConfigDir)
+		env = overrideEnv(env, "COPILOT_HOME="+in.ConfigDir)
 	}
 	return env
+}
+
+// overrideEnv drops every existing entry for the keys in kv and appends kv, so
+// the pinned value is the ONLY one and nothing depends on how a duplicate is
+// resolved (os/exec keeps the last today; getenv keeps the first).
+func overrideEnv(env []string, kv ...string) []string {
+	drop := make(map[string]struct{}, len(kv))
+	for _, e := range kv {
+		k, _, _ := strings.Cut(e, "=")
+		drop[k] = struct{}{}
+	}
+	out := make([]string, 0, len(env)+len(kv))
+	for _, e := range env {
+		k, _, _ := strings.Cut(e, "=")
+		if _, ok := drop[k]; ok {
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, kv...)
 }
 
 func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
@@ -160,14 +186,7 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	captured.attach(cmd, tee)
 	runErr := cmd.Run()
 
-	res.Stdout = captured.stdout.String()
-	res.Stderr = captured.stderr.String()
-	res.OutputDropped = captured.stdout.Dropped() + captured.stderr.Dropped()
-	if captured.sink.Overran() {
-		res.markUntrusted("a copilot event was longer than the line cap and was discarded, " +
-			"so an unknown number of events never reached the parser: this session's token and cost " +
-			"figures are incomplete")
-	}
+	captured.finishInto(&res, "copilot")
 	p.finish(&res)
 
 	// Our own deadline, not the caller's: a run-wide cancellation must not be

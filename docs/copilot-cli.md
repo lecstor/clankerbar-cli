@@ -30,10 +30,21 @@ In `-p` mode a tool request that would prompt is **denied** (there is nobody to
 ask). `--allow-tool` / `--deny-tool` open the parts of the working set a session
 needs; `--deny-tool` wins over every allow, including `--allow-all`.
 
+The session environment pins `COPILOT_ALLOW_ALL=false` and
+`COPILOT_ASSISTED_APPROVAL=false` AFTER any declared `env`, so an ambient (or
+config-declared) approval shortcut cannot reopen the posture: `COPILOT_ALLOW_ALL=true`
+approves every tool and trusts the folder, and the assisted judge is probabilistic
+and explicitly not a security boundary. A bare server name is a valid allow rule
+(`--allow-tool clankerbar` granted all of /mcp's tools in a verified session).
+
 The adapter grants `read`, `write`, `shell` and the `clankerbar` MCP server for a
 working session. The file boundary is the CLI's own path verification (the working
-directory, the system temp dir, and each `--add-dir`); an out-of-boundary path
-cannot prompt in `-p` mode, so it fails closed. A **probe** is read-only: it denies
+directory, the system temp dir, and each `--add-dir`), and it applies to shell
+commands as well as file tools: verified on 1.0.112, a `view` of `/etc/hostname` AND
+a `cat /etc/hostname` were both refused under `--allow-tool read --allow-tool shell`,
+"Permission denied because no interactive user response was available", while an
+in-workdir write and shell command succeeded. An out-of-boundary path cannot prompt
+in `-p` mode, so it fails closed. A **probe** is read-only: it denies
 `write` and `shell` outright (read-only shell commands would otherwise run without
 asking) and its only grant is `clankerbar(get_backlog_summary)`.
 
@@ -67,6 +78,18 @@ A workspace `.mcp.json` is auto-discovered **only once the folder is trusted**, 
 `--additional-mcp-config` is what makes the file reach the session regardless. The
 adapter never trusts a folder: trusting one also approves that directory's skills,
 plugins, MCP servers and hooks (including hooks that run shell commands).
+
+## Claim observation
+
+The adapter feeds Copilot's tool requests (`assistant.message.toolRequests` and
+`tool.execution_start`) and their results (`tool.execution_complete`) to the same
+shared clankerbar observer claude and opencode use, mapping an MCP call
+(`mcpServerName: "clankerbar"`, `mcpToolName: "claim_task"`) onto the canonical
+`mcp__clankerbar__claim_task` name. So `Result.Claim`, `Reports`, `Settled` and
+`ClankerbarCalls` are populated and a phased config can run on this harness. The
+request/result plumbing was verified live (a real `get_backlog_summary` call was
+observed); the claim payload itself is the plane's own JSON, which the same
+observer already parses for the other two adapters.
 
 ## Usage and billing
 
