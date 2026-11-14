@@ -106,8 +106,8 @@ func TestConflictStepDefaultsToTheImplementStep(t *testing.T) {
 	if step.Harness != "opencode" {
 		t.Errorf("harness = %q, want the implement phase's opencode", step.Harness)
 	}
-	if step.Model != "cheap-model" {
-		t.Errorf("model = %q, want the implement phase's tiered cheap-model", step.Model)
+	if got := step.Model.First(); got != "cheap-model" {
+		t.Errorf("model = %q, want the implement phase's tiered cheap-model", got)
 	}
 }
 
@@ -124,15 +124,15 @@ func TestConflictStepHonoursItsOwnBlock(t *testing.T) {
 	}
 	// A different harness is a different dialect: its own default model, never
 	// the run-wide alias the other harness serves.
-	if step.Model != "codex-model" {
-		t.Errorf("model = %q, want codex's own codex-model (not the run-wide run-model)", step.Model)
+	if got := step.Model.First(); got != "codex-model" {
+		t.Errorf("model = %q, want codex's own codex-model (not the run-wide run-model)", got)
 	}
 	if step.MaxTurns != 25 {
 		t.Errorf("max turns = %d, want the block's 25", step.MaxTurns)
 	}
 
-	c.Conflict.Model = "pinned-model"
-	if got := c.ConflictStep().Model; got != "pinned-model" {
+	c.Conflict.Model = ModelRoutes{"pinned-model"}
+	if got := c.ConflictStep().Model.First(); got != "pinned-model" {
 		t.Errorf("model = %q, want the block's own pinned-model to win", got)
 	}
 }

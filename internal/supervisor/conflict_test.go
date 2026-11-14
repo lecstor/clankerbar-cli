@@ -85,7 +85,7 @@ func TestConflictStandDownStartsOneConflictSession(t *testing.T) {
 	if call.req.Harness != "opencode" || call.req.Model != "implement-model" {
 		t.Errorf("the session runs on %s/%s, want the implement step opencode/implement-model", call.req.Harness, call.req.Model)
 	}
-	if call.step.Harness != "opencode" || call.step.Model != "implement-model" {
+	if call.step.Harness != "opencode" || call.step.Model.First() != "implement-model" {
 		t.Errorf("the resolved step = %+v, want the implement step", call.step)
 	}
 	if !strings.Contains(lines, "outcome: mechanical") {
@@ -96,7 +96,7 @@ func TestConflictStandDownStartsOneConflictSession(t *testing.T) {
 func TestConflictSessionUsesItsOwnStep(t *testing.T) {
 	f := conflictingFixture(t)
 	d := f.supervisor(0)
-	d.instances[0].cfg.Conflict = &config.ConflictStep{Model: "gpt-x", MaxTurns: 40}
+	d.instances[0].cfg.Conflict = &config.ConflictStep{Model: config.ModelRoutes{"gpt-x"}, MaxTurns: 40}
 
 	f.run(d)
 
@@ -117,7 +117,7 @@ func TestConflictSessionRefusesAHarnessThatCannotTakeExtraDirs(t *testing.T) {
 	d := f.supervisor(0)
 	// codex deliberately does not translate Invocation.ExtraDirs, so it could not
 	// create the worktree the brief names - a paid session that fails at step 2.
-	d.instances[0].cfg.Conflict = &config.ConflictStep{Harness: "codex", Model: "gpt-x"}
+	d.instances[0].cfg.Conflict = &config.ConflictStep{Harness: "codex", Model: config.ModelRoutes{"gpt-x"}}
 
 	lines := f.run(d)
 
@@ -506,10 +506,11 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 		// Not .mcp.json: that name is gated out of opencode's hand-off (CLA-318).
 		Projects: []config.Project{{Slug: "acme", MCPConfigPath: "/fleet/acme/opencode-mcp.json"}},
 	}
-	step := config.ConflictStep{Harness: "opencode", Model: "conflict-model", MaxTurns: 40}
+	step := config.ConflictStep{Harness: "opencode", Model: config.ModelRoutes{"conflict-model"}, MaxTurns: 40}
 	req := ConflictRunRequest{
 		Harness:  "opencode",
 		Model:    "conflict-model",
+		Routes:   []string{"conflict-model"},
 		WorkDir:  "/fleet/acme/widgets",
 		Worktree: "/fleet/acme/worktrees/conflict-t1",
 		Prompt:   "the brief",

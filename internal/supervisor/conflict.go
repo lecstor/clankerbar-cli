@@ -51,6 +51,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
@@ -98,7 +99,14 @@ type ConflictRunRequest struct {
 	Paths   []string
 	Gate    string
 	Harness string
-	Model   string
+	// Model is the route this attempt runs on: the first entry of Routes, or the
+	// harness's own default when both are empty.
+	Model string
+	// Routes is the ordered model route list this attempt may fall back through
+	// (CLA-890): the conflict step's resolved list, or the suffix of it left after
+	// a quota failure. A pinned single `conflict.model` is a one-entry list, so it
+	// runs only that model.
+	Routes  []string
 	WorkDir string
 	// Worktree is the exact path the session creates its branch worktree at. The
 	// supervisor names it (rather than letting the session choose) so it can
@@ -235,7 +243,8 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		Paths:    paths,
 		Gate:     gate,
 		Harness:  step.Harness,
-		Model:    step.Model,
+		Model:    step.Model.First(),
+		Routes:   step.Model.List(),
 		WorkDir:  dir,
 		Worktree: worktree,
 
@@ -580,11 +589,70 @@ func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, re
 	if err != nil {
 		return harness.Result{}, err
 	}
-	inv, err := conflictInvocation(cfg, slug, req, step)
-	if err != nil {
-		return harness.Result{}, err
+	label := strings.TrimSpace(req.TaskRef)
+	if label == "" {
+		label = req.TaskID
 	}
-	return adapter.Invoke(ctx, inv)
+	return runConflictModelLadder(label, req, adapter, func(model string, routes []string) (harness.Result, error) {
+		attempt := req
+		attempt.Model, attempt.Routes = model, routes
+		inv, err := conflictInvocation(cfg, slug, attempt, step)
+		if err != nil {
+			return harness.Result{}, err
+		}
+		return adapter.Invoke(ctx, inv)
+	})
+}
+
+// conflictModelRun launches ONE conflict session pinned to model, offered the
+// model route list from model onwards.
+type conflictModelRun func(model string, routes []string) (harness.Result, error)
+
+// runConflictModelLadder runs the conflict session on the step's first model and,
+// when an attempt ends on a usage limit while a model is left, runs the session
+// again on the next one (CLA-890).
+//
+// The classification is the harness's own DetectLimit — the same one the phase
+// ladder's limit branch reads — so a limit the adapter already handled by
+// switching routes mid-session never reaches here. What does reach here is the
+// death it could not resume: a session that ended before it had one, which is the
+// CLA-884 shape (the free route's quota was exhausted ~2s in, so there was no
+// session id and no route switch, and the conflicting PR waited for a human).
+//
+// A limit on the LAST model returns that attempt's result unchanged: there is
+// nowhere left to go, and the existing failure classification reports it. Every
+// attempt is logged with the model it ran on, so a quota failure names the route
+// it hit.
+func runConflictModelLadder(label string, req ConflictRunRequest, a harness.Adapter, run conflictModelRun) (harness.Result, error) {
+	models := req.Routes
+	if len(models) == 0 {
+		// No route named at all: ONE attempt on the harness's own default. A
+		// pinned single model arrives as a one-entry list, so it never falls back.
+		models = []string{req.Model}
+	}
+	var res harness.Result
+	var err error
+	for i, model := range models {
+		name := strings.TrimSpace(model)
+		if name == "" {
+			name = "the harness default"
+		}
+		log.Printf("conflict: %s PR %s - attempt %d/%d on %s", label, req.PR, i+1, len(models), name)
+		res, err = run(model, models[i:])
+		lim := a.DetectLimit(res)
+		if !lim.Limited {
+			return res, err
+		}
+		reason := loop.LimitStopReason(lim)
+		if i == len(models)-1 {
+			log.Printf("conflict: %s PR %s - %s ended on a usage limit (%s) and it is the last model in the list",
+				label, req.PR, name, reason)
+			return res, err
+		}
+		log.Printf("conflict: %s PR %s - %s hit a usage limit (%s) before the resolution ran - retrying the session on %s",
+			label, req.PR, name, reason, models[i+1])
+	}
+	return res, err
 }
 
 // conflictInvocation composes the invocation a conflict session runs. Split from
@@ -600,6 +668,7 @@ func conflictInvocation(cfg *config.Config, slug string, req ConflictRunRequest,
 	return harness.Invocation{
 		Prompt:              req.Prompt,
 		Model:               req.Model,
+		Routes:              req.Routes,
 		WorkDir:             req.WorkDir,
 		MCPConfigPath:       cfg.ResolveMCPConfig(req.Harness, project.MCPConfigPath, project.MCPConfigPaths),
 		ConfigDir:           hc.ConfigDir,

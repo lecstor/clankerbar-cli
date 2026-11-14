@@ -37,10 +37,12 @@ type ConflictStep struct {
 	// "implement", else the run-wide harness).
 	Harness string `json:"harness,omitempty"`
 
-	// Model pins the model alias directly, skipping the tier map. Empty = the
-	// implement step's resolved model, so the conflict session inherits the
-	// model that implemented the branch rather than the harness's default.
-	Model string `json:"model,omitempty"`
+	// Model pins the model alias (or an ordered route list, like a phase's own
+	// `model`) directly, skipping the tier map. Empty = the implement step's
+	// WHOLE route list, so the conflict session inherits the fallback chain that
+	// implemented the branch rather than its first entry alone: a quota on the
+	// first route is exactly the case the list exists for (CLA-890).
+	Model ModelRoutes `json:"model,omitempty"`
 
 	// MaxTurns caps the session's turns (harness permitting). 0 = the fleet's
 	// effective cap, exactly as a phase with no cap of its own reads it. The
@@ -53,7 +55,7 @@ type ConflictStep struct {
 func (c *Config) conflictDeclared() bool { return c != nil && c.Conflict != nil }
 
 // ConflictStep resolves the effective conflict step: the block's own fields where
-// it names them, and the implement step's harness/model everywhere else.
+// it names them, and the implement step's harness/model routes everywhere else.
 //
 // Total, never an error: an unset or partly set block is the documented default,
 // not a refusal. Validate is where an unknown harness is refused, using the same
@@ -66,19 +68,22 @@ func (c *Config) ConflictStep() ConflictStep {
 	if c.Conflict != nil {
 		step = *c.Conflict
 	}
-	implHarness, implModel := c.implementStep()
+	implHarness, implRoutes := c.implementStep()
 	step.Harness = strings.TrimSpace(step.Harness)
-	step.Model = strings.TrimSpace(step.Model)
+	// The routes are trimmed and de-duplicated here rather than left to the
+	// launcher: every consumer (the log line, the spawn, the fallback ladder)
+	// reads this one answer.
+	step.Model = ModelRoutes(step.Model.List())
 	if step.Harness == "" {
 		step.Harness = implHarness
 	}
-	if step.Model == "" {
+	if step.Model.Empty() {
 		if step.Harness == implHarness {
-			step.Model = implModel
+			step.Model = implRoutes
 		} else {
 			// A different harness is a different dialect with its own default
 			// model; another harness's alias would be a name it does not serve.
-			step.Model = c.SessionFor(step.Harness).Model.First()
+			step.Model = ModelRoutes(c.SessionFor(step.Harness).Model.List())
 		}
 	}
 	if step.MaxTurns <= 0 {
@@ -94,25 +99,26 @@ func (c *Config) ConflictStep() ConflictStep {
 	return step
 }
 
-// implementStep answers the harness and model of the config's implement step: the
-// first configured phase named "implement", or the run-wide harness/model for an
-// unphased run (where EffectivePhases synthesizes a single implement phase).
+// implementStep answers the harness and the WHOLE model route list of the
+// config's implement step: the first configured phase named "implement", or the
+// run-wide harness/model for an unphased run (where EffectivePhases synthesizes a
+// single implement phase).
 //
-// The model is resolved through the phase's own tier, so a tiered review panel
-// beside an untiered implement phase cannot shift the conflict session's model.
-func (c *Config) implementStep() (harnessName, model string) {
+// The routes are resolved through the phase's own tier, so a tiered review panel
+// beside an untiered implement phase cannot shift the conflict session's models.
+// The whole list is carried because the conflict session runs the same fallback
+// ladder a phase does (CLA-890): resolving only the first route left a free-tier
+// quota death with nowhere to go.
+func (c *Config) implementStep() (harnessName string, model ModelRoutes) {
 	for _, ph := range c.Phases {
 		if ph.Name != ImplementPhaseName {
 			continue
 		}
 		h := c.HarnessFor(ph)
-		m, _ := c.ModelForPhase(ph)
-		if strings.TrimSpace(m) == "" {
-			m = c.SessionFor(h).Model.First()
-		}
-		return h, m
+		routes, _ := c.ModelRoutesForPhase(ph)
+		return h, ModelRoutes(routes)
 	}
-	return c.Harness, c.SessionFor(c.Harness).Model.First()
+	return c.Harness, c.SessionFor(c.Harness).Model
 }
 
 // conflictHarness is the harness the conflict block names, or "" when the config
