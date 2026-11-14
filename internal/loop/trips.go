@@ -10,15 +10,6 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// spend is the run-scoped context a drain is measured in: when the run began
-// (the local budget's clock) and which target it is draining (whose stored
-// overlay, if any, governs the spend). The ledgers themselves live on the Driver
-// — see budget.go — and are charged where each session's spend is counted.
-type spend struct {
-	start time.Time
-	ti    int
-}
-
 // deadReason renders the finish reason a dead phase was classified on, for a log
 // line. The classification fired on FinishReasonUnknown, so a nil claim — a
 // session that observed no task — still has a reason to name.

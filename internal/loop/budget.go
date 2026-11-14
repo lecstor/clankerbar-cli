@@ -45,6 +45,15 @@ type targetSpend struct {
 	byHarness map[string]harnessSpend
 }
 
+// spend is the run-scoped context a drain is measured in: when the run began
+// (the local budget's clock) and which target it is draining (whose stored
+// overlay, if any, governs the spend). The ledgers themselves live on the Driver
+// and are charged where each session's spend is counted.
+type spend struct {
+	start time.Time
+	ti    int
+}
+
 // budgetVerdict is what one budget check found: the ceiling that stopped it
 // (empty for none) and the figures it measured, for the log line.
 type budgetVerdict struct {
