@@ -1169,6 +1169,12 @@ func TestRun_ResumedPhaseTransientBackoffGrowsAndResets(t *testing.T) {
 // so the control markers land here too: STOP/RESTART stop the run through it
 // (consumed by the WAIT, which is what the log line distinguishes), and RELOAD
 // applies in place and lets the wait finish so the run keeps draining.
+//
+// The STOP/RESTART markers are dropped during the RESUMED phase's session, not
+// during phase 1: since CLA-879 a marker dropped while phase 1 is in flight is
+// consumed at the phase seam before phase 2 spawns (pinned by
+// TestRun_StopAndRestartActAtThePhaseSeam). The wait these cases exercise is the
+// one owed AFTER the resumed phase's transient end.
 func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 	t.Run("STOP lands in the wait and stops the run", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
@@ -1178,7 +1184,7 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		d, _ := phaseDriver(t, h, twoPhases())
 		d.cfg.MaxIterations = 10
 		h.onInvoke = func(call int) {
-			if call == 0 {
+			if call == 1 {
 				writeMarker(t, d.state.Path(), "STOP", "")
 			}
 		}
@@ -1190,7 +1196,7 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 			t.Fatalf("Run returned error: %v", err)
 		}
 		if h.invokeCalls != 2 {
-			t.Errorf("spawned %d sessions; a STOP dropped during the failing sequence must land in the wait, before the next sequence", h.invokeCalls)
+			t.Errorf("spawned %d sessions; a STOP dropped during the resumed phase must land in the wait it owes, before the next sequence", h.invokeCalls)
 		}
 		if markerPresent(t, d.state.Path(), "STOP") {
 			t.Error("STOP must be consumed when honoured")
@@ -1208,7 +1214,7 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		d, _ := phaseDriver(t, h, twoPhases())
 		d.cfg.MaxIterations = 10
 		h.onInvoke = func(call int) {
-			if call == 0 {
+			if call == 1 {
 				writeMarker(t, d.state.Path(), MarkerRestart, "new build installed")
 			}
 		}

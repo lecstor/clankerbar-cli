@@ -1035,17 +1035,19 @@ Each roster entry declares one instance:
   healthy and resets the ladder.
 - **`desiredState: stopped`** — the supervisor writes the instance's STOP
   marker into its state dir (the same marker a hand-written `touch STOP`
-  writes) and the daemon drains at its iteration boundary. Flipping desired
-  state in the console lands on the machine within one poll.
+  writes) and the daemon drains at its next phase seam or iteration boundary —
+  so a stop waits for one phase session, not a whole task sequence. Flipping
+  desired state in the console lands on the machine within one poll.
 - **`placement: remote`** — not implemented (Decision 7); the entry is ignored
   with a log line. An entry deleted in the console has its child stopped and is
   dropped.
 
 **Stopping the supervisor stops the fleet.** SIGINT/SIGTERM to the supervisor
 writes a STOP marker into every child's own state dir, so each daemon drains at
-its iteration boundary (an in-flight session finishes) rather than being killed
-mid-session, and the supervisor waits for all of them before exiting. A child
-that was told to stop is not restarted; that covers the fleet-wide stop and the
+its next phase seam or iteration boundary (an in-flight session finishes) rather
+than being killed mid-session, and the supervisor waits for all of them before
+exiting. A child that was told to stop is not restarted; that covers the
+fleet-wide stop and the
 per-instance case — a `HALT` marker (the one marker the daemon does NOT
 consume) left in a child's state dir stops that instance for good; delete the
 marker and restart the supervisor to resume it. A hand-written `STOP`, by
@@ -1159,7 +1161,8 @@ config from the one discovered location, `~/.config/clankerbar/config.json`
 exists). When the file exists it is re-read on every reconcile. An edit that
 changes a running child's effective config is written into that child's
 generated config and queued as a graceful `RESTART`, so it reaches the child at
-its next iteration boundary — no supervisor restart and no hand-written `STOP`.
+its next phase seam or iteration boundary — no supervisor restart and no
+hand-written `STOP`.
 An edit that changes nothing writes nothing (an unchanged config serializes to
 the same bytes, so there is no restart loop), and an edit the permission-policy
 check refuses is logged and never written: the running child stays on its
