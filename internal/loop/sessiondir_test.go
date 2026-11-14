@@ -122,9 +122,8 @@ func TestSessionDir_ResumePhaseReadsTheExactTask(t *testing.T) {
 }
 
 func TestSessionDir_CapturesTheBriefedTasksSpawnCustody(t *testing.T) {
-	// CLA-476: the checkpoint peek needs to know whether the briefed task was
-	// ALREADY held with a branch when the phase spawned. The queue-head read that
-	// chooses the spawn directory already answers that, so no second read is paid.
+	// The seam's peek needs the spawn-time custody (CLA-476); the queue-head read
+	// that chooses the spawn directory already answers it, so no second read is paid.
 	_, _, _, target := twoRepos(t)
 	rel := &repoReleaser{next: plane.NextTask{
 		TaskID: "t-1", Repo: "acme/repo-b", Status: "in_progress", Branch: "clanker/x", HasWIP: true, RequiresTakeover: true,
@@ -152,6 +151,27 @@ func TestSessionDir_CapturesTheBriefedTasksSpawnCustody(t *testing.T) {
 	}
 	if !hold.Exact || hold.HeldWithBranch {
 		t.Errorf("hold = %+v, want an exact resumed brief with no queue-head custody", hold)
+	}
+}
+
+// The fallback arm of the spawn-time custody: a plane that omits requiresTakeover
+// must still yield the refusal from status+hasWip.
+func TestHeldWithBranchAtSpawn_FallbackWithoutTheTakeoverFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		next plane.NextTask
+		want bool
+	}{
+		{"in_progress with WIP, flag absent", plane.NextTask{Status: "in_progress", HasWIP: true}, true},
+		{"in_progress without WIP", plane.NextTask{Status: "in_progress"}, false},
+		{"ready with WIP", plane.NextTask{Status: "ready", HasWIP: true}, false},
+		{"takeover flag alone", plane.NextTask{RequiresTakeover: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := heldWithBranchAtSpawn(tc.next).HeldWithBranch; got != tc.want {
+				t.Errorf("HeldWithBranch = %v, want %v for %+v", got, tc.want, tc.next)
+			}
+		})
 	}
 }
 

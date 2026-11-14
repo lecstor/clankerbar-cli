@@ -133,19 +133,14 @@ func TestDrainPhases_ABlindSpotClaimIsRecoveredFromThePlaneAtTheSeam(t *testing.
 	}
 }
 
-// CLA-476: the peek must see a TRANSITION, not just a static reading. A fresh
-// phase's briefed task is the speculative queue head, and next_task may hand
-// back a stale-lease takeover candidate: already in_progress, held by a dead
-// run, with a branch that run pushed. That shape satisfies the held-with-branch
-// custody test and the origin evidence gate exactly like a hold this phase took,
-// so without the spawn-time snapshot the driver would keep the lease and spawn a
-// paid phase 2 on another run's in-flight work.
+// CLA-476: the peek must see a transition, not a static reading — a pre-existing
+// takeover-candidate hold is not this phase's checkpoint.
 func TestDrainPhases_APreExistingHeldWithBranchTaskIsNotRecovered(t *testing.T) {
 	logs := captureLogs(t)
 	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
 	rel := &peekReleaser{
 		// The queue head was ALREADY a takeover candidate when the phase spawned.
-		next: plane.NextTask{TaskID: "t-1", Status: "in_progress", HasWIP: true, RequiresTakeover: true},
+		next: plane.NextTask{TaskID: "t-1", Status: "in_progress", Branch: "clanker/x", HasWIP: true, RequiresTakeover: true},
 		// …and it still reads that way after phase 1, because phase 1 never
 		// touched it. The previous clanker's pushed branch is genuinely on origin,
 		// so only the transition check can refuse this.
@@ -178,10 +173,32 @@ func TestDrainPhases_APreExistingHeldWithBranchTaskIsNotRecovered(t *testing.T) 
 	}
 }
 
+// A spawn-time custody answer that carried no branch must not be filled in with
+// the END-time branch when the refusal is logged.
+func TestPeekCheckpointClaim_PreExistingHoldWithoutASpawnBranchDoesNotBorrowTheEndBranch(t *testing.T) {
+	logs := captureLogs(t)
+	rel := &peekReleaser{state: map[string]plane.TaskState{
+		"t-1": {Status: "in_progress", Ref: "CLA-9", ClaimedByRun: "r-previous", Branch: "clanker/end-time"},
+	}}
+	target := Target{Poller: busyPoller(), Releaser: rel}
+	d := d0(target)
+
+	if got := d.peekCheckpointClaim(context.Background(), target, 1, "phase 1", "t-1", briefedHold{HeldWithBranch: true}); got != nil {
+		t.Fatalf("a pre-existing hold was recovered: %+v", got)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "not read at spawn") {
+		t.Errorf("the refusal does not say the branch was unread at spawn:\n%s", out)
+	}
+	if strings.Contains(out, "clanker/end-time") {
+		t.Errorf("the refusal borrowed the end-time branch as a spawn-time fact:\n%s", out)
+	}
+}
+
 // The exact resumed arm: when the briefed task is the one a predecessor HELD,
-// no transition is needed — its identity is not a guess. The shipped two-phase
-// config cannot reach this through drainPhases (phase 1 is never resumed and
-// only a non-last phase peeks), so the guard is pinned here directly.
+// no transition is needed — its identity is not a guess. The direct call pins
+// the arm; a runner-claimed drain also reaches it, because plantClaim seeds
+// s.carried and runPhase passes it as prev to a non-last phase.
 func TestPeekCheckpointClaim_AnExactResumedTaskNeedsNoTransition(t *testing.T) {
 	rel := &peekReleaser{state: map[string]plane.TaskState{
 		"t-9": {Status: "in_progress", Ref: "CLA-9", ClaimedByRun: "r-9", Branch: "clanker/x"},

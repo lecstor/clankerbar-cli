@@ -30,12 +30,9 @@ import (
 // NextTask is what the queue-head peek learned. Repo is the task's `repo`
 // field, empty when the task carries none (or there is nothing queued).
 //
-// Status, HasWIP, Branch and RequiresTakeover are the task's CUSTODY shape at
-// the read (CLA-476). They matter because `next_task` may hand back a
-// stale-lease takeover candidate: a task already `in_progress`, held by a dead
-// run, with a branch recorded. That shape must not later be mistaken for a
-// checkpoint the spawned session produced, so the driver captures it at spawn
-// time and the seam's checkpoint peek requires the hold to appear AFTER it.
+// Status, HasWIP, Branch and RequiresTakeover are the task's custody shape at
+// the read; the loop uses them to require a transition into a hold rather than
+// trusting a later reading (see loop's briefedHold, CLA-476).
 type NextTask struct {
 	TaskID string
 	Repo   string
@@ -198,29 +195,22 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 	if err != nil {
 		return NextTask{}, err
 	}
-	var payload struct {
-		Next *struct {
-			ID               string `json:"id"`
-			Repo             any    `json:"repo"`
-			Status           any    `json:"status"`
-			Branch           any    `json:"branch"`
-			HasWIP           any    `json:"hasWip"`
-			RequiresTakeover any    `json:"requiresTakeover"`
-		} `json:"next"`
+	// decodeOffer owns next_task's wire shape, so a plane change cannot update
+	// one decoder and miss the other.
+	offer, err := decodeOffer(raw)
+	if err != nil {
+		return NextTask{}, err
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return NextTask{}, fmt.Errorf("next_task: decode response: %w", err)
-	}
-	if payload.Next == nil || payload.Next.ID == "" {
+	if offer.Next == nil || offer.Next.ID == "" {
 		return NextTask{}, nil
 	}
 	return NextTask{
-		TaskID:           payload.Next.ID,
-		Repo:             wireString(payload.Next.Repo),
-		Status:           wireString(payload.Next.Status),
-		Branch:           wireString(payload.Next.Branch),
-		HasWIP:           wireBool(payload.Next.HasWIP),
-		RequiresTakeover: wireBool(payload.Next.RequiresTakeover),
+		TaskID:           offer.Next.ID,
+		Repo:             offer.Next.Repo,
+		Status:           offer.Next.Status,
+		Branch:           offer.Next.Branch,
+		HasWIP:           offer.Next.HasWIP,
+		RequiresTakeover: offer.Next.RequiresTakeover,
 	}, nil
 }
 

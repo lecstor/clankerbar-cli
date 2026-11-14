@@ -397,12 +397,10 @@ func heldWithBranchAtSpawn(next plane.NextTask) briefedHold {
 // they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
 // 2 and 3). It also returns the id of the task the phase is BRIEFED on — exact
 // for a resumed phase (the predecessor's claim), best-effort for a fresh one
-// (the queue-head peek, the same read the session is about to make) — and the
-// custody shape that task had AT SPAWN. The seam's checkpoint peek reads the
-// task after the phase ends (CLA-451) and uses the spawn-time shape to tell a
-// hold this phase produced from one that was already there (CLA-476); an empty
-// id means the driver never knew which task to ask about, and the peek is
-// skipped.
+// (the queue-head peek, the same read the session is about to make) — and, for
+// a fresh phase, that task's custody AT SPAWN, which the seam's checkpoint peek
+// needs to demand a transition rather than a static hold (CLA-476). An empty id
+// means the driver never knew which task to ask about, and the peek is skipped.
 //
 // Which task that is depends on the phase. A RESUMED phase (prev carries a held
 // claim) knows its exact task, so its repo is read straight off the plane with
