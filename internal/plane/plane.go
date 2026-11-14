@@ -64,11 +64,20 @@ var ErrQuestionNotFiled = errors.New("task parked but the question was not filed
 
 // Releaser hands a claim back to the queue.
 type Releaser interface {
-	// Release ends the run holding taskID as `released` (never `failed`) and
-	// returns a no-WIP task to `ready`, so the next iteration can claim it
+	// ReleaseDriver ends the run holding taskID as `released` (never `failed`)
+	// and returns a no-WIP task to `ready`, so the next iteration can claim it
 	// immediately instead of waiting out a dead lease. It calls `release_task`,
 	// the plane's hand-an-unfinished-claim-back primitive (CLA-246), which also
-	// leaves the reclaim budget untouched.
+	// leaves the reclaim budget untouched, with `driver: true` — the marker the
+	// plane records for a handback a DRIVER made on a session's behalf, which is
+	// what lets it tell a killed session from one that handed the task back
+	// itself (CLA-556).
+	//
+	// There is deliberately no unmarked form. Every release this process makes
+	// is a driver's — the session that would have made its own has ended — and a
+	// session's own voluntary release is the session's MCP call, never this
+	// client's. One method means no future call site can forget the marker and
+	// become indistinguishable again.
 	//
 	// It must only be called for a task with NO work-in-progress branch recorded.
 	// Releasing one that HAS a branch would be actively worse than doing nothing:
@@ -77,20 +86,14 @@ type Releaser interface {
 	// next clanker there is pushed work to pick up. That trap is on the record —
 	// it is what standing decision 15 (CLA-191) was written about. The WIP case
 	// wants ExpireLease below.
-	Release(ctx context.Context, taskID, runID string) error
-
-	// ReleaseDriver is Release carrying `driver: true` on `release_task` — the
-	// same handback, recorded as one a driver made on a session's behalf rather
-	// than one the session chose. The supervisor uses it when a child it did not
-	// start a drain for has exited holding a task with no branch.
 	ReleaseDriver(ctx context.Context, taskID, runID string) error
 
 	// ExpireLease ends the holding run NOW instead of waiting out its 30-minute
 	// lease, and leaves the task an immediate takeover when a branch is recorded
 	// (or `ready` when there is none). It sends `expire: true` plus `driver: true`
 	// to release_task - the plane's CLA-707 primitive, written for a dead session
-	// whose work IS pushed. Unlike Release it keeps the WIP hand-off, so it is the
-	// correct handback for a claim with a branch recorded.
+	// whose work IS pushed. Unlike ReleaseDriver it keeps the WIP hand-off, so it
+	// is the correct handback for a claim with a branch recorded.
 	ExpireLease(ctx context.Context, taskID, runID string) error
 }
 
@@ -212,7 +215,6 @@ type ParkAPI interface {
 
 type notWired struct{}
 
-func (notWired) Release(context.Context, string, string) error       { return ErrNotWired }
 func (notWired) ReleaseDriver(context.Context, string, string) error { return ErrNotWired }
 func (notWired) ExpireLease(context.Context, string, string) error   { return ErrNotWired }
 func (notWired) Heartbeat(context.Context, string) error             { return ErrNotWired }
@@ -279,29 +281,16 @@ type mcpReleaser struct {
 	upload   *http.Client
 }
 
-func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
-	if taskID == "" || runID == "" {
-		return errors.New("release: taskId and runId are both required")
-	}
-	// `release_task` is the plane's hand-an-unfinished-claim-back primitive
-	// (CLA-246): it returns a no-WIP task to the claimable queue WITHOUT charging
-	// it a reclaim, and - unlike a status move - records the run as `released`,
-	// never `failed`. The default (neither `expire` nor `driver`) IS the handback;
-	// no `outcome` is sent: the session may have written one, and this call is a
-	// handback, not a report.
-	return r.call(ctx, "release_task", map[string]any{
-		"taskId": taskID,
-		"runId":  runID,
-	})
-}
-
-// ReleaseDriver is Release with `driver: true`, the marker the plane records for
-// a handback a driver made on a dead session's behalf (CLA-707 extended the
-// existing driver-marker guard to accept a handback as well as an expiry).
+// ReleaseDriver is the driver's handback of a claim whose session ended without
+// settling it — the wall-clock cap, a provider failure, the turn ceiling. It
+// sends `release_task` with `driver: true`, the marker the plane records for a
+// handback a driver made on a dead session's behalf (CLA-707, CLA-556), and no
+// `outcome`: the session may have written one, and this call is a handback, not
+// a report.
 //
-// It is separate from Release rather than a flag on it so the daemon's own
-// long-standing handback keeps the exact wire shape it has always had: a driver
-// marker is a claim about who ended the run, and the caller must decide it.
+// It is the ONLY release form this client offers: a session's own voluntary
+// release is the session's MCP call, so the driver can never post one that looks
+// like it (see the Releaser doc).
 func (r *mcpReleaser) ReleaseDriver(ctx context.Context, taskID, runID string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release driver: taskId and runId are both required")
@@ -316,8 +305,8 @@ func (r *mcpReleaser) ReleaseDriver(ctx context.Context, taskID, runID string) e
 // ExpireLease ends the run holding taskID now and leaves the task to the same
 // paths a natural expiry would: an immediate takeover when a branch is
 // recorded, `ready` when there is none (CLA-707). It is the handback for a
-// session that died holding PUSHED work, where Release is forbidden because it
-// would discard the takeover hand-off.
+// session that died holding PUSHED work, where ReleaseDriver is forbidden
+// because it would discard the takeover hand-off.
 //
 // `driver: true` marks it as a driver's call for a dead session, which is what
 // both the loop (on an abandoned phase) and the supervisor (on a child exit) are

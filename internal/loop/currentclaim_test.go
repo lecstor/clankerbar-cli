@@ -10,8 +10,12 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -150,6 +154,59 @@ func TestCurrentClaim_IsWrittenMidSessionAndClearedOnRelease(t *testing.T) {
 	}
 	if _, err := ReadCurrentClaim(d.state); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("record survived a release (err=%v); a supervisor would hand back a claim the driver already handed back", err)
+	}
+}
+
+// --- the driver's release handback ------------------------------------------
+
+// wireReleaser narrows a real plane client to plane.Releaser alone. The drain
+// and seam code type-asserts a Target.Releaser for TaskStateSource and friends,
+// and an embedded interface only promotes its own methods — so wrapping here
+// keeps this test on the unwired-plane path it is not about, while the handback
+// still travels the real client's HTTP wire.
+type wireReleaser struct{ plane.Releaser }
+
+// CLA-556: the driver's release of a claim whose session ended must carry the
+// `driver` marker, so the plane can tell it from a session's own hand-back. A
+// fake cannot prove this — the marker only exists on the wire — so the handback
+// runs through the real client against a recording server. Before CLA-556 the
+// body carried no `driver` at all and read as a session hand-back.
+func TestReleaseHeldClaim_CarriesTheDriverMarkerOnTheWire(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		body map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(raw, &parsed)
+		mu.Lock()
+		body = parsed
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[{"type":"text","text":"{}"}]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	rel := wireReleaser{plane.New(srv.URL+"/mcp/demo", "k-1")}
+	d := &Driver{}
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, held(okResult(1, 0), openClaim()), false); !released {
+		t.Fatal("the handback did not land: the marker cannot be checked on a request that was never made")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	params, _ := body["params"].(map[string]any)
+	if params["name"] != "release_task" {
+		t.Fatalf("tool = %v, want release_task (body: %+v)", params["name"], body)
+	}
+	args, _ := params["arguments"].(map[string]any)
+	if args["driver"] != true {
+		t.Errorf("arguments = %+v, want driver=true — a release the driver makes on a dead session's behalf must not read as a session hand-back", args)
+	}
+	// `expire` is the pushed-work handback; this claim has no branch, so sending
+	// it would be the wrong disposition even though both forms are marked.
+	if _, present := args["expire"]; present {
+		t.Errorf("the release carried expire: %+v", args)
 	}
 }
 
