@@ -28,9 +28,25 @@ package config
 // repo with no staging branch (the makesPDF plugins; lecstor/makespdf, whose
 // PRs target integration) was told to open its PR against a branch that does
 // not exist. The target is now {{prBase}}, resolved per repo by the driver.
+//
+// CLA-536: this phase's session is the last one to work in the tree, and the
+// close-out that merges may not remove a tree it did not create, so the reclaim
+// instruction has to live here or nowhere. It sits after the PR step because
+// until the branch is pushed and the PR open the tree may hold the only copy of
+// the work, and before the hand-off because that must stay the emphatic final
+// call (CLA-384). `branch -d`, never `-D` or `--force`: a refusal is the guard
+// saying the tree still holds something origin lacks.
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
 	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
-	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
+	"hand-off below. AFTER the PR is confirmed open - and before the hand-off below moves the task to in_review - " +
+	"reclaim the tree this run worked in: run `git worktree remove` " +
+	"on this run's worktree (the path `git worktree list` shows for branch " + PhaseBranchPlaceholder + ") and " +
+	"then `git branch -d " + PhaseBranchPlaceholder + "` to delete its local branch. Run both from the repo's " +
+	"main checkout - the first path `git worktree list` prints - never from inside the tree itself, which git " +
+	"deletes under you. Never pass `--force` or `-D`: a refusal means the tree or branch still holds something " +
+	"you have not pushed, and that refusal is the guard, not an obstacle. Expect gitignored local state to go " +
+	"with the tree - that is collateral, not work - and reclaim only this run's own tree, never another task's " +
+	"worktree. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"submit_for_review(taskId, runId, outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
 	"session that leaves it out has not handed anything over. The same call's risk declaration uses touches: [] " +
