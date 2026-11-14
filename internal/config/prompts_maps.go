@@ -35,12 +35,13 @@ const mapsSessionChecklist = "## Checklist\n" +
 
 // MapsSessionFirstTurn is the section appended to the phase's review brief for
 // the first notes turn: what the maps are, how to read an M and an F item, the
-// checklist, and chunk 1 of the items.
+// checklist, and chunk 1 of the items. hunksEmbedded says each M item carries
+// its hunk, so the instructions send the model to the tools only for context.
 //
 // base is the commit the per-file diff starts from (the runner's merge-base),
 // filled in literally: this text is appended after the driver's placeholder
 // substitution, so a placeholder here would reach the session unsubstituted.
-func MapsSessionFirstTurn(base string, chunk, chunks int, items string) string {
+func MapsSessionFirstTurn(base string, chunk, chunks int, items string, hunksEmbedded bool) string {
 	var b strings.Builder
 	b.WriteString("## How this review works\n")
 	b.WriteString("The runner has mapped the change into items:\n")
@@ -51,8 +52,15 @@ func MapsSessionFirstTurn(base string, chunk, chunks int, items string) string {
 		"you will be asked to turn your notes into findings. Nothing you write in a note is reported as it stands, " +
 		"so note everything you see: problems, doubts, things that look inconsistent or untested, however small. " +
 		"A note that says only \"fine\" should mean you checked and found nothing.\n\n")
-	b.WriteString("For an `M` item: read the region at head with enough surrounding code to understand it, and its " +
-		"diff. Compare it with sibling code that does the same job elsewhere. Apply the checklist below.\n\n")
+	if hunksEmbedded {
+		b.WriteString("For an `M` item: its hunk's diff is in the fenced block under the item. Read that first, " +
+			"then read the region at head with enough surrounding code to understand it. Use the tools for the " +
+			"context the hunk does not show (callers, siblings, the rest of the file), not to re-fetch the diff. " +
+			"Compare it with sibling code that does the same job elsewhere. Apply the checklist below.\n\n")
+	} else {
+		b.WriteString("For an `M` item: read the region at head with enough surrounding code to understand it, and its " +
+			"diff. Compare it with sibling code that does the same job elsewhere. Apply the checklist below.\n\n")
+	}
 	b.WriteString("For an `F` item: read the definition, then each listed use, and compare: argument count, order " +
 		"and types against the parameters; object fields and prop names written against those read; optional " +
 		"against required; sync against async (missing await, unhandled promise, a goroutine or error that is " +

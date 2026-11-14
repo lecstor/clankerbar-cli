@@ -55,24 +55,50 @@ type AddedLine struct {
 // built for, but its removed declarations still matter. A rename records the
 // source path in RenamedFrom, where the base content still lives.
 func ParseDiff(diff string) []FileDiff {
-	var files []FileDiff
+	files, _ := parseDiff(diff)
+	return files
+}
+
+// parseDiff is ParseDiff with each attached hunk's raw text returned alongside,
+// in the same order the hunks attach to files. Deleted files' hunks attach to no
+// FileDiff, so they contribute no text either.
+//
+// The raw text is captured here rather than reconstructed from Hunk because the
+// context and deleted lines the diff carried are exactly what an embedded hunk
+// must show; ParseDiff's public shape stays free of prompt-only data.
+func parseDiff(diff string) (files []FileDiff, texts []string) {
 	fileIdx := -1
 	hunkIdx := -1
 	inHunk := false
 	line := 0
 	oldPath := ""
 	renamedFrom := ""
+	var hunkLines []string
+
+	// flushHunk stores the hunk body captured so far. A trailing newline in the
+	// diff shows up as one empty split element, not as a context line, so it is
+	// trimmed rather than embedded as a blank line.
+	flushHunk := func() {
+		if fileIdx < 0 || hunkIdx < 0 || hunkIdx >= len(files[fileIdx].Hunks) || hunkLines == nil {
+			hunkLines = nil
+			return
+		}
+		texts = append(texts, strings.TrimRight(strings.Join(hunkLines, "\n"), "\n"))
+		hunkLines = nil
+	}
 
 	for _, raw := range strings.Split(diff, "\n") {
 		switch {
 		case strings.HasPrefix(raw, "diff --git "):
 			// Close the previous file's hunk so its trailing marker or the
 			// next file's "---" header cannot be read as hunk context.
+			flushHunk()
 			inHunk = false
 			hunkIdx = -1
 			oldPath = ""
 			renamedFrom = ""
 		case fileIdx >= 0 && hunkHeaderRE.MatchString(raw):
+			flushHunk()
 			m := hunkHeaderRE.FindStringSubmatch(raw)
 			start, _ := strconv.Atoi(m[1])
 			count := 1
@@ -87,7 +113,9 @@ func ParseDiff(diff string) []FileDiff {
 			hunkIdx = len(files[fileIdx].Hunks) - 1
 			inHunk = true
 			line = start
+			hunkLines = []string{raw}
 		case inHunk && hunkIdx >= 0:
+			hunkLines = append(hunkLines, raw)
 			// The body comes before the header prefixes: an added content line
 			// "-- foo" becomes "--- foo" once its '+' prefix is applied, and a
 			// deleted "++ foo" becomes "+++ foo", so those are content here.
@@ -108,6 +136,7 @@ func ParseDiff(diff string) []FileDiff {
 		case strings.HasPrefix(raw, "--- "):
 			oldPath = stripDiffPath(raw[4:])
 		case strings.HasPrefix(raw, "+++ "):
+			flushHunk()
 			path := stripDiffPath(raw[4:])
 			inHunk = false
 			hunkIdx = -1
@@ -124,7 +153,8 @@ func ParseDiff(diff string) []FileDiff {
 			fileIdx = len(files) - 1
 		}
 	}
-	return files
+	flushHunk()
+	return files, texts
 }
 
 // stripDiffPath removes the a/ or b/ prefix git puts on a diff header's path.
