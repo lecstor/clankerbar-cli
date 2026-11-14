@@ -120,6 +120,31 @@ func TestCopilotParse_modelMetricsFallback(t *testing.T) {
 	}
 }
 
+// A zero tokenDetails field is not evidence of a hole: the CLI reported, the
+// report happened to be zero. UsageReported must stay true so the driver bounds
+// only attempts that reported NOTHING (CLA-288).
+func TestCopilotParse_zeroUsageIsStillAReport(t *testing.T) {
+	res := copilotParsed(`{"type":"session.usage_checkpoint","data":{"accountingSnapshot":{"tokenDetails":{"input":{"tokenCount":0},"output":{"tokenCount":0},"cache_read":{"tokenCount":0},"cache_write":{"tokenCount":0}}}}}`)
+	if !res.UsageReported {
+		t.Error("UsageReported = false for a checkpoint that carried an all-zero report")
+	}
+	if res.Tokens != 0 {
+		t.Errorf("Tokens = %d, want 0", res.Tokens)
+	}
+}
+
+// A zero tokenDetails with real modelMetrics: the fallback has to run, or the
+// budget would see a session that reported nothing.
+func TestCopilotParse_zeroTokenDetailsFallsBackToModelMetrics(t *testing.T) {
+	res := copilotParsed(`{"type":"session.usage_checkpoint","data":{"totalNanoAiu":5000000000,"accountingSnapshot":{"tokenDetails":{"input":{"tokenCount":0},"output":{"tokenCount":0},"cache_read":{"tokenCount":0},"cache_write":{"tokenCount":0}},"modelMetrics":{"m1":{"usage":{"inputTokens":80,"outputTokens":20,"cacheReadTokens":30}}}}}}`)
+	if want := (80 - 30) + 20 + 30; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d from the modelMetrics fallback", res.Tokens, want)
+	}
+	if got := res.Raw["ai_credits"]; got != float64(5) {
+		t.Errorf("ai_credits = %v, want 5", got)
+	}
+}
+
 func TestCopilotParse_empty(t *testing.T) {
 	res := copilotParsed("")
 	if res.FinalMessage != "" || res.Tokens != 0 || res.UsageReported {
@@ -351,6 +376,16 @@ func TestCopilotDetectLimit(t *testing.T) {
 		{
 			name: "service quota message",
 			res:  Result{Stderr: "Error: quota exceeded - upgrade or enable additional usage"},
+			want: true, stop: true, reason: "budget_exhausted",
+		},
+		{
+			name: "exceeded the included allowance",
+			res:  Result{Stderr: "You have exceeded your included AI credits for this month."},
+			want: true, stop: true, reason: "budget_exhausted",
+		},
+		{
+			name: "insufficient credits",
+			res:  Result{Stdout: `{"type":"session.error","data":{"message":"Insufficient AI credits"}}`},
 			want: true, stop: true, reason: "budget_exhausted",
 		},
 		{

@@ -29,9 +29,9 @@ func init() { Register(copilot{}) }
 //   - `--additional-mcp-config @<file>` registers the operator's `mcpServers`
 //     file for one session, which is why this adapter reads `mcp_config_path` in
 //     Claude's schema: the shapes are the same object.
-//   - COPILOT_HOME is the config/state dir (the COPILOT_CONFIG_DIR analogue);
-//     auth lives in the OS keychain or an env token, so a pinned home is not a
-//     pinned login.
+//   - COPILOT_HOME is the config/state dir (the CLAUDE_CONFIG_DIR / CODEX_HOME
+//     analogue); auth lives in the OS keychain or an env token, so a pinned home
+//     is not a pinned login.
 //   - `--usage-output-file` also exists and reports AI credits; the JSONL
 //     checkpoint carries the same figures, so no temp file is written.
 //
@@ -234,8 +234,7 @@ type copilotEventData struct {
 	ToolRequests []copilotToolRequest `json:"toolRequests"`
 
 	// session.error / session.warning
-	ErrorType string `json:"errorType"`
-	Message   string `json:"message"`
+	Message string `json:"message"`
 
 	// tool.execution_start / tool.execution_complete
 	ToolCallID    string             `json:"toolCallId"`
@@ -268,11 +267,12 @@ type copilotToolResult struct {
 	Content string `json:"content"`
 }
 
-// copilotAccounting is the session's cumulative usage snapshot. The counters are
-// INCLUSIVE by construction in one place only: `tokenDetails` is already
-// disjoint (its input excludes cache reads and writes - a real session reported
-// input 15811 + cache_read 29824 against model usage.inputTokens 45635), so the
-// four buckets are copied and nothing is subtracted.
+// copilotAccounting is the session's cumulative usage snapshot.
+// `tokenDetails` is already disjoint - its input excludes cache reads and writes
+// (a real session reported input 15811 + cache_read 29824 against model
+// usage.inputTokens 45635) - so the four buckets are copied unchanged. The
+// modelMetrics fallback is INCLUSIVE of the cache buckets and is normalised in
+// noteUsage.
 type copilotAccounting struct {
 	TotalNanoAiu int64          `json:"totalNanoAiu"`
 	TokenDetails *copilotTokens `json:"tokenDetails"`
@@ -321,12 +321,12 @@ func (p *copilotParse) line(line []byte, res *Result, console io.Writer) {
 		return // partial/non-JSON line - skip
 	}
 	d := ev.Data
-	switch {
-	case ev.Type == "session.start":
+	switch ev.Type {
+	case "session.start":
 		if d.SessionID != "" {
 			p.raw(res)["session_id"] = d.SessionID
 		}
-	case ev.Type == "assistant.message":
+	case "assistant.message":
 		if d.Content != "" {
 			p.lastText = d.Content
 			if d.Phase == "final_answer" {
@@ -336,11 +336,11 @@ func (p *copilotParse) line(line []byte, res *Result, console io.Writer) {
 		for _, req := range d.ToolRequests {
 			p.noteRequest(req.ToolCallID, req.Name, req.Arguments, req.MCPServerName, req.MCPToolName, res)
 		}
-	case ev.Type == "tool.execution_start":
+	case "tool.execution_start":
 		p.noteRequest(d.ToolCallID, "", d.Arguments, d.MCPServerName, d.MCPToolName, res)
-	case ev.Type == "tool.execution_complete":
+	case "tool.execution_complete":
 		p.noteResult(d, res, console)
-	case ev.Type == "session.mcp_server_status_changed":
+	case "session.mcp_server_status_changed":
 		if d.ServerName != "" {
 			if p.mcp == nil {
 				p.mcp = map[string]string{}
@@ -351,7 +351,7 @@ func (p *copilotParse) line(line []byte, res *Result, console io.Writer) {
 			}
 			p.mcp[d.ServerName] = status
 		}
-	case ev.Type == "session.usage_checkpoint":
+	case "session.usage_checkpoint":
 		p.noteUsage(d)
 	}
 }
@@ -378,12 +378,13 @@ func (p *copilotParse) noteUsage(d copilotEventData) {
 	for _, m := range a.ModelMetrics {
 		p.reason += m.Usage.ReasoningTokens
 	}
-	if a.TokenDetails != nil {
+	if td := a.TokenDetails; td != nil &&
+		td.Input.TokenCount+td.Output.TokenCount+td.CacheRead.TokenCount+td.CacheWrite.TokenCount > 0 {
 		p.tokens = TokenUsage{
-			Input:      a.TokenDetails.Input.TokenCount,
-			Output:     a.TokenDetails.Output.TokenCount,
-			CacheRead:  a.TokenDetails.CacheRead.TokenCount,
-			CacheWrite: a.TokenDetails.CacheWrite.TokenCount,
+			Input:      td.Input.TokenCount,
+			Output:     td.Output.TokenCount,
+			CacheRead:  td.CacheRead.TokenCount,
+			CacheWrite: td.CacheWrite.TokenCount,
 		}
 		return
 	}
@@ -483,7 +484,7 @@ func (p *copilotParse) finish(res *Result) {
 }
 
 // copilotErrorText collects the CLI's OWN diagnostic text: all of stderr, the
-// stdout lines that are not events, and the events that carry an error. The
+// stdout lines that are not events, and the CLI's session-level error events. The
 // agent's narration (assistant.message content) and any tool output are
 // EXCLUDED: a backlog task body quoting "Plan: 100% used" must not stop the run
 // on a limit that never happened (the CLA-258 class). warnings are excluded too,
@@ -540,9 +541,11 @@ func buildCopilotErrorText(res Result) string {
 // 75% of a weekly allowance contains both and is not a limit.
 var copilotLimitRe = regexp.MustCompile(`(?i)` +
 	`plan:\s*100%\s*used` +
-	`|out of (ai )?credits|no (ai )?credits (left|remaining)|(ai )?credits? (exhausted|have run out)` +
-	`|(ai )?credit limit (reached|exceeded)` +
-	`|quota (exceeded|exhausted)` +
+	`|(?:out of|insufficient|no) (?:ai )?credits(?: left| remaining)?` +
+	`|(?:ai )?credits? (?:are |is )?(?:exhausted|depleted|used up|have run out)` +
+	`|(?:ai )?credit limit (?:reached|exceeded)` +
+	`|exceeded (?:your|the) (?:included )?(?:ai )?credits?` +
+	`|quota (?:exceeded|exhausted)` +
 	`|session limit reached` +
 	`|reached your weekly rate limit|hit your session rate limit|hit the rate limit for this model|hit your rate limit`)
 
