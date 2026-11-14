@@ -245,8 +245,8 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		// the budget exhausted only THIS target: carry on with the siblings
 		// (CLA-480), because one project's ceiling must not take the daemon down.
 		if stop {
-			if d.budgetStopped[d.cursor] {
-				d.budgetStopped[d.cursor] = false
+			if d.budgetStoppedAt(d.cursor) {
+				d.clearBudgetStopped(d.cursor)
 				log.Printf("%sbudget exhausted mid-drain — this project stops draining; the other projects continue", d.prefix(d.cursor))
 			} else {
 				return nil

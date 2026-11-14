@@ -217,8 +217,57 @@ func (d *Driver) targetBudgetTrip(i int, runElapsed time.Duration) budgetVerdict
 }
 
 // exhaustedAt reports whether target i has reached its ceiling for this run.
+// The lock is not decorative: a parallel panel's members run the mid-drain
+// breaker on their own goroutines (CLA-697), and the lease renewer beacons
+// fleetState — which reads this — while they do.
 func (d *Driver) exhaustedAt(i int) bool {
-	return i >= 0 && i < len(d.exhausted) && d.exhausted[i]
+	if i < 0 || i >= len(d.exhausted) {
+		return false
+	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	return d.exhausted[i]
+}
+
+// markExhausted flags the given targets as done for the run.
+func (d *Driver) markExhausted(indices []int) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	for _, i := range indices {
+		if i >= 0 && i < len(d.exhausted) {
+			d.exhausted[i] = true
+		}
+	}
+}
+
+// markBudgetStopped records that a mid-drain check was the reason target i's
+// drain ended. budgetStoppedAt reads it back for Run's stop handling, and
+// clearBudgetStopped consumes it once the drain has been accounted for.
+func (d *Driver) markBudgetStopped(i int) {
+	if i < 0 || i >= len(d.budgetStopped) {
+		return
+	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.budgetStopped[i] = true
+}
+
+func (d *Driver) budgetStoppedAt(i int) bool {
+	if i < 0 || i >= len(d.budgetStopped) {
+		return false
+	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	return d.budgetStopped[i]
+}
+
+func (d *Driver) clearBudgetStopped(i int) {
+	if i < 0 || i >= len(d.budgetStopped) {
+		return
+	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.budgetStopped[i] = false
 }
 
 // allExhausted reports whether every target has reached its ceiling for this
@@ -244,11 +293,9 @@ func (d *Driver) allExhausted() bool {
 // the siblings instead of reading the drain's stop as a run-wide stop.
 func (d *Driver) markBudgetExhausted(ti int, v budgetVerdict, midDrain bool) {
 	if ti >= 0 && ti < len(d.targets) && d.targets[ti].Cfg != nil {
-		if ti < len(d.exhausted) {
-			d.exhausted[ti] = true
-		}
-		if midDrain && ti < len(d.budgetStopped) {
-			d.budgetStopped[ti] = true
+		d.markExhausted([]int{ti})
+		if midDrain {
+			d.markBudgetStopped(ti)
 		}
 		log.Printf("%sbudget reached: %s — this project is exhausted for the rest of this run; the other projects keep draining (tokens=%d cost=$%.2f elapsed=%s)",
 			d.prefix(ti), v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
@@ -256,21 +303,21 @@ func (d *Driver) markBudgetExhausted(ti int, v budgetVerdict, midDrain bool) {
 	}
 
 	var governed []string
+	var indices []int
 	for i := range d.targets {
 		if d.targets[i].Cfg != nil {
 			continue
 		}
-		if i < len(d.exhausted) {
-			d.exhausted[i] = true
-		}
+		indices = append(indices, i)
 		name := d.targets[i].Name
 		if name == "" {
 			name = "this project"
 		}
 		governed = append(governed, name)
 	}
-	if midDrain && ti >= 0 && ti < len(d.budgetStopped) {
-		d.budgetStopped[ti] = true
+	d.markExhausted(indices)
+	if midDrain {
+		d.markBudgetStopped(ti)
 	}
 	log.Printf("budget reached: %s — the local budget governs %s, so those projects are exhausted for the rest of this run; projects with a stored budget keep draining (tokens=%d cost=$%.2f elapsed=%s)",
 		v.dim, strings.Join(governed, ", "), v.tokens, v.cost, v.elapsed.Round(time.Second))
@@ -283,21 +330,19 @@ func (d *Driver) markBudgetExhausted(ti int, v budgetVerdict, midDrain bool) {
 // others carry on.
 func (d *Driver) exhaustForWait(ti int, reason string) {
 	if ti >= 0 && ti < len(d.targets) && d.targets[ti].Cfg != nil {
-		if ti < len(d.exhausted) {
-			d.exhausted[ti] = true
-		}
+		d.markExhausted([]int{ti})
 		log.Printf("%s%s — this project is exhausted for the rest of this run; the other projects keep draining", d.prefix(ti), reason)
 	} else {
+		var indices []int
 		for i := range d.targets {
-			if d.targets[i].Cfg == nil && i < len(d.exhausted) {
-				d.exhausted[i] = true
+			if d.targets[i].Cfg == nil {
+				indices = append(indices, i)
 			}
 		}
+		d.markExhausted(indices)
 		log.Printf("%s — the projects under the local budget are exhausted for the rest of this run; projects with a stored budget keep draining", reason)
 	}
-	if ti >= 0 && ti < len(d.budgetStopped) {
-		d.budgetStopped[ti] = true
-	}
+	d.markBudgetStopped(ti)
 }
 
 // sweepBudgets judges every target not yet exhausted against the budget in
