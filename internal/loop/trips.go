@@ -178,9 +178,13 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		// The baseline the resume signal is measured against: the open-question
 		// count at the last poll, BEFORE the question below raises it by one.
 		d.fleetOpenQ[ti] = d.openQs[ti]
+		why := fmt.Sprintf("Each task died producing nothing (final step reason %q, no branch recorded) before this", deadReason(res))
+		if res != nil && res.ReportResumeFailed != "" {
+			why = "Each task's session delivered its work but its done report could not be re-emitted (the provider stream kept hanging) before this"
+		}
 		body := fmt.Sprintf(
-			"**%d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks.** Each task died producing nothing (final step reason %q, no branch recorded) before this, so the driver paused this project rather than burning more sessions against a provider that is already known to be failing.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
-			d.fleetDead[ti], deadReason(res), d.state.Path())
+			"**%d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks.** %s, so the driver paused this project rather than burning more sessions against a provider that is already known to be failing.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
+			d.fleetDead[ti], why, d.state.Path())
 		options := []string{
 			"The provider recovered — resume draining this project",
 			"Still investigating — I will answer when it is safe to resume",
@@ -283,8 +287,14 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 	// pushed, so "no branch recorded" may be false for it and the finish reason
 	// says nothing: the cause names what happened instead. The cause is the
 	// LAST attempt's, which is the one the operator is being asked about.
+	// CLA-877: a report-resume failure delivered its work too — only the reply
+	// that re-emits the done report kept failing — so it is named for what it
+	// is rather than as a session that produced nothing.
 	death := fmt.Sprintf("died producing nothing (final step reason %q, no branch recorded)", deadReason(res))
-	if res.ToolLoop != "" {
+	switch {
+	case res.ReportResumeFailed != "":
+		death = fmt.Sprintf("delivered its work but could not re-emit its done report (%s)", res.ReportResumeFailed)
+	case res.ToolLoop != "":
 		death = fmt.Sprintf("was killed by the driver (%s)", res.ToolLoop)
 	}
 	pk, ok := t.Releaser.(plane.ParkAPI)
