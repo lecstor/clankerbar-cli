@@ -661,6 +661,12 @@ func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimi
 		res, err = run(model, models[i:])
 		lim := a.DetectLimit(res)
 		if !lim.Limited {
+			// The adapter may have switched routes MID-session and finished the
+			// work on a later one; name that route too, or the attempt line reads
+			// as if the model it started on did the job.
+			if fin := strings.TrimSpace(harness.RouteFinished(res)); fin != "" && fin != name {
+				log.Printf("conflict: %s PR %s - the session finished on %s after a route switch", label, req.PR, fin)
+			}
 			return res, err
 		}
 		// The route the attempt actually ENDED on. The adapter may have switched
