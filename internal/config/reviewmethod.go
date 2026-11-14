@@ -36,6 +36,14 @@ const (
 	// DefaultMapsSessionFlowMax is the flow map's item cap. The change map has
 	// none: a reviewer that misses a changed region misses it entirely.
 	DefaultMapsSessionFlowMax = 40
+	// DefaultMapsSessionHunkBytesPerItem caps the hunk text embedded under one
+	// M item. The benchmarked PR's hunks are far under it; a very large generated
+	// file is cut at a line boundary and the item names the command for the rest.
+	DefaultMapsSessionHunkBytesPerItem = 4096
+	// DefaultMapsSessionHunkBytesTotal caps the hunk text embedded across the
+	// change map (~15k tokens). Past it the remaining items stay plain, so the
+	// embedded diffs replace reads without crowding out the brief and the notes.
+	DefaultMapsSessionHunkBytesTotal = 61440
 )
 
 // MapsSessionOptions configures the maps-session review method. Every field has
@@ -60,6 +68,42 @@ type MapsSessionOptions struct {
 	// FlowMax caps the flow map's items (uses beyond the cap are summarised in
 	// an unnumbered line). Zero selects DefaultMapsSessionFlowMax.
 	FlowMax int `json:"flow_max,omitempty"`
+
+	// EmbedHunks carries each M item's hunk in the prompt. It is off by default:
+	// a harness that batches its own reads (Claude) gains little, while a
+	// step-heavy one (DeepSeek Flash) spends its turns fetching code instead of
+	// reading it. A nil block is off.
+	EmbedHunks *EmbedHunksOptions `json:"embed_hunks,omitempty"`
+}
+
+// EmbedHunksOptions configures maps_session.embed_hunks. Zero-value budgets
+// select the defaults above, so `{"enabled": true}` is a complete profile.
+type EmbedHunksOptions struct {
+	// Enabled turns hunk embedding on. Off by default.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// MaxBytesPerItem caps the hunk text embedded under one M item. Zero
+	// selects DefaultMapsSessionHunkBytesPerItem.
+	MaxBytesPerItem int `json:"max_bytes_per_item,omitempty"`
+
+	// MaxBytesTotal caps the hunk text embedded across all M items. Zero
+	// selects DefaultMapsSessionHunkBytesTotal. The prompt is NOT chunked
+	// before it reaches a harness: opencode receives it as one argv string,
+	// and Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN), so the
+	// default's ~80 KiB first turn leaves only ~48 KiB of headroom before a
+	// raised budget fails the spawn with E2BIG.
+	MaxBytesTotal int `json:"max_bytes_total,omitempty"`
+}
+
+// Resolved returns a copy with the budget defaults filled in.
+func (o EmbedHunksOptions) Resolved() EmbedHunksOptions {
+	if o.MaxBytesPerItem == 0 {
+		o.MaxBytesPerItem = DefaultMapsSessionHunkBytesPerItem
+	}
+	if o.MaxBytesTotal == 0 {
+		o.MaxBytesTotal = DefaultMapsSessionHunkBytesTotal
+	}
+	return o
 }
 
 // Resolved returns a copy with the defaults filled and model names trimmed.
@@ -72,6 +116,10 @@ func (o MapsSessionOptions) Resolved() MapsSessionOptions {
 	}
 	o.NotesModel = strings.TrimSpace(o.NotesModel)
 	o.FindingsModel = strings.TrimSpace(o.FindingsModel)
+	if o.EmbedHunks != nil {
+		e := o.EmbedHunks.Resolved()
+		o.EmbedHunks = &e
+	}
 	return o
 }
 
@@ -164,6 +212,14 @@ func (c *Config) validateReviewMethods() error {
 		}
 		if n := ph.MapsSessionDefaults().FlowMax; n <= 0 {
 			return fmt.Errorf("%s: maps_session.flow_max must be positive, got %d", step, n)
+		}
+		if eh := ph.MapsSessionDefaults().EmbedHunks; eh != nil && eh.Enabled {
+			if eh.MaxBytesPerItem <= 0 {
+				return fmt.Errorf("%s: maps_session.embed_hunks.max_bytes_per_item must be positive, got %d", step, eh.MaxBytesPerItem)
+			}
+			if eh.MaxBytesTotal <= 0 {
+				return fmt.Errorf("%s: maps_session.embed_hunks.max_bytes_total must be positive, got %d", step, eh.MaxBytesTotal)
+			}
 		}
 	}
 	return nil

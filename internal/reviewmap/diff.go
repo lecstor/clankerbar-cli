@@ -55,24 +55,50 @@ type AddedLine struct {
 // built for, but its removed declarations still matter. A rename records the
 // source path in RenamedFrom, where the base content still lives.
 func ParseDiff(diff string) []FileDiff {
-	var files []FileDiff
+	files, _ := parseDiff(diff)
+	return files
+}
+
+// parseDiff is ParseDiff with each attached hunk's raw text returned alongside,
+// in the same order the hunks attach to files. Deleted files' hunks attach to no
+// FileDiff, so they contribute no text either.
+//
+// The raw text is captured here rather than reconstructed from Hunk because the
+// context and deleted lines the diff carried are exactly what an embedded hunk
+// must show; ParseDiff's public shape stays free of prompt-only data.
+func parseDiff(diff string) (files []FileDiff, texts []string) {
 	fileIdx := -1
 	hunkIdx := -1
 	inHunk := false
 	line := 0
 	oldPath := ""
 	renamedFrom := ""
+	var hunkLines []string
+
+	// flushHunk stores the hunk body captured so far. A trailing newline in the
+	// diff shows up as one empty split element, not as a context line, so it is
+	// trimmed rather than embedded as a blank line.
+	flushHunk := func() {
+		if fileIdx < 0 || hunkIdx < 0 || hunkIdx >= len(files[fileIdx].Hunks) || hunkLines == nil {
+			hunkLines = nil
+			return
+		}
+		texts = append(texts, strings.TrimRight(strings.Join(hunkLines, "\n"), "\n"))
+		hunkLines = nil
+	}
 
 	for _, raw := range strings.Split(diff, "\n") {
 		switch {
 		case strings.HasPrefix(raw, "diff --git "):
 			// Close the previous file's hunk so its trailing marker or the
 			// next file's "---" header cannot be read as hunk context.
+			flushHunk()
 			inHunk = false
 			hunkIdx = -1
 			oldPath = ""
 			renamedFrom = ""
 		case fileIdx >= 0 && hunkHeaderRE.MatchString(raw):
+			flushHunk()
 			m := hunkHeaderRE.FindStringSubmatch(raw)
 			start, _ := strconv.Atoi(m[1])
 			count := 1
@@ -87,7 +113,9 @@ func ParseDiff(diff string) []FileDiff {
 			hunkIdx = len(files[fileIdx].Hunks) - 1
 			inHunk = true
 			line = start
+			hunkLines = []string{raw}
 		case inHunk && hunkIdx >= 0:
+			hunkLines = append(hunkLines, raw)
 			// The body comes before the header prefixes: an added content line
 			// "-- foo" becomes "--- foo" once its '+' prefix is applied, and a
 			// deleted "++ foo" becomes "+++ foo", so those are content here.
@@ -104,10 +132,11 @@ func ParseDiff(diff string) []FileDiff {
 				line++
 			}
 		case strings.HasPrefix(raw, "rename from "):
-			renamedFrom = strings.TrimSpace(strings.TrimPrefix(raw, "rename from "))
+			renamedFrom = diffHeaderPath(strings.TrimPrefix(raw, "rename from "))
 		case strings.HasPrefix(raw, "--- "):
 			oldPath = stripDiffPath(raw[4:])
 		case strings.HasPrefix(raw, "+++ "):
+			flushHunk()
 			path := stripDiffPath(raw[4:])
 			inHunk = false
 			hunkIdx = -1
@@ -124,14 +153,82 @@ func ParseDiff(diff string) []FileDiff {
 			fileIdx = len(files) - 1
 		}
 	}
-	return files
+	flushHunk()
+	return files, texts
 }
 
-// stripDiffPath removes the a/ or b/ prefix git puts on a diff header's path.
+// stripDiffPath removes the a/ or b/ prefix git puts on a ---/+++ header's
+// path. The prefix sits inside git's quoting ("b/caf\303\251.ts"), so the path
+// is decoded first.
 func stripDiffPath(s string) string {
-	s = strings.TrimSpace(s)
+	s = diffHeaderPath(s)
 	if strings.HasPrefix(s, "a/") || strings.HasPrefix(s, "b/") {
 		return s[2:]
 	}
 	return s
+}
+
+// diffHeaderPath decodes one path taken from a diff header, padding included.
+func diffHeaderPath(s string) string {
+	s = strings.TrimSpace(s)
+	if u, ok := unquoteDiffPath(s); ok {
+		return u
+	}
+	return s
+}
+
+// unquoteDiffPath decodes git's C-style quoted path form: git quotes a path
+// holding non-ASCII bytes (core.quotePath's default), a quote, a backslash or a
+// control character. Decoding is byte-wise because git escapes each byte of a
+// UTF-8 path as \NNN — a rune-wise unquote would turn "café" into mojibake.
+// ok is false when s is not that form, or carries an escape git does not emit;
+// the caller then keeps the raw text.
+func unquoteDiffPath(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return s, false
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 1; i < len(s)-1; i++ {
+		c := s[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(s)-1 {
+			return s, false
+		}
+		switch s[i] {
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'v':
+			b.WriteByte('\v')
+		case '\\', '"':
+			b.WriteByte(s[i])
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			if i+2 >= len(s)-1 {
+				return s, false
+			}
+			n, err := strconv.ParseUint(s[i:i+3], 8, 8)
+			if err != nil {
+				return s, false
+			}
+			b.WriteByte(byte(n))
+			i += 2
+		default:
+			return s, false
+		}
+	}
+	return b.String(), true
 }

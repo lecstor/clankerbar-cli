@@ -35,20 +35,22 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 	// exit that would otherwise stop the daemon is itself part of the silent
 	// death, not a verdict.
 	//
-	// The retry is scoped to the phase the walk STARTED at (`i == start`): a
-	// retry cannot re-seed a resumed phase — invocationFor only substitutes the
-	// task/run placeholders and sets ResumeClaim when the predecessor claim is
-	// present, which the dead handback cleared — so retrying a dead RESUMED
-	// phase would spawn a session whose brief still carries the literal
+	// A retry cannot re-seed a resumed phase after the dead handback: invocationFor
+	// only substitutes the task/run placeholders and sets ResumeClaim when the
+	// predecessor claim is present, which the handback cleared. Retrying a dead
+	// RESUMED phase would spawn a session whose brief still carries the literal
 	// {{taskId}}/{{runId}} and whose handback, salvage and delivery checks are
-	// all switched off. A session-claimed start re-claims in its own session; a
-	// runner-claimed start is re-claimed by the runner before the retry. A
-	// resumed phase's dead signature still vetoes its checkpoint below (the
-	// false-premise guard applies to every phase); it just is not retried or
+	// all switched off. So the dead retry is scoped to the phase the walk
+	// STARTED at (`i == start`). A session-claimed start re-claims in its own
+	// session; a runner-claimed start is re-claimed by the runner before the
+	// retry. A resumed phase's dead signature still vetoes its checkpoint below
+	// (the false-premise guard applies to every phase); it just is not retried or
 	// parked here — the drain ends and the task returns to the queue, where a
 	// fresh claiming session retries it with a valid seed (review finding). The
 	// operator decision's "retry the implement phase N times, then park" is
-	// exactly `i == start` in the shipped [implement, review] sequence.
+	// exactly `i == start` in the shipped [implement, review] sequence. A
+	// resume-only failure is the exception (see below): it KEEPS the claim, so
+	// `prev` re-seeds it and it may retry at any non-last position.
 	//
 	// CLA-396: a dead phase feeds BOTH counters, but the per-task park is
 	// checked and taken FIRST — before the fleet counter's trip is even
@@ -72,10 +74,22 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 		if st.end.claim != nil {
 			taskID = st.end.claim.Claim.TaskID
 		}
+		// CLA-877: a resume-only failure KEPT its claim on purpose (see
+		// settleWithoutCheckpoint), so the retry resumes that same run without a
+		// re-claim. Its retry is safe in ANY phase position, not only the phase
+		// the walk started at: the kept claim is still `prev`, so invocationFor
+		// seeds the retry's brief exactly as it seeded the failed attempt's. Only
+		// the start phase carries the prep facts (s.prep), and those it keeps —
+		// minus the stale tip, dropped below.
+		resumeOnly := st.end.reportResumeFailed != "" && st.end.claim != nil && st.end.claim.Claim.Held()
+		retryable := !st.last && (s.i == s.start || resumeOnly)
 
-		if !st.last && s.i == s.start && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
+		if retryable && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
-			if st.end.toolLoop != "" {
+			switch {
+			case st.end.reportResumeFailed != "":
+				how = "failed re-emitting its done report (" + st.end.reportResumeFailed + ")"
+			case st.end.toolLoop != "":
 				how = "was killed (" + st.end.toolLoop + "), dead"
 			}
 			log.Printf("%siteration %d: the %s phase %s for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
@@ -98,12 +112,14 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			return seqBreak
 		}
 
-		if !st.last && s.i == s.start {
-			// A runner-claimed start must re-claim before the respawn: the dead
-			// phase handed the task back. The reclaim can land a DIFFERENT task
-			// when this one is gone, so the counters below follow what is
-			// actually held now, not what died.
-			if s.runnerClaimed {
+		if retryable {
+			// A runner-claimed start must re-claim before the respawn when the
+			// dead phase handed the task back. The reclaim can land a DIFFERENT
+			// task when this one is gone, so the counters below follow what is
+			// actually held now, not what died. A report-resume failure handed
+			// nothing back: its claim is still held, and re-claiming it would be
+			// a plane round trip against a live lease (and could only be refused).
+			if s.runnerClaimed && !resumeOnly {
 				if taskID == "" {
 					taskID = s.seen.TaskID
 				}
@@ -122,10 +138,30 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			} else {
 				s.deadRetries++
 			}
-			if st.end.toolLoop != "" {
+			switch {
+			case resumeOnly:
+				// The brief was captured before this phase pushed anything. The
+				// retry's context block reads WIP/branch off it, and a re-claim
+				// would have refreshed both from the plane; do the same here so
+				// the session is told the branch already carries prior work.
+				if s.claimedTask.ID != "" {
+					s.claimedTask.HasWIP = st.end.claim.Claim.HasWIP
+					if b := st.end.claim.Claim.Branch; b != "" {
+						s.claimedTask.Branch = b
+					}
+				}
+				// The prep TIP is the revision the tree held BEFORE this session
+				// pushed, so handing it to the retry would name a stale Tip (the
+				// phase never held a checkpoint, so there is no fresher one). A
+				// re-claim would have refreshed it; without one, drop it rather
+				// than misdirect the retried session.
+				s.prep.Tip = ""
+				log.Printf("%siteration %d: the %s phase delivered its work but failed re-emitting its done report (%s) — retrying it within the SAME claim %s, no handback and no reclaim (%d of %d)",
+					labelOf(t), drainNum, st.ph.Label(s.i), st.end.reportResumeFailed, claimLabel(st.end.claim.Claim), s.deadRetries, perTaskDeadBound)
+			case st.end.toolLoop != "":
 				log.Printf("%siteration %d: the %s phase was killed (%s) — retrying it (%d of %d) before any review brief sees the task",
 					labelOf(t), drainNum, st.ph.Label(s.i), st.end.toolLoop, s.deadRetries, perTaskDeadBound)
-			} else {
+			default:
 				log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
 					labelOf(t), drainNum, st.ph.Label(s.i), deadReason(st.end.claim), s.deadRetries, perTaskDeadBound)
 			}

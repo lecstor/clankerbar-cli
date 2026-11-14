@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
+	"github.com/lecstor/clankerbar-cli/internal/reviewmap"
 )
 
 // mapsTsDiff is a two-hunk TypeScript diff: two changed regions and one added
@@ -743,6 +745,232 @@ func TestMapsSessionDrain_PanelMemberWritesTheRecord(t *testing.T) {
 	for _, want := range []string{"write the record it asks for", "raisedByModel", `"findings-model"`} {
 		if !strings.Contains(findings.Prompt, want) {
 			t.Errorf("the panel member's findings turn does not carry %q:\n%s", want, findings.Prompt)
+		}
+	}
+}
+
+// TestPlanMapsSession_EmbedHunks (CLA-871): with embed_hunks enabled, each M
+// item is followed by its hunk from the same merge-base..tip diff in a fenced
+// diff block, the first-turn section says the diff is there, and F items are
+// untouched.
+func TestPlanMapsSession_EmbedHunks(t *testing.T) {
+	opts := mapsTestOpts()
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true}
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, []string{
+		"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else",
+	}, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+
+	first := plan.section
+	for _, want := range []string{
+		"M1. src/a.ts:10-12\n\n```diff\n@@ -10,3 +10,3 @@\n",
+		"-  return x + 1\n+  return x + 2",
+		"M2. src/a.ts:40-46\n\n```diff\n@@ -40,3 +40,7 @@",
+		"+export function betaThing(x: number) {",
+		"when a fenced diff block follows it",
+		"only for a file whose hunk was truncated or that is listed without one",
+	} {
+		if !strings.Contains(first, want) {
+			t.Errorf("turn 1's section does not carry %q:\n%s", want, first)
+		}
+	}
+	if strings.Contains(first, "for the diff of a file") {
+		t.Errorf("the unqualified diff-read guidance survived with hunks embedded:\n%s", first)
+	}
+	if got := strings.Count(first, "```diff"); got != 2 {
+		t.Errorf("fenced diff blocks = %d, want one per M item (2)", got)
+	}
+	if strings.Contains(first, "F1. `betaThing`\n\n```diff") {
+		t.Errorf("an F item was given an embedded diff:\n%s", first)
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksOffIsByteIdentical (CLA-871): no block, an empty
+// block and an explicit disabled block all produce exactly today's plan.
+func TestPlanMapsSession_EmbedHunksOffIsByteIdentical(t *testing.T) {
+	flow := []string{"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else"}
+	plain := planMapsSession(mapsTestOpts(), "phase", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+	for _, tc := range []struct {
+		name string
+		opts *config.EmbedHunksOptions
+	}{
+		{name: "empty block", opts: &config.EmbedHunksOptions{}},
+		{name: "explicitly disabled", opts: &config.EmbedHunksOptions{Enabled: false, MaxBytesPerItem: 1, MaxBytesTotal: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := mapsTestOpts()
+			opts.EmbedHunks = tc.opts
+			off := planMapsSession(opts, "phase", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+			if off.section != plain.section {
+				t.Errorf("turn 1's section moved with embedding off:\ngot  %q\nwant %q", off.section, plain.section)
+			}
+			if !reflect.DeepEqual(off.turns, plain.turns) {
+				t.Errorf("follow-up turns moved with embedding off:\ngot  %#v\nwant %#v", off.turns, plain.turns)
+			}
+			if off.notesTurns != plain.notesTurns {
+				t.Errorf("notes turns = %d, want %d", off.notesTurns, plain.notesTurns)
+			}
+		})
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksTotalBudgetNoteOnce (CLA-871): the total budget
+// stops embedding at an item, that item and the rest keep their plain text, and
+// the one-time note sits in the chunk where embedding stopped.
+func TestPlanMapsSession_EmbedHunksTotalBudgetNoteOnce(t *testing.T) {
+	entries := reviewmap.ChangeEntries(mapsTsDiff, reviewmap.Unlimited)
+	if len(entries) != 2 {
+		t.Fatalf("fixture change entries = %d, want 2", len(entries))
+	}
+	// Exactly the first hunk's bytes: the second cannot fit without passing it.
+	opts := mapsTestOpts()
+	opts.ChunkSize = 1
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesTotal: len(entries[0].Hunk)}
+	flow := []string{
+		"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else",
+		"`alphaThing` defined or changed at src/a.ts:10 (body changed); used at: nowhere else",
+	}
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+
+	// Chunk 1 is M1, chunk 2 is M2, then F1 and F2.
+	if !strings.Contains(plan.section, "```diff") {
+		t.Errorf("the fitting first hunk was not embedded:\n%s", plan.section)
+	}
+	if strings.Contains(plan.section, "M2.") {
+		t.Fatalf("chunk 1 should carry only M1:\n%s", plan.section)
+	}
+	second := plan.turns[0].Prompt
+	if !strings.Contains(second, "M2. src/a.ts:40-46") || strings.Contains(second, "```diff") {
+		t.Errorf("the over-budget M2 was not left plain:\n%s", second)
+	}
+	if !strings.Contains(second, "Hunk embedding stopped") || !strings.Contains(second, "from here on") {
+		t.Errorf("the chunk after the cutoff does not say embedding stopped:\n%s", second)
+	}
+	all := plan.section
+	for _, turn := range plan.turns {
+		all += "\n" + turn.Prompt
+	}
+	if got := strings.Count(all, "Hunk embedding stopped"); got != 1 {
+		t.Errorf("the budget note appears %d times, want exactly once", got)
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksTotalBudgetMidChunk (CLA-871): when chunk_size
+// puts the cutoff between two items of ONE chunk, the one-time note lands
+// between the last embedded item's closing fence and the first plain item.
+func TestPlanMapsSession_EmbedHunksTotalBudgetMidChunk(t *testing.T) {
+	entries := reviewmap.ChangeEntries(mapsTsDiff, reviewmap.Unlimited)
+	if len(entries) != 2 {
+		t.Fatalf("fixture change entries = %d, want 2", len(entries))
+	}
+	opts := mapsTestOpts() // chunk_size 2: M1 and M2 share one chunk
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesTotal: len(entries[0].Hunk)}
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+
+	if plan.notesTurns != 1 {
+		t.Fatalf("notesTurns = %d, want 1 (both M items fit one chunk)", plan.notesTurns)
+	}
+	body := plan.section
+	fence := strings.Index(body, "```\n(Hunk embedding stopped")
+	note := strings.Index(body, "(Hunk embedding stopped")
+	plain := strings.Index(body, "M2. src/a.ts:40-46")
+	if fence < 0 || note < 0 || plain < 0 {
+		t.Fatalf("chunk 1 lacks the closing-fence-then-note (%d/%d) or the plain M2 (%d):\n%s",
+			fence, note, plain, body)
+	}
+	if !(fence < note && note < plain) {
+		t.Errorf("the note is not between M1's closing fence and the plain M2: fence %d, note %d, M2 %d",
+			fence, note, plain)
+	}
+	if got := strings.Count(body, "Hunk embedding stopped"); got != 1 {
+		t.Errorf("the budget note appears %d times in the chunk, want exactly once", got)
+	}
+	if strings.Contains(body, "M2. src/a.ts:40-46\n\n```diff") {
+		t.Errorf("the over-budget M2 was embedded:\n%s", body)
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksQuotedPath (CLA-871): a file git quotes in the
+// diff header still gets its real repo path in the item and in the truncation
+// marker's git command, which names no file git can resolve otherwise.
+func TestPlanMapsSession_EmbedHunksQuotedPath(t *testing.T) {
+	const diff = `diff --git "a/caf\303\251.ts" "b/caf\303\251.ts"
+index 1111111..2222222 100644
+--- "a/caf\303\251.ts"
++++ "b/caf\303\251.ts"
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+`
+	opts := mapsTestOpts()
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 10, MaxBytesTotal: 1000}
+	plan := planMapsSession(opts, "", "abc1234", diff, nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+	for _, want := range []string{
+		"M1. café.ts:1-2",
+		"run `git diff abc1234..HEAD -- café.ts` for the rest",
+	} {
+		if !strings.Contains(plan.section, want) {
+			t.Errorf("turn 1 does not carry %q:\n%s", want, plan.section)
+		}
+	}
+	if strings.Contains(plan.section, `\303`) || strings.Contains(plan.section, `"b/`) {
+		t.Errorf("the quoted header path leaked into the prompt:\n%s", plan.section)
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksPerItemTruncation (CLA-871): a hunk over the
+// per-item budget is cut and its marker names the exact command for the rest,
+// on both M items.
+func TestPlanMapsSession_EmbedHunksPerItemTruncation(t *testing.T) {
+	opts := mapsTestOpts()
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 20}
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+	for _, want := range []string{
+		"(hunk truncated at 20 bytes: run `git diff abc1234..HEAD -- src/a.ts` for the rest)",
+	} {
+		if !strings.Contains(plan.section, want) {
+			t.Errorf("turn 1 does not carry the truncation marker %q:\n%s", want, plan.section)
+		}
+	}
+	if got := strings.Count(plan.section, "hunk truncated at 20 bytes"); got != 2 {
+		t.Errorf("truncation markers = %d, want one per over-budget M item", got)
+	}
+	if strings.Contains(plan.section, "-  return x + 1") {
+		t.Errorf("the full hunk survived the 20-byte per-item budget:\n%s", plan.section)
+	}
+}
+
+// TestMapsSessionPlanFor_EmbedsTheHunkFromTheDiff (CLA-871): enabled on a real
+// repository, the plan embeds the hunk exactly as the merge-base..tip diff has
+// it, without a second git call per item.
+func TestMapsSessionPlanFor_EmbedsTheHunkFromTheDiff(t *testing.T) {
+	repo, base, tip := mapsRepo(t)
+	ph := config.Phase{
+		Name:         config.ReviewPhaseName,
+		Prompt:       config.ReviewOnlyBrief(),
+		ReviewMethod: config.ReviewMethodMapsSession,
+		MapsSession: &config.MapsSessionOptions{ChunkSize: 25,
+			EmbedHunks: &config.EmbedHunksOptions{Enabled: true}},
+	}
+	r := &phaseRun{
+		ph:     ph,
+		shape:  phaseShape{captured: ph},
+		opts:   phaseRunOpts{taskDir: repo, runner: &runnerBriefing{baseSHA: base}},
+		prev:   &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}, CheckpointTip: tip},
+		prBase: "main",
+	}
+	plan, err := r.mapsSessionPlanFor(&phaseAttempt{inv: harness.Invocation{WorkDir: repo}})
+	if err != nil {
+		t.Fatalf("mapsSessionPlanFor: %v", err)
+	}
+	for _, want := range []string{
+		"\n\n```diff\n@@ ",
+		"-  return x + 1\n+  return x + 2",
+		"+export function betaThing(x: number) {",
+		"when a fenced diff block follows it",
+	} {
+		if !strings.Contains(plan.section, want) {
+			t.Errorf("the plan does not embed %q:\n%s", want, plan.section)
 		}
 	}
 }

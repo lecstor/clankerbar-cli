@@ -781,6 +781,9 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 	doc["agent"] = agents
 	delete(doc, "agents")
 	delete(doc, "default_agent")
+	// CLA-877: a hung provider stream must ERROR, not stay silent until the
+	// phase idle watchdog kills the whole session. See opencode_timeout.go.
+	opencodeProviderTimeouts(in, doc)
 	return json.Marshal(doc)
 }
 
@@ -1614,6 +1617,7 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit
 	`|"message": ?"transport` +
 	`|transport (error|failure|reset|dropped)|transport (is )?clos(ed|ing)|transport-level` +
 	`|stream (error|failed|closed|reset|ended|disconnected|interrupted)` +
+	`|timed out waiting for response data|sse read timed out` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be

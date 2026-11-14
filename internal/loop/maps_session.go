@@ -151,23 +151,27 @@ func gitHeadSHA(repo string) (string, error) {
 // chunks, the first-turn section and the follow-up turns. Pure, so the
 // numbering, chunking and per-stage models are testable without a repository.
 func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string, severity, ending string) *mapsSessionPlan {
-	items, overflow := mapsSessionItems(reviewmap.ChangeMap(diff, reviewmap.Unlimited), flow)
-	chunks := mapsSessionChunks(items, opts.ChunkSize)
-	bodies := make([]string, len(chunks))
-	for i, chunk := range chunks {
-		bodies[i] = strings.Join(chunk, "\n")
+	entries := reviewmap.ChangeEntries(diff, reviewmap.Unlimited)
+	items, overflow := mapsSessionItems(entries, flow)
+	items, hunkCutoff := config.EmbedMapsSessionHunks(items, mapsSessionHunks(entries), base, opts.EmbedHunks)
+	size := opts.ChunkSize
+	if size < 1 {
+		size = config.DefaultMapsSessionChunkSize
 	}
+	chunks := mapsSessionChunks(items, size)
+	bodies := mapsSessionBodies(chunks, size, hunkCutoff, base, opts.EmbedHunks)
 	// The cap's note is not an item: it is context for the reviewer, so it rides
 	// the last chunk unnumbered rather than getting an id to note.
 	if overflow != "" && len(bodies) > 0 {
 		bodies[len(bodies)-1] += "\n" + overflow
 	}
+	hunksEmbedded := opts.EmbedHunks != nil && opts.EmbedHunks.Enabled
 
 	notesModel, reportModel := opts.StageModels(phaseModel)
 
 	plan := &mapsSessionPlan{
 		notesTurns:  len(chunks),
-		section:     config.MapsSessionFirstTurn(base, 1, len(chunks), bodies[0]),
+		section:     config.MapsSessionFirstTurn(base, 1, len(chunks), bodies[0], hunksEmbedded),
 		notesModel:  notesModel,
 		reportModel: reportModel,
 	}
@@ -219,10 +223,10 @@ func mapsSessionRecordModelNote(phaseModel, reportModel string) string {
 // mapsSessionItems numbers the change map M1.. and the flow map F1.. in that
 // order. The flow map's cap note is returned apart, because it is not an item to
 // note.
-func mapsSessionItems(changes, flow []string) (items []string, overflow string) {
+func mapsSessionItems(changes []reviewmap.ChangeEntry, flow []string) (items []string, overflow string) {
 	items = make([]string, 0, len(changes)+len(flow))
 	for i, item := range changes {
-		items = append(items, fmt.Sprintf("M%d. %s", i+1, item))
+		items = append(items, fmt.Sprintf("M%d. %s", i+1, item.Text))
 	}
 	n := 0
 	for _, item := range flow {
@@ -234,6 +238,44 @@ func mapsSessionItems(changes, flow []string) (items []string, overflow string) 
 		items = append(items, fmt.Sprintf("F%d. %s", n, item))
 	}
 	return items, overflow
+}
+
+// mapsSessionHunks pairs the change map's entries with the hunk type the
+// embedding helper takes, in the same order as the M items.
+func mapsSessionHunks(entries []reviewmap.ChangeEntry) []config.MapsSessionHunk {
+	hunks := make([]config.MapsSessionHunk, len(entries))
+	for i, e := range entries {
+		hunks[i] = config.MapsSessionHunk{Path: e.Path, Text: e.Hunk}
+	}
+	return hunks
+}
+
+// mapsSessionBodies renders the chunks' bodies and, when the total hunk budget
+// stopped embedding mid-map, inserts the one-time note at that item so the
+// items above it keep their diffs and the ones below stay plain.
+func mapsSessionBodies(chunks [][]string, size, cutoff int, base string, embed *config.EmbedHunksOptions) []string {
+	bodies := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		bodies[i] = strings.Join(chunk, "\n")
+	}
+	if cutoff < 0 || embed == nil || size < 1 {
+		return bodies
+	}
+	ci := cutoff / size
+	if ci >= len(chunks) {
+		return bodies
+	}
+	within := min(cutoff-ci*size, len(chunks[ci]))
+	parts := make([]string, 0, 3)
+	if head := strings.Join(chunks[ci][:within], "\n"); head != "" {
+		parts = append(parts, head)
+	}
+	parts = append(parts, config.MapsSessionHunkBudgetNote(base, embed.Resolved().MaxBytesTotal))
+	if tail := strings.Join(chunks[ci][within:], "\n"); tail != "" {
+		parts = append(parts, tail)
+	}
+	bodies[ci] = strings.Join(parts, "\n")
+	return bodies
 }
 
 // mapsSessionChunks splits items into chunks of size. A change with no map items

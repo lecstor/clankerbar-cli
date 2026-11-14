@@ -111,7 +111,7 @@ var runnerImplementBrief = "Work the task in the context block above. This sessi
 	"when the merged tip supersedes the task. Do NOT run the review gate and do NOT move the task to in_review - " +
 	"the runner continues this task from the branch you pushed, so ending there is the task going to plan, not " +
 	"the task being abandoned." +
-	runnerDoneReport(runnerImplementReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance
+	runnerDoneReport(runnerImplementReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerCloseOutBrief is the close-out phase's brief for a runner-claimed
 // session: the task is approved and awaiting merge, and the plane's own
@@ -174,7 +174,7 @@ const runnerReviewTerminalStep = " This is a CHECKPOINT: keep holding, do NOT co
 // two record writes.
 var runnerReviewOnlyBrief = reviewOnlyBriefOpening + reviewHandoffVerified + runnerReviewResume +
 	runnerReviewWorktreeAndGate + runnerReviewRecord + runnerDoneReport(runnerReviewReportFields) +
-	runnerReviewTerminalStep + runnerRerunGuidance + runnerForbidden + handoffGuidance
+	runnerReviewTerminalStep + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerFixCore is the fix phase's substance for a runner-claimed session,
 // written fresh rather than derived: the record it reads is still the shipped
@@ -229,7 +229,7 @@ var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for this branch - push, then the PR, " +
 	"in that order - and end the session with the done report. The runner hands the task over with " +
 	"submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) + runnerRerunGuidance +
-	runnerForbidden + handoffGuidance
+	runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerFixVerifyBrief is fixVerifyBrief for a runner-claimed session: a
 // verification round follows, so the PR and the hand-over stay the verifier's.
@@ -249,7 +249,7 @@ var runnerFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + 
 	"with the done report. Do NOT open a PR and do NOT move the task to in_review: the VERIFICATION round after " +
 	"you carries that terminal step once it finds no open MUST, and a PR opened here would ship fixes the " +
 	"verifier never saw. Ending this session holding the task is the checkpoint the verification round resumes " +
-	"from." + runnerDoneReport(runnerFixReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance
+	"from." + runnerDoneReport(runnerFixReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerVerifyBrief is verifyBrief for a runner-claimed session: the review
 // scope, the adjudication and the stopping rule are the shipped substance; the
@@ -295,7 +295,7 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"end with the report including " + runnerRiskField + ". The runner records the round and hands the task to " +
 	"in_review. Never decide to run another round yourself." +
 	verifyStoppingRule + verifyDriverBounds + runnerDoneReport(runnerVerifyReportFields) + runnerRerunGuidance +
-	runnerForbidden + handoffGuidance
+	runnerForbidden + handoffGuidance + runnerReportReminder
 
 // RunnerHandoffPreamble is HandoffPreamble for a runner-claimed session: the
 // runner holds the lease, so no heartbeat, and the work stays in the worktree the

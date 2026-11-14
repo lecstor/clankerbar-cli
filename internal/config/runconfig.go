@@ -270,6 +270,10 @@ func cloneMapsSession(o *MapsSessionOptions) *MapsSessionOptions {
 		return nil
 	}
 	cp := *o
+	if cp.EmbedHunks != nil {
+		e := *cp.EmbedHunks
+		cp.EmbedHunks = &e
+	}
 	return &cp
 }
 

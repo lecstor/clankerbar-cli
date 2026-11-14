@@ -131,6 +131,10 @@ type fakeOpenAI struct {
 	rounds         [][]fakeCall
 	delay          time.Duration
 	malformedTurns int
+	// stallChunks sends the opening role chunk and then NOTHING, holding the
+	// response open until the client aborts. It is the silent-stream shape the
+	// CLA-868 incident saw: no error, no bytes, no tokens.
+	stallChunks bool
 
 	hit       atomic.Int64
 	toolTurns atomic.Int64
@@ -219,6 +223,13 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	usage := map[string]any{"prompt_tokens": fakePromptTokens, "completion_tokens": fakeCompletionTokens, "total_tokens": fakeRequestTokens}
 	chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	if f.stallChunks {
+		// Headers and one chunk arrived; the stream now goes silent. The client
+		// aborts its read when the adapter's chunkTimeout fires, which cancels
+		// this request.
+		<-r.Context().Done()
+		return
+	}
 	if f.malformedTurns > 0 && len(rec.Tools) > 0 && int(f.toolTurns.Add(1)) <= f.malformedTurns {
 		// The #43622 shape, byte-for-byte what drained on 2026-10-19: a complete
 		// answer with every finish_reason null, then [DONE]. The AI SDK raises
@@ -388,6 +399,20 @@ func requireHit(t *testing.T, f *fakeOpenAI) {
 	}
 }
 
+// streamTypes lists the event types on a retained stdout, for a diagnostic.
+func streamTypes(stdout string) []string {
+	var out []string
+	for _, line := range strings.Split(stdout, "\n") {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) == nil && ev.Type != "" {
+			out = append(out, ev.Type)
+		}
+	}
+	return out
+}
+
 // toolEvents returns the tool_use parts on a Result's retained stdout.
 func toolEvents(res Result) []opencodePart {
 	var out []opencodePart
@@ -519,9 +544,14 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 				t.Errorf("%s was offered; a tool-level deny must remove it", denied)
 			}
 		}
-		// The MCP resource reads the policy keeps; a rename upstream goes red here.
+		// The MCP resource reads the policy keeps; a rename upstream goes red
+		// here. They are 2.2.x built-ins: a 2.0.32 binary has no opencode_*
+		// family at all (the same reason the two assertions below only log),
+		// so there is nothing to keep and demanding them would fail the suite
+		// on the build the fleet actually runs.
+		hasBuiltinFamily := indexOfTool(offered, "opencode_worktree_remove") >= 0 || indexOfTool(offered, "opencode_models") >= 0
 		for _, kept := range []string{"opencode_list_mcp_resources", "opencode_read_mcp_resource"} {
-			if indexOfTool(offered, kept) < 0 {
+			if hasBuiltinFamily && indexOfTool(offered, kept) < 0 {
 				t.Errorf("%s was not offered; the policy allows MCP resource reads", kept)
 			}
 		}
@@ -1162,6 +1192,46 @@ func TestOpencodeConformance_recoveredProviderError(t *testing.T) {
 		t.Error("DetectLimit fired on a recovered provider.invalid-output event")
 	}
 	t.Logf("exit=%d %s-event recovered=%d final=%q usage_reported=%v tokens=%d", res.ExitCode, errKind, RecoveredErrors(res), res.FinalMessage, res.UsageReported, res.Tokens)
+}
+
+// CLA-877: a provider stream that goes silent must ERROR at the adapter's
+// chunkTimeout, not hang until the phase idle watchdog kills the session. Pins
+// the whole chain against the real binary: the adapter's materialised config
+// carries `providers.<id>.settings.chunkTimeout` (2.0.32 accepts the pin), and
+// opencode really aborts the stalled SSE read. The production bound is five
+// minutes; the test shrinks it so the proof costs seconds.
+func TestOpencodeConformance_chunkTimeout(t *testing.T) {
+	requireOpencodeConformance(t)
+	old := opencodeProviderChunkTimeout
+	opencodeProviderChunkTimeout = 1500 * time.Millisecond
+	t.Cleanup(func() { opencodeProviderChunkTimeout = old })
+
+	fake := &fakeOpenAI{stallChunks: true}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	in := iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, fakeConfigDoc(srv.URL)))
+	// Naming the model route is what lets the adapter name the provider whose
+	// stream it pins; the fake config resolves the same model object.
+	in.Model = "fake/fake-model"
+	start := time.Now()
+	res := invokeConformance(t, in)
+	elapsed := time.Since(start)
+	requireHit(t, fake)
+	if elapsed > 30*time.Second {
+		t.Fatalf("the stalled session took %s — the adapter's chunkTimeout did not end it (context bound %s)",
+			elapsed, conformanceTimeout)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("ExitCode = 0 for a stream that never finished; the chunk timeout must error, not look like a clean end (final %.200q)", res.FinalMessage)
+	}
+	diag := strings.ToLower((opencode{}).Diagnostic(res))
+	if !strings.Contains(diag, "timed out") && !strings.Contains(diag, "timeout") {
+		t.Errorf("the diagnostic does not name the stream timeout: %.600q", diag)
+	}
+	t.Logf("stalled stream ended in %s: provider hits=%d transport events=%d exit=%d error_type=%v diagnostic=%.300q",
+		elapsed, fake.hit.Load(), strings.Count(res.Stdout, "provider.transport"), res.ExitCode, res.Raw[OpencodeErrorTypeKey], diag)
+	t.Logf("STREAM TYPES: %s", strings.Join(streamTypes(res.Stdout), " "))
 }
 
 // The content layer is merged after OPENCODE_CONFIG. The adapter's permission

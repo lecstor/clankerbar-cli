@@ -12,9 +12,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// safeBuffer is a console writer the idle guard can use from its timer
+// goroutine while the capture writes from the exec pipe. A plain bytes.Buffer
+// races between the two: the watchdog prints its kill line the instant it
+// fires, which is exactly while the stalled stub's last bytes are arriving.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // reportBadText is a final message whose report the test's check refuses, and
 // reportGoodText the corrected one the same check accepts.
@@ -28,6 +50,12 @@ const (
 const (
 	reportBadStep  = `{"type":"step_finish","sessionID":"ses_report","part":{"type":"step-finish","reason":"stop","tokens":{"total":500,"input":100,"output":400,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`
 	reportGoodStep = `{"type":"step_finish","sessionID":"ses_report","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
+
+	// A stalled resume's evidence: the stream opens (so it is not a launch
+	// failure), reports the step it already spent, and then says nothing — the
+	// CLA-868 shape before the process was killed at the phase's 15m bound.
+	reportStallStart = `{"type":"step_start","sessionID":"ses_report","part":{"type":"step-start"}}`
+	reportStallStep  = `{"type":"step_finish","sessionID":"ses_report","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":300,"input":100,"output":200,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.02}}`
 )
 
 const reportBadStream = reportBadText + "\n" + reportBadStep
@@ -197,6 +225,8 @@ func TestReportResume_UnclaimedSessionResumesWhenAllowed(t *testing.T) {
 }
 
 // A second refusal is the runner's to fail closed on: one resume, never a loop.
+// The refused reply leaves the report as it was, and the resume-only marker
+// tells the driver to retry the phase under the claim it still holds.
 func TestReportResume_SecondRefusalIsNotResumedAgain(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "log")
 	opencodeStub(t, `#!/bin/sh
@@ -206,16 +236,23 @@ echo '`+reportBadStep+`'
 `)
 	console := &bytes.Buffer{}
 
-	if _, err := (opencode{}).Invoke(context.Background(), Invocation{
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:      "Work.",
 		Console:     console,
 		ResumeClaim: reportClaim,
 		CheckReport: reportRefusesLong,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 	if runs := stubRuns(t, logPath); len(runs) != 2 {
 		t.Errorf("stub ran %d times, want exactly 2 — one resume, never a loop:\n%v", len(runs), runs)
+	}
+	if res.ReportResumeFailed == "" {
+		t.Error("ReportResumeFailed is empty; a resume that still cannot produce an applicable report must fail closed")
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the session's own report preserved", res.FinalMessage)
 	}
 	out := console.String()
 	if !strings.Contains(out, "still fails the check") {
@@ -388,12 +425,334 @@ printf '%s\n%s\n' '`+reportGoodText+`' '`+reportGoodStep+`'
 	if !strings.Contains(res.FinalMessage, "too long") {
 		t.Errorf("FinalMessage = %q, want the refused report unchanged", res.FinalMessage)
 	}
+	// CLA-877: the error is a resume-only failure too, so the runner is told to
+	// retry the phase inside the claim it holds instead of advancing on a report
+	// that never reached it.
+	if !strings.Contains(res.ReportResumeFailed, "errored") {
+		t.Errorf("ReportResumeFailed = %q, want the resume's error", res.ReportResumeFailed)
+	}
+}
+
+// CLA-877: a report resume that produces NOTHING is killed at the resume's own
+// short idle bound, not the phase's, and retried once with the same steer. The
+// second attempt's corrected report is what the runner reads, and the stalled
+// attempt's spend is still charged.
+func TestReportResume_StalledResumeIsKilledAtTheShortBoundAndRetriedOnce(t *testing.T) {
+	old := opencodeReportResumeIdle
+	opencodeReportResumeIdle = 200 * time.Millisecond
+	t.Cleanup(func() { opencodeReportResumeIdle = old })
+
+	logPath := filepath.Join(t.TempDir(), "log")
+	countPath := filepath.Join(t.TempDir(), "resumes")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"not accepted by the runner"*)
+    n=$(cat "`+countPath+`" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo $n > "`+countPath+`"
+    if [ "$n" -eq 1 ]; then
+      echo '`+reportStallStart+`'
+      echo '`+reportStallStep+`'
+      exec sleep 30
+    fi
+    echo '`+reportGoodText+`'
+    echo '`+reportGoodStep+`'
+    ;;
+  *)
+    echo '`+reportBadText+`'
+    echo '`+reportBadStep+`'
+    ;;
+esac
+`)
+	console := &safeBuffer{}
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "Work.",
+		Console:     console,
+		ResumeClaim: reportClaim,
+		CheckReport: reportRefusesLong,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Invoke took %s — the stalled resume was not killed at the report resume's short idle bound", elapsed)
+	}
+	runs := stubRuns(t, logPath)
+	if len(runs) != 3 {
+		t.Fatalf("stub ran %d times, want 3 (the session + a stalled resume + its retry):\n%v", len(runs), runs)
+	}
+	if !strings.Contains(runs[2], "-s ses_report") || !strings.Contains(runs[2], errReportTooLong.Error()) {
+		t.Errorf("the retry did not resume the same session with the same steer: %q", runs[2])
+	}
+	if !strings.Contains(res.FinalMessage, "short") {
+		t.Errorf("FinalMessage = %q, want the retry's corrected report", res.FinalMessage)
+	}
+	if res.ReportResumeFailed != "" {
+		t.Errorf("ReportResumeFailed = %q after a successful retry, want none", res.ReportResumeFailed)
+	}
+	if want := 500 + 300 + 900; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d (the stalled attempt's spend is charged too)", res.Tokens, want)
+	}
+	out := console.String()
+	if !strings.Contains(out, "report resume stalled") || !strings.Contains(out, "retrying it with the same steer") {
+		t.Errorf("console did not announce the stall and its retry; got:\n%s", out)
+	}
+	if !strings.Contains(out, "corrected report passes the check") {
+		t.Errorf("console did not report the corrected check; got:\n%s", out)
+	}
+}
+
+// CLA-877: a SECOND stall fails closed. The report stays refused, but the
+// session's own end is preserved — no IdleKilled, the original exit code and
+// final message — and the resume-only marker tells the runner what really
+// failed, so the phase can be retried inside the claim it still holds.
+func TestReportResume_SecondStallFailsClosedAndKeepsTheSessionsOwnEnd(t *testing.T) {
+	old := opencodeReportResumeIdle
+	opencodeReportResumeIdle = 200 * time.Millisecond
+	t.Cleanup(func() { opencodeReportResumeIdle = old })
+
+	logPath := filepath.Join(t.TempDir(), "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"not accepted by the runner"*)
+    echo '`+reportStallStart+`'
+    echo '`+reportStallStep+`'
+    exec sleep 30
+    ;;
+  *)
+    echo '`+reportBadText+`'
+    echo '`+reportBadStep+`'
+    ;;
+esac
+`)
+	console := &safeBuffer{}
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "Work.",
+		Console:     console,
+		ResumeClaim: reportClaim,
+		CheckReport: reportRefusesLong,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Invoke took %s — a second stalled resume must be bounded too", elapsed)
+	}
+	if runs := stubRuns(t, logPath); len(runs) != 3 {
+		t.Fatalf("stub ran %d times, want 3 — at most two resume attempts, never a loop:\n%v", len(runs), runs)
+	}
+	if res.ReportResumeFailed == "" {
+		t.Error("ReportResumeFailed is empty; the runner cannot tell a resume-only failure from a dead session")
+	}
+	if !strings.Contains(res.ReportResumeFailed, "no output for") {
+		t.Errorf("ReportResumeFailed = %q, want the idle cause", res.ReportResumeFailed)
+	}
+	if res.IdleKilled != "" {
+		t.Errorf("IdleKilled = %q; the SESSION did not go silent, only its report resume did", res.IdleKilled)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the session's own clean exit preserved", res.ExitCode)
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the refused report unchanged", res.FinalMessage)
+	}
+	if want := 500 + 300 + 300; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d (both stalled attempts' spend is charged)", res.Tokens, want)
+	}
+	out := console.String()
+	if !strings.Contains(out, "report resume stalled 2 times") || !strings.Contains(out, "session's own end stands") {
+		t.Errorf("console did not state the fail-closed outcome; got:\n%s", out)
+	}
+}
+
+// CLA-877 review 1.review-1.1: the stall is STICKY. Attempt 1 is idle-killed at
+// the short bound and the phase wall clock then leaves less than the resume floor
+// for attempt 2, so no second process runs — but the result must still carry the
+// resume-only marker. Without it the session's own clean exit would be the whole
+// verdict: an implement phase would checkpoint on its pushed branch and advance
+// to review with no delivery record.
+func TestReportResume_StallThenWallClockSkipStillFailsClosed(t *testing.T) {
+	old := opencodeReportResumeIdle
+	// A 2s stall against a 1s surplus over the floor: the window is wide enough
+	// that process-start jitter cannot flip which gate refuses.
+	opencodeReportResumeIdle = 2 * time.Second
+	t.Cleanup(func() { opencodeReportResumeIdle = old })
+
+	logPath := filepath.Join(t.TempDir(), "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"not accepted by the runner"*)
+    echo '`+reportStallStart+`'
+    echo '`+reportStallStep+`'
+    exec sleep 30
+    ;;
+  *)
+    echo '`+reportBadText+`'
+    echo '`+reportBadStep+`'
+    ;;
+esac
+`)
+	console := &safeBuffer{}
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "Work.",
+		Console:     console,
+		ResumeClaim: reportClaim,
+		CheckReport: reportRefusesLong,
+		// Above the floor when Invoke starts (so attempt 1 is allowed), below it
+		// once the 2s stall has been killed: ~59s remain, under the 1m floor.
+		MaxSessionWallClock: opencodeResumeWallClockFloor + time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("Invoke took %s — the stalled attempt was not killed at the short bound", elapsed)
+	}
+	if runs := stubRuns(t, logPath); len(runs) != 2 {
+		t.Fatalf("stub ran %d times, want 2 (the session + the one stalled attempt the budget allowed):\n%v", len(runs), runs)
+	}
+	if res.ReportResumeFailed == "" {
+		t.Fatal("ReportResumeFailed is empty; a stall with no room for the retry must fail closed, not read as the session's clean end")
+	}
+	if !strings.Contains(res.ReportResumeFailed, "no output for") {
+		t.Errorf("ReportResumeFailed = %q, want the stall to be the cause, not the wall clock", res.ReportResumeFailed)
+	}
+	if res.IdleKilled != "" {
+		t.Errorf("IdleKilled = %q; the SESSION did not go silent, only its report resume did", res.IdleKilled)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the session's own clean exit preserved", res.ExitCode)
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the session's own refused report unchanged", res.FinalMessage)
+	}
+	out := console.String()
+	if !strings.Contains(out, "failing closed on the stall") {
+		t.Errorf("console did not say the stall fails closed when the budget ran out; got:\n%s", out)
+	}
+}
+
+// CLA-877 review 1.review-1.1: a second attempt that ends non-zero with no
+// applicable report is a resume-only failure too. Its exit must NOT be merged
+// (that would brand the phase with the resume's death) and its unreadable reply
+// must not replace the refused one; the marker names the cause.
+func TestReportResume_NonZeroRetryIsAResumeOnlyFailure(t *testing.T) {
+	old := opencodeReportResumeIdle
+	opencodeReportResumeIdle = 200 * time.Millisecond
+	t.Cleanup(func() { opencodeReportResumeIdle = old })
+
+	logPath := filepath.Join(t.TempDir(), "log")
+	countPath := filepath.Join(t.TempDir(), "resumes")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"not accepted by the runner"*)
+    n=$(cat "`+countPath+`" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo $n > "`+countPath+`"
+    if [ "$n" -eq 1 ]; then
+      echo '`+reportStallStart+`'
+      echo '`+reportStallStep+`'
+      exec sleep 30
+    fi
+    echo '`+reportGoodText+`'
+    echo '`+reportGoodStep+`'
+    exit 1
+    ;;
+  *)
+    echo '`+reportBadText+`'
+    echo '`+reportBadStep+`'
+    ;;
+esac
+`)
+	console := &safeBuffer{}
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "Work.",
+		Console:     console,
+		ResumeClaim: reportClaim,
+		CheckReport: reportRefusesLong,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if runs := stubRuns(t, logPath); len(runs) != 3 {
+		t.Fatalf("stub ran %d times, want 3 (the session + the stall + its retry):\n%v", len(runs), runs)
+	}
+	if res.ReportResumeFailed == "" {
+		t.Fatal("ReportResumeFailed is empty; a non-zero retry produced no report the runner can apply")
+	}
+	if !strings.Contains(res.ReportResumeFailed, "exit 1") {
+		t.Errorf("ReportResumeFailed = %q, want it to name the retry's end", res.ReportResumeFailed)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the session's own clean exit — the failed retry's exit must not be merged", res.ExitCode)
+	}
+	if strings.Contains(res.FinalMessage, "short") {
+		t.Errorf("FinalMessage = %q, want the failed retry's text NOT merged", res.FinalMessage)
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the session's own refused report preserved", res.FinalMessage)
+	}
+}
+
+// A resume the wall clock leaves no room to START is a resume-only failure as
+// well: no process runs, but the report is still refused, so the marker must be
+// set or the phase advances on a report the runner never accepted.
+func TestReportResume_WallClockSkipBeforeAResumeFailsClosed(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+echo '`+reportGoodText+`'
+echo '`+reportGoodStep+`'
+`)
+	console := &bytes.Buffer{}
+	res := reportSession(reportBadStream)
+	in := Invocation{Prompt: "Work.", Console: console, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Now().Add(opencodeResumeWallClockFloor/2))
+
+	if runs := stubRuns(t, logPath); len(runs) != 0 {
+		t.Errorf("stub ran %d times, want none — no budget for a resume:\n%v", len(runs), runs)
+	}
+	if res.ReportResumeFailed == "" {
+		t.Fatal("ReportResumeFailed is empty; a refused report that cannot be resumed must fail closed")
+	}
+	if !strings.Contains(res.ReportResumeFailed, "wall-clock") {
+		t.Errorf("ReportResumeFailed = %q, want the wall clock named as the cause", res.ReportResumeFailed)
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the session's own refused report unchanged", res.FinalMessage)
+	}
+	if out := console.String(); !strings.Contains(out, "wall-clock budget exhausted") {
+		t.Errorf("console did not say why no resume ran; got:\n%s", out)
+	}
+}
+
+// The resume's bound is its own, but a SHORTER phase dial still wins, and a
+// disabled phase watchdog does not disable it.
+func TestReportResumeIdle(t *testing.T) {
+	if got := reportResumeIdle(30 * time.Second); got != 30*time.Second {
+		t.Errorf("reportResumeIdle(30s) = %s, want the phase's stricter dial", got)
+	}
+	if got := reportResumeIdle(0); got != opencodeReportResumeIdle {
+		t.Errorf("reportResumeIdle(0) = %s, want the resume's own bound", got)
+	}
+	if got := reportResumeIdle(time.Hour); got != opencodeReportResumeIdle {
+		t.Errorf("reportResumeIdle(1h) = %s, want the resume's own bound", got)
+	}
 }
 
 // A corrected report the check accepts is still wasted when the resumed session
-// ended in a way the driver never applies a report on: the console must not
-// claim a pass the runner will not read.
-func TestReportResume_UnusableEndSaysTheRunnerWillNotApplyIt(t *testing.T) {
+// ended in a way the driver never applies a report on. The failed resume's exit
+// and text must NOT be merged — that would brand the phase with the resume's
+// death — and the resume-only marker must say what happened so the phase is
+// retried under the claim instead of advancing on the report.
+func TestReportResume_UnusableEndFailsClosedWithoutMerging(t *testing.T) {
 	// The continuation is cap-killed after it emits the corrected report, which
 	// is the one nil-error non-zero end opencode's own kill produces.
 	opencodeStub(t, `#!/bin/sh
@@ -408,15 +767,21 @@ exec sleep 30
 	in.MaxSessionWallClock = time.Second
 	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{})
 
+	if res.ReportResumeFailed == "" {
+		t.Fatal("ReportResumeFailed is empty; a resume whose end no report is read on must fail closed")
+	}
+	if strings.Contains(res.FinalMessage, "short") {
+		t.Errorf("FinalMessage = %q, want the unusable resume's text NOT merged", res.FinalMessage)
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the session's own refused report preserved", res.FinalMessage)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the session's own clean exit — the cap-killed resume's exit must not be merged", res.ExitCode)
+	}
 	out := console.String()
-	if !strings.Contains(res.FinalMessage, "short") {
-		t.Fatalf("test precondition: FinalMessage = %q, want the corrected report", res.FinalMessage)
-	}
-	if !strings.Contains(out, "will not apply it") {
-		t.Fatalf("console did not say the runner will not apply the corrected report; got:\n%s", out)
-	}
-	if !strings.Contains(out, res.ExitString()) {
-		t.Errorf("console does not name how the resumed session ended (%s); got:\n%s", res.ExitString(), out)
+	if !strings.Contains(out, "leaving the report as it was") {
+		t.Errorf("console did not say the refused report stands; got:\n%s", out)
 	}
 	if strings.Contains(out, "corrected report passes the check\n") {
 		t.Errorf("console reported the corrected report as a plain pass; got:\n%s", out)

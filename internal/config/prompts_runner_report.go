@@ -32,6 +32,15 @@ func runnerDoneReport(fields string) string {
 		"report: end with one or the other, never both."
 }
 
+// runnerReportReminder repeats the report contract as the brief's LAST line.
+// The full paragraph sits mid-brief; a session that reads the whole brief and
+// then writes a prose summary (the CLA-868 trigger) misses it, so the one
+// instruction it cannot complete the phase without gets the last word. It
+// defers to a declared handoff, which replaces the report.
+const runnerReportReminder = " ONE LAST TIME: unless you are declaring a handoff, the LAST thing in your final " +
+	"message is the `" + DoneMarker + "` line and its ONE JSON object, with nothing after them. A session that " +
+	"ends without them has recorded nothing."
+
 // runnerDoneFindingShape is the finding object the review and verify reports
 // carry, in the same shape the plane's durable record takes. The limits are the
 // plane's bounds: it refuses an over-limit report whole, so a session cannot

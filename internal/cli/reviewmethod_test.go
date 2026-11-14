@@ -48,6 +48,7 @@ func TestDoctor_ReportsTheMapsSessionMethod(t *testing.T) {
 		"findings=opencode-go/base",
 		"chunk_size=25",
 		"flow_max=40",
+		"embed_hunks=off",
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("doctor's reviewer line does not carry %q: %s", want, line)
@@ -113,5 +114,36 @@ func TestDoctor_ReportsEachPanelMembersMethod(t *testing.T) {
 	}
 	if !strings.Contains(line, "review-2 -> opencode/opencode-go/plain") {
 		t.Errorf("the single-pass seat is missing from the panel line: %s", line)
+	}
+}
+
+// TestDoctor_ReportsEmbeddedHunkBudgets (CLA-871): a review that will carry its
+// hunks in the prompt prints that, with the resolved budgets, so the operator
+// can see the prompt it is about to pay for.
+func TestDoctor_ReportsEmbeddedHunkBudgets(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{
+				Name:         "review",
+				ReviewMethod: config.ReviewMethodMapsSession,
+				MapsSession: &config.MapsSessionOptions{
+					EmbedHunks: &config.EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 2048},
+				},
+			},
+			{Name: "fix"},
+		},
+	}
+	line := reviewLine(t, cfg)
+	for _, want := range []string{
+		"embed_hunks=on(2048/61440)",
+		"notes=harness default",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("doctor's reviewer line does not carry %q: %s", want, line)
+		}
 	}
 }

@@ -6,7 +6,9 @@ package loop
 // phase's re-claim.
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,6 +137,176 @@ func TestRunnerClaim_DeadPhaseZeroReclaimsBeforeRetry(t *testing.T) {
 	if got := h.invocations[1].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != retryRunID {
 		t.Errorf("the retry's ResumeClaim = %+v, want %s/%s — the re-claim must be planted before the respawn",
 			got, walkClaimTaskID, retryRunID)
+	}
+}
+
+// CLA-877: a phase whose ONLY failure is its report resume stalling delivered
+// its work, so the phase is retried inside the SAME claim. No handback, no
+// ExpireLease and no re-claim — the retry resumes the run already held.
+func TestRunnerClaim_ReportResumeStallRetriesInTheSameClaim(t *testing.T) {
+	b := walkClaimBrief("CLA-877")
+	f := &claimingReleaser{
+		offers: []plane.Offer{{Next: &b}},
+		claimFn: func(string, bool) (plane.ClaimedTask, error) {
+			return plane.ClaimedTask{Task: b, RunID: walkClaimRunID}, nil
+		},
+	}
+	walkClaim := harness.Claim{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID,
+		HasWIP: true, Branch: "clanker/walk",
+	}
+	// The session's own end is clean and its branch is pushed; only the report
+	// resume went silent, and the adapter says so on the marker.
+	stalled := held(okResult(1, 0), walkClaim)
+	stalled.ReportResumeFailed = "no output for 3m0s"
+	retried := reported(held(okResult(1, 0), walkClaim), harness.Report{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID, Branch: "clanker/walk",
+	})
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: stalled},
+		{res: retried},
+		// The review hands the task on and settles it, so the only handback this
+		// drain could owe is the one the stalled phase must NOT take.
+		{res: held(okResult(1, 0), harness.Claim{TaskID: walkClaimTaskID, RunID: walkClaimRunID, Settled: true})},
+	}}
+	logged := captureLogs(t)
+	d := phaseDriverWithReleaser(t, h, twoPhases(), f)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (stalled phase, its retry, then review)", h.invokeCalls)
+	}
+	if len(f.claimCalls) != 1 {
+		t.Errorf("claim calls = %v, want only the runner's initial fresh claim — the retry must not re-claim a claim it still holds", f.claimCalls)
+	}
+	if got := handbacks(f, walkClaimTaskID); got != 0 {
+		t.Errorf("handed the task back %d time(s), want none — a resume-only failure keeps the claim: %+v / %+v",
+			got, f.calls, f.expireCalls)
+	}
+	if got := h.invocations[1].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != walkClaimRunID {
+		t.Errorf("the retry's ResumeClaim = %+v, want the SAME %s/%s the runner holds, not a re-claimed one",
+			got, walkClaimTaskID, walkClaimRunID)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "PHASE 1") {
+		t.Errorf("the retry was not a phase-1 session: %q", h.invocations[1].Prompt)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "Resumed: the branch already carried prior work") {
+		t.Errorf("the retry's context block does not say the branch already carries the stalled phase's work: %q", h.invocations[1].Prompt)
+	}
+	if !strings.Contains(h.invocations[2].Prompt, "PHASE 2") {
+		t.Errorf("the review phase did not run after the healthy retry: %q", h.invocations[2].Prompt)
+	}
+	if out := logged.String(); !strings.Contains(out, "SAME claim") {
+		t.Errorf("the retry was not named as running inside the held claim:\n%s", out)
+	}
+}
+
+// CLA-877 review 1.review-1.2: the same-claim retry is not limited to the phase
+// the walk started at. A resume-only failure keeps the claim, so `prev` is still
+// set and a later phase's retry is seeded exactly as its failed attempt was — so
+// a fix/review position that delivered its work and only lost its report is
+// retried in place too, without ending the lease or burning a reclaim.
+func TestRunnerClaim_ReportResumeFailureInALaterPhaseRetriesInTheSameClaim(t *testing.T) {
+	b := walkClaimBrief("CLA-877")
+	f := &claimingReleaser{
+		offers: []plane.Offer{{Next: &b}},
+		claimFn: func(string, bool) (plane.ClaimedTask, error) {
+			return plane.ClaimedTask{Task: b, RunID: walkClaimRunID}, nil
+		},
+	}
+	walkClaim := harness.Claim{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID,
+		HasWIP: true, Branch: "clanker/walk",
+	}
+	implemented := reported(held(okResult(1, 0), walkClaim), harness.Report{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID, Branch: "clanker/walk",
+	})
+	// The review phase (index 1 of 3, not the phase the walk started at) ends
+	// with its run clean and its branch already recorded; only its report
+	// resume went silent.
+	stalled := held(okResult(1, 0), walkClaim)
+	stalled.ReportResumeFailed = "no output for 3m0s"
+	retried := held(okResult(1, 0), harness.Claim{TaskID: walkClaimTaskID, RunID: walkClaimRunID, Settled: true})
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: implemented},
+		{res: stalled},
+		{res: retried},
+	}}
+	logged := captureLogs(t)
+	phases := []config.Phase{{Name: "implement"}, {Name: "review"}, {Name: "fix"}}
+	d := phaseDriverWithReleaser(t, h, phases, f)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (implement, the stalled review, its in-place retry)", h.invokeCalls)
+	}
+	if len(f.claimCalls) != 1 {
+		t.Errorf("claim calls = %v, want only the runner's initial fresh claim — a later phase's retry must not re-claim either", f.claimCalls)
+	}
+	if got := handbacks(f, walkClaimTaskID); got != 0 {
+		t.Errorf("handed the task back %d time(s), want none — the resume-only failure keeps the claim: %+v / %+v",
+			got, f.calls, f.expireCalls)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "PHASE 2 of 3") || !strings.Contains(h.invocations[2].Prompt, "PHASE 2 of 3") {
+		t.Errorf("the retry did not re-run the review position:\nfirst: %q\nretry: %q", h.invocations[1].Prompt, h.invocations[2].Prompt)
+	}
+	if got := h.invocations[2].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != walkClaimRunID {
+		t.Errorf("the retry's ResumeClaim = %+v, want the SAME %s/%s the runner holds", got, walkClaimTaskID, walkClaimRunID)
+	}
+	if out := logged.String(); !strings.Contains(out, "SAME claim") {
+		t.Errorf("the retry was not named as running inside the held claim:\n%s", out)
+	}
+}
+
+// CLA-877 review 1.review-1.4: the start prep's Tip is the revision the tree held
+// BEFORE the stalled phase pushed. A same-claim retry must not hand it over as
+// the current tip; with no re-claim to refresh it, the context block drops it.
+func TestRunnerClaim_ReportResumeRetryDropsTheStalePrepTip(t *testing.T) {
+	b := walkClaimBrief("CLA-877")
+	f := &claimingReleaser{
+		offers: []plane.Offer{{Next: &b}},
+		claimFn: func(string, bool) (plane.ClaimedTask, error) {
+			return plane.ClaimedTask{Task: b, RunID: walkClaimRunID}, nil
+		},
+	}
+	walkClaim := harness.Claim{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID,
+		HasWIP: true, Branch: "clanker/walk",
+	}
+	stalled := held(okResult(1, 0), walkClaim)
+	stalled.ReportResumeFailed = "no output for 3m0s"
+	retried := reported(held(okResult(1, 0), walkClaim), harness.Report{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID, Branch: "clanker/walk",
+	})
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: stalled},
+		{res: retried},
+		{res: held(okResult(1, 0), harness.Claim{TaskID: walkClaimTaskID, RunID: walkClaimRunID, Settled: true})},
+	}}
+	d := phaseDriverWithReleaser(t, h, twoPhases(), f)
+	const staleTip = "1111111111111111111111111111111111111111"
+	d.prepareWorktree = func(context.Context, worktreeRequest) (worktreePrep, error) {
+		return worktreePrep{Dir: d.cfg.WorkDir, Created: true, Tip: staleTip}, nil
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (stalled phase, its retry, then review)", h.invokeCalls)
+	}
+	if !strings.Contains(h.invocations[0].Prompt, "Tip: "+staleTip) {
+		t.Fatalf("test precondition: the first attempt's block does not name the prep tip: %q", h.invocations[0].Prompt)
+	}
+	if strings.Contains(h.invocations[1].Prompt, staleTip) {
+		t.Errorf("the retry's block still names the pre-phase tip %s as the current revision:\n%q", staleTip, h.invocations[1].Prompt)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "Resumed: the branch already carried prior work") {
+		t.Errorf("the retry's block does not say the branch already carries the stalled phase's work: %q", h.invocations[1].Prompt)
 	}
 }
 
