@@ -33,7 +33,9 @@ const (
 // 15 minutes in the CLA-868 incident, so it let a hung resume hold the whole
 // phase open until the watchdog killed it — the resume's silence then read as a
 // dead session. Three minutes leaves room for a slow provider without ever
-// being the phase's own bound.
+// being the phase's own bound. The phase bound is long partly because opencode
+// streams a tool part only once it SETTLES, so a running build emits nothing;
+// the steer forbids tools here, which is what makes a short bound safe.
 //
 // A var purely so the tests can shrink it: the production value is what they
 // test against.
