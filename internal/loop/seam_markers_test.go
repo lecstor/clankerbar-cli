@@ -9,7 +9,7 @@ package loop
 // (RESTART) without killing anything, and the next claim resumes the next phase
 // from the checkpoint.
 //
-// The four behaviours pinned here:
+// The behaviours pinned here:
 //  1. STOP mid-sequence: phase 2 never spawns, the claim is released, the
 //     marker is consumed and the daemon stops.
 //  2. RESTART mid-sequence: the same release, with the re-exec path taken.
@@ -18,9 +18,9 @@ package loop
 //     of anything to resume) and lands at the iteration boundary as before.
 //  4. No marker: the sequence runs every phase on the one claim, exactly as
 //     before.
-//
-// A project pause is NOT a seam stop, and is pinned separately: pausing may not
-// stop an in-flight sequence (decision 6019ea26).
+//  5. The verification round's open-MUST rewind to the fix phase is a seam too.
+//  6. A project pause (console flag or scheduled window) is NOT a seam stop:
+//     every remaining phase runs (decision 6019ea26).
 
 import (
 	"context"
@@ -96,9 +96,9 @@ func TestRun_StopAndRestartActAtThePhaseSeam(t *testing.T) {
 
 // TestDrainPhases_NoCheckpointKeepsTodaysHandling: a phase that ends without a
 // verified checkpoint leaves the walk nothing to resume, so it ends where it
-// always did and the seam must NOT consume the marker. The empty exit's own
-// handback runs; the marker stays for the iteration boundary (or Run's
-// task-boundary read), which is today's route to the stop.
+// always did and the seam must NOT consume the marker. The marker stays for the
+// iteration boundary (or Run's task-boundary read), which is today's route to
+// the stop.
 func TestDrainPhases_NoCheckpointKeepsTodaysHandling(t *testing.T) {
 	settled := harness.Claim{TaskID: "t-1", RunID: "r-1", Settled: true}
 	h := &fakeAdapter{steps: []invokeStep{
