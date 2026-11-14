@@ -46,6 +46,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -69,12 +70,13 @@ const (
 	// same budget the close-out gives a non-judgement call.
 	conflictCallTimeout = closeOutCallTimeout
 
-	// maxConflictAttempts bounds how many paid sessions one task may burn in this
-	// supervisor's lifetime. A failed session leaves the task approved, so
-	// without a bound the next poll would start another, and another: the exact
-	// opposite of "the agent close-out remains the fallback". A task that keeps
-	// failing falls back to the agent close-out, which is the designed
-	// fallback — not a third paid experiment.
+	// maxConflictAttempts bounds how many conflict sessions one task may burn in
+	// this supervisor's lifetime. One session may walk the step's model list once
+	// (a quota fallback, CLA-890); that whole walk is one attempt here. A failed
+	// session leaves the task approved, so without a bound the next poll would
+	// start another, and another: the exact opposite of "the agent close-out
+	// remains the fallback". A task that keeps failing falls back to the agent
+	// close-out, which is the designed fallback — not a third paid experiment.
 	maxConflictAttempts = 2
 )
 
@@ -608,6 +610,14 @@ func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, re
 // model route list from model onwards.
 type conflictModelRun func(model string, routes []string) (harness.Result, error)
 
+// conflictLimitReader is the one adapter capability the model ladder needs: the
+// harness's own DetectLimit, the same classification the phase ladder's limit
+// branch reads. Narrowed to one method so the ladder is testable without a paid
+// process; harness.Adapter is the production value.
+type conflictLimitReader interface {
+	DetectLimit(harness.Result) harness.Limit
+}
+
 // runConflictModelLadder runs the conflict session on the step's first model and,
 // when an attempt ends on a usage limit while a model is left, runs the session
 // again on the next one (CLA-890).
@@ -623,7 +633,7 @@ type conflictModelRun func(model string, routes []string) (harness.Result, error
 // nowhere left to go, and the existing failure classification reports it. Every
 // attempt is logged with the model it ran on, so a quota failure names the route
 // it hit.
-func runConflictModelLadder(label string, req ConflictRunRequest, a harness.Adapter, run conflictModelRun) (harness.Result, error) {
+func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimitReader, run conflictModelRun) (harness.Result, error) {
 	models := req.Routes
 	if len(models) == 0 {
 		// No route named at all: ONE attempt on the harness's own default. A
@@ -632,16 +642,27 @@ func runConflictModelLadder(label string, req ConflictRunRequest, a harness.Adap
 	}
 	var res harness.Result
 	var err error
-	for i, model := range models {
+	for i := 0; i < len(models); i++ {
+		model := models[i]
 		name := strings.TrimSpace(model)
 		if name == "" {
 			name = "the harness default"
 		}
-		log.Printf("conflict: %s PR %s - attempt %d/%d on %s", label, req.PR, i+1, len(models), name)
+		log.Printf("conflict: %s PR %s - attempt on %s (route %d of %d)", label, req.PR, name, i+1, len(models))
 		res, err = run(model, models[i:])
 		lim := a.DetectLimit(res)
 		if !lim.Limited {
 			return res, err
+		}
+		// The route the attempt actually ENDED on. The adapter may have switched
+		// routes mid-session already, and retrying a route it just exhausted buys
+		// nothing; skipping to the one after it keeps the ladder and the
+		// adapter's own switch from spending the same denial twice.
+		if fin := strings.TrimSpace(harness.RouteFinished(res)); fin != "" {
+			name = fin
+			if idx := slices.Index(models, fin); idx > i {
+				i = idx
+			}
 		}
 		reason := loop.LimitStopReason(lim)
 		if i == len(models)-1 {

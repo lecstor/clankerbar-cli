@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -309,5 +310,81 @@ func TestConflictHarnessIsSpawned(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("SpawnedHarnesses() = %v, want the conflict step's codex (the supervisor really starts a session there)", c.SpawnedHarnesses())
+	}
+}
+
+// CLA-890: the conflict session inherits the implement step's WHOLE route list,
+// not just its first entry. The free route's quota being exhausted is exactly
+// what the second entry is for, and resolving only the first left the conflict
+// session with nowhere to go.
+func TestConflictStepInheritsTheWholeImplementModelList(t *testing.T) {
+	const free, paid = "opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"
+	for _, tc := range []struct {
+		name      string
+		configure func(*Config)
+	}{
+		{
+			name: "the harness block's own list",
+			configure: func(c *Config) {
+				c.Harness = "opencode"
+				c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{free, paid}}}
+				c.Phases = []Phase{{Name: ImplementPhaseName}}
+			},
+		},
+		{
+			name: "the implement phase's tier route list",
+			configure: func(c *Config) {
+				c.Harness = "opencode"
+				c.Harnesses = map[string]HarnessConfig{"opencode": {
+					Models: map[string]ModelRoutes{"flash": {free, paid}},
+				}}
+				c.Phases = []Phase{{Name: ImplementPhaseName, Tier: "flash"}}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := defaults()
+			tc.configure(c)
+			c.Conflict = nil
+
+			step := c.ConflictStep()
+			if got := step.Model.List(); !slices.Equal(got, []string{free, paid}) {
+				t.Errorf("conflict models = %v, want the implement step's whole list [%s %s]", got, free, paid)
+			}
+			if got := step.Model.First(); got != free {
+				t.Errorf("first conflict model = %q, want the free route %q", got, free)
+			}
+		})
+	}
+}
+
+// A pinned single `conflict.model` is a one-entry list: it must run only that
+// model, with no inherited fallback hiding behind it.
+func TestConflictStepPinnedModelIsTheOnlyRoute(t *testing.T) {
+	c := defaults()
+	c.Harness = "opencode"
+	c.Model = "run-model"
+	c.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{"free", "paid"}}}
+	c.Phases = []Phase{{Name: ImplementPhaseName}}
+	c.Conflict = &ConflictStep{Model: ModelRoutes{"pinned"}}
+
+	if got := c.ConflictStep().Model.List(); !slices.Equal(got, []string{"pinned"}) {
+		t.Errorf("conflict models = %v, want only the pinned model", got)
+	}
+}
+
+// A conflict step on ANOTHER harness inherits that harness's list: the aliases
+// are dialect-specific, so falling back to the implement step's would name a
+// model that harness does not serve.
+func TestConflictStepOnAnotherHarnessInheritsItsWholeList(t *testing.T) {
+	c := defaults()
+	c.Harness = "opencode"
+	c.Harnesses = map[string]HarnessConfig{
+		"codex": {Model: ModelRoutes{"codex-free", "codex-paid"}},
+	}
+	c.Conflict = &ConflictStep{Harness: "codex"}
+
+	if got := c.ConflictStep().Model.List(); !slices.Equal(got, []string{"codex-free", "codex-paid"}) {
+		t.Errorf("conflict models = %v, want codex's whole list", got)
 	}
 }
