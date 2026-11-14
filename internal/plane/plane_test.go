@@ -219,9 +219,9 @@ func TestRecordBranch_RequestShape(t *testing.T) {
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" || args["branch"] != "clanker/x" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1 branch=clanker/x", args)
 	}
-	// The whole distinction from Release. record_progress has no status field at
-	// all, but it can carry an outcome and a delivery, so those must stay absent:
-	// this call is a hand-off record and nothing else.
+	// The whole distinction from ReleaseDriver. record_progress has no status
+	// field at all, but it can carry an outcome and a delivery, so those must
+	// stay absent: this call is a hand-off record and nothing else.
 	for _, forbidden := range []string{"outcome", "delivery"} {
 		if _, present := args[forbidden]; present {
 			t.Errorf("a branch record carried %q (%+v) - it must revise the record and nothing else", forbidden, args)
@@ -452,9 +452,9 @@ func TestAskProjectQuestion_FailureIsQuestionNotFiled(t *testing.T) {
 }
 
 // Heartbeat (CLA-358) renews a live claim's lease. The request shape is pinned
-// for the same reason Release's is: the loop beats on this every ten minutes
-// for the life of every session, and a shape drift would read as "renewal
-// failing" on every run at once.
+// for the same reason ReleaseDriver's is: the loop beats on this every ten
+// minutes for the life of every session, and a shape drift would read as
+// "renewal failing" on every run at once.
 
 func TestHeartbeat_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)

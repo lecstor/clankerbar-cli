@@ -176,9 +176,9 @@ type ReviewRoundCloser interface {
 // dead, so nobody is left to move the task — the driver has to (CLA-386).
 //
 // It is the one write the driver makes about a task's STATUS, and it is kept
-// deliberately narrow. Release returns a held claim to the queue; this parks a
-// task that should reach the operator rather than be retried by the next clanker
-// — the two consecutive-dead-phase case. The park files an OPEN question
+// deliberately narrow. ReleaseDriver returns a held claim to the queue; this
+// parks a task that should reach the operator rather than be retried by the next
+// clanker — the two consecutive-dead-phase case. The park files an OPEN question
 // alongside the status write, so the operator actually sees the park: a
 // recorded decision is born answered and raises nothing (CLA-395). The question
 // is deliberately a non-blocking `clarification`, not a blocking `decision`:
@@ -410,9 +410,9 @@ func (r *mcpReleaser) CloseReviewRound(ctx context.Context, taskID, runID string
 }
 
 // Park parks a task the driver has decided should reach the operator (CLA-386).
-// Unlike Release - which returns a held claim to the ready queue - this moves the
-// task to `parked`, the status a human reviews, because a task that has killed
-// two consecutive sessions must not be offered to a third.
+// Unlike ReleaseDriver - which returns a held claim to the ready queue - this
+// moves the task to `parked`, the status a human reviews, because a task that
+// has killed two consecutive sessions must not be offered to a third.
 //
 // The OUTCOME is the standalone record: the park commits before any question is
 // filed (the caller files it with AskQuestion), so if that insert fails this

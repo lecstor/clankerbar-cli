@@ -159,13 +159,6 @@ func TestCurrentClaim_IsWrittenMidSessionAndClearedOnRelease(t *testing.T) {
 
 // --- the driver's release handback ------------------------------------------
 
-// wireReleaser narrows a real plane client to plane.Releaser alone. The drain
-// and seam code type-asserts a Target.Releaser for TaskStateSource and friends,
-// and an embedded interface only promotes its own methods — so wrapping here
-// keeps this test on the unwired-plane path it is not about, while the handback
-// still travels the real client's HTTP wire.
-type wireReleaser struct{ plane.Releaser }
-
 // CLA-556: the driver's release of a claim whose session ended must carry the
 // `driver` marker, so the plane can tell it from a session's own hand-back when
 // it decides whether a killed session ended without handing back. A fake cannot
@@ -187,7 +180,7 @@ func TestReleaseHeldClaim_CarriesTheDriverMarkerOnTheWire(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	rel := wireReleaser{plane.New(srv.URL+"/mcp/demo", "k-1")}
+	rel := plane.New(srv.URL+"/mcp/demo", "k-1")
 	d := &Driver{}
 	if released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, held(okResult(1, 0), openClaim()), false); !released {
 		t.Fatal("the handback did not land: the marker cannot be checked on a request that was never made")
@@ -265,7 +258,7 @@ func TestReleaseHeldClaim_FallsBackWhenThePlanePredatesExpireLease(t *testing.T)
 		t.Errorf("expireLease attempted %d times, want 2 before the fallback", len(rel.expireCalls))
 	}
 	if len(rel.calls) != 0 {
-		t.Errorf("fell back to Release (%+v) — that is the one call forbidden for pushed work", rel.calls)
+		t.Errorf("fell back to ReleaseDriver (%+v) — that is the one call forbidden for pushed work", rel.calls)
 	}
 	out := logs.String()
 	if !strings.Contains(out, "leaving the lease to expire so the takeover hand-off survives") {
