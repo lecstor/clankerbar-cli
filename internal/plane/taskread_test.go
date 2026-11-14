@@ -73,8 +73,8 @@ func TestPeekNextTask(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PeekNextTask: %v", err)
 		}
-		if next.Status != "in_progress" || !next.HasWIP || !next.RequiresTakeover {
-			t.Errorf("next = %+v, want the takeover candidate's custody (in_progress, hasWip, requiresTakeover)", next)
+		if next.Status != "in_progress" || !next.HasWIP || !next.RequiresTakeover || next.Branch != "clanker/x" {
+			t.Errorf("next = %+v, want the takeover candidate's custody (in_progress, clanker/x, hasWip, requiresTakeover)", next)
 		}
 	})
 	t.Run("ready head has no custody", func(t *testing.T) {

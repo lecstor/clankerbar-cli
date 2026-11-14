@@ -30,17 +30,21 @@ import (
 // NextTask is what the queue-head peek learned. Repo is the task's `repo`
 // field, empty when the task carries none (or there is nothing queued).
 //
-// Status, HasWIP and RequiresTakeover are the task's CUSTODY shape at the read
-// (CLA-476). They matter because `next_task` may hand back a stale-lease
-// takeover candidate: a task already `in_progress`, held by a dead run, with a
-// branch recorded. That shape must not later be mistaken for a checkpoint the
-// spawned session produced, so the driver captures it at spawn time and the
-// seam's checkpoint peek requires the hold to appear AFTER it.
+// Status, HasWIP, Branch and RequiresTakeover are the task's CUSTODY shape at
+// the read (CLA-476). They matter because `next_task` may hand back a
+// stale-lease takeover candidate: a task already `in_progress`, held by a dead
+// run, with a branch recorded. That shape must not later be mistaken for a
+// checkpoint the spawned session produced, so the driver captures it at spawn
+// time and the seam's checkpoint peek requires the hold to appear AFTER it.
 type NextTask struct {
 	TaskID string
 	Repo   string
 	// Status is the plane's status word at the read ("ready", "in_progress", …).
 	Status string
+	// Branch is the branch name at the read. `next_task` always sends one (a
+	// synthesized name for a task with no recorded work), so hasWip — not a
+	// non-empty branch — is what distinguishes recorded WIP.
+	Branch string
 	// HasWIP reports a branch RECORDED on the task at the read.
 	HasWIP bool
 	// RequiresTakeover is the plane's own flag that this offer is abandoned
@@ -199,6 +203,7 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 			ID               string `json:"id"`
 			Repo             any    `json:"repo"`
 			Status           any    `json:"status"`
+			Branch           any    `json:"branch"`
 			HasWIP           any    `json:"hasWip"`
 			RequiresTakeover any    `json:"requiresTakeover"`
 		} `json:"next"`
@@ -213,6 +218,7 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 		TaskID:           payload.Next.ID,
 		Repo:             wireString(payload.Next.Repo),
 		Status:           wireString(payload.Next.Status),
+		Branch:           wireString(payload.Next.Branch),
 		HasWIP:           wireBool(payload.Next.HasWIP),
 		RequiresTakeover: wireBool(payload.Next.RequiresTakeover),
 	}, nil

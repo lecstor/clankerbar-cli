@@ -102,7 +102,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// a resumed phase, the spawn-time queue-head peek for a fresh one. Held onto
 	// here because the seam needs it AFTER the session ends — it is the one task
 	// the driver can ask the plane about when the stream carried no claim state.
-	spawnDir, briefedTask, briefedRepo, briefedHold, serr := d.sessionDir(ctx, t, prev)
+	// The fourth is that task's custody at spawn (CLA-476): the peek uses it to
+	// refuse a hold that was already there before the session started.
+	spawnDir, briefedTask, briefedRepo, spawnHold, serr := d.sessionDir(ctx, t, prev)
 	if serr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
 	}
@@ -134,7 +136,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	r := &phaseRun{
 		d: d, t: t, tc: tc, ti: ti, drainNum: drainNum, phaseIdx: phaseIdx, tag: tag, ph: ph,
 		last: last, prev: prev, prior: prior, phases: phases, panel: panel, opts: opts,
-		shape: shape, a: a, spawnDir: spawnDir, prBase: prBase, briefedTask: briefedTask, briefedHold: briefedHold,
+		shape: shape, a: a, spawnDir: spawnDir, prBase: prBase, briefedTask: briefedTask, briefedHold: spawnHold,
 		fixGrading: fixGrading, verifyDigest: verifyDigest, review: review, end: end,
 		// From the CAPTURED sequence, so a handoff successor (whose ph.Prompt is
 		// the predecessor's successor text) still expects its phase's report.

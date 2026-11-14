@@ -691,8 +691,12 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 		return nil
 	}
 	if !hold.Exact && hold.HeldWithBranch {
+		spawnBranch := hold.Branch
+		if spawnBranch == "" {
+			spawnBranch = st.Branch
+		}
 		log.Printf("%siteration %d: %s ended without an observed claim, but %s was ALREADY held with branch %q when the phase spawned — that hold predates the phase (a stale-lease takeover candidate or another run's work), so it is not this phase's checkpoint; keeping today's ending",
-			labelOf(t), drainNum, phaseLabel, briefedTask, st.Branch)
+			labelOf(t), drainNum, phaseLabel, briefedTask, spawnBranch)
 		return nil
 	}
 	return &harness.Result{Claim: harness.Claim{

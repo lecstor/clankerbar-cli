@@ -127,8 +127,7 @@ func TestSessionDir_CapturesTheBriefedTasksSpawnCustody(t *testing.T) {
 	// chooses the spawn directory already answers that, so no second read is paid.
 	_, _, _, target := twoRepos(t)
 	rel := &repoReleaser{next: plane.NextTask{
-		TaskID: "t-1", Repo: "acme/repo-b",
-		Status: "in_progress", HasWIP: true, RequiresTakeover: true,
+		TaskID: "t-1", Repo: "acme/repo-b", Status: "in_progress", Branch: "clanker/x", HasWIP: true, RequiresTakeover: true,
 	}}
 	target.Releaser = rel
 
@@ -139,8 +138,8 @@ func TestSessionDir_CapturesTheBriefedTasksSpawnCustody(t *testing.T) {
 	if briefed != "t-1" {
 		t.Errorf("briefed task = %q, want t-1", briefed)
 	}
-	if !hold.HeldWithBranch || hold.Exact {
-		t.Errorf("hold = %+v, want a fresh brief whose task was already held with branch", hold)
+	if !hold.HeldWithBranch || hold.Exact || hold.Branch != "clanker/x" {
+		t.Errorf("hold = %+v, want a fresh brief whose task was already held with branch clanker/x", hold)
 	}
 
 	// A resumed phase knows the exact task: a hold on it needs no transition.

@@ -376,15 +376,21 @@ type briefedHold struct {
 	// held, with a branch recorded — the shape `next_task` reports for a
 	// stale-lease takeover candidate.
 	HeldWithBranch bool
+	// Branch is the branch recorded at that read, kept for the refusal's log
+	// line. Empty for a resumed phase (whose claim names its own branch).
+	Branch string
 }
 
 // heldWithBranchAtSpawn derives the spawn-time custody from a queue-head read.
 // `requiresTakeover` is authoritative on its own: the plane computes it only for
 // an `in_progress` task whose lease expired with WIP recorded. The status+hasWip
-// pair covers a holder that is still live (a long phase 1 can lose the queue
-// head to another clanker after the read).
-func heldWithBranchAtSpawn(next plane.NextTask) bool {
-	return next.RequiresTakeover || (next.Status == "in_progress" && next.HasWIP)
+// pair reads the same shape without relying on the flag, so a plane answer that
+// omits it still yields the refusal.
+func heldWithBranchAtSpawn(next plane.NextTask) briefedHold {
+	return briefedHold{
+		HeldWithBranch: next.RequiresTakeover || (next.Status == "in_progress" && next.HasWIP),
+		Branch:         next.Branch,
+	}
 }
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
@@ -445,7 +451,7 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		case perr == nil:
 			briefed = next.TaskID
 			repo = next.Repo
-			hold.HeldWithBranch = heldWithBranchAtSpawn(next)
+			hold = heldWithBranchAtSpawn(next)
 			if next.Repo != "" {
 				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
 			}
