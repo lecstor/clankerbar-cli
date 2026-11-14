@@ -250,16 +250,18 @@ func helperMain() {
 		// An in-flight session: STOP and RESTART are honoured only after the
 		// test drops the BOUNDARY file, which stands for the child reaching its
 		// next phase seam or iteration boundary. Until then it keeps its pid and
-		// ignores both markers, exactly as a daemon mid-session does.
+		// ignores both markers, exactly as a daemon mid-session does. STOP is
+		// checked FIRST, mirroring the real daemon's precedence (run.go /
+		// seam_markers.go): a stop wins over a pending roll.
 		boundary := filepath.Join(spec.StateDir, "BOUNDARY")
 		for {
 			if _, err := os.Lstat(boundary); err == nil {
-				if _, err := os.Lstat(filepath.Join(spec.StateDir, loop.MarkerRestart)); err == nil {
-					_ = os.Remove(filepath.Join(spec.StateDir, loop.MarkerRestart))
-					os.Exit(0)
-				}
 				if _, err := os.Lstat(stopPath); err == nil {
 					_ = os.Remove(stopPath)
+					os.Exit(0)
+				}
+				if _, err := os.Lstat(filepath.Join(spec.StateDir, loop.MarkerRestart)); err == nil {
+					_ = os.Remove(filepath.Join(spec.StateDir, loop.MarkerRestart))
 					os.Exit(0)
 				}
 			}

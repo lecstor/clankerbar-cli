@@ -723,6 +723,33 @@ func TestStatusReportAdoptedChildReportsRunning(t *testing.T) {
 	}
 }
 
+// An adopted child's exit comes from wait4, not exec.Cmd, so it carries its
+// own ExitCode method. The status surface must report the real code, not the
+// generic -1 a plain error would produce.
+func TestStatusAdoptedChildExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"exit status", &adoptedExitError{code: 7, msg: "exit status 7"}, 7},
+		{"signal", &adoptedExitError{code: -1, msg: "signal: killed"}, -1},
+	} {
+		inst := &Instance{
+			name:         "clanker1",
+			desired:      RosterDesiredRunning,
+			exited:       true,
+			exitErr:      tc.err,
+			exitAt:       time.Now(),
+			childVersion: "0.25.6",
+		}
+		got := (&Supervisor{}).statusInstance(inst)
+		if got.LastExit == nil || got.LastExit.Code != tc.want {
+			t.Errorf("%s: LastExit = %+v, want code %d", tc.name, got.LastExit, tc.want)
+		}
+	}
+}
+
 // A desired-state flip to stopped drops the retry the instance was waiting on:
 // respawnDue refuses to spawn against a non-running desired state, so keeping
 // the timestamp would let the report promise a retry that cannot fire.

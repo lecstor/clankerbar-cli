@@ -25,6 +25,12 @@ func waitPid(pid int) error {
 	return errors.New("waiting on an adopted child is not supported on this platform")
 }
 
+// probeExited is unsupported off-unix, for the same reason: no adopted child
+// exists to probe.
+func probeExited(pid int) (bool, error) {
+	return false, nil
+}
+
 // processAlive is unsupported off-unix, for the same reason.
 func processAlive(pid int) bool {
 	return false

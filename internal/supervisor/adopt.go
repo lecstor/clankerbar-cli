@@ -21,10 +21,12 @@ package supervisor
 // respawns it.
 //
 // Version: an adopted child keeps its recorded version (it is still the old
-// image). Each one that reports an older version is moved onto this image
+// image). Each one whose BEACON does not yet report this image is moved onto it
 // through the same RESTART roll the one-shot command performs, one at a time,
-// idle children first. A child spawned after the swap is already on the new
-// binary.
+// idle children first. The beacon is the decision, not the recorded spawn
+// version: a child that re-exec'd in place on an earlier roll keeps its pid, so
+// it already reports the new version and must not be restarted a second time.
+// A child spawned after the swap is already on the new binary.
 
 import (
 	"encoding/json"
@@ -45,6 +47,12 @@ import (
 // its cache dir beside the REPLACE marker, and the incoming image consumes at
 // startup.
 const replaceHandoffName = "REPLACE_HANDOFF"
+
+// replaceHandoffMaxAge bounds how old a handoff may be and still describe the
+// exec that is starting this process: write-to-adopt is one exec(2), so
+// minutes of slack is generous. An older file is a leftover from a process
+// whose pid has since been reused, which the pid gate alone cannot catch.
+const replaceHandoffMaxAge = 5 * time.Minute
 
 // replaceHandoff is the file's JSON shape: the process that wrote it, and one
 // entry per live child it held.
@@ -206,18 +214,22 @@ func (d *Supervisor) adoptReplaceHandoff() []*Instance {
 	h := readReplaceHandoff(d.cacheDir)
 	d.removeReplaceHandoff()
 	if h == nil {
-		log.Printf("replace: discarding an unreadable handoff file in %s", d.cacheDir)
+		log.Printf("replace: discarding an unreadable handoff file in %s - any children it named are still this process's and will run unreaped, and the next reconcile can spawn duplicates on the same state dirs; inspect the file before re-running the replacement", d.cacheDir)
 		return nil
 	}
 	if h.SupervisorPID != os.Getpid() {
 		log.Printf("replace: discarding a handoff file written by supervisor pid %d - this process is pid %d, so the children are not ours to adopt", h.SupervisorPID, os.Getpid())
 		return nil
 	}
+	if !h.WrittenAt.IsZero() && time.Since(h.WrittenAt) > replaceHandoffMaxAge {
+		log.Printf("replace: discarding a handoff file written at %s - more than %s before this process adopted it, so it cannot describe the exec that started this image", h.WrittenAt.UTC().Format(time.RFC3339), replaceHandoffMaxAge)
+		return nil
+	}
 	if len(h.Children) == 0 {
 		log.Print("replace: the handoff file names no live children - nothing to adopt")
 		return nil
 	}
-	log.Printf("replace: handoff from supervisor %s (pid %d) accepted - adopting %d live child(ren)", h.Version, h.SupervisorPID, len(h.Children))
+	log.Printf("replace: handoff from supervisor %s (pid %d, written %s) accepted - adopting %d live child(ren)", h.Version, h.SupervisorPID, h.WrittenAt.UTC().Format(time.RFC3339), len(h.Children))
 
 	var adopted []*Instance
 	seen := make(map[string]bool, len(h.Children))
@@ -229,6 +241,14 @@ func (d *Supervisor) adoptReplaceHandoff() []*Instance {
 		seen[c.Name] = true
 		if !processAlive(c.PID) {
 			log.Printf("replace: handoff names %s (pid %d, version %s) but the process is gone - it will be spawned afresh on the next reconcile", c.Name, c.PID, c.Version)
+			continue
+		}
+		// A child that died after the handoff was written is a zombie: kill(0)
+		// still reports it alive, but it is already this process's to reap. Reap
+		// it here, before the roll starts, rather than adopting a dead
+		// generation the roll could then hand a spurious RESTART.
+		if reaped, werr := probeExited(c.PID); reaped {
+			log.Printf("replace: handoff names %s (pid %d) but it exited during the exec window (%s) - it is reaped and the next reconcile spawns it afresh on this image", c.Name, c.PID, exitErrString(werr))
 			continue
 		}
 		cmd := adoptedCmd(c.PID)
@@ -243,6 +263,7 @@ func (d *Supervisor) adoptReplaceHandoff() []*Instance {
 			cmd:          cmd,
 			aliveSince:   c.SpawnedAt,
 			childVersion: c.Version,
+			adoptSettled: make(chan struct{}),
 		}
 		d.instances = append(d.instances, inst)
 		adopted = append(adopted, inst)
@@ -271,12 +292,75 @@ func adoptedCmd(pid int) *exec.Cmd {
 // exitEvent spawn's Wait goroutine does, so onExit, backoff and respawn need
 // no adoption-specific branch. ECHILD (a reused pid, or one already reaped)
 // arrives as an ordinary exit error; the next reconcile respawns the instance.
+//
+// The non-blocking probe runs BEFORE the adopted roll decides anything about
+// this instance (adoptSettled): a child that was already a zombie at adoption
+// is marked exitPending before the roll can see it as alive, so the roll never
+// writes a RESTART into a dead generation. For a live child the probe settles
+// the roll's decision immediately and the blocking wait follows.
 func (d *Supervisor) reapAdopted(inst *Instance, pid int) {
-	err := waitPid(pid)
+	reaped, err := probeExited(pid)
+	if reaped {
+		inst.mu.Lock()
+		inst.exitPending = true
+		inst.mu.Unlock()
+		inst.settleAdopted()
+	} else {
+		inst.settleAdopted()
+		err = waitPid(pid)
+	}
 	if errors.Is(err, errNotAChild) {
 		err = fmt.Errorf("pid %d is not this supervisor's child: %w", pid, err)
 	}
+	if !reaped {
+		inst.mu.Lock()
+		inst.exitPending = true
+		inst.mu.Unlock()
+	}
 	d.exits <- exitEvent{inst: inst, err: err, at: time.Now()}
+}
+
+// settleAdopted releases the adopted roll's decision for this instance: its
+// reaper's first wait4 has run, so an exit that was already pending has set
+// exitPending. Called exactly once per adopted child, by its reaper.
+func (inst *Instance) settleAdopted() {
+	close(inst.adoptSettled)
+}
+
+// waitAdoptSettled waits for the instance's reaper to settle the roll's
+// decision. A spawned instance has no reaper and settles immediately.
+func (inst *Instance) waitAdoptSettled() {
+	if inst.adoptSettled != nil {
+		<-inst.adoptSettled
+	}
+}
+
+// adoptedOnTarget reports whether an adopted child is already on this image.
+// The decision comes from the child's own beacon, exactly as Roll makes it: a
+// child that re-exec'd in place on an earlier roll keeps its pid, so the
+// supervisor never observes the new version through a respawn and its recorded
+// childVersion stays stale. Updating childVersion here is what makes the
+// listing report what the child ACTUALLY runs.
+func adoptedOnTarget(inst *Instance) bool {
+	inst.mu.Lock()
+	dir := inst.stateDir
+	v := inst.childVersion
+	inst.mu.Unlock()
+	if b := readLocalBeacon(dir); b != nil && b.Version == version.Current {
+		inst.mu.Lock()
+		inst.childVersion = version.Current
+		inst.mu.Unlock()
+		return true
+	}
+	return v == version.Current
+}
+
+// adoptedRollCandidate is one adopted child plus the idle rank computed for
+// the sort. The rank is read ONCE: a firmer read inside the comparator could
+// see a beacon change mid-sort, and a non-transitive comparator is not a sort.
+type adoptedRollCandidate struct {
+	inst *Instance
+	idle int
 }
 
 // startAdoptedRoll moves the adopted children still on the old binary onto
@@ -285,27 +369,30 @@ func (d *Supervisor) reapAdopted(inst *Instance, pid int) {
 // first: a busy child's in-flight session must not delay a child that could
 // come back immediately.
 func (d *Supervisor) startAdoptedRoll(adopted []*Instance) {
-	var roll []*Instance
+	var candidates []adoptedRollCandidate
 	for _, inst := range adopted {
 		inst.mu.Lock()
 		alive := inst.cmd != nil && !inst.exited
-		v := inst.childVersion
 		inst.mu.Unlock()
 		if !alive || inst.removed || inst.refused || inst.desired != RosterDesiredRunning {
 			continue
 		}
-		if v == version.Current {
+		if adoptedOnTarget(inst) {
 			log.Printf("replace: adopted %s already runs %s - not rolled", inst.name, version.Current)
 			continue
 		}
-		roll = append(roll, inst)
+		candidates = append(candidates, adoptedRollCandidate{inst: inst, idle: adoptedIdleRank(inst)})
 	}
-	if len(roll) == 0 {
+	if len(candidates) == 0 {
 		return
 	}
-	sort.SliceStable(roll, func(i, j int) bool {
-		return adoptedIdleRank(roll[i]) < adoptedIdleRank(roll[j])
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].idle < candidates[j].idle
 	})
+	roll := make([]*Instance, len(candidates))
+	for i, c := range candidates {
+		roll[i] = c.inst
+	}
 	d.adoptWG.Add(1)
 	go func() {
 		defer d.adoptWG.Done()
@@ -336,20 +423,28 @@ func (d *Supervisor) rollAdopted(insts []*Instance) {
 		if d.baseCtx().Err() != nil {
 			return
 		}
+		// Never decide before the reaper's first wait4 has run: a child whose
+		// exit is already pending (the exec-window zombie) must not have a
+		// RESTART written into its dead generation.
+		inst.waitAdoptSettled()
 		inst.mu.Lock()
 		alive := inst.cmd != nil && !inst.exited
+		pending := inst.exitPending
 		dir := inst.stateDir
+		inst.mu.Unlock()
+		if !alive || pending {
+			continue
+		}
+		if adoptedOnTarget(inst) {
+			// A child that came back on this image while the roll waited on its
+			// predecessor (or that an earlier roll already moved) needs nothing;
+			// restarting it again would be a swap nobody asked for.
+			log.Printf("replace: adopted %s already reports %s - not rolled", inst.name, version.Current)
+			continue
+		}
+		inst.mu.Lock()
 		was := inst.childVersion
 		inst.mu.Unlock()
-		if !alive {
-			continue
-		}
-		if was == version.Current {
-			// A child that crashed and respawned while the roll was waiting on
-			// its predecessor is already on this image; restarting it again
-			// would be a swap nobody asked for.
-			continue
-		}
 		log.Printf("replace: rolling adopted %s (was %s) - writing RESTART; it comes back on %s at its next phase seam or iteration boundary", inst.name, was, version.Current)
 		if err := writeRestartMarker(dir, inst.name); err != nil {
 			log.Printf("replace: %s: %v - halting the adopted roll; the remaining adopted children keep running their current version and `clankerbar supervise roll` can finish them", inst.name, err)

@@ -354,6 +354,16 @@ type Instance struct {
 	// supervisor stored the exit ERROR for its own logging, but a time has to be
 	// captured at the exit itself, because the status row needs to say WHEN.
 	exitAt time.Time
+
+	// adoptSettled is closed by an adopted child's reaper once its first
+	// non-blocking wait4 has run: the adopted roll waits on it so it never
+	// writes a RESTART into a generation whose exit is already pending. Nil for
+	// a spawned child, whose Wait goroutine the roll does not need to consult.
+	adoptSettled chan struct{}
+	// exitPending is set by an adopted child's reaper when wait4 has returned,
+	// before the exit event is posted, so the adopted roll can skip a child
+	// that is already gone even though onExit has not consumed its event yet.
+	exitPending bool
 }
 
 // exitEvent is posted by a child's Wait goroutine when its process ends.
@@ -620,6 +630,12 @@ func (d *Supervisor) reconcile() error {
 			if cached := loadCachedRoster(d.cacheDir); len(cached) > 0 {
 				log.Printf("plane unreachable at start (%v) - starting from the cached roster", err)
 				d.entries = cached
+			} else if len(d.instances) > 0 {
+				// Adopted children keep the process alive with no roster to
+				// reconcile them against; the next successful fetch picks
+				// them up again.
+				log.Printf("plane unreachable at start (%v) and no cached roster - the %d adopted instance(s) keep running without a roster and will be re-reconciled when the plane returns", err, len(d.instances))
+				return nil
 			} else {
 				log.Printf("plane unreachable at start (%v) and no cached roster - nothing to supervise", err)
 				return nil
@@ -800,6 +816,11 @@ func (d *Supervisor) refreshInstance(inst *Instance) {
 // derivation, Validate, the phase-2c permission-policy gate, and the state-dir
 // resolution.
 func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error) {
+	if e == nil {
+		// An adopted child has no roster row until the first successful fetch;
+		// there is no configuration to build it from yet.
+		return nil, "", errors.New("no roster entry yet - the plane has not been reached since this instance was adopted")
+	}
 	base := d.o.BaseCfg
 	if base == nil {
 		var err error
@@ -1407,6 +1428,16 @@ func (d *Supervisor) respawnDue() {
 		// schedule is the idempotent move: the next reconcile re-evaluates the
 		// instance from the roster.
 		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused || inst.halted || inst.limitStopped {
+			continue
+		}
+		if inst.entry == nil {
+			// An adopted child whose exit landed before the plane was ever
+			// reached has nothing to spawn from (buildConfig would have no
+			// entry). Drop the schedule rather than retrying in a busy loop;
+			// the next reconcile re-evaluates the instance once it can see a
+			// roster again.
+			inst.restartAt = time.Time{}
+			log.Printf("%s: cannot respawn - it has no roster entry yet (the plane has not been reached since adoption); the next poll re-evaluates it", inst.name)
 			continue
 		}
 		d.spawn(inst)

@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
@@ -46,6 +47,10 @@ type execCall struct {
 type execRecorder struct {
 	mu    sync.Mutex
 	calls []execCall
+	// handoffAtExec records whether REPLACE_HANDOFF existed at the instant the
+	// hook ran. Production exec never returns, so handoff-before-exec can only
+	// be observed from inside the hook.
+	handoffAtExec bool
 }
 
 // hook records the call and returns an error — the shape of a failed exec, in
@@ -58,6 +63,20 @@ func (r *execRecorder) hook() func(bin string, argv []string, env []string) erro
 // successful exec(2): in production this call never returns.
 func (r *execRecorder) succeedHook() func(bin string, argv []string, env []string) error {
 	return r.resultHook(nil)
+}
+
+// succeedHookCheckingHandoff is succeedHook plus the ordering assertion: it
+// records whether the handoff file already exists when the exec is attempted,
+// pinning the one property the new image depends on.
+func (r *execRecorder) succeedHookCheckingHandoff(path string) func(bin string, argv []string, env []string) error {
+	return func(bin string, argv []string, env []string) error {
+		_, err := os.Lstat(path)
+		r.mu.Lock()
+		r.calls = append(r.calls, execCall{bin: bin, argv: argv, env: env})
+		r.handoffAtExec = err == nil
+		r.mu.Unlock()
+		return nil
+	}
 }
 
 func (r *execRecorder) resultHook(result error) func(bin string, argv []string, env []string) error {
@@ -79,6 +98,13 @@ func (r *execRecorder) first() execCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.calls[0]
+}
+
+// handoffSeenAtExec reports whether the handoff existed when the hook ran.
+func (r *execRecorder) handoffSeenAtExec() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.handoffAtExec
 }
 
 // stagedChild is one child the outgoing supervisor holds: a real process with
@@ -147,8 +173,12 @@ func stageReplaceableChild(t *testing.T, d *Supervisor, name, mode, v string) *s
 	d.instances = append(d.instances, inst)
 	sc := &stagedChild{name: name, pid: cmd.Process.Pid, stateDir: sd, inst: inst, cmd: cmd}
 	// Best effort: a child a test neither adopted nor stopped must not outlive
-	// the test. A reaped pid makes this a no-op (or a harmless ESRCH).
+	// the test. A reaped pid makes the kill a no-op (or a harmless ESRCH). The
+	// BOUNDARY write matters for a respawned busy child: its STOP/RESTART only
+	// lands at that boundary, so without it a failed assertion would leave an
+	// orphan behind after the test's cancel.
 	t.Cleanup(func() {
+		_ = os.WriteFile(filepath.Join(sd, "BOUNDARY"), []byte("boundary\n"), 0o600)
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	})
@@ -161,6 +191,16 @@ func waitForBeaconVersion(t *testing.T, dir, want string) {
 		b := readLocalBeacon(dir)
 		return b != nil && b.Version == want
 	})
+}
+
+// writeBeaconVersion plants a local beacon reporting v, standing in for a child
+// that re-exec'd in place and kept its pid.
+func writeBeaconVersion(t *testing.T, dir, v string) {
+	t.Helper()
+	body := []byte(fmt.Sprintf(`{"version":%q,"state":"idle","at":%q}`, v, time.Now().UTC().Format(time.RFC3339)))
+	if err := os.WriteFile(filepath.Join(dir, loop.LocalBeaconName), body, 0o600); err != nil {
+		t.Fatalf("write beacon in %s: %v", dir, err)
+	}
 }
 
 // waitForLog is waitFor with the captured log on failure: adoption failures are
@@ -199,7 +239,7 @@ func TestReplaceAdoptsLiveChildrenInsteadOfDraining(t *testing.T) {
 	o.VersionOf = func() string { return version.Current } // respawns are the new image
 	o.VerifyTimeout = 5 * time.Second
 	rec := &execRecorder{}
-	o.ExecInPlace = rec.succeedHook()
+	o.ExecInPlace = rec.succeedHookCheckingHandoff(filepath.Join(cacheDir, replaceHandoffName))
 
 	out := newOutgoingSupervisor(t, o, cacheDir)
 	busy := stageReplaceableChild(t, out, "daemon-busy", "busy", "1.0.0")
@@ -212,6 +252,9 @@ func TestReplaceAdoptsLiveChildrenInsteadOfDraining(t *testing.T) {
 
 	if got := rec.len(); got != 1 {
 		t.Fatalf("exec invoked %d time(s), want 1", got)
+	}
+	if !rec.handoffSeenAtExec() {
+		t.Error("the handoff file did not exist when the exec was attempted - the new image would find no children to adopt")
 	}
 	// No child was signalled or stopped: the swap is adoption, not a drain.
 	for _, sc := range []*stagedChild{busy, idle} {
@@ -346,8 +389,9 @@ func TestReplaceAdoptsLiveChildrenInsteadOfDraining(t *testing.T) {
 }
 
 // A child that exits between the handoff write and the new image's wait is a
-// zombie still owned by this process: the adopted wait4 reaps it at once,
-// reports a normal exit, and the reconcile respawns the instance.
+// zombie still owned by this process. Adoption reaps it at once (rather than
+// adopting a dead generation the roll could then hand a spurious RESTART), and
+// the first reconcile spawns it afresh on the new binary.
 func TestReplaceReapsAChildThatExitsInTheExecWindow(t *testing.T) {
 	cacheDir := t.TempDir()
 	setHelperMode(t, "scripted")
@@ -388,16 +432,27 @@ func TestReplaceReapsAChildThatExitsInTheExecWindow(t *testing.T) {
 	}
 
 	done := runSupervise(ctx, o)
-	waitFor(t, 5*time.Second, "the dead-in-window child to be adopted and reaped", func() bool {
+	waitFor(t, 5*time.Second, "the dead-in-window child to be reaped at adoption", func() bool {
 		text := buf.String()
-		return strings.Contains(text, "replace: adopted daemon-window") &&
-			strings.Contains(text, "daemon-window: exited unexpectedly") &&
+		return strings.Contains(text, "exited during the exec window") &&
+			strings.Contains(text, "daemon-window") &&
 			strings.Contains(text, "signal")
 	})
+	if strings.Contains(buf.String(), "replace: adopted daemon-window") {
+		t.Errorf("a child that died in the exec window was adopted:\n%s", buf.String())
+	}
 	waitFor(t, 5*time.Second, "the reaped instance to be respawned on the new version", func() bool {
 		return countRuns(t, child.stateDir) == 2 && readLocalBeacon(child.stateDir) != nil &&
 			readLocalBeacon(child.stateDir).Version == version.Current
 	})
+	// No RESTART may exist: the roll never saw the dead generation, so the
+	// replacement child does not inherit a spurious restart marker.
+	if markerPresent(child.stateDir, "RESTART") {
+		t.Errorf("a RESTART was written into the exec-window child's state dir; the replacement child would honour it")
+	}
+	if got := countRuns(t, child.stateDir); got != 2 {
+		t.Errorf("spawn count = %d, want 2 (the staged run + one respawn)", got)
+	}
 
 	cancel()
 	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
@@ -411,6 +466,172 @@ func TestReplaceReapsAChildThatExitsInTheExecWindow(t *testing.T) {
 			return false
 		}
 	})
+}
+
+// An adopted child can outlive the plane: it is running from the handoff, the
+// first roster fetch fails and there is no cache, so its instance has no entry.
+// When it exits, the respawn path must not build a config from that nil entry
+// (a nil dereference would take the whole supervisor, and the fleet with it);
+// it skips the spawn and is re-evaluated on the next poll.
+func TestAdoptedChildExitWithNoRosterDoesNotPanic(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "scripted")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-orphan", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := testOptions(t, cacheDir, srv)
+	o.VersionOf = func() string { return version.Current }
+	o.VerifyTimeout = 5 * time.Second
+
+	out := newOutgoingSupervisor(t, o, cacheDir)
+	child := stageReplaceableChild(t, out, "daemon-orphan", "sleep", "1.0.0")
+	waitForBeaconVersion(t, child.stateDir, "1.0.0")
+	if n, err := out.writeReplaceHandoff(); err != nil || n != 1 {
+		t.Fatalf("writeReplaceHandoff = %d, %v; want 1, nil", n, err)
+	}
+
+	// The incoming image adopts the live child, but can never reach the plane:
+	// the adopted instance keeps running with no roster entry.
+	plane.setDown(true)
+	done := runSupervise(ctx, o)
+	waitFor(t, 5*time.Second, "the live child to be adopted", func() bool {
+		return strings.Contains(buf.String(), "replace: adopted daemon-orphan (pid "+fmt.Sprint(child.pid))
+	})
+	// Now the child exits, still with no roster entry to respawn it from.
+	if err := syscall.Kill(child.pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the adopted child's exit to be reported", func() bool {
+		return strings.Contains(buf.String(), "daemon-orphan: exited unexpectedly")
+	})
+	waitFor(t, 5*time.Second, "the no-entry respawn guard to skip the spawn", func() bool {
+		return strings.Contains(buf.String(), "cannot respawn - it has no roster entry yet")
+	})
+	// Still serving: the guard skipped a spawn, it did not kill the supervisor.
+	select {
+	case err := <-done:
+		t.Fatalf("Supervise returned %v after the adopted child's exit, want it still running", err)
+	default:
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// The documented roll-then-replace flow must not restart every child twice. A
+// child that re-exec'd in place on the earlier roll keeps its pid, so the
+// supervisor's recorded spawn version is stale while the child's beacon already
+// reports the target: the adopted roll decides from the beacon, exactly as
+// `supervise roll` does, and writes no RESTART.
+func TestAdoptedRollSkipsAChildWhoseBeaconAlreadyReportsTheTarget(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "scripted")
+	plane := &fakePlane{}
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	o := testOptions(t, cacheDir, srv)
+	out := newOutgoingSupervisor(t, o, cacheDir)
+	child := stageReplaceableChild(t, out, "daemon-already", "sleep", "1.0.0")
+	waitForBeaconVersion(t, child.stateDir, "1.0.0")
+	// The earlier roll re-exec'd the child onto the launched binary in place:
+	// its beacon reports the target while the spawn-time version stays stale.
+	writeBeaconVersion(t, child.stateDir, version.Current)
+
+	d := &Supervisor{o: o, ctx: context.Background(), cacheDir: cacheDir, exits: make(chan exitEvent, 16)}
+	d.instances = []*Instance{child.inst}
+	d.startAdoptedRoll([]*Instance{child.inst})
+	time.Sleep(300 * time.Millisecond) // a wrong roll writes RESTART immediately
+
+	if markerPresent(child.stateDir, "RESTART") {
+		t.Errorf("RESTART was written to a child whose beacon already reports %s", version.Current)
+	}
+	if !strings.Contains(buf.String(), "already runs "+version.Current) {
+		t.Errorf("the roll did not record the beacon-confirmed version:\n%s", buf.String())
+	}
+	child.inst.mu.Lock()
+	got := child.inst.childVersion
+	child.inst.mu.Unlock()
+	if got != version.Current {
+		t.Errorf("recorded child version = %q, want the beacon-confirmed %q", got, version.Current)
+	}
+}
+
+// The replacement's conflict-session wait can hold a reconcile pass for up to
+// VerifyTimeout. If the fleet stop lands during that wait, the pass must abort
+// BEFORE touching the roster: a cancelled context would make Fetch fail, and
+// the "plane unreachable" line (with the fake plane up) is what proves the
+// guard did not do its job.
+func TestReconcileAbortsWhenTheFleetStopLandsDuringTheReplaceWait(t *testing.T) {
+	cacheDir := t.TempDir()
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := testOptions(t, cacheDir, srv)
+	o.LaunchVersion = func() (string, error) { return version.Current, nil }
+	o.VerifyTimeout = 5 * time.Second
+	rec := &execRecorder{}
+	o.ExecInPlace = rec.hook()
+
+	d := newOutgoingSupervisor(t, o, cacheDir)
+	d.ctx = ctx
+	d.conflictBusy.Store(true)
+	writeMarker(t, cacheDir, version.Current)
+
+	errc := make(chan error, 1)
+	go func() { errc <- d.reconcile() }()
+	waitFor(t, 5*time.Second, "the replacement to wait for the conflict session", func() bool {
+		return strings.Contains(buf.String(), "a conflict-only session is running")
+	})
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("reconcile returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconcile did not return after the fleet stop")
+	}
+
+	if got := rec.len(); got != 0 {
+		t.Errorf("exec invoked %d time(s), want 0 after the fleet stop aborted the replacement", got)
+	}
+	if _, err := os.Lstat(filepath.Join(cacheDir, replaceHandoffName)); !os.IsNotExist(err) {
+		t.Errorf("the aborted replacement wrote a handoff file; stat err = %v", err)
+	}
+	if strings.Contains(buf.String(), "plane unreachable") {
+		t.Errorf("the pass fell through to the roster fetch after the fleet stop:\n%s", buf.String())
+	}
+	if d.entries != nil {
+		t.Errorf("reconcile fetched %d roster entries after the fleet stop, want none", len(d.entries))
+	}
 }
 
 // A handoff pid that is not our child (reused, or already reaped) comes back
@@ -641,13 +862,17 @@ func TestReplaceTouchesLocalChildrenOnly(t *testing.T) {
 
 	writeMarker(t, cacheDir, version.Current)
 	waitFor(t, 5*time.Second, "the exec to be invoked", func() bool { return rec.len() == 1 })
-	h := readReplaceHandoff(cacheDir)
-	// The handoff has already been removed by the failed exec; the log line
-	// names the count, and the remote state dir is the durable evidence.
+	// A failed exec removes the handoff AFTER it logs the failure, so wait for
+	// the removal itself: sampling the file the moment the hook is recorded
+	// races the supervisor goroutine.
+	waitFor(t, 5*time.Second, "the failed exec to discard the handoff", func() bool {
+		_, err := os.Lstat(filepath.Join(cacheDir, replaceHandoffName))
+		return os.IsNotExist(err)
+	})
 	if !strings.Contains(buf.String(), "replace: handoff written for 1 live child(ren)") {
 		t.Errorf("handoff did not carry exactly the local child:\n%s", buf.String())
 	}
-	if h != nil {
+	if h := readReplaceHandoff(cacheDir); h != nil {
 		t.Errorf("handoff survived the failed exec: %+v", h)
 	}
 	if _, err := os.Lstat(remoteState); !os.IsNotExist(err) {

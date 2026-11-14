@@ -44,17 +44,45 @@ func waitPid(pid int) error {
 			}
 			return err
 		}
-		switch {
-		case ws.Exited():
-			if code := ws.ExitStatus(); code != 0 {
-				return &adoptedExitError{code: code, msg: fmt.Sprintf("exit status %d", code)}
-			}
-			return nil
-		case ws.Signaled():
-			return &adoptedExitError{code: -1, msg: fmt.Sprintf("signal: %s", ws.Signal())}
-		default:
-			return nil
+		return waitStatusErr(ws)
+	}
+}
+
+// probeExited reaps a child that has ALREADY exited, without blocking: the
+// exec-window case, where the handoff names a child that died before the new
+// image got to wait on it. reaped is false while the child still runs, and the
+// caller then blocks in waitPid. ECHILD is deliberately left to waitPid to
+// report (as errNotAChild), so a reused or foreign pid keeps that same path.
+func probeExited(pid int) (reaped bool, err error) {
+	var ws syscall.WaitStatus
+	for {
+		got, werr := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+		if errors.Is(werr, syscall.EINTR) {
+			continue
 		}
+		if werr != nil {
+			return false, nil
+		}
+		if got == 0 {
+			return false, nil
+		}
+		return true, waitStatusErr(ws)
+	}
+}
+
+// waitStatusErr renders wait4's status the way exec.ExitError does: a zero
+// exit is nil, a non-zero exit keeps its code, and a signal is code -1.
+func waitStatusErr(ws syscall.WaitStatus) error {
+	switch {
+	case ws.Exited():
+		if code := ws.ExitStatus(); code != 0 {
+			return &adoptedExitError{code: code, msg: fmt.Sprintf("exit status %d", code)}
+		}
+		return nil
+	case ws.Signaled():
+		return &adoptedExitError{code: -1, msg: fmt.Sprintf("signal: %s", ws.Signal())}
+	default:
+		return nil
 	}
 }
 
