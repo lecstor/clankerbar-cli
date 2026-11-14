@@ -491,7 +491,11 @@ func buildCopilotErrorText(res Result) string {
 		if json.Unmarshal([]byte(line), &ev) != nil {
 			continue
 		}
-		if !strings.Contains(ev.Type, "error") && len(ev.Data.Error) == 0 {
+		// Only the CLI's own session-level failures. A tool.* event can carry an
+		// error too, but that text is the tool's output - a failed shell command
+		// echoes whatever it was run against - and reading it here would reopen
+		// exactly the injection the narration exclusion closes.
+		if !strings.Contains(ev.Type, "error") || strings.HasPrefix(ev.Type, "tool.") {
 			continue
 		}
 		b.WriteByte('\n')
@@ -526,7 +530,12 @@ var copilotLimitRe = regexp.MustCompile(`(?i)` +
 // copilotRateLimitRe names the window a rate-limit statement refers to, for the
 // log line only: every recognised limit is a Stop here (metered billing, no
 // window to wait out).
-var copilotRateLimitRe = regexp.MustCompile(`(?i)weekly rate limit`)
+var (
+	copilotWeeklyRateRe  = regexp.MustCompile(`(?i)weekly rate limit`)
+	copilotSessionRateRe = regexp.MustCompile(`(?i)session rate limit`)
+	copilotModelRateRe   = regexp.MustCompile(`(?i)rate limit for this model`)
+	copilotAnyRateRe     = regexp.MustCompile(`(?i)rate limit`)
+)
 
 func (copilot) DetectLimit(res Result) Limit {
 	text := copilotErrorText(res)
@@ -539,9 +548,18 @@ func (copilot) DetectLimit(res Result) Limit {
 	// the operator top up / resume, which is docs/limit-stop.md's flow.
 	reason := "budget_exhausted"
 	window := "monthly"
-	if copilotRateLimitRe.MatchString(text) {
+	if copilotAnyRateRe.MatchString(text) {
 		reason = "usage_limit"
-		window = "weekly"
+		switch {
+		case copilotWeeklyRateRe.MatchString(text):
+			window = "weekly"
+		case copilotSessionRateRe.MatchString(text):
+			window = "session"
+		case copilotModelRateRe.MatchString(text):
+			window = "model"
+		default:
+			window = ""
+		}
 	}
 	return Limit{Limited: true, Stop: true, Reason: reason, Window: window}
 }

@@ -274,16 +274,17 @@ boundary too. Two other consequences worth knowing:
   spawns roughly three sessions for the same limit — and the middle one is the
   expensive review.
 - **A multi-phase config requires a harness that observes the session's task
-  claim**, which today means `claude` or `opencode`. The handback across a seam,
-  the salvage and the delivery check all depend on it, so a config naming `codex`
-  alongside two or more phases is refused at validation rather than quietly
+  claim**, which today means `claude`, `opencode` or `copilot`. The handback across
+  a seam, the salvage and the delivery check all depend on it, so a config naming
+  `codex` alongside two or more phases is refused at validation rather than quietly
   stopping after phase 1 on every task. A single phase hands off to nobody, so it
   is allowed anywhere.
-- **`max_turns` is a `claude`-only backstop.** `opencode` can now run phases, but
-  `Invocation.MaxTurns` never reaches its CLI and it has no mid-stream token
-  ceiling either, so a phased `opencode` config has no per-session cap at all —
-  only the budget breaker at the phase boundary and `max_wall_clock`. Set those
-  deliberately rather than assuming the `max_turns` you wrote is doing anything.
+- **`max_turns` is a `claude`-only backstop.** `opencode` and `copilot` can run
+  phases, but `Invocation.MaxTurns` never reaches either CLI and neither has a
+  mid-stream token ceiling, so a phased config on them has no turn cap at all — only
+  the budget breaker at the phase boundary and `max_wall_clock` (both adapters
+  enforce that one). Set those deliberately rather than assuming the `max_turns`
+  you wrote is doing anything.
 - **A sequence that ends on the `implement` brief is refused**, on any harness:
   that brief tells its session to stop at the checkpoint and leave `in_review`
   alone, so with no phase after it every task would stop half-finished, forever,
@@ -837,9 +838,9 @@ the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
 
 **Every key in `harnesses` must name a registered harness** — `claude`, `codex`,
-`opencode`. A block keyed by anything else is refused at startup rather than kept
-as dead config: nothing ever looks that key up, so its `model`, `models` and
-paths would silently stop applying. What that catches is the leftover of a
+`opencode`, `copilot`. A block keyed by anything else is refused at startup
+rather than kept as dead config: nothing ever looks that key up, so its `model`,
+`models` and paths would silently stop applying. What that catches is the leftover of a
 rename — a `harnesses.opencode2` block from the retired 2.x preview harness
 (CLA-675) — and the refusal names the rename to make.
 
@@ -880,9 +881,9 @@ alias inside it is a provider's and does not. A harness whose block names no
 models runs on that harness's own configured default, which is where opencode's
 model lives; a claude alias is never handed to another harness's `--model`.
 
-**Every phase's harness has to observe the session's task claim** (`claude` or
-`opencode`), not only the first one's. The first phase has to *observe* a claim
-or there is nothing to hand on; a later phase is *handed* one - but seeding it is
+**Every phase's harness has to observe the session's task claim** (`claude`,
+`opencode` or `copilot`), not only the first one's. The first phase has to
+*observe* a claim or there is nothing to hand on; a later phase is *handed* one - but seeding it is
 the adapter's job, and an adapter that does not track claims does not seed
 either. A non-tracking phase mid-sequence would end every drain early with a log
 line that reads like an ordinary finish, and one at the end would leave the
@@ -2876,8 +2877,21 @@ alternatives, in order of preference:
 | Claude Code (`claude`) | primary |
 | Codex (`codex`) | adapter present; parsing being hardened |
 | OpenCode (`opencode`) | opencode **2.x** only (1.x and the `opencode2` harness name are retired); provider-agnostic (model comes from opencode's own config) |
+| GitHub Copilot CLI (`copilot`) | verified against Copilot CLI 1.0.112; metered AI-credit billing (no wait path — an exhausted allowance stops the run) |
 
 New harnesses are a small adapter (`internal/harness`). Contributions welcome.
+
+**`copilot` is driven headless with a pinned, fail-closed policy.** `copilot -p`
+denies any tool request it would otherwise prompt for, so the adapter grants only
+`read`, `write`, `shell` and the `clankerbar` MCP server for a working session; the
+file boundary is the CLI's own path verification (workdir, temp, `--add-dir`). A
+probe denies `write` and `shell` outright. `mcp_config_path` is handed over as
+`--additional-mcp-config @<file>` and read in Claude's `mcpServers` schema (the same
+object), which is what gives a session its clankerbar tools — a workspace `.mcp.json`
+is only auto-loaded for a *trusted* folder, and this adapter never trusts one.
+Copilot reports AI credits, never money, so `budget.max_cost_usd` is inert on this
+harness and `budget.max_tokens` is the breaker; the guide is
+[`docs/copilot-cli.md`](./docs/copilot-cli.md).
 
 **Permissions are set per harness, and the loop fails closed under all of them.**
 `claude` gets its allowlist from the settings file (`--settings`), `codex` from
@@ -2979,6 +2993,7 @@ the catch-all matches last, denying every read.
 - [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
+- [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
 
 ## License
 

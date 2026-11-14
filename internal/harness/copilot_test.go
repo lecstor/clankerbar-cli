@@ -1,10 +1,13 @@
 package harness
 
 import (
+	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // copilotParsed runs a captured stdout stream through exactly the machinery
@@ -16,6 +19,9 @@ func copilotParsed(stdout string) Result {
 
 func copilotParsedIn(in Invocation, stdout string) Result {
 	res := newSessionResult(in)
+	// The real Invoke retains the tail it parsed; mirror that so the
+	// classification tests can run against a Result shaped like production's.
+	res.Stdout = stdout
 	var p copilotParse
 	sink := newLineSink(func(line []byte) { p.line(line, &res, io.Discard) })
 	_, _ = io.WriteString(sink, stdout)
@@ -223,4 +229,458 @@ func jsonString(t *testing.T, s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// everyFlag returns the argv positions of flag, so a test can assert a flag is
+// absent without matching a prompt that merely contains its text.
+func everyFlag(args []string, flag string) []int {
+	var at []int
+	for i, a := range args {
+		if a == flag {
+			at = append(at, i)
+		}
+	}
+	return at
+}
+
+func TestCopilotArgs(t *testing.T) {
+	in := Invocation{
+		Prompt:        "Work the backlog.",
+		Model:         "  gpt-5.6-sol  ",
+		MCPConfigPath: "/work/.mcp.json",
+		ExtraDirs:     []string{"/repos/one", "/repos/two"},
+	}
+	args := copilotArgs(in)
+	joined := strings.Join(args, " ")
+
+	for _, want := range []string{"--output-format json", "--no-ask-user", "--additional-mcp-config @/work/.mcp.json"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args %q missing %q", joined, want)
+		}
+	}
+	if i := indexOf(args, "--model"); i < 0 || args[i+1] != "gpt-5.6-sol" {
+		t.Errorf("args %q: --model must carry the trimmed alias", joined)
+	}
+	// The fail-closed posture: the four grants, each as its own flag/value pair.
+	for _, rule := range []string{"read", "write", "shell", "clankerbar"} {
+		found := false
+		for _, i := range everyFlag(args, "--allow-tool") {
+			if i+1 < len(args) && args[i+1] == rule {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("args %q: missing --allow-tool %s", joined, rule)
+		}
+	}
+	for _, dir := range in.ExtraDirs {
+		found := false
+		for _, i := range everyFlag(args, "--add-dir") {
+			if i+1 < len(args) && args[i+1] == dir {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("args %q: missing --add-dir %s", joined, dir)
+		}
+	}
+	if len(args) < 2 || args[len(args)-2] != "-p" || args[len(args)-1] != in.Prompt {
+		t.Errorf("args %q: the prompt must be the VALUE of a trailing -p", joined)
+	}
+	for _, never := range []string{"--allow-all", "--allow-all-tools", "--allow-all-paths", "--allow-all-urls", "--yolo"} {
+		if len(everyFlag(args, never)) > 0 {
+			t.Errorf("args %q carries %s, which would defeat the fail-closed posture", joined, never)
+		}
+	}
+}
+
+// A blank model emits no flag at all; the shared ratchet covers the raw-field
+// read, and this pins the flag's absence for THIS adapter's builder.
+func TestCopilotArgs_blankModelEmitsNoFlag(t *testing.T) {
+	for _, blank := range []string{"", " ", "\t", "  \n "} {
+		args := copilotArgs(Invocation{Prompt: "work", Model: blank})
+		if len(everyFlag(args, "--model")) > 0 {
+			t.Errorf("args %q for model %q: --model must be absent", strings.Join(args, " "), blank)
+		}
+	}
+}
+
+// A probe is read-only by construction: no write/shell grant, explicit denies,
+// and its only allow is the cheap clankerbar read - never --allow-all.
+func TestCopilotProbeIsReadOnly(t *testing.T) {
+	args := copilotArgs(Invocation{Probe: true, Prompt: "Work the backlog.", MCPConfigPath: "/work/.mcp.json"})
+	joined := strings.Join(args, " ")
+	for _, denied := range []string{"write", "shell"} {
+		found := false
+		for _, i := range everyFlag(args, "--deny-tool") {
+			if i+1 < len(args) && args[i+1] == denied {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("probe args %q: missing --deny-tool %s", joined, denied)
+		}
+	}
+	for _, i := range everyFlag(args, "--allow-tool") {
+		if i+1 < len(args) && args[i+1] != "clankerbar(get_backlog_summary)" {
+			t.Errorf("probe args %q: only the read-only clankerbar tool may be allowed, got %q", joined, args[i+1])
+		}
+	}
+	if !strings.Contains(joined, "get_backlog_summary") {
+		t.Errorf("probe args %q: the prompt must ask for the read-only clankerbar call that proves the MCP wiring", joined)
+	}
+	if !strings.HasSuffix(joined, "-p "+copilotPrompt(Invocation{Probe: true, MCPConfigPath: "/work/.mcp.json"})) {
+		t.Errorf("probe args %q do not end with the probe prompt", joined)
+	}
+}
+
+// Without an MCP config a probe has no server to reach, so it stays the
+// cheapest possible request.
+func TestCopilotProbeWithoutMCPIsJustAPing(t *testing.T) {
+	args := copilotArgs(Invocation{Probe: true, Prompt: "Work the backlog."})
+	if !strings.HasSuffix(strings.Join(args, " "), "-p .") {
+		t.Errorf("args %q: want the bare '.' probe prompt", strings.Join(args, " "))
+	}
+	for _, i := range everyFlag(args, "--allow-tool") {
+		t.Errorf("args %q: a probe without an MCP config granted %q", strings.Join(args, " "), args[i+1])
+	}
+}
+
+func TestCopilotDetectLimit(t *testing.T) {
+	cases := []struct {
+		name   string
+		res    Result
+		want   bool
+		stop   bool
+		reason string
+	}{
+		{
+			name: "documented plan exhaustion",
+			res:  Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"errorType":"query","message":"Plan: 100% used, resets 2026-12-01"}}`},
+			want: true, stop: true, reason: "budget_exhausted",
+		},
+		{
+			name: "service quota message",
+			res:  Result{Stderr: "Error: quota exceeded - upgrade or enable additional usage"},
+			want: true, stop: true, reason: "budget_exhausted",
+		},
+		{
+			name: "out of credits",
+			res:  Result{Stderr: "You are out of AI credits for this month."},
+			want: true, stop: true, reason: "budget_exhausted",
+		},
+		{
+			name: "documented weekly rate limit",
+			res:  Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"message":"You've reached your weekly rate limit."}}`},
+			want: true, stop: true, reason: "usage_limit",
+		},
+		{
+			name: "documented session rate limit",
+			res:  Result{Stderr: "You've hit your session rate limit."},
+			want: true, stop: true, reason: "usage_limit",
+		},
+		{
+			name: "documented per-model rate limit",
+			res:  Result{Stderr: "You've hit the rate limit for this model."},
+			want: true, stop: true, reason: "usage_limit",
+		},
+		{
+			name: "the 75% notice is a warning, not a limit",
+			res:  Result{Stdout: `{"type":"session.warning","data":{"message":"You've used over 75% of your weekly usage limit. Your limit resets soon."}}`},
+		},
+		{
+			name: "a task body quoting the plan exhaustion is narration",
+			res:  Result{Stdout: `{"type":"assistant.message","data":{"content":"The task says: Plan: 100% used, resets 2026-12-01"}}`},
+		},
+		{
+			name: "a tool result quoting it is tool output",
+			res:  Result{Stdout: `{"type":"tool.execution_complete","data":{"toolCallId":"c1","success":true,"result":{"content":"Out of AI credits, quota exceeded"}}}`},
+		},
+		{
+			name: "a FAILED tool call quoting it is still tool output",
+			res:  Result{Stdout: `{"type":"tool.execution_complete","data":{"toolCallId":"c1","success":false,"error":"grep: Plan: 100% used","result":{"content":"grep: Plan: 100% used"}}}`},
+		},
+		{
+			name: "a 429 is transient, not a limit",
+			res:  Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"message":"Execution failed: 429 Too Many Requests"}}`},
+		},
+		{
+			name: "an unavailable model is neither",
+			res:  Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"errorType":"query","message":"Execution failed: Model \"nope\" is not available."}}`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := (copilot{}).DetectLimit(tc.res)
+			if lim.Limited != tc.want {
+				t.Fatalf("DetectLimit.Limited = %v, want %v", lim.Limited, tc.want)
+			}
+			if !tc.want {
+				return
+			}
+			if lim.Stop != tc.stop {
+				t.Errorf("Limit.Stop = %v, want %v (metered billing: no wait)", lim.Stop, tc.stop)
+			}
+			if lim.Reason != tc.reason {
+				t.Errorf("Limit.Reason = %q, want %q", lim.Reason, tc.reason)
+			}
+		})
+	}
+}
+
+func TestCopilotIsTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{"429 error event", Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"message":"Execution failed: 429 Too Many Requests"}}`}, true},
+		{"service unavailable", Result{Stderr: "Error: 503 Service Unavailable"}, true},
+		{"connection reset", Result{Stderr: "Error: read ECONNRESET"}, true},
+		{"socket hang up", Result{Stderr: "Error: socket hang up"}, true},
+		{"unavailable model is a real failure", Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"errorType":"query","message":"Execution failed: Model \"nope\" is not available."}}`}, false},
+		{"clean run", Result{Stdout: `{"type":"assistant.message","data":{"content":"done"}}`}, false},
+		{"a task body mentioning a 500 is narration", Result{Stdout: `{"type":"assistant.message","data":{"content":"the server returned 500 earlier"}}`}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (copilot{}).IsTransient(tc.res); got != tc.want {
+				t.Errorf("IsTransient = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Diagnostic must read the same scope the classifiers do: the CLI's own text,
+// never the agent's narration or a tool's output.
+func TestCopilotDiagnosticExcludesNarrationAndToolOutput(t *testing.T) {
+	res := Result{
+		Stderr: "Warning: Skipped workspace MCP servers (.mcp.json) because the folder is not trusted.",
+		Stdout: strings.Join([]string{
+			`{"type":"assistant.message","data":{"content":"backlog body quoting Plan: 100% used, resets 2030"}}`,
+			`{"type":"tool.execution_complete","data":{"toolCallId":"c1","success":true,"result":{"content":"quota exceeded"}}}`,
+			`{"type":"session.error","data":{"errorType":"query","message":"Execution failed: connection reset by peer"}}`,
+		}, "\n"),
+	}
+	diag := (copilot{}).Diagnostic(res)
+	if !strings.Contains(diag, "connection reset by peer") {
+		t.Errorf("Diagnostic %q does not carry the harness's own error", diag)
+	}
+	if strings.Contains(diag, "Plan: 100% used") || strings.Contains(diag, "quota exceeded") {
+		t.Errorf("Diagnostic %q copied agent/tool text into the classification scope", diag)
+	}
+	if lim := (copilot{}).DetectLimit(res); lim.Limited {
+		t.Errorf("DetectLimit fired on text outside the diagnostic scope: %+v", lim)
+	}
+}
+
+// The captured invalid-model stream: a real error event and exit 1, which is a
+// real failure - neither a limit nor a blip.
+func TestCopilotCapturedModelError(t *testing.T) {
+	data, err := os.ReadFile("testdata/copilot/model-unavailable.jsonl")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	res := copilotParsed(string(data))
+	if lim := (copilot{}).DetectLimit(res); lim.Limited {
+		t.Errorf("DetectLimit = %+v, want no limit", lim)
+	}
+	if (copilot{}).IsTransient(res) {
+		t.Error("IsTransient = true for a model that does not exist")
+	}
+	if !strings.Contains((copilot{}).Diagnostic(res), "not available") {
+		t.Errorf("Diagnostic %q does not name the real failure", (copilot{}).Diagnostic(res))
+	}
+}
+
+func TestCopilotEnvPinsCopilotHome(t *testing.T) {
+	env := (copilot{}).env(Invocation{WorkDir: t.TempDir(), ConfigDir: "/config/copilot"})
+	found := false
+	for _, e := range env {
+		if e == "COPILOT_HOME=/config/copilot" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("env %v does not carry COPILOT_HOME from ConfigDir", env)
+	}
+}
+
+// copilotStub installs an executable named `copilot` first on PATH.
+func copilotStub(t *testing.T, script string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "copilot"), []byte(script), 0o755); err != nil {
+		t.Fatalf("writing stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// The real Invoke path, end to end through a stub binary: the argv the adapter
+// builds reaches the child, and the captured stream comes back parsed.
+func TestCopilotInvokeParsesTheStreamAndPassesThePrompt(t *testing.T) {
+	dir := t.TempDir()
+	stream := filepath.Join(dir, "stream.jsonl")
+	if err := os.WriteFile(stream, []byte(copilotSmokeStream(t)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	argv := filepath.Join(dir, "argv.txt")
+	t.Setenv("COPILOT_STUB_STREAM", stream)
+	t.Setenv("COPILOT_STUB_ARGV", argv)
+	copilotStub(t, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$COPILOT_STUB_ARGV\"\ncat \"$COPILOT_STUB_STREAM\"\n")
+
+	res, err := (copilot{}).Invoke(context.Background(), Invocation{
+		Prompt:        "Work the backlog.",
+		WorkDir:       dir,
+		Console:       io.Discard,
+		MCPConfigPath: "/work/.mcp.json",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", res.ExitCode)
+	}
+	if want := 15811 + 29824 + 65; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d", res.Tokens, want)
+	}
+	if !strings.Contains(res.FinalMessage, "backlog=169") {
+		t.Errorf("FinalMessage = %q", res.FinalMessage)
+	}
+	got, err := os.ReadFile(argv)
+	if err != nil {
+		t.Fatalf("stub wrote no argv: %v", err)
+	}
+	for _, want := range []string{"-p\nWork the backlog.", "--additional-mcp-config\n@/work/.mcp.json", "--output-format\njson"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("argv %q does not contain %q", got, want)
+		}
+	}
+}
+
+// A non-zero exit is still a parsed Result, and its documented exhaustion text
+// classifies as a Stop the driver can act on.
+func TestCopilotInvokeReturnsALimitFromANonZeroExit(t *testing.T) {
+	copilotStub(t, "#!/bin/sh\n"+
+		"echo '{\"type\":\"session.error\",\"data\":{\"errorType\":\"query\",\"message\":\"Plan: 100% used, resets 2026-12-01\"}}'\n"+
+		"exit 1\n")
+
+	res, err := (copilot{}).Invoke(context.Background(), Invocation{Prompt: "work", Console: io.Discard})
+	if err != nil {
+		t.Fatalf("Invoke returned an error for an ordinary non-zero exit: %v", err)
+	}
+	if res.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", res.ExitCode)
+	}
+	lim := (copilot{}).DetectLimit(res)
+	if !lim.Limited || !lim.Stop {
+		t.Errorf("DetectLimit = %+v, want Limited and Stop", lim)
+	}
+}
+
+// The cap has to END the session, not hang on it.
+func TestCopilotInvokeEndsASessionThatOutlivesItsWallClockCap(t *testing.T) {
+	copilotStub(t, "#!/bin/sh\nexec sleep 30\n")
+	start := time.Now()
+	res, err := (copilot{}).Invoke(context.Background(), Invocation{
+		Prompt:              "work",
+		Console:             io.Discard,
+		MaxSessionWallClock: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Invoke returned an error for our own kill: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Invoke took %s; the wall-clock cap did not end the session", elapsed)
+	}
+	if !(copilot{}).WallClockCapped(res) {
+		t.Errorf("WallClockCapped = false, want the cap marker (%+v, raw %v)", res, res.Raw)
+	}
+	if res.ExitCode != -1 {
+		t.Errorf("ExitCode = %d, want -1 for a killed session", res.ExitCode)
+	}
+}
+
+// A caller's cancellation is not the phase reaching its backstop.
+func TestCopilotCallerCancellationIsNotAWallClockCap(t *testing.T) {
+	copilotStub(t, "#!/bin/sh\nexec sleep 30\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	res, err := (copilot{}).Invoke(ctx, Invocation{
+		Prompt:  "work",
+		Console: io.Discard,
+		// No MaxSessionWallClock: the only deadline is the caller's.
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if (copilot{}).WallClockCapped(res) {
+		t.Error("a caller-cancelled session was reported as wall-clock capped")
+	}
+}
+
+// The live smoke: ONE real headless Copilot session, read-only, with the
+// adapter's fail-closed probe posture, reaching clankerbar over the real
+// /mcp. Opt-in because it is a paid call, and it needs the operator's auth
+// (the machine's stored Copilot credential) plus a real .mcp.json:
+//
+//	CLANKERBAR_COPILOT_LIVE=1 CLANKERBAR_COPILOT_MCP=$PWD/.mcp.json \
+//	  go test ./internal/harness -run TestCopilotLiveSmoke -v
+//
+// What it pins that no fixture can: the custom-MCP config really loads from
+// --additional-mcp-config, the `${CLANKERBAR_API_KEY}` header expands, a
+// clankerbar tool call is observed through toolRequests/execution_complete, and
+// the probe writes nothing.
+func TestCopilotLiveSmoke(t *testing.T) {
+	if os.Getenv("CLANKERBAR_COPILOT_LIVE") == "" {
+		t.Skip("set CLANKERBAR_COPILOT_LIVE=1 and CLANKERBAR_COPILOT_MCP=<.mcp.json> to run the paid live smoke")
+	}
+	mcp := os.Getenv("CLANKERBAR_COPILOT_MCP")
+	if mcp == "" {
+		t.Skip("CLANKERBAR_COPILOT_MCP must name the .mcp.json to hand the session")
+	}
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	res, err := (copilot{}).Invoke(ctx, Invocation{
+		Probe:         true,
+		WorkDir:       dir,
+		MCPConfigPath: mcp,
+		Console:       io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("live probe: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("live probe exited %d: stdout=%s stderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if res.ClankerbarCalls < 1 {
+		t.Errorf("ClankerbarCalls = %d, want at least 1: the read-only get_backlog_summary never succeeded (stderr %q)", res.ClankerbarCalls, res.Stderr)
+	}
+	mcpStatus, _ := res.Raw["mcp_servers"].(map[string]string)
+	if mcpStatus["clankerbar"] != "connected" {
+		t.Errorf("Raw[mcp_servers][clankerbar] = %q, want connected (%v)", mcpStatus["clankerbar"], mcpStatus)
+	}
+	if lim := (copilot{}).DetectLimit(res); lim.Limited {
+		t.Errorf("DetectLimit = %+v on a healthy session", lim)
+	}
+	if !res.UsageReported || res.Tokens == 0 {
+		t.Errorf("usage not reported: reported=%v tokens=%d", res.UsageReported, res.Tokens)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the read-only probe wrote %d entries into the workdir: %v", len(entries), entries)
+	}
+	t.Logf("live probe: tokens=%d credits=%.3f final=%q", res.Tokens, res.Raw["ai_credits"], snippetText(res.FinalMessage))
+}
+
+func snippetText(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
 }

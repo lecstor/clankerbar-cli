@@ -118,6 +118,12 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 	case "opencode":
 		return checkOpencodePermissions(cfg, label, harnessName)
 
+	case "copilot":
+		// The adapter pins both halves itself: -p refuses anything that would
+		// prompt, and the four --allow-tool grants are all the working set.
+		c.status = pass
+		c.detail = "adapter pins fail-closed --allow-tool rules (-p denies anything unapproved); --deny-tool write/shell on probes"
+
 	default:
 		c.status = pass
 		c.detail = "no permission-policy checks for " + harnessName

@@ -1,0 +1,143 @@
+# Driving GitHub Copilot CLI headless
+
+The `copilot` adapter drives GitHub Copilot CLI's non-interactive mode. Everything
+here was verified against **Copilot CLI 1.0.112** on Linux; it is the reference for
+the flags and event shapes `internal/harness/copilot.go` depends on, and for what an
+operator has to configure.
+
+## The session
+
+```
+copilot --output-format json --no-ask-user --no-auto-update --no-color \
+        --disable-builtin-mcps [--model <alias>] \
+        [--additional-mcp-config @<mcp_config_path>] [--add-dir <dir>]... \
+        --allow-tool read --allow-tool write --allow-tool shell \
+        --allow-tool clankerbar \
+        -p "<prompt>"
+```
+
+- `-p/--prompt` is one non-interactive session; the CLI exits when it is done.
+- `--output-format json` makes stdout a JSONL event stream. `assistant.message`
+  carries the final answer (`data.content`; the last one is `phase: "final_answer"`),
+  `tool.execution_*` carries tool calls, and `session.usage_checkpoint` carries the
+  session's usage.
+- The prompt is the VALUE of `-p`, never a positional argument, so a prompt that
+  starts with `-` cannot be read as a flag.
+
+## Permissions are fail-closed by default
+
+In `-p` mode a tool request that would prompt is **denied** (there is nobody to
+ask). `--allow-tool` / `--deny-tool` open the parts of the working set a session
+needs; `--deny-tool` wins over every allow, including `--allow-all`.
+
+The adapter grants `read`, `write`, `shell` and the `clankerbar` MCP server for a
+working session. The file boundary is the CLI's own path verification (the working
+directory, the system temp dir, and each `--add-dir`); an out-of-boundary path
+cannot prompt in `-p` mode, so it fails closed. A **probe** is read-only: it denies
+`write` and `shell` outright (read-only shell commands would otherwise run without
+asking) and its only grant is `clankerbar(get_backlog_summary)`.
+
+`--disable-builtin-mcps` drops the built-in GitHub MCP server. Its tools are not in
+the allow policy, so in `-p` mode they would be offered to the model and then
+denied; a session's MCP servers are the operator's `mcp_config_path` and nothing
+else.
+
+## MCP servers
+
+`--additional-mcp-config @<file>` registers a file for one session, in the same
+`mcpServers` schema Claude Code uses:
+
+```json
+{
+  "mcpServers": {
+    "clankerbar": {
+      "type": "http",
+      "url": "https://clankerbar.com/mcp/clankerbar",
+      "headers": { "Authorization": "Bearer ${CLANKERBAR_API_KEY}" }
+    }
+  }
+}
+```
+
+This is why the adapter reports `mcp_config_path` as Claude's schema: the object is
+the one it reads. `${VAR}` expansion inside the file works (verified: the server
+connected with 37 tools and a real `get_backlog_summary` call succeeded).
+
+A workspace `.mcp.json` is auto-discovered **only once the folder is trusted**, and
+`--additional-mcp-config` is what makes the file reach the session regardless. The
+adapter never trusts a folder: trusting one also approves that directory's skills,
+plugins, MCP servers and hooks (including hooks that run shell commands).
+
+## Usage and billing
+
+Copilot moved to usage-based AI-credit billing on 2026-06-01: a monthly allowance of
+AI credits, then per-token overage. It is **metered**, not a rolling-window
+subscription, so there is no 5-hour/weekly window to wait out and the adapter never
+enters the supervised wait.
+
+`session.usage_checkpoint.data.accountingSnapshot` is the session's cumulative
+report. `tokenDetails` is already disjoint — `input` excludes `cache_read` and
+`cache_write` — so the adapter copies the four buckets into `Result.Usage` and sums
+them into `Result.Tokens`. `modelMetrics.*.usage.inputTokens` is **inclusive** of the
+cache buckets; that path is only used as a fallback when `tokenDetails` is absent,
+and subtracts them. The CLI's `reasoningTokens` is folded into output; it is kept in
+`Raw["reasoning_tokens"]` for diagnostics rather than invented as a fifth bucket.
+
+`totalNanoAiu` is AI credits × 10⁹ (10⁹ nano-AIU = 1 credit). It is **not money**:
+a credit's dollar value depends on the plan and on whether the call is inside the
+included allowance. `Result.CostUSD` therefore stays zero and
+`Capabilities.ReportsCost` is false — `budget.max_cost_usd` is inert under this
+harness, and `budget.max_tokens` (fed by the checkpoint) is the breaker.
+
+## Limits
+
+`DetectLimit` recognises the CLI's documented exhaustion statements
+(`copilot help billing`, `copilot help limits`):
+
+- plan allowance exhausted — `Plan: 100% used, resets <date>`, "out of AI credits",
+  "quota exceeded";
+- the session AI-credit cap — "Session limit reached";
+- account rate limits — "You've reached your weekly rate limit", "You've hit your
+  session rate limit", "You've hit the rate limit for this model".
+
+All of them are `Limit.Stop` (`budget_exhausted`, or `usage_limit` for the rate-limit
+statements): the run stops cleanly and writes the `LIMIT_STOP` marker
+(`docs/limit-stop.md`) for the operator to resume after topping up.
+
+The scope is the CLI's own text — stderr, non-JSON stdout lines, and error events —
+never `assistant.message` content or a tool result. That is what stops a backlog
+body quoting "Plan: 100% used" from tripping a stop. The CLI's 75%-used quota notice
+is a `session.warning` and is deliberately out of scope: it is not a limit.
+
+## What the adapter does not provide
+
+- **No turn cap.** `Invocation.MaxTurns` has no Copilot CLI equivalent. The phase
+  backstop is `max_session_wall_clock`, which the adapter enforces itself.
+- **No idle watchdog or repeated-tool-failure guard.** `max_session_idle` and
+  `max_repeated_tool_failures` are inert for this harness.
+- **No multi-turn sequences.** `Invocation.Turns` is refused; the CLI can resume a
+  session (`--resume` / `--session-id`) but the adapter does not use it yet.
+- **No headless account usage.** `/usage` is TUI-only; `ReadUsage` returns
+  `ErrUsageUnsupported`. `--usage-output-file` writes the same session figures the
+  JSONL checkpoint carries.
+
+## Reading the output
+
+`internal/harness/testdata/copilot/mcp-smoke.jsonl` is a captured run (fixture for
+the parser tests), and `model-unavailable.jsonl` is a captured real failure. To
+capture another, run the command above with a scratch `COPILOT_HOME` and keep the
+stdout.
+
+The quickest live check that the wiring is intact is the opt-in smoke, which runs
+ONE real read-only session through the adapter (a paid call, ~0.2 AI credits):
+
+```sh
+CLANKERBAR_COPILOT_LIVE=1 CLANKERBAR_COPILOT_MCP=$PWD/.mcp.json \
+  go test ./internal/harness -run TestCopilotLiveSmoke -v
+```
+
+It asserts that `--additional-mcp-config` loaded the server, that the
+`${CLANKERBAR_API_KEY}` header expanded (a real `get_backlog_summary` result), that
+the call was observed, that usage was reported, and that the read-only posture
+wrote nothing. The probe records every server's status in
+`Result.Raw["mcp_servers"]`.
