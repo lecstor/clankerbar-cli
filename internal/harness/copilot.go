@@ -596,7 +596,12 @@ var copilotTransientRe = regexp.MustCompile(`(?i)` +
 	`|connection reset|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout|is unreachable)` +
 	`|fetch failed|timed out|temporarily unavailable|try again later`)
 
-func (copilot) IsTransient(res Result) bool {
+func (c copilot) IsTransient(res Result) bool {
+	// A limit statement mentions "rate limit", so the word classes overlap; a
+	// hard limit is never a blip to retry, whatever the wording.
+	if c.DetectLimit(res).Limited {
+		return false
+	}
 	return copilotTransientRe.MatchString(copilotErrorText(res))
 }
 

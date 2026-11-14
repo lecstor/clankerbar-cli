@@ -463,6 +463,7 @@ func TestCopilotIsTransient(t *testing.T) {
 		{"connection reset", Result{Stderr: "Error: read ECONNRESET"}, true},
 		{"socket hang up", Result{Stderr: "Error: socket hang up"}, true},
 		{"unavailable model is a real failure", Result{ExitCode: 1, Stdout: `{"type":"session.error","data":{"errorType":"query","message":"Execution failed: Model \"nope\" is not available."}}`}, false},
+		{"a recognised limit is not a blip", Result{Stderr: "You've reached your weekly rate limit."}, false},
 		{"clean run", Result{Stdout: `{"type":"assistant.message","data":{"content":"done"}}`}, false},
 		{"a task body mentioning a 500 is narration", Result{Stdout: `{"type":"assistant.message","data":{"content":"the server returned 500 earlier"}}`}, false},
 	}
