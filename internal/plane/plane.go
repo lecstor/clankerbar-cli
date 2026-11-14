@@ -288,9 +288,9 @@ type mcpReleaser struct {
 // `outcome`: the session may have written one, and this call is a handback, not
 // a report.
 //
-// It is the ONLY release form this client offers: a session's own voluntary
-// release is the session's MCP call, so the driver can never post one that looks
-// like it (see the Releaser doc).
+// It is the only release form on Releaser: a session's own voluntary release is
+// the session's MCP call, so the driver can never post one that looks like it
+// (see the Releaser doc).
 func (r *mcpReleaser) ReleaseDriver(ctx context.Context, taskID, runID string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release driver: taskId and runId are both required")

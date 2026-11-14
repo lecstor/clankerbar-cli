@@ -167,10 +167,10 @@ func TestCurrentClaim_IsWrittenMidSessionAndClearedOnRelease(t *testing.T) {
 type wireReleaser struct{ plane.Releaser }
 
 // CLA-556: the driver's release of a claim whose session ended must carry the
-// `driver` marker, so the plane can tell it from a session's own hand-back. A
-// fake cannot prove this — the marker only exists on the wire — so the handback
-// runs through the real client against a recording server. Before CLA-556 the
-// body carried no `driver` at all and read as a session hand-back.
+// `driver` marker, so the plane can tell it from a session's own hand-back when
+// it decides whether a killed session ended without handing back. A fake cannot
+// prove this — the marker only exists on the wire — so the handback runs through
+// the real client against a recording server.
 func TestReleaseHeldClaim_CarriesTheDriverMarkerOnTheWire(t *testing.T) {
 	var (
 		mu   sync.Mutex
