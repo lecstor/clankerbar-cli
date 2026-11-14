@@ -52,7 +52,9 @@ type MapsSessionOptions struct {
 	NotesModel string `json:"notes_model,omitempty"`
 
 	// FindingsModel names the model the final findings turn runs on. Empty
-	// inherits the phase's model, like NotesModel.
+	// inherits the phase's model, like NotesModel; when the phase names no model
+	// either, it inherits the resolved notes stage model, since that is the model
+	// the live session is already on (see StageModels).
 	FindingsModel string `json:"findings_model,omitempty"`
 
 	// FlowMax caps the flow map's items (uses beyond the cap are summarised in
@@ -71,6 +73,29 @@ func (o MapsSessionOptions) Resolved() MapsSessionOptions {
 	o.NotesModel = strings.TrimSpace(o.NotesModel)
 	o.FindingsModel = strings.TrimSpace(o.FindingsModel)
 	return o
+}
+
+// StageModels resolves the model each stage runs on for a phase whose resolved
+// model is phaseModel: a stage's own model wins, an empty one inherits the
+// phase's, and a findings stage with neither runs on the notes stage's model —
+// a live session cannot return to the harness's own default mid-conversation, so
+// the notes model is what the findings turn actually produces. The runner and
+// doctor both read this one function so the record and the preflight cannot
+// disagree about which model wrote the findings.
+func (o MapsSessionOptions) StageModels(phaseModel string) (notes, findings string) {
+	notes = o.NotesModel
+	if notes == "" {
+		notes = phaseModel
+	}
+	findings = o.FindingsModel
+	if findings == "" {
+		if phaseModel != "" {
+			findings = phaseModel
+		} else {
+			findings = notes
+		}
+	}
+	return notes, findings
 }
 
 // UsesMapsSession reports whether this phase asked for the maps-session method.

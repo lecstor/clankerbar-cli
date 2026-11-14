@@ -163,14 +163,7 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 		bodies[len(bodies)-1] += "\n" + overflow
 	}
 
-	notesModel := opts.NotesModel
-	if notesModel == "" {
-		notesModel = phaseModel
-	}
-	reportModel := opts.FindingsModel
-	if reportModel == "" {
-		reportModel = phaseModel
-	}
+	notesModel, reportModel := opts.StageModels(phaseModel)
 
 	plan := &mapsSessionPlan{
 		notesTurns:  len(chunks),
@@ -181,7 +174,15 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 	for i := 1; i < len(chunks); i++ {
 		plan.turns = append(plan.turns, harness.Turn{Prompt: config.MapsSessionNotesTurn(i+1, len(chunks), bodies[i])})
 	}
-	findings := harness.Turn{Prompt: config.MapsSessionFindingsTurn(ending)}
+	findingsPrompt := config.MapsSessionFindingsTurn(ending)
+	// A phase that writes its own record had the brief's model placeholders
+	// filled from the PHASE's attribution before the stage models were resolved.
+	// When the findings stage runs elsewhere, say so here or the member records
+	// findings under a model that did not produce them.
+	if ending == config.MapsSessionRecordEnding {
+		findingsPrompt += mapsSessionRecordModelNote(phaseModel, reportModel)
+	}
+	findings := harness.Turn{Prompt: findingsPrompt}
 	// A blank Turn.Model means "inherit the session's current model", which after
 	// the notes turns is the notes model. Name the findings model whenever that
 	// inheritance would land somewhere else — including when the phase names no
@@ -193,6 +194,26 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 	}
 	plan.turns = append(plan.turns, findings)
 	return plan
+}
+
+// mapsSessionRecordModelNote names the model the findings turn actually runs on
+// when it is not the one the phase's own record contract names. The contract's
+// placeholders were substituted with the phase's model (or "harness default"),
+// so a panel member whose findings stage runs elsewhere would otherwise sign its
+// durable record — and every finding's raisedByModel — with the wrong model.
+func mapsSessionRecordModelNote(phaseModel, reportModel string) string {
+	named := phaseModel
+	if named == "" {
+		named = "harness default"
+	}
+	actual := reportModel
+	if actual == "" {
+		actual = "harness default"
+	}
+	if actual == named {
+		return ""
+	}
+	return fmt.Sprintf(" Write the record's `model` and every finding's `raisedByModel` as %q: the findings were produced by that model, not the one named above.", actual)
 }
 
 // mapsSessionItems numbers the change map M1.. and the flow map F1.. in that

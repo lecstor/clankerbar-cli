@@ -282,10 +282,12 @@ type ReviewPanelMember struct {
 	// can run one maps-session seat beside a single-pass one.
 	ReviewMethod string `json:"review_method,omitempty"`
 
-	// MapsSession overrides the review phase's maps-session options for this
-	// member. Nil inherits the phase's block (a member that sets only the method
-	// therefore gets the phase's profile, not the benchmark defaults by
-	// accident).
+	// MapsSession overrides the phase's maps-session options for this member.
+	// Nil inherits the phase's block, so a member that only tunes the options
+	// keeps the inherited method and profile. A member that NAMES a method takes
+	// its own options with it, and nil then means the benchmark defaults — a seat
+	// opting out of maps-session must not silently keep the phase's knobs for a
+	// method that has no use for them.
 	MapsSession *MapsSessionOptions `json:"maps_session,omitempty"`
 }
 

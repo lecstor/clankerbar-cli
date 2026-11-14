@@ -208,7 +208,8 @@ func TestReviewMethod_PanelMemberInheritance(t *testing.T) {
 		"review_panel": [
 			{"model": "opencode-go/one"},
 			{"model": "opencode-go/two", "review_method": "single-pass"},
-			{"model": "opencode-go/three", "maps_session": {"chunk_size": 4}}
+			{"model": "opencode-go/three", "maps_session": {"chunk_size": 4}},
+			{"model": "opencode-go/four", "review_method": "maps-session"}
 		]
 	}`)
 	if err := cfg.Validate(); err != nil {
@@ -220,8 +221,8 @@ func TestReviewMethod_PanelMemberInheritance(t *testing.T) {
 			members = append(members, ph)
 		}
 	}
-	if len(members) != 3 {
-		t.Fatalf("effective members = %d, want 3", len(members))
+	if len(members) != 4 {
+		t.Fatalf("effective members = %d, want 4", len(members))
 	}
 	if !members[0].UsesMapsSession() || members[0].MapsSessionDefaults().ChunkSize != 10 {
 		t.Errorf("member 1 = method %q chunk %d, want the review phase's maps-session / 10", members[0].ReviewMethod, members[0].MapsSessionDefaults().ChunkSize)
@@ -231,6 +232,13 @@ func TestReviewMethod_PanelMemberInheritance(t *testing.T) {
 	}
 	if !members[2].UsesMapsSession() || members[2].MapsSessionDefaults().ChunkSize != 4 {
 		t.Errorf("member 3 = method %q chunk %d, want the inherited method with its own chunk size 4", members[2].ReviewMethod, members[2].MapsSessionDefaults().ChunkSize)
+	}
+	// Naming the METHOD takes the member's own options with it: nil means the
+	// benchmark defaults, never the phase's block (which is tuned for another
+	// seat's profile).
+	if !members[3].UsesMapsSession() || members[3].MapsSessionDefaults().ChunkSize != DefaultMapsSessionChunkSize {
+		t.Errorf("member 4 = method %q chunk %d, want its own maps-session at the benchmark default %d, not the phase's 10",
+			members[3].ReviewMethod, members[3].MapsSessionDefaults().ChunkSize, DefaultMapsSessionChunkSize)
 	}
 }
 

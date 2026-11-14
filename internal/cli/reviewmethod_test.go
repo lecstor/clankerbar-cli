@@ -53,6 +53,37 @@ func TestDoctor_ReportsTheMapsSessionMethod(t *testing.T) {
 			t.Errorf("doctor's reviewer line does not carry %q: %s", want, line)
 		}
 	}
+
+	// A phase naming no model at all with only notes_model set: the findings turn
+	// inherits the notes stage in the live session, so doctor must print that —
+	// not "harness default", which the record would contradict (round 1
+	// 1.review-1.1).
+	edge := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{
+				Name:         "review",
+				ReviewMethod: config.ReviewMethodMapsSession,
+				MapsSession:  &config.MapsSessionOptions{NotesModel: "opencode-go/strong"},
+			},
+			{Name: "fix"},
+		},
+	}
+	line = reviewLine(t, edge)
+	for _, want := range []string{
+		"review: single reviewer (opencode/harness default)",
+		"notes=opencode-go/strong",
+		"findings=opencode-go/strong",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("doctor's notes-only edge line does not carry %q: %s", want, line)
+		}
+	}
+	if strings.Contains(line, "findings=harness default") {
+		t.Errorf("doctor printed findings=harness default where the findings turn runs on the notes model: %s", line)
+	}
 }
 
 // TestDoctor_ReportsEachPanelMembersMethod (CLA-869): the panel line marks the

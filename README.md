@@ -510,7 +510,11 @@ stronger note-taker can feed a cheaper findings writer, or the reverse — the
 choice is yours, and the runner never picks one. One edge: if the phase names no
 model at all and only `notes_model` is set, the findings turn runs on the notes
 model too, because a live session cannot return to a harness's own default
-mid-conversation.
+mid-conversation — and `doctor` and the review record name that model, since it
+is the one that produced the findings. A stage model is a single route, not the
+phase's route list: setting `notes_model` or `findings_model` drops the ordered
+model fallback for the session, so a usage limit on a per-stage model ends the
+phase rather than switching to the paid route.
 
 **Two requirements, both refused rather than degraded.** The method applies to
 the review-only gate — the built-in `review` phase with a phase after it —

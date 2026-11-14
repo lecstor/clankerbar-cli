@@ -125,8 +125,9 @@ func TestPlanMapsSession_StageModels(t *testing.T) {
 		{name: "same model on both stages", opts: config.MapsSessionOptions{ChunkSize: 25, NotesModel: "same", FindingsModel: "same"}, phaseModel: "base", wantNotes: "same", wantReport: "same", wantTurnFind: "same"},
 		// The documented edge: with no phase model, a findings stage that names
 		// nothing cannot be returned to the harness default inside a live
-		// session, so it inherits the notes model.
-		{name: "notes named, phase model absent", opts: config.MapsSessionOptions{ChunkSize: 25, NotesModel: "notes"}, wantNotes: "notes", wantReport: "", wantTurnFind: ""},
+		// session, so it inherits the notes model — and the record must name that
+		// model, since it is the one that produced the findings.
+		{name: "notes named, phase model absent", opts: config.MapsSessionOptions{ChunkSize: 25, NotesModel: "notes"}, wantNotes: "notes", wantReport: "notes", wantTurnFind: ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,6 +145,48 @@ func TestPlanMapsSession_StageModels(t *testing.T) {
 				if turn.Model != "" {
 					t.Errorf("notes turn %d names model %q; the notes turns must inherit turn 1's model", i+2, turn.Model)
 				}
+			}
+		})
+	}
+}
+
+// TestPlanMapsSession_RecordNamesTheFindingsStageModel (CLA-869 round 1
+// 1.review-1.3): a phase that writes its own record had its brief's `model` and
+// `raisedByModel` placeholders filled from the PHASE's attribution before the
+// stage models were resolved, so a findings stage on another model would sign
+// findings it did not produce. The findings turn names the real model instead.
+func TestPlanMapsSession_RecordNamesTheFindingsStageModel(t *testing.T) {
+	cases := []struct {
+		name       string
+		opts       config.MapsSessionOptions
+		phaseModel string
+		wantModel  string // "" = the clause is not needed
+	}{
+		{name: "findings model differs", opts: config.MapsSessionOptions{ChunkSize: 25, FindingsModel: "findings-model"}, phaseModel: "base-model", wantModel: "findings-model"},
+		{name: "notes only, no phase model", opts: config.MapsSessionOptions{ChunkSize: 25, NotesModel: "notes-model"}, wantModel: "notes-model"},
+		{name: "findings inherits the phase", opts: config.MapsSessionOptions{ChunkSize: 25}, phaseModel: "base-model"},
+		{name: "neither names a model", opts: config.MapsSessionOptions{ChunkSize: 25}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionRecordEnding)
+			last := plan.turns[len(plan.turns)-1].Prompt
+			if tc.wantModel == "" {
+				if strings.Contains(last, "raisedByModel") {
+					t.Errorf("the findings turn overrides the record's model though the brief already names it:\n%s", last)
+				}
+				return
+			}
+			for _, want := range []string{"raisedByModel", `"` + tc.wantModel + `"`} {
+				if !strings.Contains(last, want) {
+					t.Errorf("the panel member's findings turn does not name %q for the record:\n%s", want, last)
+				}
+			}
+			// A runner-claimed review's record is written by the runner from the
+			// stage model; its done report owes no model sentence.
+			done := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionDoneReportEnding)
+			if strings.Contains(done.turns[len(done.turns)-1].Prompt, "raisedByModel") {
+				t.Errorf("the done-report ending was given the record-model override:\n%s", done.turns[len(done.turns)-1].Prompt)
 			}
 		})
 	}
@@ -566,5 +609,119 @@ func TestMapsSessionPlanFor_DiffsTheReviewedTip(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reviewed tip") || !strings.Contains(err.Error(), "wrong revision") {
 		t.Errorf("the refusal does not say why the tree must be at the tip: %v", err)
+	}
+}
+
+// TestMapsSessionHandoffContinuation_SkipsTheTurns (CLA-869 round 1
+// 1.review-1.6): a handoff respawn replaces ph.Prompt with the predecessor's
+// continuation, so that successor did not start this phase's review and must not
+// receive the map — and the refusal-free skip is the point: the phase still runs,
+// just as the single-pass review it really is.
+func TestMapsSessionHandoffContinuation_SkipsTheTurns(t *testing.T) {
+	repo, base, tip := mapsRepo(t)
+	phases := mapsReviewPhases()
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	d, _, prev, opts := mapsDrainRun(t, h, phases, repo, base, tip)
+	effective := d.cfg.EffectivePhases()
+
+	// Exactly the handoff respawn: the captured sequence still carries the
+	// review phase, while the phase passed to the attempt carries the successor's
+	// continuation text instead of the brief.
+	continuation := effective[1]
+	continuation.Prompt = "Continue the work the predecessor handed off; it already read the change."
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, _, _, err := d.drainPhase(ctx, 1, 0, 1, "-p2", continuation, true, prev, d.targets[0],
+		spend{start: time.Now()}, effective, panelState{}, opts); err != nil {
+		t.Fatalf("drainPhase refused a maps-session phase's handoff continuation: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1", h.invokeCalls)
+	}
+	inv := h.invocations[0]
+	if len(inv.Turns) != 0 {
+		t.Errorf("the handoff continuation carried %d maps-session turn(s), want none", len(inv.Turns))
+	}
+	if strings.Contains(inv.Prompt, "How this review works") {
+		t.Errorf("the maps section was appended to a handoff continuation:\n%s", inv.Prompt)
+	}
+}
+
+// TestMapsSessionDrain_PanelMemberWritesTheRecord (CLA-869 round 1 1.review-1.7,
+// 1.review-1.3): a panel member runs the same sequence from its own checkout at
+// the reviewed tip, ends with the RECORD ending rather than a done report, and
+// its findings turn names the findings stage's model because the member writes
+// the durable record itself.
+func TestMapsSessionDrain_PanelMemberWritesTheRecord(t *testing.T) {
+	repo, base, tip := mapsRepo(t)
+	phases := []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{
+			Name:         config.ReviewPhaseName,
+			Model:        config.ModelRoutes{"opencode-go/base-model"},
+			ReviewMethod: config.ReviewMethodMapsSession,
+			MapsSession:  &config.MapsSessionOptions{ChunkSize: 2, FindingsModel: "findings-model"},
+		},
+		{Name: config.FixPhaseName},
+	}
+	// A panel member's session does reach the backlog (it reads the task before
+	// recording); report that so the no_mcp backstop does not retry the fixture.
+	panelResult := okResult(1, 0)
+	panelResult.ClankerbarCalls = 1
+	h := &fakeAdapter{steps: []invokeStep{{res: panelResult}}}
+	d, _, prev, opts := mapsDrainRun(t, h, phases, repo, base, tip)
+	d.cfg.ReviewPanel = []config.ReviewPanelMember{{Model: config.ModelRoutes{"opencode-go/base-model"}}}
+	effective := d.cfg.EffectivePhases()
+	if len(effective) != 3 || !effective[1].IsPanelMember() {
+		t.Fatalf("the fixture did not expand one panel member: %+v", effective)
+	}
+	// The panel's parallel runner owns a detached checkout at the reviewed tip
+	// and carries no runner briefing; the merge-base rides opts.
+	opts.taskDir = ""
+	opts.worktree = repo
+	opts.runner = nil
+	opts.baseSHA = base
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, _, _, err := d.drainPhase(ctx, 1, 0, 1, "-preview-1", effective[1], false, prev, d.targets[0],
+		spend{start: time.Now()}, effective, panelState{}, opts); err != nil {
+		t.Fatalf("drainPhase: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want ONE invocation carrying every turn", h.invokeCalls)
+	}
+	inv := h.invocations[0]
+	// The fixture's 4 items at chunk_size 2 are 2 notes turns; turn 1 carries
+	// chunk 1 and one follow-up carries chunk 2, then the findings turn.
+	if len(inv.Turns) != 2 {
+		t.Fatalf("follow-up turns = %d, want 2 (1 notes turn + findings)", len(inv.Turns))
+	}
+	for _, want := range []string{"## How this review works", "## Chunk 1 of 2", "a review PANEL"} {
+		if !strings.Contains(inv.Prompt, want) {
+			t.Errorf("the panel member's turn 1 does not carry %q:\n%s", want, inv.Prompt)
+		}
+	}
+	// The brief's record contract was substituted with the PHASE's model; the
+	// findings stage runs on another one, and the findings turn says so because
+	// the member writes the record itself.
+	if !strings.Contains(inv.Prompt, `model: "opencode-go/base-model"`) {
+		t.Errorf("the panel brief no longer names the phase model the clause corrects:\n%s", inv.Prompt)
+	}
+	if inv.Model != "opencode-go/base-model" {
+		t.Errorf("turn 1 model = %q, want the notes stage's inherited base model", inv.Model)
+	}
+	if inv.Turns[0].Model != "" {
+		t.Errorf("the notes follow-up names model %q; it must inherit turn 1's", inv.Turns[0].Model)
+	}
+	findings := inv.Turns[1]
+	if findings.Model != "findings-model" {
+		t.Errorf("findings turn model = %q, want findings-model", findings.Model)
+	}
+	for _, want := range []string{"write the record it asks for", "raisedByModel", `"findings-model"`} {
+		if !strings.Contains(findings.Prompt, want) {
+			t.Errorf("the panel member's findings turn does not carry %q:\n%s", want, findings.Prompt)
+		}
 	}
 }

@@ -173,24 +173,29 @@ func singleReviewerLabel(cfg *config.Config) string {
 // reviewMethodLabel renders the review method doctor reports after a reviewer's
 // harness/model (CLA-869): empty for the shipped single-pass review, and for
 // maps-session the model each stage will actually run on — an unset stage model
-// inherits the phase's, and a phase naming neither runs the harness's default.
+// inherits the phase's, and with no phase model the findings stage inherits the
+// resolved notes stage (the live-session inheritance). Only a review naming no
+// model at any level runs the harness's default.
 func reviewMethodLabel(cfg *config.Config, ph config.Phase) string {
 	if !ph.UsesMapsSession() {
 		return ""
 	}
 	opts := ph.MapsSessionDefaults()
 	phaseModel, _ := cfg.ModelForPhase(ph)
-	stage := func(model string) string {
-		if model == "" {
-			model = phaseModel
-		}
-		if model == "" {
-			return "harness default"
-		}
-		return model
-	}
+	notes, findings := opts.StageModels(phaseModel)
+	// Same resolution the runner's plan uses (config.MapsSessionOptions.StageModels),
+	// so a preflight cannot report a findings stage the record will not name.
 	return fmt.Sprintf(" (maps-session: notes=%s, findings=%s, chunk_size=%d, flow_max=%d)",
-		stage(opts.NotesModel), stage(opts.FindingsModel), opts.ChunkSize, opts.FlowMax)
+		stageModelLabel(notes), stageModelLabel(findings), opts.ChunkSize, opts.FlowMax)
+}
+
+// stageModelLabel prints a resolved stage model, naming the harness's own
+// default when the config pinned none.
+func stageModelLabel(model string) string {
+	if model == "" {
+		return "harness default"
+	}
+	return model
 }
 
 // reviewerHarnessModel is the `<harness>/<model>` a review phase spawns on:
