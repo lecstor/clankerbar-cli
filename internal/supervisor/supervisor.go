@@ -213,8 +213,8 @@ type Options struct {
 	// the operator installs the new build at the launch path and runs the
 	// roll from it, and a roll whose launch path still carries another
 	// version refuses rather than rolling nothing. The replace (phase 5c)
-	// compares it against the marker's requesting version BEFORE draining any
-	// child. Nil = run `<Binary> version` and parse the line.
+	// compares it against the marker's requesting version BEFORE handing the
+	// fleet to the new image. Nil = run `<Binary> version` and parse the line.
 	LaunchVersion func() (string, error)
 
 	// ExecInPlace replaces the supervisor's process image in place with the
@@ -1139,7 +1139,10 @@ func (d *Supervisor) spawn(inst *Instance) {
 	cmd.Env = spawnEnv(v)
 	// The children's logs stream to the same stdout/stderr the supervisor's
 	// do — the operator watches daemons today by watching one terminal per
-	// daemon, and the fleet must not be quieter than that.
+	// daemon, and the fleet must not be quieter than that. Adoption across an
+	// exec(2) replacement depends on this direct inheritance: a pipe owned by
+	// the supervisor would not survive the image swap, so do not turn these
+	// into pipes without teaching adoption to pass the fds across.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -1581,7 +1584,14 @@ func (d *Supervisor) writeStop(inst *Instance, dir string) stopOutcome {
 	inst.mu.Lock()
 	cfg := inst.cfg
 	inst.mu.Unlock()
-	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
+	// An adopted child can be alive before its first successful config build
+	// (the roster fetch has not landed yet); the state-dir open must not depend
+	// on a config that does not exist.
+	var roots []string
+	if cfg != nil {
+		roots = cfg.SessionWorkDirs()
+	}
+	st, err := statedir.Open(dir, roots...)
 	if err != nil {
 		log.Printf("%s: cannot open its state dir to write STOP: %v - the child keeps running; stop it by hand (kill the supervisor's child pid %d)", inst.name, err, instPid(inst))
 		return stopFailed

@@ -1313,9 +1313,15 @@ page. Those lines, and its refuse/spawn/exit decisions, are also written to
 `<supervisor state dir>/supervise.log` (see [Visibility](#visibility)).
 `clankerbar supervise roll` rolls the children onto a newly installed
 binary one at a time, verifying each one's next beacon reports it before the
-next is touched; `clankerbar supervise replace` drains the fleet and execs the
-running supervisor into a newly installed build. Neither fetches or installs
-anything — you install the new build at the fleet's launch path first.
+next is touched; `clankerbar supervise replace` execs the running supervisor
+into a newly installed build **without draining the fleet**: the live children
+are handed to the new image, adopted across the exec by pid, and each one still
+on the old binary is rolled onto the new one through the same RESTART roll at
+its own phase seam or iteration boundary (idle children come back at once,
+busy ones when their session ends). A unit stop still drains, and that drain is
+the launchd/systemd fallback — and the only path on a platform without
+`exec(2)`. Neither fetches or installs anything — you install the new build at
+the fleet's launch path first.
 
 The config dir can hold more JSON than the base config — MCP configs
 (`opencode-mcp.json`), headless permission policies (`headless-drain.json`),

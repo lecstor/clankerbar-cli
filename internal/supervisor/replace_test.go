@@ -1,14 +1,18 @@
 package supervisor
 
-// Phase 5c (daemon-supervisor): the supervisor replaces itself in place once
-// its children are drained. The tests drive the same fake-daemon + fake-plane
-// harness the roll uses: the REPLACE marker is written into the cache dir
-// (through the Replace command or directly), and the supervisor honours it at
-// its next poll — drain every child at its iteration boundary, then exec the
-// launch path. The exec is intercepted through the ExecInPlace hook: the test
-// records the call (so the drain-before-exec ordering can be pinned in the
-// log) and returns an error (so the supervisor resumes the loop and the fleet
-// is respawned — the same shape a failed exec takes in production).
+// Phase 5c (daemon-supervisor) after CLA-878: the supervisor replaces itself in
+// place WITHOUT draining the fleet. The outgoing image writes a handoff naming
+// its live children and execs at once; the incoming image adopts each live pid,
+// reaps it itself, and rolls older-version children onto the new binary
+// through the RESTART roll at their own boundaries.
+//
+// The tests drive the outgoing half directly on a Supervisor whose instances
+// hold real child processes started by the test (no exec.Cmd.Wait goroutine:
+// the adopted reaper must be the only waiter, exactly as after exec(2)), then
+// run a second Supervisor over the same cache dir. Because the test process is
+// the supervisor's stand-in, os.Getpid() is unchanged across the "exec", so the
+// handoff pid gate accepts it — and a handoff written for another pid is
+// exercised explicitly.
 
 import (
 	"context"
@@ -16,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -24,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
@@ -42,12 +48,24 @@ type execRecorder struct {
 	calls []execCall
 }
 
+// hook records the call and returns an error — the shape of a failed exec, in
+// which the old image keeps running untouched.
 func (r *execRecorder) hook() func(bin string, argv []string, env []string) error {
+	return r.resultHook(errors.New("exec refused by the test"))
+}
+
+// succeedHook records the call and returns nil — the seam that stands in for a
+// successful exec(2): in production this call never returns.
+func (r *execRecorder) succeedHook() func(bin string, argv []string, env []string) error {
+	return r.resultHook(nil)
+}
+
+func (r *execRecorder) resultHook(result error) func(bin string, argv []string, env []string) error {
 	return func(bin string, argv []string, env []string) error {
 		r.mu.Lock()
 		r.calls = append(r.calls, execCall{bin: bin, argv: argv, env: env})
 		r.mu.Unlock()
-		return errors.New("exec refused by the test")
+		return result
 	}
 }
 
@@ -63,17 +81,111 @@ func (r *execRecorder) first() execCall {
 	return r.calls[0]
 }
 
-// The drain-before-exec gate: a REPLACE marker lands while two children run;
-// the supervisor writes STOP to BOTH, waits for BOTH to drain at their
-// iteration boundary, and only then invokes the exec — the ordering pinned in
-// the log. The hook's failure resumes the loop: the children are respawned
-// (from the launch path), the consumed marker does not re-trigger, and the
-// fleet keeps serving on the old supervisor.
-func TestReplaceDrainsEveryChildBeforeTheExec(t *testing.T) {
+// stagedChild is one child the outgoing supervisor holds: a real process with
+// the materialized config and beacon a supervisor-spawned child would have,
+// started by the test and deliberately not waited on.
+type stagedChild struct {
+	name     string
+	pid      int
+	stateDir string
+	inst     *Instance
+	cmd      *exec.Cmd
+}
+
+// newOutgoingSupervisor builds the supervisor stand-in the replacement runs
+// on: the same options, cache dir and hostname a running Supervise would use,
+// with no loop. checkReplace needs exactly these.
+func newOutgoingSupervisor(t *testing.T, o Options, cacheDir string) *Supervisor {
+	t.Helper()
+	host, _ := os.Hostname()
+	return &Supervisor{
+		o:         o,
+		ctx:       context.Background(),
+		hostname:  host,
+		cacheDir:  cacheDir,
+		startedAt: time.Now(),
+		exits:     make(chan exitEvent, 16),
+	}
+}
+
+// stageReplaceableChild starts one fake daemon exactly as spawn would (same
+// materialized config, same version env) but leaves it un-waited, so the
+// adopted reaper is the process's only Wait after the "exec". mode is the
+// per-instance SCRIPT_MODE the fake daemon reads: "sleep" is idle, "busy" is a
+// child mid-session that ignores RESTART until its BOUNDARY file appears.
+func stageReplaceableChild(t *testing.T, d *Supervisor, name, mode, v string) *stagedChild {
+	t.Helper()
+	e := runEntry(name, "")
+	cfg, sd, err := d.buildConfig(&e)
+	if err != nil {
+		t.Fatalf("%s: buildConfig: %v", name, err)
+	}
+	inst := &Instance{
+		name:         name,
+		entry:        &e,
+		cfg:          cfg,
+		stateDir:     sd,
+		desired:      RosterDesiredRunning,
+		childVersion: v,
+		aliveSince:   time.Now().Add(-time.Minute),
+	}
+	cfgPath, err := d.materializeConfig(inst)
+	if err != nil {
+		t.Fatalf("%s: materializeConfig: %v", name, err)
+	}
+	if err := os.WriteFile(filepath.Join(sd, "SCRIPT_MODE"), []byte(mode+"\n"), 0o600); err != nil {
+		t.Fatalf("%s: SCRIPT_MODE: %v", name, err)
+	}
+	cmd := exec.Command(d.o.Binary, "run", "-c", cfgPath)
+	cmd.Env = append(os.Environ(), childVersionEnv+"="+v)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("%s: start: %v", name, err)
+	}
+	inst.cmd = cmd
+	d.instances = append(d.instances, inst)
+	sc := &stagedChild{name: name, pid: cmd.Process.Pid, stateDir: sd, inst: inst, cmd: cmd}
+	// Best effort: a child a test neither adopted nor stopped must not outlive
+	// the test. A reaped pid makes this a no-op (or a harmless ESRCH).
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return sc
+}
+
+func waitForBeaconVersion(t *testing.T, dir, want string) {
+	t.Helper()
+	waitFor(t, 5*time.Second, fmt.Sprintf("a beacon reporting %s in %s", want, dir), func() bool {
+		b := readLocalBeacon(dir)
+		return b != nil && b.Version == want
+	})
+}
+
+// waitForLog is waitFor with the captured log on failure: adoption failures are
+// almost always visible in the supervisor's own lines.
+func waitForLog(t *testing.T, timeout time.Duration, what string, buf *lockedBuffer, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s\nlog:\n%s", what, buf.String())
+}
+
+// The contract: a replace execs at once with no STOP written to any child. The
+// incoming image adopts both children by pid; the idle child is rolled onto the
+// new version first, while the busy child keeps its pid and reports running
+// until its own boundary, then comes back on the new version.
+func TestReplaceAdoptsLiveChildrenInsteadOfDraining(t *testing.T) {
 	cacheDir := t.TempDir()
-	setHelperMode(t, "sleep")
+	setHelperMode(t, "scripted")
 	plane := &fakePlane{}
-	plane.set([]RosterEntry{runEntry("daemon-one", ""), runEntry("daemon-two", "")})
+	plane.set([]RosterEntry{runEntry("daemon-busy", ""), runEntry("daemon-idle", "")})
 	srv := plane.serve(t)
 
 	var buf lockedBuffer
@@ -84,47 +196,71 @@ func TestReplaceDrainsEveryChildBeforeTheExec(t *testing.T) {
 	defer cancel()
 	o := testOptions(t, cacheDir, srv)
 	o.LaunchVersion = func() (string, error) { return version.Current, nil }
+	o.VersionOf = func() string { return version.Current } // respawns are the new image
 	o.VerifyTimeout = 5 * time.Second
 	rec := &execRecorder{}
-	o.ExecInPlace = rec.hook()
-	done := runSupervise(ctx, o)
+	o.ExecInPlace = rec.succeedHook()
 
-	a := entryStateDir(cacheDir, "daemon-one")
-	b := entryStateDir(cacheDir, "daemon-two")
-	waitFor(t, 5*time.Second, "both children to come up", func() bool {
-		return countRuns(t, a) == 1 && countRuns(t, b) == 1
-	})
+	out := newOutgoingSupervisor(t, o, cacheDir)
+	busy := stageReplaceableChild(t, out, "daemon-busy", "busy", "1.0.0")
+	idle := stageReplaceableChild(t, out, "daemon-idle", "sleep", "1.0.0")
+	waitForBeaconVersion(t, busy.stateDir, "1.0.0")
+	waitForBeaconVersion(t, idle.stateDir, "1.0.0")
 
-	if err := Replace(context.Background(), o); err != nil {
-		t.Fatalf("Replace returned %v, want nil", err)
+	writeMarker(t, cacheDir, version.Current)
+	out.checkReplace()
+
+	if got := rec.len(); got != 1 {
+		t.Fatalf("exec invoked %d time(s), want 1", got)
 	}
-	waitFor(t, 5*time.Second, "the exec to be invoked after the drain", func() bool {
-		return rec.len() == 1
-	})
-
-	// The gate: BOTH children got their STOP and drained BEFORE the exec.
-	text := buf.String()
-	iExec := strings.Index(text, "replace: the fleet is drained - replacing myself in place")
-	if iExec < 0 {
-		t.Fatalf("no replacement line in the log:\n%s", text)
+	// No child was signalled or stopped: the swap is adoption, not a drain.
+	for _, sc := range []*stagedChild{busy, idle} {
+		for _, marker := range []string{"STOP", "RESTART"} {
+			if markerPresent(sc.stateDir, marker) {
+				t.Errorf("%s: %s was written during the replace - the fleet must not be signalled", sc.name, marker)
+			}
+		}
+		if !processAlive(sc.pid) {
+			t.Errorf("%s (pid %d) is no longer alive after the replace", sc.name, sc.pid)
+		}
 	}
-	for _, want := range []string{
-		"replace: REPLACE honoured - writing STOP to every child",
-		"daemon-one: STOP written to",
-		"daemon-two: STOP written to",
-	} {
-		i := strings.Index(text, want)
-		if i < 0 {
-			t.Errorf("log does not contain %q:\n%s", want, text)
+	// The handoff carries every live child and the writer's identity.
+	h := readReplaceHandoff(cacheDir)
+	if h == nil {
+		t.Fatalf("no readable handoff file in %s", cacheDir)
+	}
+	if h.SupervisorPID != os.Getpid() {
+		t.Errorf("handoff supervisor pid = %d, want %d", h.SupervisorPID, os.Getpid())
+	}
+	if h.Version != version.Current {
+		t.Errorf("handoff version = %q, want %q", h.Version, version.Current)
+	}
+	if len(h.Children) != 2 {
+		t.Fatalf("handoff children = %d, want 2: %+v", len(h.Children), h.Children)
+	}
+	byName := map[string]replaceHandoffChild{}
+	for _, c := range h.Children {
+		byName[c.Name] = c
+	}
+	for _, sc := range []*stagedChild{busy, idle} {
+		c, ok := byName[sc.name]
+		if !ok {
+			t.Errorf("handoff does not name %s", sc.name)
 			continue
 		}
-		if i > iExec {
-			t.Errorf("%q logged after the replacement (%d > %d) - the drain did not precede the exec:\n%s", want, i, iExec, text)
+		if c.PID != sc.pid {
+			t.Errorf("%s: handoff pid = %d, want %d", sc.name, c.PID, sc.pid)
+		}
+		if c.Version != "1.0.0" {
+			t.Errorf("%s: handoff version = %q, want 1.0.0", sc.name, c.Version)
+		}
+		if want := filepath.Join(sc.stateDir, statedir.MaterializedConfigName); c.ConfigPath != want {
+			t.Errorf("%s: handoff config path = %q, want %q", sc.name, c.ConfigPath, want)
+		}
+		if c.SpawnedAt.IsZero() {
+			t.Errorf("%s: handoff spawn time is zero", sc.name)
 		}
 	}
-
-	// What would have been exec'd: the launch binary, the supervisor's own
-	// argv and environment.
 	call := rec.first()
 	if call.bin != o.Binary {
 		t.Errorf("exec binary = %q, want %q", call.bin, o.Binary)
@@ -135,20 +271,64 @@ func TestReplaceDrainsEveryChildBeforeTheExec(t *testing.T) {
 	if len(call.env) == 0 {
 		t.Error("exec env is empty, want the supervisor's environment")
 	}
-	// The marker was consumed: the replacement cannot re-trigger.
-	if _, err := os.Lstat(filepath.Join(cacheDir, replaceMarkerName)); !os.IsNotExist(err) {
-		t.Errorf("the REPLACE marker was not consumed; stat err = %v", err)
+
+	// The incoming image: adopt, keep the children running, roll idle first.
+	done := runSupervise(ctx, o)
+	waitForLog(t, 5*time.Second, "both children to be adopted", &buf, func() bool {
+		text := buf.String()
+		return strings.Contains(text, "replace: adopted daemon-busy (pid "+fmt.Sprint(busy.pid)) &&
+			strings.Contains(text, "replace: adopted daemon-idle (pid "+fmt.Sprint(idle.pid))
+	})
+	waitFor(t, 5*time.Second, "the idle child to be rolled before the busy one", func() bool {
+		return strings.Contains(buf.String(), "replace: rolling adopted daemon-busy")
+	})
+	if !strings.Contains(buf.String(), "replace: rolling adopted daemon-idle") {
+		t.Fatalf("the idle child was never rolled:\n%s", buf.String())
+	}
+	waitForBeaconVersion(t, idle.stateDir, version.Current)
+	// The busy child kept its pid and stayed running on the old version while
+	// the idle one came back.
+	if !processAlive(busy.pid) {
+		t.Fatalf("the busy child (pid %d) was signalled or reaped by the idle roll", busy.pid)
+	}
+	if b := readLocalBeacon(busy.stateDir); b == nil || b.Version != "1.0.0" {
+		t.Fatalf("busy beacon = %+v, want still 1.0.0 before its boundary", b)
+	}
+	var busyRunning bool
+	for _, rep := range plane.statusReports(t) {
+		if inst := runningInstance(rep, "daemon-busy"); inst != nil &&
+			inst.State == StatusRunning && inst.ChildVersion == "1.0.0" {
+			busyRunning = true
+		}
+	}
+	if !busyRunning {
+		t.Error("no status report showed the busy child running with its adopted pid/version")
+	}
+	if !strings.Contains(buf.String(), fmt.Sprintf("daemon-busy: running (pid %d, version 1.0.0)", busy.pid)) {
+		t.Errorf("the fleet listing did not show the busy child running with its pid:\n%s", buf.String())
+	}
+	// Ordering is pinned: the idle child's next beacon was seen before the
+	// busy child was so much as asked to restart.
+	text := buf.String()
+	iIdle := strings.Index(text, "replace: rolling adopted daemon-idle")
+	iIdleDone := strings.Index(text, "roll: daemon-idle: the next beacon reports")
+	iBusy := strings.Index(text, "replace: rolling adopted daemon-busy")
+	if iIdle < 0 || iIdleDone < 0 || iBusy < 0 || !(iIdle < iIdleDone && iIdleDone < iBusy) {
+		t.Errorf("the adopted roll did not move the idle child first:\n%s", text)
 	}
 
-	// The exec failed (the hook's contract): the supervisor resumes the loop
-	// and the drained children are respawned — the fleet keeps serving on the
-	// old supervisor, and the consumed marker never re-triggers.
-	waitFor(t, 5*time.Second, "the fleet to be respawned after the failed exec", func() bool {
-		return countRuns(t, a) == 2 && countRuns(t, b) == 2
+	// The busy child reaches its boundary: it now honours the RESTART and
+	// comes back on the new version.
+	if err := os.WriteFile(filepath.Join(busy.stateDir, "BOUNDARY"), []byte("boundary\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForBeaconVersion(t, busy.stateDir, version.Current)
+	waitFor(t, 5*time.Second, "the busy child to be respawned on the new version", func() bool {
+		return countRuns(t, busy.stateDir) == 2
 	})
-	time.Sleep(300 * time.Millisecond) // several polls with no marker
-	if got := rec.len(); got != 1 {
-		t.Errorf("exec invoked %d time(s), want 1 - the consumed marker must not re-trigger", got)
+	// The idle child was never stopped or restarted a second time.
+	if got := countRuns(t, idle.stateDir); got != 2 {
+		t.Errorf("idle spawns = %d, want 2 (initial + roll)", got)
 	}
 
 	cancel()
@@ -165,15 +345,14 @@ func TestReplaceDrainsEveryChildBeforeTheExec(t *testing.T) {
 	})
 }
 
-// A child that never drains HALTS the replacement: the drain hits
-// VerifyTimeout, the exec is never invoked, the marker is consumed so nothing
-// re-triggers, and the log names the stuck child — the supervisor never
-// replaces itself over a fleet that is not drained.
-func TestReplaceHaltsWithoutExecWhenAChildNeverDrains(t *testing.T) {
+// A child that exits between the handoff write and the new image's wait is a
+// zombie still owned by this process: the adopted wait4 reaps it at once,
+// reports a normal exit, and the reconcile respawns the instance.
+func TestReplaceReapsAChildThatExitsInTheExecWindow(t *testing.T) {
 	cacheDir := t.TempDir()
-	setHelperMode(t, "stubborn")
+	setHelperMode(t, "scripted")
 	plane := &fakePlane{}
-	plane.set([]RosterEntry{runEntry("stuck", "")})
+	plane.set([]RosterEntry{runEntry("daemon-window", "")})
 	srv := plane.serve(t)
 
 	var buf lockedBuffer
@@ -184,45 +363,44 @@ func TestReplaceHaltsWithoutExecWhenAChildNeverDrains(t *testing.T) {
 	defer cancel()
 	o := testOptions(t, cacheDir, srv)
 	o.LaunchVersion = func() (string, error) { return version.Current, nil }
-	o.VerifyTimeout = 300 * time.Millisecond
-	rec := &execRecorder{}
-	o.ExecInPlace = rec.hook()
+	o.VersionOf = func() string { return version.Current }
+	o.VerifyTimeout = 5 * time.Second
+	o.ExecInPlace = (&execRecorder{}).succeedHook()
+
+	out := newOutgoingSupervisor(t, o, cacheDir)
+	child := stageReplaceableChild(t, out, "daemon-window", "sleep", "1.0.0")
+	waitForBeaconVersion(t, child.stateDir, "1.0.0")
+
+	// The handoff is written while the child is still live, then the child dies
+	// before the incoming image starts: exactly the exec-window race.
+	n, err := out.writeReplaceHandoff()
+	if err != nil || n != 1 {
+		t.Fatalf("writeReplaceHandoff = %d, %v; want 1, nil", n, err)
+	}
+	if err := syscall.Kill(child.pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // let the signal land; nobody reaps it
+	if !processAlive(child.pid) {
+		// A zombie still counts as alive; if it does not, the test cannot
+		// exercise the zombie path and should say so rather than pass.
+		t.Fatalf("child pid %d is gone before adoption - the zombie window was missed", child.pid)
+	}
+
 	done := runSupervise(ctx, o)
-
-	state := entryStateDir(cacheDir, "stuck")
-	waitFor(t, 5*time.Second, "the stubborn child to come up", func() bool {
-		return countRuns(t, state) == 1
-	})
-
-	writeMarker(t, cacheDir, version.Current)
-	waitFor(t, 5*time.Second, "the halted replacement to be logged", func() bool {
+	waitFor(t, 5*time.Second, "the dead-in-window child to be adopted and reaped", func() bool {
 		text := buf.String()
-		return strings.Contains(text, "did not drain within") && strings.Contains(text, "stuck")
+		return strings.Contains(text, "replace: adopted daemon-window") &&
+			strings.Contains(text, "daemon-window: exited unexpectedly") &&
+			strings.Contains(text, "signal")
 	})
-	// The gate held: no exec, the marker is gone, and the stuck child was
-	// never killed or respawned — it is still running its original spawn.
-	if got := rec.len(); got != 0 {
-		t.Fatalf("exec invoked %d time(s), want 0 — the replacement must not happen over an undrained fleet", got)
-	}
-	if _, err := os.Lstat(filepath.Join(cacheDir, replaceMarkerName)); !os.IsNotExist(err) {
-		t.Errorf("the REPLACE marker was not consumed; stat err = %v", err)
-	}
-	if got := countRuns(t, state); got != 1 {
-		t.Errorf("spawns = %d, want 1 — the stuck child must not be respawned by the halted replacement", got)
-	}
-	// A STOP did land (the drain's write) — the child just never honours it.
-	if _, err := os.Lstat(filepath.Join(state, "STOP")); err != nil {
-		t.Errorf("no STOP was written to the stuck child: %v", err)
-	}
+	waitFor(t, 5*time.Second, "the reaped instance to be respawned on the new version", func() bool {
+		return countRuns(t, child.stateDir) == 2 && readLocalBeacon(child.stateDir) != nil &&
+			readLocalBeacon(child.stateDir).Version == version.Current
+	})
 
-	// The fleet stop after a halted replacement still has to wait for the
-	// wedged child; kill it so the test leaves no orphan, exactly as the
-	// stuck-stop test does.
 	cancel()
-	if pid := spawnPid(t, buf.String()); pid > 0 {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
-	waitFor(t, 5*time.Second, "the supervisor to return once the child is gone", func() bool {
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
 		select {
 		case err := <-done:
 			if err != nil {
@@ -235,21 +413,13 @@ func TestReplaceHaltsWithoutExecWhenAChildNeverDrains(t *testing.T) {
 	})
 }
 
-// A fleet stop landing MID-drain aborts the replacement AND the reconcile
-// pass that was running it: the drain can hold a reconcile for up to
-// VerifyTimeout, and the top-of-reconcile guard ("a cancelled context
-// reconciles to nothing — acting on the roster now could spawn a child
-// stopAll is about to drain") must hold after the drain's abort too, not only
-// before it. The abort reads as the absence of the fall-through's one
-// observable: the fake plane is UP, so a "plane unreachable" line can only
-// come from a roster fetch run on a cancelled context — the continued
-// reconcile the fix stops. No exec either, and the fleet is left exactly as
-// the stop finds it.
-func TestReplaceMidDrainFleetStopAbortsWithoutFallingThroughToReconcile(t *testing.T) {
+// A handoff pid that is not our child (reused, or already reaped) comes back
+// ECHILD: the instance reads as exited and the next reconcile respawns it.
+func TestReplaceTreatsANonChildPIDAsExited(t *testing.T) {
 	cacheDir := t.TempDir()
-	setHelperMode(t, "stubborn")
+	setHelperMode(t, "scripted")
 	plane := &fakePlane{}
-	plane.set([]RosterEntry{runEntry("stuck", "")})
+	plane.set([]RosterEntry{runEntry("daemon-ghost", "")})
 	srv := plane.serve(t)
 
 	var buf lockedBuffer
@@ -258,77 +428,184 @@ func TestReplaceMidDrainFleetStopAbortsWithoutFallingThroughToReconcile(t *testi
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	o := testOptions(t, cacheDir, srv)
+	o.VersionOf = func() string { return version.Current }
+	o.VerifyTimeout = 5 * time.Second
+	state := entryStateDir(cacheDir, "daemon-ghost")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Our own pid is alive but is not our child: wait4 answers ECHILD.
+	if err := writeReplaceHandoffFile(cacheDir, replaceHandoff{
+		SupervisorPID: os.Getpid(),
+		Version:       "1.0.0",
+		WrittenAt:     time.Now().UTC(),
+		Children: []replaceHandoffChild{{
+			Name:       "daemon-ghost",
+			PID:        os.Getpid(),
+			ConfigPath: filepath.Join(state, statedir.MaterializedConfigName),
+			Version:    "1.0.0",
+			SpawnedAt:  time.Now().Add(-time.Minute),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := runSupervise(ctx, o)
+	waitFor(t, 5*time.Second, "the non-child pid to read as an exit", func() bool {
+		text := buf.String()
+		return strings.Contains(text, "replace: adopted daemon-ghost") &&
+			strings.Contains(text, "is not this supervisor's child")
+	})
+	waitFor(t, 5*time.Second, "the instance to be respawned", func() bool {
+		return countRuns(t, state) == 1
+	})
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A handoff written by an earlier process is stale: the pid gate discards it,
+// no child is adopted, and the roster spawns the fleet afresh.
+func TestReplaceDiscardsAHandoffFromAnotherSupervisor(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := testOptions(t, cacheDir, srv)
+	o.VersionOf = func() string { return version.Current }
+	state := entryStateDir(cacheDir, "daemon-one")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stalePID := os.Getpid() + 1
+	if err := writeReplaceHandoffFile(cacheDir, replaceHandoff{
+		SupervisorPID: stalePID,
+		Version:       "1.0.0",
+		WrittenAt:     time.Now().UTC(),
+		Children: []replaceHandoffChild{{
+			Name:       "daemon-one",
+			PID:        os.Getpid(),
+			ConfigPath: filepath.Join(state, statedir.MaterializedConfigName),
+			Version:    "1.0.0",
+			SpawnedAt:  time.Now().Add(-time.Minute),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := runSupervise(ctx, o)
+	waitFor(t, 5*time.Second, "the stale handoff to be discarded", func() bool {
+		return strings.Contains(buf.String(), fmt.Sprintf("discarding a handoff file written by supervisor pid %d", stalePID))
+	})
+	if _, err := os.Lstat(filepath.Join(cacheDir, replaceHandoffName)); !os.IsNotExist(err) {
+		t.Errorf("the stale handoff was not consumed; stat err = %v", err)
+	}
+	waitFor(t, 5*time.Second, "the roster to spawn the child afresh", func() bool {
+		return countRuns(t, state) == 1
+	})
+	if strings.Contains(buf.String(), "replace: adopted daemon-one") {
+		t.Errorf("a stale handoff was adopted:\n%s", buf.String())
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// An exec that fails leaves the old image and its children untouched: no child
+// is signalled, the handoff is removed so no later process can adopt it, and
+// the fleet keeps serving.
+func TestReplaceExecFailureKeepsTheOldImageAndItsChildren(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "scripted")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
 	o := testOptions(t, cacheDir, srv)
 	o.LaunchVersion = func() (string, error) { return version.Current, nil }
 	o.VerifyTimeout = 5 * time.Second
 	rec := &execRecorder{}
-	o.ExecInPlace = rec.hook()
-	done := runSupervise(ctx, o)
+	o.ExecInPlace = rec.hook() // returns an error: the exec fails
 
-	state := entryStateDir(cacheDir, "stuck")
-	waitFor(t, 5*time.Second, "the stubborn child to come up", func() bool {
-		return countRuns(t, state) == 1
-	})
+	out := newOutgoingSupervisor(t, o, cacheDir)
+	child := stageReplaceableChild(t, out, "daemon-one", "sleep", "1.0.0")
+	exited := &Instance{name: "daemon-backoff", desired: RosterDesiredRunning, exited: true, childVersion: "1.0.0"}
+	out.instances = append(out.instances, exited)
+	waitForBeaconVersion(t, child.stateDir, "1.0.0")
 
 	writeMarker(t, cacheDir, version.Current)
-	// The drain is now in progress: it has written STOP and is waiting for a
-	// child that will never honour it — the fleet stop lands here, mid-drain.
-	waitFor(t, 5*time.Second, "the drain to have written STOP", func() bool {
-		return strings.Contains(buf.String(), "STOP written to")
-	})
-	cancel()
+	out.checkReplace()
 
-	waitFor(t, 5*time.Second, "the mid-drain abort to be logged", func() bool {
-		return strings.Contains(buf.String(), "the fleet stop landed mid-drain")
-	})
-	// The abort's log arm says the supervisor exits instead of replacing
-	// itself — it must not borrow the timeout arm's tail ("the children that
-	// stopped are respawned"), which is false here: the stop owns the fleet.
-	if text := buf.String(); strings.Contains(text, "the children that stopped are respawned") {
-		t.Errorf("the mid-drain abort logged the timeout arm's respawn claim:\n%s", text)
+	if got := rec.len(); got != 1 {
+		t.Fatalf("exec invoked %d time(s), want 1", got)
 	}
-	// Fix: the aborted reconcile does NOT fall through to the roster. The
-	// plane is up, so the continued reconcile's cancelled-context fetch is the
-	// only possible source of a "plane unreachable" line; give a would-be
-	// fall-through a beat, then pin its absence.
-	time.Sleep(500 * time.Millisecond)
-	if text := buf.String(); strings.Contains(text, "plane unreachable") {
-		t.Errorf("reconcile fell through to the roster after the mid-drain abort:\n%s", text)
+	if !processAlive(child.pid) {
+		t.Errorf("the child (pid %d) was touched by a failed exec", child.pid)
 	}
-	// No exec, marker consumed, child untouched: the stop owns the fleet now.
-	if got := rec.len(); got != 0 {
-		t.Errorf("exec invoked %d time(s), want 0 - the abort must not exec", got)
-	}
-	if _, err := os.Lstat(filepath.Join(cacheDir, replaceMarkerName)); !os.IsNotExist(err) {
-		t.Errorf("the REPLACE marker was not consumed; stat err = %v", err)
-	}
-	if got := countRuns(t, state); got != 1 {
-		t.Errorf("spawns = %d, want 1 - the fleet stop must not respawn the child", got)
-	}
-
-	// The fleet stop still has to wait for the wedged child; kill it so the
-	// test leaves no orphan, exactly as the stuck-stop test does.
-	if pid := spawnPid(t, buf.String()); pid > 0 {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
-	waitFor(t, 5*time.Second, "the supervisor to return once the child is gone", func() bool {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("Supervise returned %v, want nil", err)
-			}
-			return true
-		default:
-			return false
+	for _, marker := range []string{"STOP", "RESTART"} {
+		if markerPresent(child.stateDir, marker) {
+			t.Errorf("%s was written despite the failed exec", marker)
 		}
-	})
+	}
+	if _, err := os.Lstat(filepath.Join(cacheDir, replaceHandoffName)); !os.IsNotExist(err) {
+		t.Errorf("the handoff survived a failed exec; stat err = %v", err)
+	}
+	if got := out.statusInstance(out.instances[0]).State; got != StatusRunning {
+		t.Errorf("the old image reports the child %q, want running", got)
+	}
+	// Only the live child is in the handoff; a child in backoff is not.
+	h := readReplaceHandoff(cacheDir)
+	if h != nil {
+		t.Errorf("a handoff is still readable after the failed exec: %+v", h)
+	}
+	text := buf.String()
+	for _, want := range []string{
+		"replace: handoff written for 1 live child(ren)",
+		"replace: the replacement exec failed",
+		"the supervisor keeps running with its children untouched",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("log does not contain %q:\n%s", want, text)
+		}
+	}
 }
 
-// The replacement is scoped to local placement (Decision 7): the drain acts
-// on the supervisor's own instances, which reconcile builds from local
-// entries only — a remote entry never becomes an instance, so it is never
-// touched by the replacement, and the local child drains and the exec fires
-// exactly as if the remote entry did not exist.
+// The replacement is scoped to local placement (Decision 7): only the
+// supervisor's own instances are handed to the new image; a remote entry never
+// becomes an instance and its state dir is never created.
 func TestReplaceTouchesLocalChildrenOnly(t *testing.T) {
 	cacheDir := t.TempDir()
 	setHelperMode(t, "sleep")
@@ -350,7 +627,7 @@ func TestReplaceTouchesLocalChildrenOnly(t *testing.T) {
 	o.LaunchVersion = func() (string, error) { return version.Current, nil }
 	o.VerifyTimeout = 5 * time.Second
 	rec := &execRecorder{}
-	o.ExecInPlace = rec.hook()
+	o.ExecInPlace = rec.hook() // failure: the old image resumes and respawns nothing
 	done := runSupervise(ctx, o)
 
 	localState := entryStateDir(cacheDir, "local")
@@ -363,18 +640,25 @@ func TestReplaceTouchesLocalChildrenOnly(t *testing.T) {
 	})
 
 	writeMarker(t, cacheDir, version.Current)
-	waitFor(t, 5*time.Second, "the exec to be invoked after the local drain", func() bool {
-		return rec.len() == 1
-	})
-	// The local child drained (STOP written, then respawned by the failed
-	// exec's resume); the remote entry has no state dir at all — it was never
-	// an instance, so the replacement never touched it.
+	waitFor(t, 5*time.Second, "the exec to be invoked", func() bool { return rec.len() == 1 })
+	h := readReplaceHandoff(cacheDir)
+	// The handoff has already been removed by the failed exec; the log line
+	// names the count, and the remote state dir is the durable evidence.
+	if !strings.Contains(buf.String(), "replace: handoff written for 1 live child(ren)") {
+		t.Errorf("handoff did not carry exactly the local child:\n%s", buf.String())
+	}
+	if h != nil {
+		t.Errorf("handoff survived the failed exec: %+v", h)
+	}
 	if _, err := os.Lstat(remoteState); !os.IsNotExist(err) {
 		t.Errorf("a state dir appeared for the remote entry; stat err = %v", err)
 	}
-	waitFor(t, 5*time.Second, "the local child to be respawned after the failed exec", func() bool {
-		return countRuns(t, localState) == 2
-	})
+	if _, err := os.Lstat(filepath.Join(localState, "STOP")); err == nil {
+		t.Error("a STOP was written to the local child - a replace must not drain")
+	}
+	if got := countRuns(t, localState); got != 1 {
+		t.Errorf("local spawns = %d, want 1 - a failed exec must not respawn the child", got)
+	}
 
 	cancel()
 	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
@@ -391,15 +675,14 @@ func TestReplaceTouchesLocalChildrenOnly(t *testing.T) {
 }
 
 // A marker a supervisor starts later finds STALE and discards: a REPLACE
-// written before this process began is not a request this process owes, so
-// the fleet is not drained and nothing is exec'd — a leftover marker must not
-// make a fresh supervisor replace itself.
+// written before this process began is not a request this process owes, so no
+// child is handed off and nothing is exec'd — a leftover marker must not make a
+// fresh supervisor replace itself.
 func TestReplaceDiscardsAMarkerOlderThanTheSupervisor(t *testing.T) {
 	cacheDir := t.TempDir()
 	setHelperMode(t, "sleep")
 	plane := &fakePlane{}
 	plane.set([]RosterEntry{runEntry("daemon-one", "")})
-	srv := plane.serve(t)
 
 	var buf lockedBuffer
 	log.SetOutput(&buf)
@@ -416,6 +699,7 @@ func TestReplaceDiscardsAMarkerOlderThanTheSupervisor(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	srv := plane.serve(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	o := testOptions(t, cacheDir, srv)
@@ -433,8 +717,11 @@ func TestReplaceDiscardsAMarkerOlderThanTheSupervisor(t *testing.T) {
 	if got := rec.len(); got != 0 {
 		t.Errorf("exec invoked %d time(s), want 0 - a stale marker must not trigger a replacement", got)
 	}
-	if _, err := os.Lstat(filepath.Join(state, "STOP")); err == nil {
-		t.Error("a STOP was written to a child under a stale marker - the fleet must not be drained")
+	if markerPresent(state, "STOP") {
+		t.Error("a STOP was written to a child under a stale marker - the fleet must not be signalled")
+	}
+	if _, err := os.Lstat(filepath.Join(cacheDir, replaceHandoffName)); !os.IsNotExist(err) {
+		t.Errorf("a stale marker wrote a handoff file; stat err = %v", err)
 	}
 	if got := countRuns(t, state); got != 1 {
 		t.Errorf("spawns = %d, want 1 - the fleet must keep running untouched", got)
@@ -460,7 +747,7 @@ func TestReplaceDiscardsAMarkerOlderThanTheSupervisor(t *testing.T) {
 // The honour-time re-probe is a gate of its own: a marker requesting one
 // version is refused when the launch binary reports another — the operator's
 // install must have landed, and a marker for a swap that did not happen must
-// not drain a healthy fleet. The refusal consumes the marker, so the fixed
+// not exec over a healthy fleet. The refusal consumes the marker, so the fixed
 // install makes re-running the command the whole recovery.
 func TestReplaceRefusesWhenTheLaunchBinaryDoesNotMatchTheMarker(t *testing.T) {
 	cacheDir := t.TempDir()
@@ -497,8 +784,11 @@ func TestReplaceRefusesWhenTheLaunchBinaryDoesNotMatchTheMarker(t *testing.T) {
 	if got := rec.len(); got != 0 {
 		t.Errorf("exec invoked %d time(s), want 0 - a mismatched marker must not trigger a replacement", got)
 	}
-	if _, err := os.Lstat(filepath.Join(state, "STOP")); err == nil {
-		t.Error("a STOP was written to a child under a refused marker - the fleet must not be drained")
+	if markerPresent(state, "STOP") {
+		t.Error("a STOP was written to a child under a refused marker - the fleet must not be signalled")
+	}
+	if _, err := os.Lstat(filepath.Join(cacheDir, replaceHandoffName)); !os.IsNotExist(err) {
+		t.Errorf("a refused marker wrote a handoff file; stat err = %v", err)
 	}
 	if got := countRuns(t, state); got != 1 {
 		t.Errorf("spawns = %d, want 1 - the fleet must keep running untouched", got)
@@ -523,8 +813,8 @@ func TestReplaceRefusesWhenTheLaunchBinaryDoesNotMatchTheMarker(t *testing.T) {
 
 // The command's pre-flight refuses a replacement whose launch path still
 // carries another version: the operator forgot to install the new build (or
-// is running the command from a copy), and a marker for that swap would drain
-// a healthy fleet for nothing.
+// is running the command from a copy), and a marker for that swap would exec
+// over a healthy fleet for nothing.
 func TestReplaceCommandRefusesWhenTheLaunchPathCarriesAnotherVersion(t *testing.T) {
 	cacheDir := t.TempDir()
 	o := Options{
@@ -615,6 +905,35 @@ func TestParseReplaceMarker(t *testing.T) {
 		if err != nil || v != tc.wantV || at.IsZero() {
 			t.Errorf("%s: parseReplaceMarker(%q) = %q, %v, %v; want %q", tc.name, tc.in, v, at, err, tc.wantV)
 		}
+	}
+}
+
+// The handoff reader refuses a symlink and an unreadable body: a handoff is a
+// control file like every other in the state surface.
+func TestReadReplaceHandoffRefusesUntrustedFiles(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere")
+	if err := os.WriteFile(target, []byte(`{"supervisorPid":1,"children":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, replaceHandoffName)); err != nil {
+		t.Fatal(err)
+	}
+	if h := readReplaceHandoff(dir); h != nil {
+		t.Fatalf("readReplaceHandoff followed a symlink: %+v", h)
+	}
+	_ = os.Remove(filepath.Join(dir, replaceHandoffName))
+	if err := os.WriteFile(filepath.Join(dir, replaceHandoffName), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if h := readReplaceHandoff(dir); h != nil {
+		t.Fatalf("readReplaceHandoff accepted an unreadable body: %+v", h)
+	}
+	if err := os.WriteFile(filepath.Join(dir, replaceHandoffName), []byte(`{"supervisorPid":1,"children":[{"name":"x","pid":0}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if h := readReplaceHandoff(dir); h != nil {
+		t.Fatalf("readReplaceHandoff accepted a pid-less child: %+v", h)
 	}
 }
 

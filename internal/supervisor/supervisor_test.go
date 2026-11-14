@@ -28,10 +28,14 @@ package supervisor
 // The modes: "sleep" (exit on STOP), "sleep-seen" (exit on STOP, leave the
 // marker and drop a STOP-SEEN file as proof the marker landed), "crash" (exit
 // 1 immediately), "halt" (write HALT, exit 1), "sleep-no-dir" (never create
-// the state dir: the daemon-stuck-before-startup shape) and "stubborn" (never
-// exit, whatever lands in the state dir: the drain-stuck shape). No test runs
+// the state dir: the daemon-stuck-before-startup shape), "stubborn" (never
+// exit, whatever lands in the state dir: the drain-stuck shape), "busy" (an
+// in-flight session: beacon says iteration and RESTART is ignored until the
+// test drops BOUNDARY) and "scripted" (read the mode from the child's own
+// SCRIPT_MODE file, so one run can hold an idle and a busy instance at once —
+// the adopt-on-exec tests need that per-instance split). No other test runs
 // instances in different modes at once, so a single process-wide variable is
-// enough.
+// enough there.
 
 import (
 	"bytes"
@@ -115,6 +119,20 @@ func helperMain() {
 		os.Exit(9)
 	}
 	mode := os.Getenv(helperModeEnv)
+	// "scripted" reads the mode from the child's own state dir, so ONE test
+	// process-wide mode can still run an idle and a busy child side by side
+	// (the supervisor's spawn inherits the process env; the state dir is
+	// per-instance and survives a respawn). This is what the adopt-on-exec
+	// tests need: the busy child's in-flight session is held at its boundary
+	// while the idle one is rolled.
+	if mode == "scripted" {
+		if b, err := os.ReadFile(filepath.Join(spec.StateDir, "SCRIPT_MODE")); err == nil {
+			mode = strings.TrimSpace(string(b))
+		}
+		if mode == "" || mode == "scripted" {
+			mode = "sleep"
+		}
+	}
 
 	// The real daemon creates its own state dir at startup — except
 	// "sleep-no-dir", which deliberately does not, so the supervisor faces a
@@ -141,14 +159,19 @@ func helperMain() {
 		// The local beacon (phase 5b): what the roll verifies against. The
 		// supervisor passes the version it recorded for THIS spawn in
 		// CLANKERBAR_CHILD_VERSION; the fake reports it back the way the real
-		// daemon reports its own build.
+		// daemon reports its own build. "busy" is the in-flight-session shape:
+		// its beacon says iteration until its boundary arrives.
 		v := os.Getenv(childVersionEnv)
 		if v == "" {
 			v = version.Current
 		}
+		state := "idle"
+		if mode == "busy" {
+			state = "iteration"
+		}
 		beaconBody, err := json.Marshal(map[string]any{
 			"version": v,
-			"state":   "idle",
+			"state":   state,
 			"at":      time.Now().UTC().Format(time.RFC3339),
 		})
 		if err != nil {
@@ -220,6 +243,25 @@ func helperMain() {
 			if _, err := os.Lstat(filepath.Join(spec.StateDir, loop.MarkerRestart)); err == nil {
 				_ = os.Remove(filepath.Join(spec.StateDir, loop.MarkerRestart))
 				os.Exit(0)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	case "busy":
+		// An in-flight session: STOP and RESTART are honoured only after the
+		// test drops the BOUNDARY file, which stands for the child reaching its
+		// next phase seam or iteration boundary. Until then it keeps its pid and
+		// ignores both markers, exactly as a daemon mid-session does.
+		boundary := filepath.Join(spec.StateDir, "BOUNDARY")
+		for {
+			if _, err := os.Lstat(boundary); err == nil {
+				if _, err := os.Lstat(filepath.Join(spec.StateDir, loop.MarkerRestart)); err == nil {
+					_ = os.Remove(filepath.Join(spec.StateDir, loop.MarkerRestart))
+					os.Exit(0)
+				}
+				if _, err := os.Lstat(stopPath); err == nil {
+					_ = os.Remove(stopPath)
+					os.Exit(0)
+				}
 			}
 			time.Sleep(20 * time.Millisecond)
 		}

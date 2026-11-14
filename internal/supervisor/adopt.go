@@ -203,7 +203,7 @@ func (d *Supervisor) adoptReplaceHandoff() []*Instance {
 	if _, err := os.Lstat(path); err != nil {
 		return nil
 	}
-	h := readReplaceHandoff(path)
+	h := readReplaceHandoff(d.cacheDir)
 	d.removeReplaceHandoff()
 	if h == nil {
 		log.Printf("replace: discarding an unreadable handoff file in %s", d.cacheDir)
@@ -217,9 +217,16 @@ func (d *Supervisor) adoptReplaceHandoff() []*Instance {
 		log.Print("replace: the handoff file names no live children - nothing to adopt")
 		return nil
 	}
+	log.Printf("replace: handoff from supervisor %s (pid %d) accepted - adopting %d live child(ren)", h.Version, h.SupervisorPID, len(h.Children))
 
 	var adopted []*Instance
+	seen := make(map[string]bool, len(h.Children))
 	for _, c := range h.Children {
+		if seen[c.Name] {
+			log.Printf("replace: handoff names %s more than once - keeping the first entry and ignoring the duplicate (pid %d)", c.Name, c.PID)
+			continue
+		}
+		seen[c.Name] = true
 		if !processAlive(c.PID) {
 			log.Printf("replace: handoff names %s (pid %d, version %s) but the process is gone - it will be spawned afresh on the next reconcile", c.Name, c.PID, c.Version)
 			continue
@@ -337,6 +344,12 @@ func (d *Supervisor) rollAdopted(insts []*Instance) {
 		if !alive {
 			continue
 		}
+		if was == version.Current {
+			// A child that crashed and respawned while the roll was waiting on
+			// its predecessor is already on this image; restarting it again
+			// would be a swap nobody asked for.
+			continue
+		}
 		log.Printf("replace: rolling adopted %s (was %s) - writing RESTART; it comes back on %s at its next phase seam or iteration boundary", inst.name, was, version.Current)
 		if err := writeRestartMarker(dir, inst.name); err != nil {
 			log.Printf("replace: %s: %v - halting the adopted roll; the remaining adopted children keep running their current version and `clankerbar supervise roll` can finish them", inst.name, err)
@@ -346,6 +359,14 @@ func (d *Supervisor) rollAdopted(insts []*Instance) {
 			log.Printf("replace: %v - halting the adopted roll; the remaining adopted children keep running their current version and `clankerbar supervise roll` can finish them", err)
 			return
 		}
+		// The beacon is the child's own report: record it, so the supervisor's
+		// listing shows the version the adopted child ACTUALLY runs even when
+		// it re-exec'd in place and kept its pid (no respawn would update it).
+		// The next reconcile publishes the change; statusReport reads the field
+		// under inst.mu, so writing it from this goroutine is safe.
+		inst.mu.Lock()
+		inst.childVersion = version.Current
+		inst.mu.Unlock()
 	}
 	log.Printf("replace: every adopted child now reports %s", version.Current)
 }
