@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
@@ -395,5 +396,35 @@ func TestConflictStepOnAnotherHarnessInheritsItsWholeList(t *testing.T) {
 
 	if got := c.ConflictStep().Model.List(); !slices.Equal(got, []string{"codex-free", "codex-paid"}) {
 		t.Errorf("conflict models = %v, want codex's whole list", got)
+	}
+}
+
+// The model field's wire form must not move for the shapes that existed before it
+// carried a route list. Config.Identity() hashes the marshalled config, and a
+// changed identity makes every running supervisor treat its config as edited and
+// restart its children: an upgrade must not do that on its own.
+func TestConflictStepModelKeepsItsWireForm(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		step   ConflictStep
+		want   string
+		absent string
+	}{
+		{"one pinned alias marshals as the historical string", ConflictStep{Model: ModelRoutes{"alias"}}, `"model":"alias"`, ""},
+		{"no model is omitted", ConflictStep{MaxTurns: 40}, `"max_turns":40`, "model"},
+		{"several routes use the array form", ConflictStep{Model: ModelRoutes{"free", "paid"}}, `"model":["free","paid"]`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.step)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !strings.Contains(string(b), tc.want) {
+				t.Errorf("marshalled conflict step = %s, want it to carry %s", b, tc.want)
+			}
+			if tc.absent != "" && strings.Contains(string(b), tc.absent) {
+				t.Errorf("marshalled conflict step = %s, want no %q key at all", b, tc.absent)
+			}
+		})
 	}
 }

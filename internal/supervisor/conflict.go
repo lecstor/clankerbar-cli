@@ -15,9 +15,10 @@ package supervisor
 //  1. takes the plane CLAIM itself, so the claim is the lock an agent close-out
 //     and this path both race for. A refused claim means someone else has the
 //     task: no session is started.
-//  2. starts ONE session, on the fleet's IMPLEMENT harness/model unless the
-//     config's `conflict` step names its own, and logs one line with the task,
-//     the PR, the conflicting paths and the outcome.
+//  2. starts ONE session, on the fleet's IMPLEMENT harness/model routes unless
+//     the config's `conflict` step names its own, and logs one line with the
+//     task, the PR, the conflicting paths and the outcome. An attempt that ends
+//     on a usage limit is re-run on the next model in the list (CLA-890).
 //  3. lets the session do the work under that claim: merge the base into the
 //     branch (never a rebase), resolve only the conflicting hunks, run the
 //     repo-wide gate, push, and hand the task back. The brief is short and lives
@@ -686,7 +687,8 @@ func runConflictModelLadder(label string, req ConflictRunRequest, a conflictLimi
 
 // conflictInvocation composes the invocation a conflict session runs. Split from
 // the launcher so the composition — the one part that needs no paid process — is
-// testable: the prompt, the model, the reach (ExtraDirs) and the ceilings.
+// testable: the prompt, the model and its route list, the reach (ExtraDirs) and
+// the ceilings.
 func conflictInvocation(cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Invocation, error) {
 	env, err := cfg.SessionEnv(req.Harness, slug)
 	if err != nil {
