@@ -87,7 +87,11 @@ type EmbedHunksOptions struct {
 	MaxBytesPerItem int `json:"max_bytes_per_item,omitempty"`
 
 	// MaxBytesTotal caps the hunk text embedded across all M items. Zero
-	// selects DefaultMapsSessionHunkBytesTotal.
+	// selects DefaultMapsSessionHunkBytesTotal. The prompt is NOT chunked
+	// before it reaches a harness: opencode receives it as one argv string,
+	// and Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN), so the
+	// default's ~80 KiB first turn leaves only ~48 KiB of headroom before a
+	// raised budget fails the spawn with E2BIG.
 	MaxBytesTotal int `json:"max_bytes_total,omitempty"`
 }
 

@@ -132,7 +132,7 @@ func parseDiff(diff string) (files []FileDiff, texts []string) {
 				line++
 			}
 		case strings.HasPrefix(raw, "rename from "):
-			renamedFrom = strings.TrimSpace(strings.TrimPrefix(raw, "rename from "))
+			renamedFrom = diffHeaderPath(strings.TrimPrefix(raw, "rename from "))
 		case strings.HasPrefix(raw, "--- "):
 			oldPath = stripDiffPath(raw[4:])
 		case strings.HasPrefix(raw, "+++ "):
@@ -157,11 +157,78 @@ func parseDiff(diff string) (files []FileDiff, texts []string) {
 	return files, texts
 }
 
-// stripDiffPath removes the a/ or b/ prefix git puts on a diff header's path.
+// stripDiffPath removes the a/ or b/ prefix git puts on a ---/+++ header's
+// path. The prefix sits inside git's quoting ("b/caf\303\251.ts"), so the path
+// is decoded first.
 func stripDiffPath(s string) string {
-	s = strings.TrimSpace(s)
+	s = diffHeaderPath(s)
 	if strings.HasPrefix(s, "a/") || strings.HasPrefix(s, "b/") {
 		return s[2:]
 	}
 	return s
+}
+
+// diffHeaderPath decodes one path taken from a diff header, padding included.
+func diffHeaderPath(s string) string {
+	s = strings.TrimSpace(s)
+	if u, ok := unquoteDiffPath(s); ok {
+		return u
+	}
+	return s
+}
+
+// unquoteDiffPath decodes git's C-style quoted path form: git quotes a path
+// holding non-ASCII bytes (core.quotePath's default), a quote, a backslash or a
+// control character. Decoding is byte-wise because git escapes each byte of a
+// UTF-8 path as \NNN — a rune-wise unquote would turn "café" into mojibake.
+// ok is false when s is not that form, or carries an escape git does not emit;
+// the caller then keeps the raw text.
+func unquoteDiffPath(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return s, false
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 1; i < len(s)-1; i++ {
+		c := s[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(s)-1 {
+			return s, false
+		}
+		switch s[i] {
+		case 'a':
+			b.WriteByte('\a')
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case 'v':
+			b.WriteByte('\v')
+		case '\\', '"':
+			b.WriteByte(s[i])
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			if i+2 >= len(s)-1 {
+				return s, false
+			}
+			n, err := strconv.ParseUint(s[i:i+3], 8, 8)
+			if err != nil {
+				return s, false
+			}
+			b.WriteByte(byte(n))
+			i += 2
+		default:
+			return s, false
+		}
+	}
+	return b.String(), true
 }

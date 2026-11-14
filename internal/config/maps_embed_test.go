@@ -202,14 +202,17 @@ func TestEmbedMapsSessionHunks_EdgeCases(t *testing.T) {
 	})
 }
 
-// TestMapsSessionHunkBudgetNote (CLA-871): the one-time note names the spent
-// total and the command for the items left plain.
+// TestMapsSessionHunkBudgetNote (CLA-871): the one-time note names the budget
+// the next hunk would pass and the command for the items left plain.
 func TestMapsSessionHunkBudgetNote(t *testing.T) {
 	note := MapsSessionHunkBudgetNote("abc1234", DefaultMapsSessionHunkBytesTotal)
-	for _, want := range []string{"Hunk embedding stopped", "61440-byte per-review budget", "from here on", "`git diff abc1234..HEAD -- <path>`"} {
+	for _, want := range []string{"Hunk embedding stopped", "the next hunk would", "61440-byte per-review budget", "from here on", "`git diff abc1234..HEAD -- <path>`"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("note does not carry %q: %s", want, note)
 		}
+	}
+	if strings.Contains(note, "is spent") {
+		t.Errorf("the note claims the whole budget was used: %s", note)
 	}
 }
 

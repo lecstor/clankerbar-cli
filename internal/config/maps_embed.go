@@ -74,10 +74,14 @@ func MapsSessionHunkTruncatedMarker(base, path string, limit int) string {
 // MapsSessionHunkBudgetNote is the one-time note placed where the total budget
 // stopped embedding. The caller inserts it at the first unembedded item, so the
 // items above it in the chunk still carry their diffs.
+//
+// The stop condition is that the NEXT hunk alone would pass the total, not that
+// every byte was used, so the note says which budget was hit rather than
+// claiming it is spent.
 func MapsSessionHunkBudgetNote(base string, total int) string {
-	return fmt.Sprintf("(Hunk embedding stopped: the %d-byte per-review budget is spent. The items from here on "+
-		"are listed without their diffs; run `git diff %s..HEAD -- <path>` for a file you need.)",
-		total, diffBaseLabel(base))
+	return fmt.Sprintf("(Hunk embedding stopped: the next hunk would take the %d-byte per-review budget past its "+
+		"limit. The items from here on are listed without their diffs; run `git diff %s..HEAD -- <path>` for a "+
+		"file you need.)", total, diffBaseLabel(base))
 }
 
 func hunkBlock(item, text string) string {

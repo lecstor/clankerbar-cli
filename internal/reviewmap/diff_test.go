@@ -162,3 +162,67 @@ func TestParseDiffHeaderPrefixStaysInHunk(t *testing.T) {
 		}
 	}
 }
+
+// TestParseDiffQuotedPaths (CLA-871): git C-quotes a path holding non-ASCII
+// bytes, a quote or a backslash (core.quotePath's default), and the parser must
+// decode it. Every consumer names that path — the change-map item a reviewer is
+// sent to, and the truncation marker's git command — so the quoted form would
+// name no file git can resolve.
+func TestParseDiffQuotedPaths(t *testing.T) {
+	diff := `diff --git "a/caf\303\251.ts" "b/caf\303\251.ts"
+index 1111111..2222222 100644
+--- "a/caf\303\251.ts"
++++ "b/caf\303\251.ts"
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+diff --git "a/we\"ird.ts" "b/we\"ird.ts"
+index 1111111..2222222 100644
+--- "a/we\"ird.ts"
++++ "b/we\"ird.ts"
+@@ -1 +1,2 @@
+ x
++y
+diff --git "a/back\\slash.ts" "b/back\\slash.ts"
+index 1111111..2222222 100644
+--- "a/back\\slash.ts"
++++ "b/back\\slash.ts"
+@@ -1 +1,2 @@
+ y
++z
+`
+	want := []string{"café.ts", `we"ird.ts`, `back\slash.ts`}
+	files := ParseDiff(diff)
+	if len(files) != len(want) {
+		t.Fatalf("ParseDiff() = %d files, want %d: %#v", len(files), len(want), files)
+	}
+	for i, p := range want {
+		if files[i].Path != p {
+			t.Errorf("file %d path = %q, want %q", i, files[i].Path, p)
+		}
+	}
+}
+
+// TestParseDiffQuotedRenameFrom (CLA-871): git quotes a rename's source path the
+// same way, and the flow map reads that path's base content by it.
+func TestParseDiffQuotedRenameFrom(t *testing.T) {
+	diff := `diff --git "a/caf\303\251.ts" "b/renam\303\251.ts"
+similarity index 60%
+rename from "caf\303\251.ts"
+rename to "b/renam\303\251.ts"
+index 1111111..2222222 100644
+--- "a/caf\303\251.ts"
++++ "b/renam\303\251.ts"
+@@ -1 +1 @@
+-old
++new
+`
+	files := ParseDiff(diff)
+	if len(files) != 1 {
+		t.Fatalf("ParseDiff() = %#v, want one file", files)
+	}
+	if files[0].Path != "renamé.ts" || files[0].RenamedFrom != "café.ts" {
+		t.Errorf("path/from = %q / %q, want renamé.ts / café.ts", files[0].Path, files[0].RenamedFrom)
+	}
+}

@@ -537,14 +537,18 @@ caps one item's hunk: over it the hunk is cut at a line boundary and a marker
 names the exact `git diff <merge-base>..HEAD -- <file>` command for the rest.
 `max_bytes_total` (default 61440, about 15k tokens) caps the whole map: once
 the next hunk would pass it, that item and every later one stay plain, and a
-single note in that chunk says embedding stopped. The defaults cover the
-benchmarked 100-line PR's hunks nearly whole while leaving the brief, the
+single note in that chunk says embedding stopped. There is a practical ceiling
+above the schema's: the whole prompt reaches opencode as ONE argv string, and
+Linux caps a single argument at 128 KiB (`MAX_ARG_STRLEN`). At the defaults a
+worst-case first turn is ~80 KB, so a `max_bytes_total` much past the default
+fails the spawn with `E2BIG` instead of growing the prompt. The defaults cover
+the benchmarked 100-line PR's hunks nearly whole while leaving the brief, the
 checklist and the notes room in the window; both budgets count the hunk text,
 not the fences.
 
 The hunk is untrusted repository content in the prompt, so it cannot break out:
-the fence is one backtick longer than the longest backtick run the hunk
-contains, and a hunk line whose content is exactly the done marker is embedded
+the fence is at least three backticks and longer than any backtick run in the
+hunk, and a hunk line whose content is exactly the done marker is embedded
 with a backslash after its diff prefix, so neither copying it whole nor
 stripping the prefix yields a marker the done-report parser accepts. With
 `enabled: false` (or no `embed_hunks` key at all) the items are byte for byte

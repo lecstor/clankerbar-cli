@@ -258,3 +258,28 @@ diff --git a/b.ts b/b.ts
 		t.Errorf("the merged a.ts entry does not carry both hunks:\n%s", merged[0].Hunk)
 	}
 }
+
+// TestChangeEntriesQuotedPath (CLA-871): a header git quoted decodes to the real
+// repo path, and the item a reviewer is sent to renders that path, not git's
+// escaped form.
+func TestChangeEntriesQuotedPath(t *testing.T) {
+	diff := `diff --git "a/caf\303\251.ts" "b/caf\303\251.ts"
+index 1111111..2222222 100644
+--- "a/caf\303\251.ts"
++++ "b/caf\303\251.ts"
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+`
+	entries := ChangeEntries(diff, Unlimited)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v, want one", entries)
+	}
+	if entries[0].Path != "café.ts" {
+		t.Errorf("Path = %q, want café.ts", entries[0].Path)
+	}
+	if !strings.Contains(entries[0].Text, "café.ts:1-2") || strings.Contains(entries[0].Text, `\303`) {
+		t.Errorf("the item does not name the real repo path: %q", entries[0].Text)
+	}
+}

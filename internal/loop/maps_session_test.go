@@ -746,10 +746,14 @@ func TestPlanMapsSession_EmbedHunks(t *testing.T) {
 		"M2. src/a.ts:40-46\n\n```diff\n@@ -40,3 +40,7 @@",
 		"+export function betaThing(x: number) {",
 		"when a fenced diff block follows it",
+		"only for a file whose hunk was truncated or that is listed without one",
 	} {
 		if !strings.Contains(first, want) {
 			t.Errorf("turn 1's section does not carry %q:\n%s", want, first)
 		}
+	}
+	if strings.Contains(first, "for the diff of a file") {
+		t.Errorf("the unqualified diff-read guidance survived with hunks embedded:\n%s", first)
 	}
 	if got := strings.Count(first, "```diff"); got != 2 {
 		t.Errorf("fenced diff blocks = %d, want one per M item (2)", got)
@@ -826,6 +830,70 @@ func TestPlanMapsSession_EmbedHunksTotalBudgetNoteOnce(t *testing.T) {
 	}
 	if got := strings.Count(all, "Hunk embedding stopped"); got != 1 {
 		t.Errorf("the budget note appears %d times, want exactly once", got)
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksTotalBudgetMidChunk (CLA-871): when chunk_size
+// puts the cutoff between two items of ONE chunk, the one-time note lands
+// between the last embedded item's closing fence and the first plain item.
+func TestPlanMapsSession_EmbedHunksTotalBudgetMidChunk(t *testing.T) {
+	entries := reviewmap.ChangeEntries(mapsTsDiff, reviewmap.Unlimited)
+	if len(entries) != 2 {
+		t.Fatalf("fixture change entries = %d, want 2", len(entries))
+	}
+	opts := mapsTestOpts() // chunk_size 2: M1 and M2 share one chunk
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesTotal: len(entries[0].Hunk)}
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionDoneReportEnding)
+
+	if plan.notesTurns != 1 {
+		t.Fatalf("notesTurns = %d, want 1 (both M items fit one chunk)", plan.notesTurns)
+	}
+	body := plan.section
+	fence := strings.Index(body, "```\n(Hunk embedding stopped")
+	note := strings.Index(body, "(Hunk embedding stopped")
+	plain := strings.Index(body, "M2. src/a.ts:40-46")
+	if fence < 0 || note < 0 || plain < 0 {
+		t.Fatalf("chunk 1 lacks the closing-fence-then-note (%d/%d) or the plain M2 (%d):\n%s",
+			fence, note, plain, body)
+	}
+	if !(fence < note && note < plain) {
+		t.Errorf("the note is not between M1's closing fence and the plain M2: fence %d, note %d, M2 %d",
+			fence, note, plain)
+	}
+	if got := strings.Count(body, "Hunk embedding stopped"); got != 1 {
+		t.Errorf("the budget note appears %d times in the chunk, want exactly once", got)
+	}
+	if strings.Contains(body, "M2. src/a.ts:40-46\n\n```diff") {
+		t.Errorf("the over-budget M2 was embedded:\n%s", body)
+	}
+}
+
+// TestPlanMapsSession_EmbedHunksQuotedPath (CLA-871): a file git quotes in the
+// diff header still gets its real repo path in the item and in the truncation
+// marker's git command, which names no file git can resolve otherwise.
+func TestPlanMapsSession_EmbedHunksQuotedPath(t *testing.T) {
+	const diff = `diff --git "a/caf\303\251.ts" "b/caf\303\251.ts"
+index 1111111..2222222 100644
+--- "a/caf\303\251.ts"
++++ "b/caf\303\251.ts"
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+`
+	opts := mapsTestOpts()
+	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 10, MaxBytesTotal: 1000}
+	plan := planMapsSession(opts, "", "abc1234", diff, nil, config.MapsSessionDoneReportEnding)
+	for _, want := range []string{
+		"M1. café.ts:1-2",
+		"run `git diff abc1234..HEAD -- café.ts` for the rest",
+	} {
+		if !strings.Contains(plan.section, want) {
+			t.Errorf("turn 1 does not carry %q:\n%s", want, plan.section)
+		}
+	}
+	if strings.Contains(plan.section, `\303`) || strings.Contains(plan.section, `"b/`) {
+		t.Errorf("the quoted header path leaked into the prompt:\n%s", plan.section)
 	}
 }
 

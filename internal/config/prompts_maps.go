@@ -66,13 +66,18 @@ func MapsSessionFirstTurn(base string, chunk, chunks int, items string, hunksEmb
 		"against required; sync against async (missing await, unhandled promise, a goroutine or error that is " +
 		"dropped); return values the caller ignores or assumes non-null; renamed or removed exports still " +
 		"referenced. Follow a use one level further when the value is passed on.\n\n")
-	if base != "" {
-		fmt.Fprintf(&b, "Use `git diff %s..HEAD -- <path>` for the diff of a file, git grep to find more uses, "+
-			"and read whole files where you need them.\n\n", base)
-	} else {
-		b.WriteString("Use `git diff <base>..HEAD -- <path>` for the diff of a file, git grep to find more uses, " +
-			"and read whole files where you need them.\n\n")
+	// The embedded hunks replace the diff reads; saying otherwise in the next
+	// breath would send a step-heavy model straight back to them.
+	diffHint := "Use `git diff %s..HEAD -- <path>` for the diff of a file"
+	if hunksEmbedded {
+		diffHint = "Use `git diff %s..HEAD -- <path>` only for a file whose hunk was truncated or that is listed without one"
 	}
+	baseLabel := base
+	if baseLabel == "" {
+		baseLabel = "<base>"
+	}
+	fmt.Fprintf(&b, diffHint+", git grep to find more uses, and read whole files where you need them.\n\n",
+		baseLabel)
 	b.WriteString(mapsSessionChecklist + "\n\n")
 	b.WriteString(mapsSessionChunkHeading(chunk, chunks) + "\n\n" + items + "\n\n")
 	b.WriteString(mapsSessionNotesRule)
