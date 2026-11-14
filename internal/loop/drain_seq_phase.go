@@ -129,21 +129,24 @@ func (s *drainSeq) checkPhaseBoundary(st *seqStep) seqNext {
 	prior := s.prior
 	if s.spawned > 0 {
 		// The breaker at a phase boundary — the third place a session ends and
-		// the loop decides whether to spawn another, alongside between-drains
-		// and between-attempts, and the finest granularity the ceiling has had.
-		// It is not decoration: one measured task spent 92% of a whole run's
-		// 75M ceiling inside a single session, which a between-drains check
-		// cannot see coming and cannot interrupt. A handoff respawn gets the
-		// same check, BEFORE the respawn: a session cannot spend its way past
-		// the ceiling by handing off to itself.
-		if dim := d.budgetTrip(prior.tokens+s.tokens, prior.cost+s.cost, time.Since(prior.start)); dim != "" {
+		// the loop decides whether to spawn another, alongside between-drains and
+		// between-attempts. It is not decoration: one measured task spent 92% of a
+		// whole run's 75M ceiling inside a single session, which a between-drains
+		// check cannot see coming. A handoff respawn gets the same check, BEFORE
+		// the respawn: a session cannot spend its way past the ceiling by handing
+		// off to itself.
+		//
+		// The breaker is the TARGET's account (CLA-480): a stored overlay's
+		// budget over its project's spend, or the local budget over the projects
+		// it still governs. charge() books every counted phase, so the ledger
+		// already carries the phases before this boundary.
+		if v := d.budgetStop(s.ti, time.Since(prior.start)); v.dim != "" {
 			boundary := "the " + st.ph.Label(s.i) + " phase boundary"
 			if st.isHandoff {
 				boundary = "the handoff respawn"
 			}
-			log.Printf("iteration %d: budget reached at %s: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-				drainNum, boundary, dim, prior.tokens+s.tokens, prior.cost+s.cost,
-				time.Since(prior.start).Round(time.Second))
+			log.Printf("iteration %d: budget reached at %s: %s — ending this drain (tokens=%d cost=$%.2f elapsed=%s)",
+				drainNum, boundary, v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 			s.stop = true
 			return seqBreak
 		}
@@ -211,9 +214,8 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 		}
 	}
 	st.ptokens, st.pcost, st.pstop, st.end, st.perr = d.drainPhase(ctx, drainNum, ti, s.i, st.tag, st.ph, st.terminal, s.carried, t, spend{
-		start:  prior.start,
-		tokens: prior.tokens + s.tokens,
-		cost:   prior.cost + s.cost,
+		start: prior.start,
+		ti:    s.ti,
 	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, opts)
 	s.tokens += st.ptokens
 	s.cost += st.pcost

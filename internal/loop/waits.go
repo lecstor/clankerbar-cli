@@ -190,9 +190,12 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	nextProbe := time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 
 	for {
-		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
-			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
-				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
+		// The target's own account (CLA-480): charge() books this wait's probes as
+		// they land, so a stored overlay's budget is judged on its project's spend
+		// and a local-file budget on the projects it governs.
+		if v := d.budgetStop(sofar.ti, time.Since(sofar.start)); v.dim != "" {
+			log.Printf("budget reached while paused: %s — ending the wait rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
+				v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 			return tokens, cost, true
 		}
 		// waitOrStopHalt stays the sleep, so STOP / RESTART / RELOAD - and, in
@@ -254,7 +257,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// with tc.HarnessFor), so its spend is booked under that same name —
 		// keying on the base harness would bill an overlay-redirected phase to
 		// the wrong per-harness account (CLA-410).
-		d.charge(tc.HarnessFor(ph), got.Tokens, got.CostUSD)
+		d.charge(sofar.ti, tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true

@@ -2543,6 +2543,14 @@ re-reads and re-overlays before spawning again. A document that fails local
 validation keeps the previous config and says so loudly. Flags still outrank the
 stored document: `--model` on the command line wins over a ratified value.
 
+A stored `budget` — including `per_harness` — governs **that project's own
+sessions**, and its wall clock is measured on the project's own clock. A ratified
+ceiling looser than this file's is therefore the one in force for that project
+(otherwise a stored ceiling could only ever tighten), and a trip **exhausts that
+project only**: its siblings keep draining, and the daemon stops when every
+project has reached its ceiling. Projects with no stored document share this
+file's budget as one instance-wide pool.
+
 Import today's file as the starting point with:
 
 ```sh
@@ -2589,7 +2597,11 @@ Per entry: `slug` (required, the `<slug>` in `/mcp/<slug>`), `workdir`, and
 optionally `mcp_config_path` (defaults to `<workdir>/.mcp.json`). Budgets,
 `max_iterations`, and the control markers (`STOP`/`HALT` plus the
 `ctl restart`/`reload` family) stay **instance-global** — one
-operator, one spend pool; the console pause is per project. With no `projects`
+operator, one spend pool; the console pause is per project. The one exception is
+a project whose **stored run-config document** sets a `budget` (see *Execution
+config from the plane*): that project's ceilings are judged on its own spend and
+a trip exhausts only that project, so a looser ceiling can be ratified for one
+project without loosening the pool for the others. With no `projects`
 list, the top-level fields drive a single project exactly as before.
 
 ### Resilience
@@ -2778,7 +2790,9 @@ alternatives, in order of preference:
    name, counted over **only that harness's own sessions** and measured in the
    unit that harness understands - tokens for `claude`, dollars for a metered
    backend. **Any block that trips stops the whole run**: these are circuit
-   breakers, not per-harness quotas.
+   breakers, not per-harness quotas. (When the block comes from a project's
+   stored run-config document, "the whole run" is that project — see *Execution
+   config from the plane*; the local file's block is the instance-wide pool.)
 
    A token ceiling in a block derives the per-session runaway detector
    (`max_session_tokens`) exactly as the run-wide `max_tokens` does, so moving a

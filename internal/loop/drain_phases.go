@@ -324,15 +324,6 @@ type phaseRunOpts struct {
 	// recording, and the close is what releases the findings they must not see.
 	panelParallel bool
 
-	// panelSpend, when non-nil, is this member's handle on its panel's shared
-	// spend ledger (CLA-697 review finding 1.review-1.1). Every attempt's counted
-	// spend is published to it the moment the ladder counts it, and the ladder's
-	// pre-spawn budget check measures the run's totals PLUS the siblings' counted
-	// spend. Without it each member compared the same prior snapshot plus its own
-	// local spend against a run-wide ceiling none of them could see the others
-	// approaching. Nil for every caller that is not a parallel panel member.
-	panelSpend *panelSpendHandle
-
 	// onSessionLaunch, when non-nil, is called immediately before the adapter is
 	// invoked — the first moment this phase's session launch has actually BEGUN —
 	// on every attempt the ladder makes. A parallel panel member uses it to

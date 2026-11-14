@@ -84,32 +84,7 @@ type phaseRun struct {
 	retries int
 }
 
-// The budget breaker's view of this decision, beside the run's own totals
-// (CLA-697 review finding 1.review-1.1). For a PARALLEL panel member the
-// siblings' published spend is part of it: the members share the run's
-// ceilings, and a check that measured only the shared `prior` plus this
-// member's own local spend could spawn an attempt the panel's AGGREGATE had
-// already made unaffordable. Nil handle — every other caller — returns
-// exactly the arithmetic the ladder has always done.
-func (r *phaseRun) sofar() (int, float64) {
-	tokensSoFar, costSoFar := r.prior.tokens+r.tokens, r.prior.cost+r.cost
-	if r.opts.panelSpend != nil {
-		peersTokens, peersCost := r.opts.panelSpend.peers()
-		tokensSoFar += peersTokens
-		costSoFar += peersCost
-	}
-	return tokensSoFar, costSoFar
-}
-
-// Every attempt's spend reaches the ledger the moment the ladder counts it,
-// so a sibling's next pre-spawn check sees a member that has already paid.
-func (r *phaseRun) publishSpend() {
-	if r.opts.panelSpend != nil {
-		r.opts.panelSpend.publish(r.tokens, r.cost)
-	}
-}
-
-// result is the drainPhase return a verdict ends the phase with.
+// attemptNext says what the ladder does after a stage.
 func (r *phaseRun) result(v attemptVerdict) (int, float64, bool, phaseEnd, error) {
 	if v.zeroSpend {
 		return 0, 0, v.stop, r.end, v.err

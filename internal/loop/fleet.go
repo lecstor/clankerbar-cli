@@ -114,8 +114,10 @@ func (d *Driver) fleetState(ti int) fleet.State {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
 	// A scheduled pause is reported after the iteration check: a session still in
-	// flight reports its iteration, and the window holds only the NEXT spawn.
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.schedPaused {
+	// flight reports its iteration, and the window holds only the NEXT spawn. An
+	// exhausted target (CLA-480) reads the same as a paused one: alive, spawning
+	// nothing new, because its own budget has been reached.
+	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.exhaustedAt(ti) || d.schedPaused {
 		return fleet.State{Kind: fleet.StateDraining}
 	}
 	return fleet.State{Kind: fleet.StateIdle}

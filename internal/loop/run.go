@@ -96,8 +96,6 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	}
 
 	start := time.Now()
-	var totalTokens int
-	var totalCost float64
 	drains := 0
 
 	// CLA-461: everything below runs on a context this Run owns, so a RESTART_NOW
@@ -126,9 +124,14 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
 		}
-		if dim := d.budgetTrip(totalTokens, totalCost, time.Since(start)); dim != "" {
-			log.Printf("budget reached: %s — stopping to leave headroom (tokens=%d cost=$%.2f elapsed=%s)",
-				dim, totalTokens, totalCost, time.Since(start).Round(time.Second))
+		// The budget breaker's between-iterations pass (CLA-480): every target's
+		// own account is judged against the budget in force for it, and a target
+		// that reaches a ceiling stops draining while its siblings carry on. The
+		// run ends only when every target is exhausted. Run here, before the poll
+		// gate, so an already-elapsed wall-clock ceiling still stops the loop
+		// before it spends or even polls.
+		if d.sweepBudgets(time.Since(start)) {
+			log.Print("every project's budget is exhausted — stopping")
 			return nil
 		}
 
@@ -153,30 +156,30 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, handoffs, stop, err := d.drainPhases(runCtx, drains, d.cursor, target,
-			spend{start: start, tokens: totalTokens, cost: totalCost})
-		// Count the spend BEFORE deciding what to do with the outcome: a drain that
-		// stopped or failed still burned what it burned, and the accumulator is what
-		// the next iteration's breaker and log line are measured against. Handoff
-		// respawns are charged here too (CLA-352): unlike phase sessions, which the
-		// operator priced in when they configured `phases`, each respawn is a
-		// session the SESSION chose to add, so it consumes an iteration of the
+		// The target's own budget clock starts at its first drain (CLA-480): a
+		// stored max_wall_clock measures how long THIS project has been drained,
+		// not how long the daemon has been up for its siblings.
+		if d.cursor < len(d.tgtStart) && d.tgtStart[d.cursor].IsZero() {
+			d.tgtStart[d.cursor] = time.Now()
+		}
+		tokens, _, handoffs, stop, err := d.drainPhases(runCtx, drains, d.cursor, target,
+			spend{start: start, ti: d.cursor})
+		// The drain's spend is already in the target's ledger: charge() books it
+		// as each session's result is counted, which is what lets the mid-drain
+		// checks and this between-iterations sweep read the same live account.
+		// Handoff respawns are charged there too (CLA-352): unlike phase sessions,
+		// which the operator priced in when they configured `phases`, each respawn
+		// is a session the SESSION chose to add, so it consumes an iteration of the
 		// operator's ceiling rather than extending the run for free.
-		totalTokens += tokens
-		totalCost += cost
-		// The per-target ledger (CLA-410): where a stored budget is in force for
-		// THIS target, its ceilings are judged on its own spend, not on a total
-		// every target feeds. Checked here — the same between-iterations moment
-		// the run-wide breaker reads — and only when an overlay exists, so an
-		// un-overlaid target's behaviour is untouched.
-		d.tgtTokens[d.cursor] += tokens
-		d.tgtCost[d.cursor] += cost
-		if eff := d.targets[d.cursor].Cfg; eff != nil {
-			if dim := eff.Budget.ExceededBy(d.tgtTokens[d.cursor], d.tgtCost[d.cursor], time.Since(start)); dim != "" {
-				log.Printf("%sbudget reached: %s — stopping to leave headroom (target tokens=%d cost=$%.2f)",
-					d.prefix(d.cursor), dim, d.tgtTokens[d.cursor], d.tgtCost[d.cursor])
-				return nil
-			}
+		//
+		// Judge the budget now, at the same between-iterations moment the old
+		// run-wide breaker read (CLA-480). A target that has reached the budget in
+		// force for it is exhausted for the rest of the run; the run stops only
+		// when every target is.
+		allGone := d.sweepBudgets(time.Since(start))
+		if allGone {
+			log.Print("every project's budget is exhausted — stopping")
+			return nil
 		}
 		// Hand the drain's tokens to the verdict that will judge it: a fruitless
 		// drain is charged to the token-denominated quiet accumulator (CLA-343), and
@@ -237,8 +240,17 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			// drainPhases (implement success only).
 			d.startupFails[d.cursor] = 0
 		}
+		// The run ends when every target has reached the budget in force for it
+		// (handled above, before the drain's outcome). A drain that stopped for
+		// the budget exhausted only THIS target: carry on with the siblings
+		// (CLA-480), because one project's ceiling must not take the daemon down.
 		if stop {
-			return nil
+			if d.budgetStopped[d.cursor] {
+				d.budgetStopped[d.cursor] = false
+				log.Printf("%sbudget exhausted mid-drain — this project stops draining; the other projects continue", d.prefix(d.cursor))
+			} else {
+				return nil
+			}
 		}
 
 		// CLA-564: every task boundary is a stop boundary, not just idle waits.
@@ -412,7 +424,7 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 						d.startupRaised[i] = false
 						log.Printf("%sstartup-failure pause cleared - the operator answered the harness question; resuming", d.prefix(i))
 					}
-					if sum.Spawnable() && !d.backedOff(i) && !sched && !d.fleetPaused[i] && !d.startupPaused[i] {
+					if sum.Spawnable() && !d.backedOff(i) && !sched && !d.fleetPaused[i] && !d.startupPaused[i] && !d.exhaustedAt(i) {
 						candidates[i] = true
 						anyCandidate = true
 					}
@@ -465,7 +477,7 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 		for i := 1; i <= len(d.targets); i++ {
 			idx := (orig + i) % len(d.targets)
 			d.cursor = idx
-			if !d.backedOff(idx) {
+			if !d.backedOff(idx) && !d.exhaustedAt(idx) {
 				found = true
 				break
 			}

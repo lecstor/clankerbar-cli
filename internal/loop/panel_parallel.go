@@ -59,80 +59,6 @@ const (
 	panelCleanupTimeout = 30 * time.Second
 )
 
-// panelSpend is one parallel panel's shared spend account (CLA-697).
-//
-// The run's ceilings are run-wide, but until this ledger existed the breaker
-// could not see a panel's aggregate: every member's pre-spawn budget check
-// measured the same `prior` snapshot plus its OWN local spend, so N members
-// could each pass a check the sum of their attempts had already failed. The
-// ledger closes that: a member publishes the spend it has COUNTED the moment the
-// ladder counts it, and every member's check adds its siblings' published
-// totals. A member that starts after a sibling has paid (the concurrency cap
-// staggers them) therefore sees money already spent against the same ceiling.
-type panelSpend struct {
-	mu      sync.Mutex
-	members map[*panelSpendMember]struct{}
-}
-
-// panelSpendMember is ONE member's slot in the ledger: the totals it has
-// published. Guarded by the ledger's mutex, never read directly.
-type panelSpendMember struct {
-	tokens int
-	cost   float64
-}
-
-// panelSpendHandle is one member's handle on its panel's ledger: the slot it
-// publishes into and the aggregate of its siblings. It rides drainPhase through
-// phaseRunOpts; a nil handle is every caller that is not a parallel member.
-type panelSpendHandle struct {
-	ledger *panelSpend
-	self   *panelSpendMember
-}
-
-func newPanelSpend() *panelSpend {
-	return &panelSpend{members: map[*panelSpendMember]struct{}{}}
-}
-
-// join adds one member's slot to the ledger and returns it.
-func (s *panelSpend) join() *panelSpendMember {
-	m := &panelSpendMember{}
-	s.mu.Lock()
-	s.members[m] = struct{}{}
-	s.mu.Unlock()
-	return m
-}
-
-// publish records how much this member has counted so far. Called wherever the
-// member's attempt ladder counts an attempt's spend, so a sibling's next
-// pre-spawn check sees it.
-func (s *panelSpend) publish(m *panelSpendMember, tokens int, cost float64) {
-	s.mu.Lock()
-	m.tokens, m.cost = tokens, cost
-	s.mu.Unlock()
-}
-
-// peers is every OTHER member's published spend — the part of the panel's
-// aggregate a member's own accumulator does not already carry.
-func (s *panelSpend) peers(m *panelSpendMember) (tokens int, cost float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for other := range s.members {
-		if other != m {
-			tokens += other.tokens
-			cost += other.cost
-		}
-	}
-	return tokens, cost
-}
-
-func (h *panelSpendHandle) publish(tokens int, cost float64) {
-	h.ledger.publish(h.self, tokens, cost)
-}
-
-func (h *panelSpendHandle) peers() (int, float64) {
-	return h.ledger.peers(h.self)
-}
-
 // panelMemberOutcome is one member's finished pass, before the join folds it
 // into the drain's panel bookkeeping.
 type panelMemberOutcome struct {
@@ -319,10 +245,10 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	log.Printf("%siteration %d: review panel: running %d members concurrently (cap %d), each in its own detached worktree at %s",
 		labelOf(t), drainNum, n, concurrency, shortSHA(tip))
 
-	// One shared spend ledger for the panel (CLA-697 review finding
-	// 1.review-1.1): the members share the run's ceilings, so their budget
-	// checks must see each other's counted spend, not only the same `prior`.
-	ledger := newPanelSpend()
+	// One shared account serves the whole panel through the Driver's per-target
+	// ledger: charge() books each member's counted spend as it lands, so every
+	// member's pre-spawn check already sees a sibling's money (CLA-697, CLA-480).
+	// Nothing extra is wired here.
 
 	runPanelMembers(n, concurrency, func(k int, started func()) {
 		idx := start + k
@@ -350,7 +276,6 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			panelState{}, phaseRunOpts{
 				worktree:      dir,
 				panelParallel: true,
-				panelSpend:    &panelSpendHandle{ledger: ledger, self: ledger.join()},
 				// A member carries no runner briefing (it writes no report), so
 				// the prep's merge-base rides the opts instead: its brief must
 				// diff from the same commit the single reviewer's would.

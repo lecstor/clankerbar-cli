@@ -91,20 +91,19 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 		if n, conc := runEnd-s.i, tc.EffectivePanelConcurrency(runEnd-s.i); n > 1 && conc > 1 {
 			// The breaker at the boundary BEFORE the fan-out, exactly as the
 			// sequential path's per-spawn check would have stopped before the
-			// first member it could not afford.
+			// first member it could not afford. The target's ledger already
+			// carries every counted member (CLA-480).
 			if s.spawned > 0 {
-				if dim := d.budgetTrip(prior.tokens+s.tokens, prior.cost+s.cost, time.Since(prior.start)); dim != "" {
-					log.Printf("iteration %d: budget reached at the %s phase boundary: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-						drainNum, st.ph.Label(s.i), dim, prior.tokens+s.tokens, prior.cost+s.cost,
-						time.Since(prior.start).Round(time.Second))
+				if v := d.budgetStop(s.ti, time.Since(prior.start)); v.dim != "" {
+					log.Printf("iteration %d: budget reached at the %s phase boundary: %s — ending this drain (tokens=%d cost=$%.2f elapsed=%s)",
+						drainNum, st.ph.Label(s.i), v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 					s.stop = true
 					return seqBreak
 				}
 			}
 			if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, s.i, runEnd, conc, s.carried, spend{
-				start:  prior.start,
-				tokens: prior.tokens + s.tokens,
-				cost:   prior.cost + s.cost,
+				start: prior.start,
+				ti:    s.ti,
 			}, s.prep.BaseSHA); ok {
 				s.tokens += out.tokens
 				s.cost += out.cost

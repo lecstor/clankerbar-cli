@@ -1260,9 +1260,12 @@ func TestDrainWithRetries_CeilingCountsSpendFromEarlierDrains(t *testing.T) {
 	}}
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
+	// $9.50 already spent by earlier drains: the ledger is the run's memory, so
+	// the drain must count it against the ceiling (CLA-480).
+	d.charge(0, "claude", 0, 9.5)
 
-	// $9.50 already spent by earlier drains; this one's $1 crosses the $10 ceiling.
-	_, _, stop, err := d.drainWithRetries(context.Background(), 4, d.targets[0], spend{start: time.Now(), cost: 9.5})
+	// This drain's $1 crosses the $10 ceiling.
+	_, _, stop, err := d.drainWithRetries(context.Background(), 4, d.targets[0], spend{start: time.Now()})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
