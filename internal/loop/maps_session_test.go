@@ -51,7 +51,7 @@ func TestPlanMapsSession_NumbersAndChunks(t *testing.T) {
 		"`betaThing` defined or changed at src/a.ts:43; used at: src/b.ts:9",
 		"`alphaThing` defined or changed at src/a.ts:10 (body changed); used at: src/b.ts:2",
 	}
-	plan := planMapsSession(mapsTestOpts(), "phase-model", "abc1234", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(mapsTestOpts(), "phase-model", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 
 	// 2 M items + 2 F items at 2 per chunk = 2 notes turns.
 	if plan.notesTurns != 2 {
@@ -91,7 +91,7 @@ func TestPlanMapsSession_NumbersAndChunks(t *testing.T) {
 // still gets one notes turn carrying the sentence, so the findings turn never
 // asks a session to turn notes it never wrote into findings.
 func TestPlanMapsSession_NoItemsStillOneChunk(t *testing.T) {
-	plan := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 	if plan.notesTurns != 1 {
 		t.Fatalf("notesTurns = %d, want 1", plan.notesTurns)
 	}
@@ -106,6 +106,27 @@ func TestPlanMapsSession_NoItemsStillOneChunk(t *testing.T) {
 	}
 	if !strings.Contains(plan.section, "git diff <base>..HEAD") {
 		t.Errorf("an unknown base was not left as the placeholder:\n%s", plan.section)
+	}
+}
+
+// TestPlanMapsSession_SeverityMatchesTheReviewContract (CLA-870 round 1
+// 1.review-1.2): a phase review grades MUST against its task's done-when bar,
+// while `clankerbar review run` has no task and its findings turn must not name
+// a bar the brief says does not exist.
+func TestPlanMapsSession_SeverityMatchesTheReviewContract(t *testing.T) {
+	task := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
+	taskFindings := task.turns[len(task.turns)-1].Prompt
+	if !strings.Contains(taskFindings, "violates the task's done-when bar") {
+		t.Errorf("the phase's findings turn lost its done-when clause:\n%s", taskFindings)
+	}
+
+	taskless := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionSeverityTaskless, config.MapsSessionDoneReportEnding)
+	tasklessFindings := taskless.turns[len(taskless.turns)-1].Prompt
+	if strings.Contains(tasklessFindings, "done-when") {
+		t.Errorf("the taskless findings turn names a done-when bar it does not have:\n%s", tasklessFindings)
+	}
+	if !strings.Contains(tasklessFindings, "violates the repo's gates, or correctness/safety") {
+		t.Errorf("the taskless findings turn does not state the remaining MUST bar:\n%s", tasklessFindings)
 	}
 }
 
@@ -133,7 +154,7 @@ func TestPlanMapsSession_StageModels(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionDoneReportEnding)
+			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 			if plan.notesModel != tc.wantNotes {
 				t.Errorf("notes model = %q, want %q", plan.notesModel, tc.wantNotes)
 			}
@@ -171,7 +192,7 @@ func TestPlanMapsSession_RecordNamesTheFindingsStageModel(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionRecordEnding)
+			plan := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionSeverityTask, config.MapsSessionRecordEnding)
 			last := plan.turns[len(plan.turns)-1].Prompt
 			if tc.wantModel == "" {
 				if strings.Contains(last, "raisedByModel") {
@@ -186,7 +207,7 @@ func TestPlanMapsSession_RecordNamesTheFindingsStageModel(t *testing.T) {
 			}
 			// A runner-claimed review's record is written by the runner from the
 			// stage model; its done report owes no model sentence.
-			done := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionDoneReportEnding)
+			done := planMapsSession(tc.opts.Resolved(), tc.phaseModel, "", "", nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 			if strings.Contains(done.turns[len(done.turns)-1].Prompt, "raisedByModel") {
 				t.Errorf("the done-report ending was given the record-model override:\n%s", done.turns[len(done.turns)-1].Prompt)
 			}
@@ -202,7 +223,7 @@ func TestPlanMapsSession_CapNoteIsNotAnItem(t *testing.T) {
 		"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else",
 		"(3 more changed definitions not listed)",
 	}
-	plan := planMapsSession(config.MapsSessionOptions{ChunkSize: 25}.Resolved(), "", "", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(config.MapsSessionOptions{ChunkSize: 25}.Resolved(), "", "", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 	if strings.Contains(plan.section, "F2.") {
 		t.Errorf("the cap note was numbered as an item:\n%s", plan.section)
 	}
@@ -566,7 +587,7 @@ func TestPlanMapsSession_RecordEndingForAPanelMember(t *testing.T) {
 	if got := r.mapsSessionEnding(); got != config.MapsSessionDoneReportEnding {
 		t.Errorf("a done-report review phase's ending = %q, want the done-report ending", got)
 	}
-	plan := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionRecordEnding)
+	plan := planMapsSession(mapsTestOpts(), "", "", "", nil, config.MapsSessionSeverityTask, config.MapsSessionRecordEnding)
 	if !strings.Contains(plan.turns[len(plan.turns)-1].Prompt, "write the record it asks for") {
 		t.Errorf("the record ending is not on the findings turn:\n%s", plan.turns[len(plan.turns)-1].Prompt)
 	}
@@ -737,7 +758,7 @@ func TestPlanMapsSession_EmbedHunks(t *testing.T) {
 	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true}
 	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, []string{
 		"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else",
-	}, config.MapsSessionDoneReportEnding)
+	}, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 
 	first := plan.section
 	for _, want := range []string{
@@ -767,7 +788,7 @@ func TestPlanMapsSession_EmbedHunks(t *testing.T) {
 // block and an explicit disabled block all produce exactly today's plan.
 func TestPlanMapsSession_EmbedHunksOffIsByteIdentical(t *testing.T) {
 	flow := []string{"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else"}
-	plain := planMapsSession(mapsTestOpts(), "phase", "abc1234", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
+	plain := planMapsSession(mapsTestOpts(), "phase", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 	for _, tc := range []struct {
 		name string
 		opts *config.EmbedHunksOptions
@@ -778,7 +799,7 @@ func TestPlanMapsSession_EmbedHunksOffIsByteIdentical(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := mapsTestOpts()
 			opts.EmbedHunks = tc.opts
-			off := planMapsSession(opts, "phase", "abc1234", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
+			off := planMapsSession(opts, "phase", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 			if off.section != plain.section {
 				t.Errorf("turn 1's section moved with embedding off:\ngot  %q\nwant %q", off.section, plain.section)
 			}
@@ -808,7 +829,7 @@ func TestPlanMapsSession_EmbedHunksTotalBudgetNoteOnce(t *testing.T) {
 		"`betaThing` defined or changed at src/a.ts:43; used at: nowhere else",
 		"`alphaThing` defined or changed at src/a.ts:10 (body changed); used at: nowhere else",
 	}
-	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, flow, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, flow, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 
 	// Chunk 1 is M1, chunk 2 is M2, then F1 and F2.
 	if !strings.Contains(plan.section, "```diff") {
@@ -843,7 +864,7 @@ func TestPlanMapsSession_EmbedHunksTotalBudgetMidChunk(t *testing.T) {
 	}
 	opts := mapsTestOpts() // chunk_size 2: M1 and M2 share one chunk
 	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesTotal: len(entries[0].Hunk)}
-	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 
 	if plan.notesTurns != 1 {
 		t.Fatalf("notesTurns = %d, want 1 (both M items fit one chunk)", plan.notesTurns)
@@ -883,7 +904,7 @@ index 1111111..2222222 100644
 `
 	opts := mapsTestOpts()
 	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 10, MaxBytesTotal: 1000}
-	plan := planMapsSession(opts, "", "abc1234", diff, nil, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(opts, "", "abc1234", diff, nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 	for _, want := range []string{
 		"M1. café.ts:1-2",
 		"run `git diff abc1234..HEAD -- café.ts` for the rest",
@@ -903,7 +924,7 @@ index 1111111..2222222 100644
 func TestPlanMapsSession_EmbedHunksPerItemTruncation(t *testing.T) {
 	opts := mapsTestOpts()
 	opts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true, MaxBytesPerItem: 20}
-	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionDoneReportEnding)
+	plan := planMapsSession(opts, "", "abc1234", mapsTsDiff, nil, config.MapsSessionSeverityTask, config.MapsSessionDoneReportEnding)
 	for _, want := range []string{
 		"(hunk truncated at 20 bytes: run `git diff abc1234..HEAD -- src/a.ts` for the rest)",
 	} {

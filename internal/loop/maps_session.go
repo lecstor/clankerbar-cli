@@ -133,7 +133,7 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 	if err != nil {
 		return nil, fmt.Errorf("review_method maps-session could not map the changed definitions: %w", err)
 	}
-	return planMapsSession(opts, at.inv.Model, base, diff, flow, r.mapsSessionEnding()), nil
+	return planMapsSession(opts, at.inv.Model, base, diff, flow, config.MapsSessionSeverityTask, r.mapsSessionEnding()), nil
 }
 
 // gitHeadSHA is the commit the worktree has checked out.
@@ -150,7 +150,7 @@ func gitHeadSHA(repo string) (string, error) {
 // planMapsSession turns a diff and its flow items into the plan: numbered items,
 // chunks, the first-turn section and the follow-up turns. Pure, so the
 // numbering, chunking and per-stage models are testable without a repository.
-func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string, ending string) *mapsSessionPlan {
+func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string, severity, ending string) *mapsSessionPlan {
 	entries := reviewmap.ChangeEntries(diff, reviewmap.Unlimited)
 	items, overflow := mapsSessionItems(entries, flow)
 	items, hunkCutoff := config.EmbedMapsSessionHunks(items, mapsSessionHunks(entries), base, opts.EmbedHunks)
@@ -178,7 +178,7 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 	for i := 1; i < len(chunks); i++ {
 		plan.turns = append(plan.turns, harness.Turn{Prompt: config.MapsSessionNotesTurn(i+1, len(chunks), bodies[i])})
 	}
-	findingsPrompt := config.MapsSessionFindingsTurn(ending)
+	findingsPrompt := config.MapsSessionFindingsTurn(severity, ending)
 	// A phase that writes its own record had the brief's model placeholders
 	// filled from the PHASE's attribution before the stage models were resolved.
 	// When the findings stage runs elsewhere, say so here or the member records
@@ -297,25 +297,34 @@ func mapsSessionChunks(items []string, size int) [][]string {
 	return chunks
 }
 
-// applyMapsSession wires a plan onto the attempt's invocation: the first-turn
-// section, the turn-1 model and the follow-up turns. It also records how many
-// notes turns the log has to capture.
+// wireMapsPlan applies a plan to an invocation: the turn-1 notes model, the
+// first-turn section and the follow-up turns, returning the invocation and the
+// model whose output the findings turn is. The phase and the standalone review
+// share this so their application paths cannot drift.
+func wireMapsPlan(inv harness.Invocation, plan *mapsSessionPlan) (harness.Invocation, string) {
+	// Turn 1 is the phase's own invocation, so a notes-stage model has to be
+	// pinned here, by the same rule a follow-up turn's own model follows: an
+	// explicit stage model is a single route, never a fallback list.
+	if plan.notesModel != inv.Model {
+		inv = inv.OnTurn(harness.Turn{Model: plan.notesModel})
+	}
+	inv.Prompt += "\n\n" + plan.section
+	inv.Turns = plan.turns
+	return inv, plan.reportModel
+}
+
+// applyMapsSession wires a plan onto the attempt's invocation and records how
+// many notes turns the log has to capture.
 func (r *phaseRun) applyMapsSession(at *phaseAttempt, plan *mapsSessionPlan) {
 	if plan == nil {
 		return
 	}
 	at.mapsNotes = plan.notesTurns
-	// Turn 1 is the phase's own invocation, so a notes-stage model has to be
-	// pinned here, by the same rule a follow-up turn's own model follows: an
-	// explicit stage model is a single route, never a fallback list.
-	if plan.notesModel != at.inv.Model {
-		at.inv = at.inv.OnTurn(harness.Turn{Model: plan.notesModel})
-	}
-	at.inv.Prompt += "\n\n" + plan.section
-	at.inv.Turns = plan.turns
+	var reportModel string
+	at.inv, reportModel = wireMapsPlan(at.inv, plan)
 	// The record is the findings turn's work, so the attribution the runner
 	// writes names that stage's model — the one whose output it is.
-	at.attr.Model = plan.reportModel
+	at.attr.Model = reportModel
 }
 
 // writeMapsNotes puts every notes turn's reply in the iteration log under a

@@ -202,6 +202,28 @@ func TestReportResume_RefusedReportResumesOnceWithTheError(t *testing.T) {
 	}
 }
 
+// A STANDALONE invocation holds no claim and applies the report itself rather
+// than a runner writing records, so the one re-emit must still be available.
+func TestReportResume_UnclaimedSessionResumesWhenAllowed(t *testing.T) {
+	logPath := reportStub(t)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:         "Work.",
+		Console:        &bytes.Buffer{},
+		AllowUnclaimed: true,
+		CheckReport:    reportRefusesLong,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if runs := stubRuns(t, logPath); len(runs) != 2 {
+		t.Fatalf("stub ran %d times, want exactly 2 (the session + ONE report re-emit):\n%v", len(runs), runs)
+	}
+	if !strings.Contains(res.FinalMessage, "short") {
+		t.Errorf("FinalMessage = %q, want the continuation's corrected report", res.FinalMessage)
+	}
+}
+
 // A second refusal is the runner's to fail closed on: one resume, never a loop.
 // The refused reply leaves the report as it was, and the resume-only marker
 // tells the driver to retry the phase under the claim it still holds.

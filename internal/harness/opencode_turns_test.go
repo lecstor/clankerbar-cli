@@ -410,6 +410,36 @@ func TestOpencodeInvokeStopsTurnsWhenTheClaimIsGone(t *testing.T) {
 	}
 }
 
+// A STANDALONE invocation (AllowUnclaimed) holds no claim and writes no plane
+// record, so the missing claim must not stop its turn sequence at turn 1.
+func TestOpencodeInvokeRunsUnclaimedTurnsWhenAllowed(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, turnScript(logPath,
+		turnStubTurn{"turn-one", turnAnswer("one", 10, "0.001")},
+		turnStubTurn{"turn-two", turnAnswer("two", 20, "0.002")},
+	))
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:         "turn-one",
+		Model:          routeFree,
+		AllowUnclaimed: true,
+		Turns:          []Turn{{Prompt: "turn-two"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 2 {
+		t.Fatalf("the stub ran %d times, want 2 — an allowed unclaimed session runs every turn:\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if res.TurnStopped != 0 || res.TurnStopReason != "" {
+		t.Errorf("TurnStopped = %d (%q), want 0: every turn ran", res.TurnStopped, res.TurnStopReason)
+	}
+	if want := []string{"one", "two"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q", res.TurnMessages, want)
+	}
+}
+
 // A turn whose model produces no answer records an empty message rather than
 // inheriting the previous turn's text (mergeResume keeps the base when a
 // continuation emits none, which is why runTurns blanks it first).

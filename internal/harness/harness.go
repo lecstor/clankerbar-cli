@@ -398,6 +398,15 @@ type Invocation struct {
 	// closed on the bad report as before.
 	CheckReport func(finalMessage string) error
 
+	// AllowUnclaimed runs this session without a clankerbar claim. A runner
+	// phase is seeded with ResumeClaim and holds one throughout; a STANDALONE
+	// caller (clankerbar review run) neither claims nor consumes the report into
+	// plane records, so the adapter's resume guards must not treat the absent
+	// claim as an end. It covers BOTH uses of that guard: the one report
+	// re-emit, and the later turns of a multi-turn sequence, which would
+	// otherwise stop after the first one with "claim_not_held".
+	AllowUnclaimed bool
+
 	// OnClaim, when non-nil, is called by the adapter's parser the moment it
 	// observes the session's clankerbar claim state change: a claim_task whose
 	// result carried both ids (the tracked claim), and a settle of that claim.

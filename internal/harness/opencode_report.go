@@ -76,14 +76,16 @@ func reportSteerPrompt(err error) string {
 // A claim that is not held is one of those ends: the runner writes no record
 // under a claim the session does not hold, so there is nothing to re-emit. A
 // runner phase is seeded with in.ResumeClaim, so Held() is true whenever the
-// runner would apply the report.
+// runner would apply the report. A standalone invocation sets AllowUnclaimed:
+// it neither claims nor writes a record, so it has nothing to guard against a
+// missing claim, and its later turns would otherwise stop at turn 1.
 func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *Result) string {
 	switch {
 	case in.Probe:
 		return "probe"
 	case ctx.Err() != nil:
 		return "cancelled"
-	case !res.Claim.Held():
+	case !res.Claim.Held() && !in.AllowUnclaimed:
 		return "claim_not_held"
 	case res.Untrusted != "":
 		return "untrusted_stream"
