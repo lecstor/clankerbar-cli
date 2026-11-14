@@ -299,10 +299,14 @@ checkpointable phase empty, the driver asks the plane about the one task it can
 name — the task it dispatched: if that task is held with a branch recorded and
 that branch verifies on the origin remote (the same evidence gate every
 checkpoint passes), the driver treats it as the checkpoint and resumes the run
-by heartbeat in the next phase, exactly as after an observed claim. The guards
-are unchanged: an unreadable stream is never filled in from the plane, a session
-that died producing nothing is never promoted by a plane answer, an observed
-claim always wins over a peeked one, and a failed peek keeps today's ending.
+by heartbeat in the next phase, exactly as after an observed claim. The hold
+must also be new: a task that already read held-with-a-branch when the phase
+spawned — a stale-lease takeover candidate offered as the queue head, or another
+run's live work — is not accepted as this phase's checkpoint (CLA-476). The
+other guards are unchanged: an unreadable stream is never filled in from the
+plane, a session that died producing nothing is never promoted by a plane
+answer, an observed claim always wins over a peeked one, and a failed peek keeps
+today's ending.
 
 The saving is **still unmeasured**: a phased run has now happened, but it is not
 comparable evidence - its implement phase reached the checkpoint over an

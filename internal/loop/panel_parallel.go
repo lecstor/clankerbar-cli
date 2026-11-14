@@ -279,7 +279,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			labelOf(t), drainNum)
 		return nil, false
 	}
-	baseDir, _, _, err := d.sessionDir(ctx, t, carried)
+	baseDir, _, _, _, err := d.sessionDir(ctx, t, carried)
 	if err != nil {
 		log.Printf("%siteration %d: the review panel could not resolve its checkout (%v) — running its members sequentially",
 			labelOf(t), drainNum, err)

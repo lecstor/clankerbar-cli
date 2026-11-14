@@ -415,6 +415,7 @@ func (r *phaseRun) recoverUnobservedClaim(ctx context.Context, at *phaseAttempt)
 	panel := r.panel
 	opts := r.opts
 	briefedTask := r.briefedTask
+	spawnHold := r.briefedHold
 	nextReviewShaped := r.shape.nextReviewShaped
 	panelOptional := r.shape.panelOptional
 	// CLA-451: the blind-spot convergence. Everything above learns about
@@ -461,7 +462,7 @@ func (r *phaseRun) recoverUnobservedClaim(ctx context.Context, at *phaseAttempt)
 	// to the standard ending below.
 	if r.end.claim == nil && !last && at.res.Untrusted == "" && !at.producedNothing &&
 		!at.res.Claim.Held() && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock || at.recoveredExit) {
-		if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
+		if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask, spawnHold); claim != nil {
 			r.end.claim = claim
 			var peekTip string
 			r.end.branch, peekTip, at.evidenceOK, at.evidenceUnverified, at.evidenceWhy = d.checkpointEvidence(ctx, t, *claim, at.inv.WorkDir, &r.review)

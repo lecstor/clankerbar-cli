@@ -361,13 +361,46 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 	}, nil
 }
 
+// briefedHold is the custody shape of the task a phase was briefed on, read at
+// SPAWN time. The checkpoint peek (CLA-476) requires a TRANSITION into
+// held-with-branch: a task already in that shape before the session starts is a
+// stale-lease takeover candidate or another run's live work, and a phase that
+// claimed nothing observable must not be credited with it and hand phase 2
+// another run's in-flight branch to review.
+type briefedHold struct {
+	// Exact is true when the briefed task is the one a predecessor held (or the
+	// runner itself claimed), so the peek may attribute a hold on it without a
+	// transition.
+	Exact bool
+	// HeldWithBranch is true when the spawn-time read already showed the task
+	// held, with a branch recorded — the shape `next_task` reports for a
+	// stale-lease takeover candidate.
+	HeldWithBranch bool
+	// Branch is the branch recorded at that read, kept for the refusal's log
+	// line. Empty for a resumed phase (whose claim names its own branch).
+	Branch string
+}
+
+// heldWithBranchAtSpawn derives the spawn-time custody from a queue-head read.
+// `requiresTakeover` is authoritative on its own: the plane computes it only for
+// an `in_progress` task whose lease expired with WIP recorded. The status+hasWip
+// pair reads the same shape without relying on the flag, so a plane answer that
+// omits it still yields the refusal.
+func heldWithBranchAtSpawn(next plane.NextTask) briefedHold {
+	return briefedHold{
+		HeldWithBranch: next.RequiresTakeover || (next.Status == "in_progress" && next.HasWIP),
+		Branch:         next.Branch,
+	}
+}
+
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
 // they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
 // 2 and 3). It also returns the id of the task the phase is BRIEFED on — exact
 // for a resumed phase (the predecessor's claim), best-effort for a fresh one
-// (the queue-head peek, the same read the session is about to make). The seam's
-// checkpoint peek reads it after the phase ends (CLA-451); empty means the
-// driver never knew which task to ask about, and the peek is skipped.
+// (the queue-head peek, the same read the session is about to make) — and, for
+// a fresh phase, that task's custody AT SPAWN, which the seam's checkpoint peek
+// needs to demand a transition rather than a static hold (CLA-476). An empty id
+// means the driver never knew which task to ask about, and the peek is skipped.
 //
 // Which task that is depends on the phase. A RESUMED phase (prev carries a held
 // claim) knows its exact task, so its repo is read straight off the plane with
@@ -395,38 +428,38 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 // caller can key the pr_base override by it (CLA-608) without a second plane
 // read; "" is the same best-effort empty the checkout resolution already
 // tolerates, and means only "no override can match".
-func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, string, string, error) {
-	repo := ""
-	briefed := ""
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (dir, briefed, repo string, hold briefedHold, err error) {
 	if prev != nil && prev.Claim.Held() {
 		briefed = prev.Claim.TaskID
+		hold.Exact = true
 		if src, ok := t.Releaser.(plane.TaskRepoSource); ok {
-			r, err := src.TaskRepo(ctx, prev.Claim.TaskID)
+			r, rerr := src.TaskRepo(ctx, prev.Claim.TaskID)
 			switch {
-			case err == nil:
+			case rerr == nil:
 				repo = r
-			case errors.Is(err, plane.ErrNotWired):
+			case errors.Is(rerr, plane.ErrNotWired):
 				// No plane endpoint/key: nothing to read, the fallback chain runs.
 			default:
-				log.Printf("%scould not read the repo of resumed task %s (%v) — falling back to the primary repo", labelOf(t), claimLabel(prev.Claim), err)
+				log.Printf("%scould not read the repo of resumed task %s (%v) — falling back to the primary repo", labelOf(t), claimLabel(prev.Claim), rerr)
 			}
 		}
 	} else if peeker, ok := t.Releaser.(plane.TaskPeeker); ok {
-		next, err := peeker.PeekNextTask(ctx)
+		next, perr := peeker.PeekNextTask(ctx)
 		switch {
-		case err == nil:
+		case perr == nil:
 			briefed = next.TaskID
 			repo = next.Repo
+			hold = heldWithBranchAtSpawn(next)
 			if next.Repo != "" {
 				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
 			}
-		case errors.Is(err, plane.ErrNotWired):
+		case errors.Is(perr, plane.ErrNotWired):
 		default:
-			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), err)
+			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), perr)
 		}
 	}
-	dir, err := d.checkoutFor(t, repo)
-	return dir, briefed, repo, err
+	dir, err = d.checkoutFor(t, repo)
+	return dir, briefed, repo, hold, err
 }
 
 // checkoutFor resolves a repo identity to the local checkout this target runs
