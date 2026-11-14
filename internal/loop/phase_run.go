@@ -31,6 +31,7 @@ type phaseRun struct {
 	spawnDir     string
 	prBase       string
 	briefedTask  string
+	briefedHold  briefedHold
 	fixGrading   string
 	verifyDigest string
 

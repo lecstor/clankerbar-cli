@@ -29,9 +29,23 @@ import (
 
 // NextTask is what the queue-head peek learned. Repo is the task's `repo`
 // field, empty when the task carries none (or there is nothing queued).
+//
+// Status, HasWIP and RequiresTakeover are the task's CUSTODY shape at the read
+// (CLA-476). They matter because `next_task` may hand back a stale-lease
+// takeover candidate: a task already `in_progress`, held by a dead run, with a
+// branch recorded. That shape must not later be mistaken for a checkpoint the
+// spawned session produced, so the driver captures it at spawn time and the
+// seam's checkpoint peek requires the hold to appear AFTER it.
 type NextTask struct {
 	TaskID string
 	Repo   string
+	// Status is the plane's status word at the read ("ready", "in_progress", …).
+	Status string
+	// HasWIP reports a branch RECORDED on the task at the read.
+	HasWIP bool
+	// RequiresTakeover is the plane's own flag that this offer is abandoned
+	// work which can only be claimed with takeover: true.
+	RequiresTakeover bool
 }
 
 // TaskPeeker reads which task a FRESH phase would claim, so its repo can steer
@@ -166,7 +180,9 @@ type TaskStateSource interface {
 // find work, which is a read and not a claim: it holds nothing, so the peek
 // cannot race a session out of work. It may hand back a stale-lease takeover
 // candidate; that is still the task the spawned session will be offered first,
-// so its repo is the right cwd to start in.
+// so its repo is the right cwd to start in. The custody fields NextTask carries
+// let the caller tell that takeover candidate apart from a task nobody held at
+// spawn time (CLA-476).
 //
 // The arguments are an EMPTY OBJECT, not nil: the plane's next_task schema is
 // `inputSchema: {}` and MCP servers reject a null `arguments` against an object
@@ -180,8 +196,11 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 	}
 	var payload struct {
 		Next *struct {
-			ID   string `json:"id"`
-			Repo any    `json:"repo"`
+			ID               string `json:"id"`
+			Repo             any    `json:"repo"`
+			Status           any    `json:"status"`
+			HasWIP           any    `json:"hasWip"`
+			RequiresTakeover any    `json:"requiresTakeover"`
 		} `json:"next"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -190,7 +209,13 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 	if payload.Next == nil || payload.Next.ID == "" {
 		return NextTask{}, nil
 	}
-	return NextTask{TaskID: payload.Next.ID, Repo: wireString(payload.Next.Repo)}, nil
+	return NextTask{
+		TaskID:           payload.Next.ID,
+		Repo:             wireString(payload.Next.Repo),
+		Status:           wireString(payload.Next.Status),
+		HasWIP:           wireBool(payload.Next.HasWIP),
+		RequiresTakeover: wireBool(payload.Next.RequiresTakeover),
+	}, nil
 }
 
 // TaskRepo calls get_task for one task and returns its `repo` field. The

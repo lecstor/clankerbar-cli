@@ -648,6 +648,18 @@ func attributionOr(v, fallback string) string {
 // the sequence is over; a hold without a branch is the empty exit CLA-457
 // already refuses to advance on.
 //
+// CLA-476: the hold must also be NEW. A fresh phase's briefed task is a
+// speculative queue head, and `next_task` may hand back a stale-lease takeover
+// candidate — already `in_progress`, held by a dead run, with a branch the
+// previous clanker pushed — before our session even starts. That shape passes
+// every check above and the origin evidence gate, so a phase that claimed
+// nothing observable would be credited with another run's in-flight work and
+// spawn a paid review on it. `hold` is the task's custody read at SPAWN time:
+// a task already held-with-branch then is refused, and only a task that MOVED
+// into that shape during the phase is recovered. The one exception is the exact
+// task a predecessor held (hold.Exact): its identity is not a guess, so no
+// transition is needed.
+//
 // The three fields together are also the honest boundary of what this can
 // know: the plane does not expose WHICH key holds a task, so "some run of this
 // project's credential" is approximated by "held at all". The driver shares
@@ -655,7 +667,7 @@ func attributionOr(v, fallback string) string {
 // driver's own dispatch, and a wrong attribution fails safe — a foreign run's
 // id seeds a heartbeat the plane refuses, ending the drain loudly rather than
 // silently stranding work.
-func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int, phaseLabel, briefedTask string) *harness.Result {
+func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int, phaseLabel, briefedTask string, hold briefedHold) *harness.Result {
 	if briefedTask == "" {
 		return nil
 	}
@@ -676,6 +688,11 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 		return nil
 	}
 	if st.Status != "in_progress" || st.ClaimedByRun == "" || st.Branch == "" {
+		return nil
+	}
+	if !hold.Exact && hold.HeldWithBranch {
+		log.Printf("%siteration %d: %s ended without an observed claim, but %s was ALREADY held with branch %q when the phase spawned — that hold predates the phase (a stale-lease takeover candidate or another run's work), so it is not this phase's checkpoint; keeping today's ending",
+			labelOf(t), drainNum, phaseLabel, briefedTask, st.Branch)
 		return nil
 	}
 	return &harness.Result{Claim: harness.Claim{
