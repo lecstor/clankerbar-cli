@@ -54,6 +54,12 @@ Usage:
     --task <ref|id>             and print its review URL. Same byte-free path:
                                 the HTML goes up as a text/html asset, then
                                 binds to the task as its review deck.
+  clankerbar review run        Review one local base..head with the driver's own
+    --base <commit>            review, outside any task, claim or plane, and
+                               print the findings as JSON. Runs in a temporary
+                               detached worktree; the repository is never
+                               modified. --method maps-session runs the map
+                               method on a session that can continue turns.
   clankerbar supervise roll    Roll the fleet onto the version THIS binary
                                 runs, one child at a time: install the new
                                 build at the fleet's launch path and run this
@@ -77,6 +83,7 @@ Usage:
 
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
 --help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
-'clankerbar upload --help' or 'clankerbar deck --help' for their flags.
+'clankerbar upload --help', 'clankerbar deck --help' or 'clankerbar review run
+--help' for their flags.
 `)
 }

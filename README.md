@@ -547,6 +547,70 @@ says so rather than silently dropping the method (which would run every machine
 single-pass while your config asks for maps-session). The method is local-file
 only until the plane's schema and this build's `$schema_version` move together.
 
+### Standalone review: `clankerbar review run`
+
+`clankerbar review run --repo <checkout> --base <commit> [--head <commit>]` runs
+the driver's own review over one local change and prints the findings as JSON.
+It is the same review the `review` phase runs — the same brief substance, gate
+scope and MUST bar, the maps-session planner when asked for it, and the same
+done report read by the same validator — with the task removed: no claim, no
+plane record and no MCP config, so the session cannot touch your backlog. The
+reviewed repository is only read from: the session runs in a temporary detached
+worktree at `--head`, and that worktree is removed on success and on failure.
+
+Use it to score the driver against ReviewBench (or an eval of your own), or to
+point the same review at any local base..head by hand.
+
+```console
+clankerbar review run --repo ~/dev/project --base origin/staging
+clankerbar review run --base 1a2b3c4 --head 5d6e7f8 \
+  --method maps-session --model opencode-go/gpt-6-luna --json review.json
+```
+
+Flags: `--repo` (default `.`), `--base` (required), `--head` (default `HEAD`),
+`--method` (`single-pass` or its `single` shorthand, the default, or
+`maps-session`), `--harness` (default `opencode`; maps-session needs a harness
+that can continue one session), `--model`, and for maps-session
+`--notes-model`, `--findings-model`, `--chunk-size` (default 25) and
+`--flow-max` (default 40). `--title` and `--description-file` give the reviewer
+the context a task body would otherwise carry. The maps knobs are refused with
+`--method single-pass` rather than silently ignored. `--json <file>` writes the
+report to a file; without it the JSON goes to stdout and human lines to stderr.
+
+The JSON document:
+
+```json
+{
+  "base": "<resolved base commit>",
+  "head": "<resolved head commit>",
+  "method": "single-pass | maps-session",
+  "models": { "review": "..." },
+  "findings": [ { "severity": "must", "summary": "...", "file": "...", "line": 1 } ],
+  "omitted": 0,
+  "notes_turns": [],
+  "usage": {
+    "input": 0, "output": 0, "reasoning": 0,
+    "cache_read": 0, "cache_write": 0, "cost_usd": 0
+  },
+  "time_ms": 0,
+  "turns": 1
+}
+```
+
+For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead.
+`base` and `head` are the full commit SHAs git resolved, never the flag values.
+`findings` uses the review record's own shape (`severity`, `summary`,
+`evidenceKind`, `evidence`, `file`, `line`, `kind`, `requiredFix`), and
+`notes_turns` carries the map method's per-chunk notes — the evidence a
+missed-finding analysis reads, never findings. `turns` counts the turns that
+actually ran.
+
+The exit contract: a session that ends without a valid done report fails the
+command, after the harness's one re-emit, with the parse error named. The JSON
+the run did produce is still written when there is one, so a failed eval keeps
+its evidence. A failed `git worktree remove` also exits non-zero, with the
+report.
+
 ### Session-initiated handoff: a boundary the session chooses
 
 Phases cut at two fixed, driver-chosen points. A session can also choose its own
