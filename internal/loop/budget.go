@@ -221,8 +221,8 @@ func (d *Driver) exhaustedAt(i int) bool {
 	return i >= 0 && i < len(d.exhausted) && d.exhausted[i]
 }
 
-// allExhausted reports whether every target has reached its ceiling: the run's
-// one honest stop while a budget that is not the local pool's is in force.
+// allExhausted reports whether every target has reached its ceiling for this
+// run — the stop a budget-scoped run ends on once nothing is left with headroom.
 func (d *Driver) allExhausted() bool {
 	if len(d.targets) == 0 {
 		return false

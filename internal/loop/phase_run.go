@@ -84,7 +84,7 @@ type phaseRun struct {
 	retries int
 }
 
-// attemptNext says what the ladder does after a stage.
+// result is the drainPhase return a verdict ends the phase with.
 func (r *phaseRun) result(v attemptVerdict) (int, float64, bool, phaseEnd, error) {
 	if v.zeroSpend {
 		return 0, 0, v.stop, r.end, v.err
