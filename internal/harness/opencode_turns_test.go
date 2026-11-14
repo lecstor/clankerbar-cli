@@ -538,13 +538,14 @@ func TestOpencodeSingleTurnHasNoTurnRecord(t *testing.T) {
 // front, with an error naming the harness and the field. Silently dropping the
 // later turns would hand the caller a half-finished answer shaped like a
 // complete one.
-func TestClaudeAndCodexRefuseTurns(t *testing.T) {
+func TestAdaptersWithoutTurnSupportRefuseTurns(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		ad   Adapter
 	}{
 		{"claude", claude{}},
 		{"codex", codex{}},
+		{"copilot", copilot{}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			// PATH is emptied so a refusal that failed to fire would fail this

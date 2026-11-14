@@ -132,6 +132,25 @@ func TestConflictSessionRefusesAHarnessThatCannotTakeExtraDirs(t *testing.T) {
 	}
 }
 
+// The allowlist is inverted on purpose: a harness that translates ExtraDirs into
+// a writable root has to be named deliberately, and copilot's --add-dir is one.
+func TestConflictHarnessExtraDirAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		harness string
+		want    bool
+	}{
+		{"opencode", true},
+		{"claude", true},
+		{"copilot", true},
+		{"codex", false},
+		{"", false},
+	} {
+		if got := conflictHarnessTakesExtraDirs(tc.harness); got != tc.want {
+			t.Errorf("conflictHarnessTakesExtraDirs(%q) = %v, want %v", tc.harness, got, tc.want)
+		}
+	}
+}
+
 func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	f := conflictingFixture(t)
 	// Two approved tasks in the queue, both conflicting. The second must wait for

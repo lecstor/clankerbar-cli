@@ -258,15 +258,26 @@ func TestOutputCapStall_ReasonlessFinalStepNeverResumes(t *testing.T) {
 	}
 }
 
-// failWriter is a console whose writes always fail: os/exec's copy of the
-// session's stdout then fails after the bytes have already reached the line
-// sink, which is the one way to reach runSession's error arm WITH events
-// observed. It also records what was written, so a test can see which arm the
-// resume took.
+// failWriter is a console that fails once the session's FINAL line has reached
+// it: os/exec's copy of the session's stdout then fails after the bytes have
+// already reached the line sink, which is the one way to reach runSession's
+// error arm WITH events observed. It also records what was written, so a test
+// can see which arm the resume took.
+//
+// The failure waits for the terminal step_finish rather than landing on the
+// first write, because a shell's printf is not one write syscall: a copy that
+// stops reading after the first line leaves the stub's second write with no
+// reader, the child dies of SIGPIPE, and runSession reports a signal death
+// (ExitCode -1, no error) instead of the copy error this test is about. Waiting
+// for the last line means the child has nothing left to write when the console
+// fails.
 type failWriter struct{ notes bytes.Buffer }
 
 func (w *failWriter) Write(p []byte) (int, error) {
 	w.notes.Write(p)
+	if !bytes.Contains(w.notes.Bytes(), []byte(`"type":"step_finish"`)) {
+		return len(p), nil
+	}
 	return 0, errors.New("console gone")
 }
 

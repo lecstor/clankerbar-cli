@@ -261,8 +261,10 @@ func classify(path string) (Log, error) {
 // step events (step_start/step_finish/tool_use); codex emits `thread.`/`item.`/
 // `turn.`-prefixed JSON (internal/harness/codex.go: thread.started,
 // item.started/item.completed, turn.completed — verified against codex.go's
-// own test fixtures, not guessed); an opencode 2.x log of a plain answer can
-// carry only text-part JSON, which is opencode too; claude emits rendered text.
+// own test fixtures, not guessed); copilot emits session.start, assistant.message
+// and tool.execution_* (internal/harness/copilot.go); an opencode 2.x log of a
+// plain answer can carry only text-part JSON, which is opencode too; claude emits
+// rendered text.
 func harnessOf(data []byte) string {
 	for _, line := range splitLines(data) {
 		var ev struct {
@@ -276,6 +278,9 @@ func harnessOf(data []byte) string {
 			return "opencode"
 		case strings.HasPrefix(ev.Type, "thread.") || strings.HasPrefix(ev.Type, "item.") || strings.HasPrefix(ev.Type, "turn."):
 			return "codex"
+		case ev.Type == "session.start" || strings.HasPrefix(ev.Type, "assistant.message") ||
+			strings.HasPrefix(ev.Type, "tool.execution_"):
+			return "copilot"
 		case ev.Type == "text":
 			return "opencode"
 		}
@@ -287,13 +292,13 @@ func harnessOf(data []byte) string {
 // detects the adapter's own raw cap/failure console lines, which the live
 // driver reads as !capped && !ceiling && !wallclock && !untrusted.
 //
-// harness is passed in because the CLAUDE surface is rendered text, not JSON:
-// its claim observation shows as a "· holding" console line (noteClaimed) and a
-// resumed phase's heartbeat as a "→ mcp__clankerbar__heartbeat" marker, and
-// without reading those a claude session that ran would count toward neither
-// counter. Codex emits no claim state the scan can read, so its
-// sessions count as run only when a claim marker appears; they can never be
-// dead either way (no step_finish reason on that surface).
+// harness is passed in because the CLAUDE and COPILOT surfaces render the claim
+// observation as console text rather than JSON the scan reads: a "· holding"
+// line (noteClaimed) and a resumed phase's heartbeat as a
+// "→ mcp__clankerbar__heartbeat" marker, and without reading those a session
+// that ran would count toward neither counter. Codex emits no claim state the
+// scan can read, so its sessions count as run only when a claim marker appears;
+// they can never be dead either way (no step_finish reason on that surface).
 func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded bool, lastReason string, apiErrors []string, dead, stalled bool) {
 	// The driver's dead conjuncts, mirrored from the log:
 	//   reason "unknown" AND no branch AND got past its claim AND not a cap.
@@ -315,9 +320,9 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 				strings.Contains(s, "!! stream read failed") {
 				capKilled = true
 			}
-			if harness == "claude" && !gotPastClaim {
+			if (harness == "claude" || harness == "copilot") && !gotPastClaim {
 				// noteClaimed renders "· holding <ref>" only when a claim
-				// result actually parsed — the claude mirror of a completed
+				// result actually parsed — the rendered mirror of a completed
 				// claim_task. A resumed phase never claims; it heartbeats on
 				// its seeded claim, and the "→ mcp__clankerbar__heartbeat"
 				// tool marker is that observation.
@@ -330,6 +335,7 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 		var ev struct {
 			Type  string `json:"type"`
 			Part  json.RawMessage
+			Data  json.RawMessage
 			Error *struct {
 				Name string          `json:"name"`
 				Data json.RawMessage `json:"data"`
@@ -367,6 +373,23 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 				if len(ev.Error.Data) > 0 {
 					msg += ": " + string(ev.Error.Data)
 				}
+				apiErrors = append(apiErrors, msg)
+			}
+		case "session.error":
+			// copilot's error envelope: the CLI's own failure text.
+			var d struct {
+				ErrorType string `json:"errorType"`
+				Message   string `json:"message"`
+			}
+			_ = json.Unmarshal(ev.Data, &d)
+			msg := d.ErrorType
+			if d.Message != "" {
+				if msg != "" {
+					msg += ": "
+				}
+				msg += d.Message
+			}
+			if msg != "" {
 				apiErrors = append(apiErrors, msg)
 			}
 		}

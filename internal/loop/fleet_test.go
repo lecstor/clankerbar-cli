@@ -1571,7 +1571,7 @@ func TestSessionRunIDSendsTheUUIDNotTheCredential(t *testing.T) {
 }
 
 // The dollar figure is recorded only when there IS one: an adapter that never
-// reports cost (Capabilities.ReportsCost false — codex today) and a session that
+// reports cost (Capabilities.ReportsCost false — codex and copilot today) and a session that
 // reported nothing at all both leave it nil, because a zero would read as "$0
 // spent" for a session nobody measured. A harness that really reported zero keeps
 // its zero.

@@ -324,17 +324,23 @@ func (c *capture) attach(cmd *exec.Cmd, console io.Writer) {
 // Call it after cmd.Run/Wait: that is what joins os/exec's copy goroutines, and
 // so what makes everything written here safe to read.
 func (c *capture) result(harness string) Result {
+	var res Result
+	c.finishInto(&res, harness)
+	return res
+}
+
+// finishInto is result for an adapter that already holds a Result — copilot's
+// parser writes the shared observer's claim state into one as the stream arrives
+// — so the two paths cannot drift on the untrusted message or the scan memo.
+func (c *capture) finishInto(res *Result, harness string) {
 	c.sink.Flush() // a final line that arrived without a newline
-	res := Result{
-		Stdout:        c.stdout.String(),
-		Stderr:        c.stderr.String(),
-		OutputDropped: c.stdout.Dropped() + c.stderr.Dropped(),
-		scans:         newScanCache(),
-	}
+	res.Stdout = c.stdout.String()
+	res.Stderr = c.stderr.String()
+	res.OutputDropped = c.stdout.Dropped() + c.stderr.Dropped()
+	res.scans = newScanCache()
 	if c.sink.Overran() {
 		res.markUntrusted("a " + harness + " event was longer than the line cap and was discarded, " +
 			"so an unknown number of events never reached the parser: this session's token and cost " +
 			"figures are incomplete")
 	}
-	return res
 }

@@ -61,6 +61,7 @@ func TestEveryAdapterPinsChildPWDToItsWorkDir(t *testing.T) {
 		"opencode": {"opencode", func(ctx context.Context, in Invocation) (Result, error) { return opencode{}.Invoke(ctx, in) }},
 		"claude":   {"claude", func(ctx context.Context, in Invocation) (Result, error) { return claude{}.Invoke(ctx, in) }},
 		"codex":    {"codex", func(ctx context.Context, in Invocation) (Result, error) { return codex{}.Invoke(ctx, in) }},
+		"copilot":  {"copilot", func(ctx context.Context, in Invocation) (Result, error) { return copilot{}.Invoke(ctx, in) }},
 	}
 	for name, a := range adapters {
 		t.Run(name, func(t *testing.T) {
@@ -127,6 +128,7 @@ func TestEachAdaptersEnvPinsPWDBeforeExec(t *testing.T) {
 		"opencode": opencodeEnv,
 		"claude":   claude{}.env(in),
 		"codex":    codex{}.env(in),
+		"copilot":  copilot{}.env(in),
 	} {
 		if got := lastValue(env, "PWD"); got != workdir {
 			t.Errorf("%s: PWD handed to exec = %q, want the invocation's workdir %q (CLA-441)", name, got, workdir)
@@ -177,8 +179,9 @@ func TestPinnedPWDIsAbsolute(t *testing.T) {
 func TestExplicitCallerPWDStillWins(t *testing.T) {
 	in := Invocation{WorkDir: t.TempDir(), Env: []string{"PWD=/explicitly/asked/for"}}
 	for name, env := range map[string][]string{
-		"claude": claude{}.env(in),
-		"codex":  codex{}.env(in),
+		"claude":  claude{}.env(in),
+		"codex":   codex{}.env(in),
+		"copilot": copilot{}.env(in),
 	} {
 		if last := lastValue(env, "PWD"); last != "/explicitly/asked/for" {
 			t.Errorf("%s: effective PWD = %q, want the caller's explicit value", name, last)

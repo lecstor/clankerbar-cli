@@ -947,7 +947,7 @@ func TestOnlyOpencodeGuesses(t *testing.T) {
 	if !(opencode{}).IsUnclassifiedTransient(res) {
 		t.Error("opencode stopped reporting its heuristic - the loop can no longer bound it")
 	}
-	if (claude{}).IsUnclassifiedTransient(res) || (codex{}).IsUnclassifiedTransient(res) {
+	if (claude{}).IsUnclassifiedTransient(res) || (codex{}).IsUnclassifiedTransient(res) || (copilot{}).IsUnclassifiedTransient(res) {
 		t.Error("a pattern-driven adapter reported a guess")
 	}
 }

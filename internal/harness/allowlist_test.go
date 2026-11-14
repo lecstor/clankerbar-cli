@@ -53,6 +53,7 @@ func TestNoAllowlistStillInheritsTheWholeEnvironment(t *testing.T) {
 		"opencode": {"opencode", func(ctx context.Context, in Invocation) (Result, error) { return opencode{}.Invoke(ctx, in) }},
 		"claude":   {"claude", func(ctx context.Context, in Invocation) (Result, error) { return claude{}.Invoke(ctx, in) }},
 		"codex":    {"codex", func(ctx context.Context, in Invocation) (Result, error) { return codex{}.Invoke(ctx, in) }},
+		"copilot":  {"copilot", func(ctx context.Context, in Invocation) (Result, error) { return copilot{}.Invoke(ctx, in) }},
 	}
 	for name, a := range adapters {
 		t.Run(name, func(t *testing.T) {
@@ -82,6 +83,7 @@ func TestAllowlistDropsUnlistedInheritedVariablesOnEveryAdapter(t *testing.T) {
 		"opencode": {"opencode", func(ctx context.Context, in Invocation) (Result, error) { return opencode{}.Invoke(ctx, in) }},
 		"claude":   {"claude", func(ctx context.Context, in Invocation) (Result, error) { return claude{}.Invoke(ctx, in) }},
 		"codex":    {"codex", func(ctx context.Context, in Invocation) (Result, error) { return codex{}.Invoke(ctx, in) }},
+		"copilot":  {"copilot", func(ctx context.Context, in Invocation) (Result, error) { return copilot{}.Invoke(ctx, in) }},
 	}
 	for name, a := range adapters {
 		t.Run(name, func(t *testing.T) {

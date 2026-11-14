@@ -2992,6 +2992,31 @@ func TestBudgetGuards_WarnWhenAnOpencodeRunHasNoSessionBackstopAtAll(t *testing.
 	})
 }
 
+// A guard the copilot adapter cannot arm must be named before the run: the dial
+// looks live in the config and protects nothing.
+func TestBudgetGuards_CopilotInertGuardsAreNamed(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "copilot"
+	maxFailures := 5
+	cfg.MaxRepeatedToolFailures = &maxFailures
+	idle := config.Duration(10 * time.Minute)
+	cfg.SessionIdle = map[string]config.IdleBounds{"copilot": {MaxIdle: &idle}}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("a copilot run with unenforceable guards: got %v, want WARN", c.status)
+	}
+	joined := strings.Join(c.info, "\n")
+	for _, want := range []string{"max_repeated_tool_failures", "session_idle[copilot]", "INERT"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("doctor did not name %q among its guard notes:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(c.remedy, "max_repeated_tool_failures") {
+		t.Errorf("the remedy tells the operator to set a dial that cannot fire: %q", c.remedy)
+	}
+}
+
 // inertNote returns the check's inert-wall-clock info line, failing if there is
 // none: the advice lives in the note rather than the remedy, because the guard
 // block's generic "set <dials>" line routinely claims the remedy first.
