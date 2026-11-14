@@ -293,14 +293,18 @@ walk:
 // It is what a config with no `phases` gets, and it is kept as its own entry
 // point because that is the shape every existing test drives.
 //
+// ti is the target's index, taken explicitly rather than from prior: a caller
+// that passes spend{start: ...} without a ti must not have its spend silently
+// booked to target 0 and judged by target 0's stored budget.
+//
 // The phase comes from EffectivePhases, not an inline literal, so the unphased
 // path carries the same resolution every other path does — the top-level or
 // default turn cap (CLA-343), which is precisely what the inline zero-value
 // version failed to do.
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	phases := d.targetCfg(t).EffectivePhases()
 	ph := phases[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, prior.ti, 0, "", ph, true, nil, t, prior, phases, panelState{}, phaseRunOpts{})
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, ti, 0, "", ph, true, nil, t, prior, phases, panelState{}, phaseRunOpts{})
 	return tokens, cost, stop, err
 }
 

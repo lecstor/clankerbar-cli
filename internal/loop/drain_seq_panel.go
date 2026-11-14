@@ -137,10 +137,10 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 				}
 				// The run-level endings, in the order the sequential handler
 				// checks them: a close that failed is fail-closed and stops the
-				// drain; a member's budget stop ends the run; a limit or
-				// transient end hands the drain its wait (the claim is left to
-				// lapse into a takeover, never released); no record at all means
-				// no fix.
+				// drain; a member's budget stop ends the drain and exhausts that
+				// target (other projects continue); a limit or transient end
+				// hands the drain its wait (the claim is left to lapse into a
+				// takeover, never released); no record at all means no fix.
 				switch {
 				case out.runLost:
 					// The task is no longer this run's: nothing is owed a handback and no later

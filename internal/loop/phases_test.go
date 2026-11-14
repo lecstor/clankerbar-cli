@@ -1868,7 +1868,7 @@ func TestDrain_ZeroUsageUnknownEndIsLoggedByName(t *testing.T) {
 	d := New(fastCfg(), h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 	if err != nil || stop {
 		t.Fatalf("drainWithRetries: stop=%v err=%v", stop, err)
 	}

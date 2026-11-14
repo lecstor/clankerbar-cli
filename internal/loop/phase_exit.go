@@ -82,7 +82,7 @@ func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) atte
 		// either (recordPassSpend runs only where the loop counts an attempt),
 		// so the record says "unknown" instead of publishing a FLOOR from a
 		// stream with a hole in it as if it were a report.
-		utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), at.logPath, at.res, r.tokens, r.cost)
+		utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, r.ti, drainNum, tc.HarnessFor(ph), at.logPath, at.res, r.tokens, r.cost)
 		return attemptVerdict{next: attemptReturn, spendOverride: true, tokens: utokens, cost: ucost, stop: ustop, err: uerr}
 	}
 

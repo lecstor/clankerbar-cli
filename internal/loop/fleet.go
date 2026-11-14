@@ -100,6 +100,10 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 //
 //   - mid-drain                -> iteration {n, taskRef, phase}
 //   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new)
+//   - budget-exhausted           -> draining, indistinguishable from a pause HERE:
+//     the wire State carries no reason field, so the console shows a project that
+//     reached its ceiling exactly as it shows one an operator paused. The log line
+//     from markBudgetExhausted is the operator's signal until a reason is carried.
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:

@@ -344,10 +344,11 @@ func TestDrainMidDrain_PerHarnessBlockStopsTheRetryLadder(t *testing.T) {
 	}
 }
 
-// A run-wide figure printed after a per-harness reason reads as a contradiction
-// in a mixed-harness run ("opencode cost $2.05 >= $2.00 ... cost=$4.50"), so the
-// tripped harness's own totals ride along with the reason.
-func TestBudgetTrip_NamesTheTrippedHarnessesOwnSpend(t *testing.T) {
+// A per-harness reason names the harness whose block tripped, but the FIGURES
+// belong to the account and every caller prints them once. Appending the harness
+// totals to the reason as well put two different token/$ pairs on one line
+// (CLA-480 review 1.review-1.13).
+func TestBudgetTrip_NamesTheHarnessAndLeavesTheFiguresToTheCaller(t *testing.T) {
 	cfg := fastCfg()
 	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
 		"opencode": {MaxCostUSD: 2},
@@ -357,9 +358,12 @@ func TestBudgetTrip_NamesTheTrippedHarnessesOwnSpend(t *testing.T) {
 	d.charge(0, "opencode", 900_000, 2.5)
 
 	dim := d.budgetTrip(60_900_000, 2.5, time.Minute)
-	for _, want := range []string{"opencode cost", "opencode so far", "tokens=900000", "cost=$2.50"} {
-		if !strings.Contains(dim, want) {
-			t.Errorf("budgetTrip = %q, want it to carry %q", dim, want)
+	if !strings.Contains(dim, "opencode cost") {
+		t.Errorf("budgetTrip = %q, want it to name the harness whose block tripped", dim)
+	}
+	for _, unwanted := range []string{"so far", "tokens=900000", "cost=$2.50"} {
+		if strings.Contains(dim, unwanted) {
+			t.Errorf("budgetTrip = %q carries the harness's own totals too (%q); the caller prints the account's figures exactly once", dim, unwanted)
 		}
 	}
 }

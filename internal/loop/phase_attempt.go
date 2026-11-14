@@ -19,7 +19,7 @@ import (
 // the spawn itself, and how the session's exit is classified.
 
 // checkBreakers is the two bounds that stop the ladder spawning another paid
-// session: the run-wide budget breaker, and the zero-spend attempt bound.
+// session: the budget in force for the target, and the zero-spend attempt bound.
 func (r *phaseRun) checkBreakers(ctx context.Context) attemptVerdict {
 	d := r.d
 	drainNum := r.drainNum

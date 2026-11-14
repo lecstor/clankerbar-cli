@@ -338,7 +338,7 @@ func drainOnce(t *testing.T, d *Driver) (int, float64, bool, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return d.drainWithRetries(ctx, 1, d.targets[0], spend{start: time.Now()})
+	return d.drainWithRetries(ctx, 1, 0, d.targets[0], spend{start: time.Now()})
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +520,7 @@ func TestDrainWithRetries_ResetPastBudgetStopsInsteadOfWaiting(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -549,7 +549,7 @@ func TestDrainWithRetries_ResetInsideBudgetStillWaits(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil || stop {
 		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
@@ -576,7 +576,7 @@ func TestDrainWithRetries_WaitLogsNameTheWindow(t *testing.T) {
 	openTestStateDir(t, d)
 
 	logs := captureLogs(t)
-	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); err != nil || stop {
+	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); err != nil || stop {
 		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
 	}
 	out := logs.String()
@@ -773,7 +773,7 @@ func TestDrainWithRetries(t *testing.T) {
 			d := New(cfg, h, &fakePoller{})
 			openTestStateDir(t, d) // drainWithRetries writes per-iteration logs here
 
-			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -816,7 +816,7 @@ func TestDrainWithRetries_StatedResetPassed(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1029,7 +1029,7 @@ func TestDrainWithRetries_CostCeilingEndsASupervisedWait(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	_, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	_, cost, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1059,7 +1059,7 @@ func TestDrainWithRetries_UnreachedCeilingStillWaitsOutTheLimit(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil || stop {
 		t.Fatalf("$1 of a $10 ceiling must still be waited out: stop=%v err=%v", stop, err)
@@ -1235,7 +1235,7 @@ func TestDrainWithRetries_TokenCeilingEndsATransientRetry(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1265,7 +1265,7 @@ func TestDrainWithRetries_CeilingCountsSpendFromEarlierDrains(t *testing.T) {
 	d.charge(0, "claude", 0, 9.5)
 
 	// This drain's $1 crosses the $10 ceiling.
-	_, _, stop, err := d.drainWithRetries(context.Background(), 4, d.targets[0], spend{start: time.Now()})
+	_, _, stop, err := d.drainWithRetries(context.Background(), 4, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1355,7 +1355,7 @@ func TestDrainWithRetries_BacklogTextCannotFakeALimit(t *testing.T) {
 	d := New(fastCfg(), h, &fakePoller{})
 	openTestStateDir(t, d)
 
-	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()})
 
 	if err != nil || stop {
 		t.Fatalf("a clean session must finish the drain: stop=%v err=%v", stop, err)
@@ -2851,7 +2851,7 @@ func TestIterationLogNeverWritesThroughAPlantedSymlink(t *testing.T) {
 		t.Fatal("planted nothing")
 	}
 
-	if _, _, _, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); err != nil {
+	if _, _, _, err := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); err != nil {
 		t.Fatalf("drain returned error: %v", err)
 	}
 	got, err := os.ReadFile(victim)
@@ -3013,7 +3013,7 @@ func TestLimitReasonNamesTheWindow(t *testing.T) {
 func TestDrainWithRetries_StopLimitWritesTheMarker(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{steps: []invokeStep{{res: limitStopResult()}}}, &fakePoller{})
 	openTestStateDir(t, d)
-	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); !stop {
+	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, 0, d.targets[0], spend{start: time.Now()}); !stop {
 		t.Fatal("stop = false, want true")
 	}
 	present, reason := d.readMarker(LimitStopName)
@@ -3023,7 +3023,7 @@ func TestDrainWithRetries_StopLimitWritesTheMarker(t *testing.T) {
 
 	d2 := New(fastCfg(), &fakeAdapter{steps: []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}}}, &fakePoller{})
 	openTestStateDir(t, d2)
-	d2.drainWithRetries(context.Background(), 1, d2.targets[0], spend{start: time.Now()})
+	d2.drainWithRetries(context.Background(), 1, 0, d2.targets[0], spend{start: time.Now()})
 	if present, _ := d2.readMarker(LimitStopName); present {
 		t.Error("a waited-out rolling limit must not write LIMIT_STOP")
 	}

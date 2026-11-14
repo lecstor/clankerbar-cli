@@ -25,7 +25,7 @@ import (
 // accumulator would put a made-up number in front of the breaker and in the
 // iteration's cost line.
 //
-// # Why a spend ceiling then STOPS the run
+// # Why a spend ceiling then stops the account
 //
 // Because the ceiling is a promise, and this is the driver saying it can no longer
 // keep it. An operator who set `max_tokens` or `max_cost_usd` has asked to be
@@ -33,6 +33,11 @@ import (
 // One unaccounted session is survivable; a night of them against an inert ceiling
 // is the failure CLA-287 and CLA-258 were both about. Stopping is clean, loud, and
 // resumable — the operator restarts the run once they know why.
+//
+// WHICH account stops follows the budget in force (CLA-480): a target whose stored
+// document set the ceiling is exhausted on its own, with budgetStopped recorded so
+// Run carries on with its siblings; only the local pool's ceiling (the run-wide
+// promise over every project it governs) keeps the daemon-wide stop.
 //
 // With no spend ceiling set there is nothing to break: the wall clock does not
 // depend on anything the child said, so the run carries on and the no-progress
@@ -43,12 +48,15 @@ import (
 // (CLA-366) the session that went unreadable is not necessarily on d.h. Asking
 // d.h would let an unreadable opencode session be waved through on the grounds
 // that CLAUDE has no ceiling set.
-func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName, logPath string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+func (d *Driver) endUntrustedDrain(t Target, ti, drainNum int, harnessName, logPath string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
 	log.Printf("iteration %d UNTRUSTED — %s (log: %s)", drainNum, res.Untrusted, logPath)
 	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%s), and not handing back any claim it appeared to hold",
 		drainNum, res.Tokens, res.CostUSD, res.ExitString())
 	if !d.targetCfg(t).Budget.CountsSpendFor(harnessName) {
 		return tokens, cost, false, nil
+	}
+	if d.exhaustUnmeasurable(ti, "the session's spend cannot be read, so that project's ceiling can no longer be honoured") {
+		return tokens, cost, true, nil
 	}
 	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured — check the iteration log, then rerun to resume (log: %s)", drainNum, logPath)
 	return tokens, cost, true, nil

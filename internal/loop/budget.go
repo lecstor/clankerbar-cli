@@ -3,12 +3,13 @@ package loop
 // Budget enforcement (CLA-410, CLA-480). Two accounts are judged, and the
 // distinction is the whole point of the stored run-config overlay:
 //
-//   - a target with a stored document in force is judged by THAT document's
+//   - a target whose stored document SET a budget is judged by THAT document's
 //     budget over its own spend, on its own clock. The local file's dials are
 //     not a second, tighter bound for it — a ratified looser ceiling wins.
-//   - every target with no overlay in force is judged together by the local
-//     file's budget, over their combined spend, on the run's clock: the
-//     instance-global pool the README documents.
+//   - every target the local file still governs — no stored document, or one
+//     that sets no budget — is judged together by the local file's budget, over
+//     their combined spend, on the run's clock: the instance-global pool the
+//     README documents.
 //
 // A trip exhausts the account's targets for the rest of the run. Run keeps
 // round-robining the others and stops only when every target is exhausted, so
@@ -21,7 +22,6 @@ package loop
 // down from the last boundary.
 
 import (
-	"fmt"
 	"log"
 	"maps"
 	"slices"
@@ -77,8 +77,12 @@ type budgetVerdict struct {
 // than failing, so the ledger asks the config what a session IS and asks the
 // adapter only behavioural questions.
 //
-// An UNTRUSTED session is charged nowhere, for the reason endUntrustedDrain
-// gives: a figure parsed out of a stream with a hole in it is not a measurement.
+// An UNTRUSTED phase/session stream is charged nowhere, for the reason
+// endUntrustedDrain gives: a figure parsed out of a stream with a hole in it is
+// not a measurement. A supervised wait's probe is the one exception — the wait
+// cannot avoid spawning it, and its parsed floor is booked so the ledger does
+// not under-count the sessions the wait itself adds (supervisedWait stops under
+// a spend ceiling rather than poll on spend it cannot see).
 func (d *Driver) charge(ti int, harnessName string, tokens int, cost float64) {
 	if ti < 0 || ti >= len(d.tgtSpend) {
 		// A Driver built by hand in a test may carry no target ledger; production
@@ -112,13 +116,13 @@ func (d *Driver) targetSpendAt(i int) targetSpend {
 }
 
 // localSpend is the combined spend of every target the LOCAL file governs: a
-// target with a stored overlay in force is judged by that document instead, so
-// its spend neither trips nor counts against the local ceiling.
+// target whose stored document sets its own budget is judged by that document
+// instead, so its spend neither trips nor counts against the local ceiling.
 func (d *Driver) localSpend() (tokens int, cost float64) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	for i := range d.targets {
-		if d.targets[i].Cfg != nil || i >= len(d.tgtSpend) {
+		if d.overlayBudgetAt(i) || i >= len(d.tgtSpend) {
 			continue
 		}
 		tokens += d.tgtSpend[i].tokens
@@ -134,7 +138,7 @@ func (d *Driver) localSpentBy() map[string]harnessSpend {
 	defer d.stateMu.Unlock()
 	out := make(map[string]harnessSpend)
 	for i := range d.targets {
-		if d.targets[i].Cfg != nil || i >= len(d.tgtSpend) {
+		if d.overlayBudgetAt(i) || i >= len(d.tgtSpend) {
 			continue
 		}
 		for name, s := range d.tgtSpend[i].byHarness {
@@ -163,11 +167,12 @@ func tripBudget(b config.Budget, tokens int, cost float64, elapsed time.Duration
 	for _, name := range slices.Sorted(maps.Keys(byHarness)) {
 		s := byHarness[name]
 		if dim := b.ExceededByHarness(name, s.tokens, s.cost); dim != "" {
-			// That harness's OWN totals ride along, because every caller prints
-			// the figures after the reason: in a mixed-harness run two dollar
-			// figures on one line read as a contradiction, which is the defect
-			// Budget.ExceededBy's doc comment exists to prevent, one level down.
-			return fmt.Sprintf("%s (%s so far: tokens=%d cost=$%.2f)", dim, name, s.tokens, s.cost)
+			// The harness name already leads the dimension, and the caller prints
+			// the account's totals after the reason. Appending this harness's
+			// own totals here too would put two different token/$ pairs on one
+			// line — the contradiction Budget.ExceededBy's doc comment exists to
+			// prevent, one level down.
+			return dim
 		}
 	}
 	return ""
@@ -183,28 +188,42 @@ func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) str
 // targetElapsed is how long target i has been draining. The stored budget's
 // wall clock runs on THIS clock, not the run's: a project polled into a daemon
 // two hours old has not thereby spent two hours of its own ratified ceiling.
-// Zero until the target's first drain.
+// Zero until the target's first drain. stateMu is not decorative: a parallel
+// panel's members run budget checks on their own goroutines while the run's next
+// boundary may stamp the clock.
 func (d *Driver) targetElapsed(i int) time.Duration {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if i < 0 || i >= len(d.tgtStart) || d.tgtStart[i].IsZero() {
 		return 0
 	}
 	return time.Since(d.tgtStart[i])
 }
 
+// noteTargetStart stamps target i's clock at its first drain; later drains keep
+// the original stamp.
+func (d *Driver) noteTargetStart(i int) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if i >= 0 && i < len(d.tgtStart) && d.tgtStart[i].IsZero() {
+		d.tgtStart[i] = time.Now()
+	}
+}
+
 // budgetElapsed is the clock the budget in force for target i runs on: the
-// target's own when a stored overlay governs it, else the run's.
+// target's own when a stored overlay sets its ceiling, else the run's.
 func (d *Driver) budgetElapsed(i int, runElapsed time.Duration) time.Duration {
-	if i >= 0 && i < len(d.targets) && d.targets[i].Cfg != nil {
+	if d.overlayBudgetAt(i) {
 		return d.targetElapsed(i)
 	}
 	return runElapsed
 }
 
 // targetBudgetTrip judges target i's account against the budget in force for
-// it: its stored document when one is in force, else the local file's budget
-// over every target the local file still governs.
+// it: its stored document's budget when one is in force, else the local file's
+// budget over every target the local file still governs.
 func (d *Driver) targetBudgetTrip(i int, runElapsed time.Duration) budgetVerdict {
-	if i >= 0 && i < len(d.targets) {
+	if i >= 0 && i < len(d.targets) && d.overlayBudgetAt(i) {
 		if eff := d.targets[i].Cfg; eff != nil {
 			s := d.targetSpendAt(i)
 			elapsed := d.targetElapsed(i)
@@ -294,14 +313,15 @@ func (d *Driver) allExhausted() bool {
 }
 
 // markBudgetExhausted records a trip against the target(s) its account governs,
-// and says so once per account. An overlay budget governs its one target; the
+// and says so once per account. A stored budget governs its one target; the
 // local file's budget is the run-wide promise over every target it still
-// governs, so they are exhausted together.
+// governs (no document, or a document that sets no budget), so they are
+// exhausted together.
 //
 // midDrain marks the trip as the reason THIS drain ended, so Run continues with
 // the siblings instead of reading the drain's stop as a run-wide stop.
 func (d *Driver) markBudgetExhausted(ti int, v budgetVerdict, midDrain bool) {
-	if ti >= 0 && ti < len(d.targets) && d.targets[ti].Cfg != nil {
+	if d.overlayBudgetAt(ti) {
 		d.markExhausted([]int{ti})
 		if midDrain {
 			d.markBudgetStopped(ti)
@@ -314,7 +334,7 @@ func (d *Driver) markBudgetExhausted(ti int, v budgetVerdict, midDrain bool) {
 	var governed []string
 	var indices []int
 	for i := range d.targets {
-		if d.targets[i].Cfg != nil {
+		if d.overlayBudgetAt(i) {
 			continue
 		}
 		indices = append(indices, i)
@@ -338,13 +358,13 @@ func (d *Driver) markBudgetExhausted(ti int, v budgetVerdict, midDrain bool) {
 // the effect is the same: no more sessions for that account this run, while the
 // others carry on.
 func (d *Driver) exhaustForWait(ti int, reason string) {
-	if ti >= 0 && ti < len(d.targets) && d.targets[ti].Cfg != nil {
+	if d.overlayBudgetAt(ti) {
 		d.markExhausted([]int{ti})
 		log.Printf("%s%s — this project is exhausted for the rest of this run; the other projects keep draining", d.prefix(ti), reason)
 	} else {
 		var indices []int
 		for i := range d.targets {
-			if d.targets[i].Cfg == nil {
+			if !d.overlayBudgetAt(i) {
 				indices = append(indices, i)
 			}
 		}
@@ -352,6 +372,21 @@ func (d *Driver) exhaustForWait(ti int, reason string) {
 		log.Printf("%s — the projects under the local budget are exhausted for the rest of this run; projects with a stored budget keep draining", reason)
 	}
 	d.markBudgetStopped(ti)
+}
+
+// exhaustUnmeasurable ends target ti's draining when a session's spend cannot be
+// read and the ceiling that protects that spend is the target's own stored
+// budget. It reports whether the target was the account: false means the local
+// pool's ceiling can no longer be honoured, and the caller's daemon-wide stop
+// stands (see endUntrustedDrain for why that is the local pool's posture).
+func (d *Driver) exhaustUnmeasurable(ti int, reason string) bool {
+	if !d.overlayBudgetAt(ti) {
+		return false
+	}
+	d.markExhausted([]int{ti})
+	d.markBudgetStopped(ti)
+	log.Printf("%s%s — this project is exhausted for the rest of this run; the other projects keep draining", d.prefix(ti), reason)
+	return true
 }
 
 // sweepBudgets judges every target not yet exhausted against the budget in

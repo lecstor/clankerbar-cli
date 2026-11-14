@@ -306,11 +306,12 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	for k, m := range out.members {
 		out.tokens += m.tokens
 		out.cost += m.cost
-		// CLA-784: a run-level STOP (the budget breaker, a cancel) is the run's,
-		// not the member's, so it stops the run whoever the seat is. A member's
-		// OWN Stop — credit exhaustion — is converted to a recorded failure in
-		// drainPhase before it reaches here, so an optional seat cannot end the
-		// run through this flag.
+		// CLA-784: a CANCEL is the run's, not the member's, so it stops the run
+		// whoever the seat is. A budget stop is account-scoped (CLA-480): it
+		// ends this drain and exhausts the target, and the run continues with
+		// its siblings. A member's OWN Stop — credit exhaustion — is converted
+		// to a recorded failure in drainPhase before it reaches here, so an
+		// optional seat cannot end the run through this flag.
 		if m.stop {
 			out.stop = true
 		}

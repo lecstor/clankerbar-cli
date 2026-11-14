@@ -159,9 +159,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		// The target's own budget clock starts at its first drain (CLA-480): a
 		// stored max_wall_clock measures how long THIS project has been drained,
 		// not how long the daemon has been up for its siblings.
-		if d.cursor < len(d.tgtStart) && d.tgtStart[d.cursor].IsZero() {
-			d.tgtStart[d.cursor] = time.Now()
-		}
+		d.noteTargetStart(d.cursor)
 		tokens, _, handoffs, stop, err := d.drainPhases(runCtx, drains, d.cursor, target,
 			spend{start: start, ti: d.cursor})
 		// The drain's spend is already in the target's ledger: charge() books it
@@ -247,7 +245,10 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		if stop {
 			if d.budgetStoppedAt(d.cursor) {
 				d.clearBudgetStopped(d.cursor)
-				log.Printf("%sbudget exhausted mid-drain — this project stops draining; the other projects continue", d.prefix(d.cursor))
+				// markBudgetExhausted has already named the account and its
+				// projects; this line only says the drain is unwinding rather than
+				// ending the daemon.
+				log.Printf("%sbudget exhausted mid-drain — continuing with the projects that still have headroom", d.prefix(d.cursor))
 			} else {
 				return nil
 			}
@@ -401,8 +402,12 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 					}
 					// A poll taken while the loop has stopped spawning cannot tell "our
 					// last drain settled nothing" from "nothing happened because we
-					// stopped", so the verdict waits until the loop is live again.
-					if !sched {
+					// stopped", so the verdict waits until the loop is live again. A
+					// budget-exhausted target is one of those stops (CLA-480): judging
+					// its poll would charge the drain that reached the ceiling to the
+					// quiet accumulator and log a back-off for a project that will
+					// never spawn again this run.
+					if !sched && !d.exhaustedAt(i) {
 						d.judgeProgress(i, sum)
 					}
 					// CLA-396: a target the fleet counter paused stays

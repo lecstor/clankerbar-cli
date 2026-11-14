@@ -567,8 +567,16 @@ type Driver struct {
 
 	// tgtStart is when each target's first drain began: the clock a stored
 	// budget's max_wall_clock runs on. A target polled into a daemon hours old has
-	// not thereby spent hours of its own ratified ceiling.
+	// not thereby spent hours of its own ratified ceiling. Guarded by stateMu:
+	// Run stamps it at the first drain, and budget checks a parallel panel's
+	// members run on their own goroutines read it while they do.
 	tgtStart []time.Time
+
+	// overlayBudget marks a target whose stored run-config document SET a
+	// budget: only that target's own spend is judged by it. A document that
+	// sets no budget leaves the target in the local pool, because the README's
+	// exception is the document's budget, not its mere existence (see budget.go).
+	overlayBudget []bool
 
 	// exhausted marks a target that has reached the budget in force for it: no
 	// more sessions for it this run, while its siblings keep draining. Run stops
@@ -645,6 +653,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		rcFails:             make([]int, n),
 		tgtSpend:            make([]targetSpend, n),
 		tgtStart:            make([]time.Time, n),
+		overlayBudget:       make([]bool, n),
 		exhausted:           make([]bool, n),
 		budgetStopped:       make([]bool, n),
 		waitGrace:           time.Minute,
