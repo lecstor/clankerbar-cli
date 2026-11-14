@@ -209,6 +209,12 @@ func reviewRunSession(ctx context.Context, opts ReviewRunOptions, cfg *config.Co
 			reason = "an unreported end"
 		}
 		return report, fmt.Errorf("the review session stopped at turn %d of its sequence (%s), so the review did not complete", res.TurnStopped, reason)
+	case res.ToolLoop != "":
+		return report, fmt.Errorf("the review session was killed for a tool loop (%s), which is not an orderly end, so its report is not a completed review", res.ToolLoop)
+	case res.IdleKilled != "":
+		return report, fmt.Errorf("the review session was killed for silence (%s), which is not an orderly end, so its report is not a completed review", res.IdleKilled)
+	case res.ExitCode != 0 && harness.RecoveredErrors(res) == 0:
+		return report, fmt.Errorf("the review session ended %s, which is not an orderly end, so its done report is not applied", res.ExitString())
 	case parseErr != nil:
 		return report, fmt.Errorf("the review session ended without a usable done report after the one re-emit: %w", parseErr)
 	}
@@ -229,6 +235,14 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	}
 	hc := cfg.SessionFor(opts.Harness)
 	idle, toolCall := cfg.SessionIdleFor(opts.Harness)
+	// A standalone review has no phase of its own, so it takes the run-wide cap
+	// and then the built-in default, exactly as resolveMaxTurns does for a phase
+	// with no cap. A harness that honours Invocation.MaxTurns (claude) would
+	// otherwise have no turn backstop at all.
+	maxTurns := cfg.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = config.DefaultMaxTurns
+	}
 	inv := harness.Invocation{
 		Prompt:                  config.ReviewRunBrief(config.ReviewRunBriefOptions{Base: base, Head: head, Title: opts.Title, Description: opts.Description}),
 		Model:                   strings.TrimSpace(opts.Model),
@@ -240,6 +254,7 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 		EnvAllowlist:            cfg.SessionEnvAllowlist(opts.Harness, ""),
 		MaxSessionTokens:        cfg.Budget.SessionTokenCeilingFor(opts.Harness),
 		MaxRepeatedToolFailures: cfg.RepeatedToolFailureBound(),
+		MaxTurns:                maxTurns,
 		MaxSessionIdle:          idle,
 		MaxToolCallDuration:     toolCall,
 		MaxSessionWallClock:     cfg.MaxSessionWallClock.Duration(),
@@ -266,13 +281,12 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	if err != nil {
 		return inv, stage, fmt.Errorf("map the changed definitions: %w", err)
 	}
-	plan := planMapsSession(mapOpts, inv.Model, base, diff, flow, config.MapsSessionDoneReportEnding)
-	if plan.notesModel != inv.Model {
-		inv = inv.OnTurn(harness.Turn{Model: plan.notesModel})
-	}
-	inv.Prompt += "\n\n" + plan.section
-	inv.Turns = plan.turns
-	stage.models = map[string]string{"notes": plan.notesModel, "findings": plan.reportModel}
+	// A standalone review has no task, so its findings turn grades MUST against
+	// the repo's gates and correctness/safety only — never a done-when bar.
+	plan := planMapsSession(mapOpts, inv.Model, base, diff, flow, config.MapsSessionSeverityTaskless, config.MapsSessionDoneReportEnding)
+	var reportModel string
+	inv, reportModel = wireMapsPlan(inv, plan)
+	stage.models = map[string]string{"notes": plan.notesModel, "findings": reportModel}
 	stage.notesTurns = plan.notesTurns
 	return inv, stage, nil
 }
@@ -307,9 +321,11 @@ func reviewRunUsage(res harness.Result) ReviewRunUsage {
 	}
 }
 
-// reviewRunTurns reports how many turns actually ran. A single-pass invocation
-// is one turn by construction; a maps-session's TurnMessages carries one entry
-// per turn that ran, including a turn that ended the sequence early.
+// reviewRunTurns reports the review's own turns: one for a single-pass
+// invocation, and for a maps-session one entry per turn that ran (TurnMessages
+// includes a turn that ended the sequence early). The harness's one report
+// re-emit and a stall or interrupt resume are the harness's turns, not the
+// review's, so neither is counted.
 func reviewRunTurns(method string, res harness.Result) int {
 	if method != config.ReviewMethodMapsSession {
 		return 1

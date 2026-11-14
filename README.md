@@ -577,6 +577,11 @@ the context a task body would otherwise carry. The maps knobs are refused with
 `--method single-pass` rather than silently ignored. `--json <file>` writes the
 report to a file; without it the JSON goes to stdout and human lines to stderr.
 
+`--embed-hunks` is **not accepted yet**: the embedded-hunk map lands with
+CLA-871 (`maps_session.embed_hunks`), so passing it today fails as an unknown
+flag. An eval harness should leave it out until that method option is in the
+build rather than passing a flag this command would have to fake.
+
 The JSON document:
 
 ```json
@@ -602,8 +607,11 @@ For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead.
 `findings` uses the review record's own shape (`severity`, `summary`,
 `evidenceKind`, `evidence`, `file`, `line`, `kind`, `requiredFix`), and
 `notes_turns` carries the map method's per-chunk notes — the evidence a
-missed-finding analysis reads, never findings. `turns` counts the turns that
-actually ran.
+missed-finding analysis reads, never findings. `turns` counts the review's own
+turns — one for single-pass, and a maps-session's notes chunks plus its findings
+turn. It does not count the harness's one report re-emit or a stall/interrupt
+resume, which are recovery, not review; an eval that wants session length should
+read `usage` and `time_ms` instead.
 
 The exit contract: a session that ends without a valid done report fails the
 command, after the harness's one re-emit, with the parse error named. The JSON

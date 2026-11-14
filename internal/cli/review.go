@@ -217,5 +217,7 @@ The JSON carries the resolved base/head commits, the method, the model per
 stage, the findings, the omitted count, the maps-session notes and the session's
 usage. A session that ends without a usable done report fails the command
 (non-zero), after the harness's one re-emit.
+
+--embed-hunks is not accepted yet: the embedded-hunk map lands with CLA-871.
 `)
 }

@@ -157,6 +157,9 @@ func TestRunReviewSinglePassReport(t *testing.T) {
 	if !got.AllowUnclaimed {
 		t.Error("AllowUnclaimed = false: a standalone review holds no claim and the adapter would refuse its turns")
 	}
+	if got.MaxTurns != config.DefaultMaxTurns {
+		t.Errorf("MaxTurns = %d, want the built-in default %d: a standalone review has no phase cap", got.MaxTurns, config.DefaultMaxTurns)
+	}
 	if got.CheckReport == nil {
 		t.Fatal("CheckReport is nil: a bad report would reach the JSON as if it were valid")
 	}
@@ -231,6 +234,13 @@ func TestRunReviewMapsSessionTurnsAndModels(t *testing.T) {
 	if got.Turns[len(got.Turns)-1].Model != "test/findings-model" {
 		t.Errorf("the findings turn runs on %q, want test/findings-model", got.Turns[len(got.Turns)-1].Model)
 	}
+	findingsTurn := got.Turns[len(got.Turns)-1].Prompt
+	if strings.Contains(findingsTurn, "done-when") {
+		t.Errorf("the standalone findings turn names a done-when bar the brief says does not exist:\n%s", findingsTurn)
+	}
+	if !strings.Contains(findingsTurn, "violates the repo's gates, or correctness/safety") {
+		t.Errorf("the standalone findings turn does not state the taskless MUST bar:\n%s", findingsTurn)
+	}
 	if len(report.Findings) != 1 || report.Findings[0].Severity != "must" {
 		t.Errorf("findings = %+v, want the findings turn's one MUST", report.Findings)
 	}
@@ -257,6 +267,84 @@ func TestRunReviewMapsSessionTurnsAndModels(t *testing.T) {
 	}
 	if !strings.Contains(got.Prompt, "M1.") {
 		t.Errorf("the maps section did not reach the first turn:\n%s", got.Prompt)
+	}
+}
+
+// TestRunReviewRefusesNonOrderlyEnd (CLA-870 round 1 1.review-1.1): a parseable
+// done report is not a completed review when the session ended non-orderly —
+// the same gate the review phase's done_apply applies to a report.
+func TestRunReviewRefusesNonOrderlyEnd(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("README.md", "base\n")
+	base := r.commit("base")
+	r.write("README.md", "head\n")
+	head := r.commit("head")
+
+	cases := []struct {
+		name string
+		res  harness.Result
+		want string
+	}{
+		{"nonzero exit", harness.Result{ExitCode: 1, FinalMessage: reviewRunDone(head, reviewRunMustFinding)}, "exit 1"},
+		{"tool loop", harness.Result{ToolLoop: "the same failing tool call repeated", FinalMessage: reviewRunDone(head, reviewRunMustFinding)}, "tool loop"},
+		{"idle killed", harness.Result{IdleKilled: "no output for ten minutes", FinalMessage: reviewRunDone(head, reviewRunMustFinding)}, "silence"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := ReviewRunOptions{
+				Repo: r.dir, Base: base, Head: head, Harness: "opencode", cfg: &config.Config{},
+				invoke: func(context.Context, harness.Invocation) (harness.Result, error) { return tc.res, nil },
+			}
+			report, err := RunReview(context.Background(), opts)
+			if err == nil || !strings.Contains(err.Error(), "not an orderly end") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want a non-orderly end naming %q", err, tc.want)
+			}
+			if report == nil || len(report.Findings) != 1 {
+				t.Errorf("report = %+v, want the parsed findings still returned beside the error", report)
+			}
+		})
+	}
+
+	// The phase accepts an exit the adapter recovered from; the standalone review
+	// must not refuse a report that gate accepts.
+	t.Run("nonzero exit with a recovered error", func(t *testing.T) {
+		res := harness.Result{
+			ExitCode:     1,
+			Raw:          map[string]any{harness.RecoveredErrorsKey: 1},
+			FinalMessage: reviewRunDone(head, reviewRunMustFinding),
+		}
+		opts := ReviewRunOptions{
+			Repo: r.dir, Base: base, Head: head, Harness: "opencode", cfg: &config.Config{},
+			invoke: func(context.Context, harness.Invocation) (harness.Result, error) { return res, nil },
+		}
+		if _, err := RunReview(context.Background(), opts); err != nil {
+			t.Fatalf("RunReview refused a report from a recovered exit: %v", err)
+		}
+	})
+}
+
+// TestReviewRunInvocationMaxTurns (CLA-870 round 1 1.review-1.4): the run-wide
+// turn cap wins over the built-in default, as a phase with no cap of its own
+// resolves it.
+func TestReviewRunInvocationMaxTurns(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *config.Config
+		want int
+	}{
+		{"built-in default", &config.Config{}, config.DefaultMaxTurns},
+		{"run-wide cap", &config.Config{MaxTurns: 37}, 37},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inv, _, err := reviewRunInvocation(ReviewRunOptions{Harness: "opencode"}, tc.cfg, config.ReviewMethodSinglePass, t.TempDir(), "base", "head")
+			if err != nil {
+				t.Fatalf("reviewRunInvocation: %v", err)
+			}
+			if inv.MaxTurns != tc.want {
+				t.Errorf("MaxTurns = %d, want %d", inv.MaxTurns, tc.want)
+			}
+		})
 	}
 }
 
