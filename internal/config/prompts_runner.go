@@ -227,8 +227,8 @@ var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"(verdict: pass), there is nothing to fix: commit nothing and report an empty findingUpdates." +
 	" FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes, then open a PR targeting the " +
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for this branch - push, then the PR, " +
-	"in that order - and end the session with the done report. The runner hands the task over with " +
-	"submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) + runnerRerunGuidance +
+	"in that order." + worktreeReclaimStep + " Then end the session with the done report. The runner hands the " +
+	"task over with submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) + runnerRerunGuidance +
 	runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerFixVerifyBrief is fixVerifyBrief for a runner-claimed session: a
@@ -291,9 +291,9 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"change its status. The runner records the round, releases it, and spawns another fix or parks the task at " +
 	"the round cap.\n\n" +
 	"If NO MUST remains open: confirm the branch is pushed (push any fix commit the fixer left local), open a " +
-	"PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for the branch, and " +
-	"end with the report including " + runnerRiskField + ". The runner records the round and hands the task to " +
-	"in_review. Never decide to run another round yourself." +
+	"PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for the branch." +
+	worktreeReclaimStep + " Then end with the report including " + runnerRiskField + ". The runner records the " +
+	"round and hands the task to in_review. Never decide to run another round yourself." +
 	verifyStoppingRule + verifyDriverBounds + runnerDoneReport(runnerVerifyReportFields) + runnerRerunGuidance +
 	runnerForbidden + handoffGuidance + runnerReportReminder
 

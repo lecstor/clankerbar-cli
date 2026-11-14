@@ -1,5 +1,34 @@
 package config
 
+// worktreeReclaimStep is the reclaim every FINAL phase step carries: the session
+// that takes the work off the machine removes the tree it worked in, because the
+// close-out that merges may not touch a tree it did not create (CLA-534). It is
+// one constant so the shipped review and verify steps and the runner's final fix
+// and verify steps cannot drift apart.
+//
+// Order is the property: it follows the PR's confirmation, because until then
+// the tree may hold the only copy of the work, and it precedes the phase's final
+// call, which stays the emphatic ending (CLA-384).
+//
+// The upstream reset is load-bearing, not tidiness. A fresh task worktree is cut
+// with `git worktree add -b <branch> <dir> origin/<prBase>`, so its branch
+// tracks the PR BASE, and `git branch -d` deletes only a branch fully merged in
+// its UPSTREAM: without the reset the delete refuses a pushed, unmerged branch.
+// No `--force` or `-D` anywhere - a refusal is the guard.
+const worktreeReclaimStep = " AFTER the PR is confirmed open - and before this session's final call - " +
+	"reclaim the tree this run worked in, in ONE shell invocation started from the repo's main checkout (the " +
+	"first path `git worktree list` prints, so the shell is never left in a deleted directory): " +
+	"`git worktree remove <this run's worktree>` - the path `git worktree list` shows for branch " +
+	PhaseBranchPlaceholder + " - then `git branch -d " + PhaseBranchPlaceholder + "`. Before the delete, point " +
+	"the branch at its own remote with `git push -u origin " + PhaseBranchPlaceholder + "` (or " +
+	"`git branch --set-upstream-to=origin/" + PhaseBranchPlaceholder + " " + PhaseBranchPlaceholder + "`): `-d` " +
+	"deletes only a branch fully merged in its upstream, and a fresh task tree tracks the PR base, so without " +
+	"this it refuses a pushed, unmerged branch. Never pass `--force` or `-D`: the expected refusals are that " +
+	"unmerged-base upstream and untracked files you generated or cached - delete only files you created (never " +
+	"a tracked modification) and retry, or leave the tree and report it; a refusal is not evidence of unpushed " +
+	"work. Expect gitignored local state to go with the tree: collateral, not work. Reclaim only this run's own " +
+	"tree, never another task's worktree."
+
 // reviewTerminalStep is the review phase's LAST instruction, kept as a constant so
 // its position can be pinned by a test and not only its wording.
 //
@@ -28,9 +57,14 @@ package config
 // repo with no staging branch (the makesPDF plugins; lecstor/makespdf, whose
 // PRs target integration) was told to open its PR against a branch that does
 // not exist. The target is now {{prBase}}, resolved per repo by the driver.
+//
+// CLA-536: this phase's session is the last one to work in the tree, so the
+// reclaim rides the shared worktreeReclaimStep - after the PR, before the
+// hand-off that must stay the emphatic final call.
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
 	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
-	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
+	"hand-off below." + worktreeReclaimStep +
+	" FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"submit_for_review(taskId, runId, outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
 	"session that leaves it out has not handed anything over. The same call's risk declaration uses touches: [] " +
