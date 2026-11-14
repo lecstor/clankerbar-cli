@@ -42,6 +42,7 @@ limit for ~82s before it exits).
 | `_errors` | 401 -> `provider.auth`, not transient; unknown model -> `provider.no-route`, no request sent, not transient; 429 -> `provider.rate-limit`, transient. None reports usage. |
 | `_recoveredProviderError` | The #43622 stream shape (every `finish_reason` null, then `[DONE]`): opencode RETRIES the request itself and finishes the turn. 2.0.32 emits a `provider.invalid-output` error event and exits **1** anyway, and the adapter records the recovered events (CLA-700). 2.2.x emits a `retry` event carrying the error and exits 0; the adapter counts that as recovered too. Either way the session is neither transient nor failed. |
 | `_contentPin` | `OPENCODE_CONFIG_CONTENT` wins over `OPENCODE_CONFIG`. The permission policy and the Code Mode rewrite live in that layer. |
+| `_chunkTimeout` | The adapter pins `providers.<id>.settings.chunkTimeout` (2.0.32's SSE-chunk bound, default 15m — the same as the phase idle watchdog) at 5m for every provider its model route names. A fake provider that sends headers and one chunk then goes silent is aborted with `SSE read timed out` and exits non-zero in seconds, rather than hanging silently until the watchdog kills the session (CLA-877). |
 
 ## How the hermetic harness works
 

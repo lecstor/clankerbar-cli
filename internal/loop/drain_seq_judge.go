@@ -72,10 +72,20 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 		if st.end.claim != nil {
 			taskID = st.end.claim.Claim.TaskID
 		}
+		// CLA-877: a report-resume stall KEPT its claim on purpose (see
+		// settleWithoutCheckpoint), so the retry resumes that same run. It is
+		// safe at ANY phase index, unlike a normal dead retry: the objection to
+		// retrying a resumed phase is that invocationFor cannot re-seed a claim
+		// the dead handback cleared, and this claim was never cleared.
+		resumeOnly := st.end.reportResumeStalled != "" && st.end.claim != nil && st.end.claim.Claim.Held()
+		retryable := !st.last && (s.i == s.start || resumeOnly)
 
-		if !st.last && s.i == s.start && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
+		if retryable && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
-			if st.end.toolLoop != "" {
+			switch {
+			case st.end.reportResumeStalled != "":
+				how = "stalled re-emitting its done report (" + st.end.reportResumeStalled + ")"
+			case st.end.toolLoop != "":
 				how = "was killed (" + st.end.toolLoop + "), dead"
 			}
 			log.Printf("%siteration %d: the %s phase %s for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
@@ -98,12 +108,14 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			return seqBreak
 		}
 
-		if !st.last && s.i == s.start {
-			// A runner-claimed start must re-claim before the respawn: the dead
-			// phase handed the task back. The reclaim can land a DIFFERENT task
-			// when this one is gone, so the counters below follow what is
-			// actually held now, not what died.
-			if s.runnerClaimed {
+		if retryable {
+			// A runner-claimed start must re-claim before the respawn when the
+			// dead phase handed the task back. The reclaim can land a DIFFERENT
+			// task when this one is gone, so the counters below follow what is
+			// actually held now, not what died. A report-resume stall handed
+			// nothing back: its claim is still held, and re-claiming it would be
+			// a plane round trip against a live lease (and could only be refused).
+			if s.runnerClaimed && !resumeOnly {
 				if taskID == "" {
 					taskID = s.seen.TaskID
 				}
@@ -122,10 +134,14 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			} else {
 				s.deadRetries++
 			}
-			if st.end.toolLoop != "" {
+			switch {
+			case resumeOnly:
+				log.Printf("%siteration %d: the %s phase delivered its work but stalled re-emitting its done report (%s) — retrying it within the SAME claim %s, no handback and no reclaim (%d of %d)",
+					labelOf(t), drainNum, st.ph.Label(s.i), st.end.reportResumeStalled, claimLabel(st.end.claim.Claim), s.deadRetries, perTaskDeadBound)
+			case st.end.toolLoop != "":
 				log.Printf("%siteration %d: the %s phase was killed (%s) — retrying it (%d of %d) before any review brief sees the task",
 					labelOf(t), drainNum, st.ph.Label(s.i), st.end.toolLoop, s.deadRetries, perTaskDeadBound)
-			} else {
+			default:
 				log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
 					labelOf(t), drainNum, st.ph.Label(s.i), deadReason(st.end.claim), s.deadRetries, perTaskDeadBound)
 			}

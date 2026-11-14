@@ -7,6 +7,7 @@ package loop
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,6 +136,66 @@ func TestRunnerClaim_DeadPhaseZeroReclaimsBeforeRetry(t *testing.T) {
 	if got := h.invocations[1].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != retryRunID {
 		t.Errorf("the retry's ResumeClaim = %+v, want %s/%s — the re-claim must be planted before the respawn",
 			got, walkClaimTaskID, retryRunID)
+	}
+}
+
+// CLA-877: a phase whose ONLY failure is its report resume stalling delivered
+// its work, so the phase is retried inside the SAME claim. No handback, no
+// ExpireLease and no re-claim — the retry resumes the run already held.
+func TestRunnerClaim_ReportResumeStallRetriesInTheSameClaim(t *testing.T) {
+	b := walkClaimBrief("CLA-877")
+	f := &claimingReleaser{
+		offers: []plane.Offer{{Next: &b}},
+		claimFn: func(string, bool) (plane.ClaimedTask, error) {
+			return plane.ClaimedTask{Task: b, RunID: walkClaimRunID}, nil
+		},
+	}
+	walkClaim := harness.Claim{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID,
+		HasWIP: true, Branch: "clanker/walk",
+	}
+	// The session's own end is clean and its branch is pushed; only the report
+	// resume went silent, and the adapter says so on the marker.
+	stalled := held(okResult(1, 0), walkClaim)
+	stalled.ReportResumeStalled = "no output for 3m0s"
+	retried := reported(held(okResult(1, 0), walkClaim), harness.Report{
+		TaskID: walkClaimTaskID, Ref: "CLA-877", RunID: walkClaimRunID, Branch: "clanker/walk",
+	})
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: stalled},
+		{res: retried},
+		// The review hands the task on and settles it, so the only handback this
+		// drain could owe is the one the stalled phase must NOT take.
+		{res: held(okResult(1, 0), harness.Claim{TaskID: walkClaimTaskID, RunID: walkClaimRunID, Settled: true})},
+	}}
+	logged := captureLogs(t)
+	d := phaseDriverWithReleaser(t, h, twoPhases(), f)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (stalled phase, its retry, then review)", h.invokeCalls)
+	}
+	if len(f.claimCalls) != 1 {
+		t.Errorf("claim calls = %v, want only the runner's initial fresh claim — the retry must not re-claim a claim it still holds", f.claimCalls)
+	}
+	if got := handbacks(f, walkClaimTaskID); got != 0 {
+		t.Errorf("handed the task back %d time(s), want none — a resume-only failure keeps the claim: %+v / %+v",
+			got, f.calls, f.expireCalls)
+	}
+	if got := h.invocations[1].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != walkClaimRunID {
+		t.Errorf("the retry's ResumeClaim = %+v, want the SAME %s/%s the runner holds, not a re-claimed one",
+			got, walkClaimTaskID, walkClaimRunID)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "PHASE 1") {
+		t.Errorf("the retry was not a phase-1 session: %q", h.invocations[1].Prompt)
+	}
+	if !strings.Contains(h.invocations[2].Prompt, "PHASE 2") {
+		t.Errorf("the review phase did not run after the healthy retry: %q", h.invocations[2].Prompt)
+	}
+	if out := logged.String(); !strings.Contains(out, "SAME claim") {
+		t.Errorf("the retry was not named as running inside the held claim:\n%s", out)
 	}
 }
 

@@ -542,6 +542,11 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// gRPC's commonest transient phrasing, and a stream drop shape the anchored
 		// arms would otherwise have to guess at.
 		{"transport is closing", Result{ExitCode: 1, Stderr: "rpc error: code = Unavailable desc = transport is closing"}, true},
+		// CLA-877: the adapter pins a provider chunkTimeout, so a hung stream now
+		// ends as a provider.transport event rather than silence. A provider that
+		// stops sending mid-answer is a blip to ride out, not a config stop.
+		{"provider chunk timeout is transient", Result{ExitCode: 1, Stdout: `{"type":"error","error":{"type":"provider.transport","message":"timed out waiting for response data","status":200}}`}, true},
+		{"SSE read timeout on stderr is transient", Result{ExitCode: 1, Stderr: "Error: SSE read timed out"}, true},
 		{"stream disconnected", Result{ExitCode: 1, Stderr: "opencode: stream disconnected before the final event"}, true},
 		// The driver's OWN permission policy fails closed, so opencode refuses tools
 		// on every run by design - and if those refusals read as a fatal stop, our

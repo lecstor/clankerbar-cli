@@ -28,6 +28,12 @@ const (
 const (
 	reportBadStep  = `{"type":"step_finish","sessionID":"ses_report","part":{"type":"step-finish","reason":"stop","tokens":{"total":500,"input":100,"output":400,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`
 	reportGoodStep = `{"type":"step_finish","sessionID":"ses_report","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
+
+	// A stalled resume's evidence: the stream opens (so it is not a launch
+	// failure), reports the step it already spent, and then says nothing — the
+	// CLA-868 shape before the process was killed at the phase's 15m bound.
+	reportStallStart = `{"type":"step_start","sessionID":"ses_report","part":{"type":"step-start"}}`
+	reportStallStep  = `{"type":"step_finish","sessionID":"ses_report","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":300,"input":100,"output":200,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.02}}`
 )
 
 const reportBadStream = reportBadText + "\n" + reportBadStep
@@ -365,6 +371,156 @@ printf '%s\n%s\n' '`+reportGoodText+`' '`+reportGoodStep+`'
 	}
 	if !strings.Contains(res.FinalMessage, "too long") {
 		t.Errorf("FinalMessage = %q, want the refused report unchanged", res.FinalMessage)
+	}
+}
+
+// CLA-877: a report resume that produces NOTHING is killed at the resume's own
+// short idle bound, not the phase's, and retried once with the same steer. The
+// second attempt's corrected report is what the runner reads, and the stalled
+// attempt's spend is still charged.
+func TestReportResume_StalledResumeIsKilledAtTheShortBoundAndRetriedOnce(t *testing.T) {
+	old := opencodeReportResumeIdle
+	opencodeReportResumeIdle = 200 * time.Millisecond
+	t.Cleanup(func() { opencodeReportResumeIdle = old })
+
+	logPath := filepath.Join(t.TempDir(), "log")
+	countPath := filepath.Join(t.TempDir(), "resumes")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"not accepted by the runner"*)
+    n=$(cat "`+countPath+`" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo $n > "`+countPath+`"
+    if [ "$n" -eq 1 ]; then
+      echo '`+reportStallStart+`'
+      echo '`+reportStallStep+`'
+      exec sleep 30
+    fi
+    echo '`+reportGoodText+`'
+    echo '`+reportGoodStep+`'
+    ;;
+  *)
+    echo '`+reportBadText+`'
+    echo '`+reportBadStep+`'
+    ;;
+esac
+`)
+	console := &bytes.Buffer{}
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "Work.",
+		Console:     console,
+		ResumeClaim: reportClaim,
+		CheckReport: reportRefusesLong,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Invoke took %s — the stalled resume was not killed at the report resume's short idle bound", elapsed)
+	}
+	runs := stubRuns(t, logPath)
+	if len(runs) != 3 {
+		t.Fatalf("stub ran %d times, want 3 (the session + a stalled resume + its retry):\n%v", len(runs), runs)
+	}
+	if !strings.Contains(runs[2], "-s ses_report") || !strings.Contains(runs[2], errReportTooLong.Error()) {
+		t.Errorf("the retry did not resume the same session with the same steer: %q", runs[2])
+	}
+	if !strings.Contains(res.FinalMessage, "short") {
+		t.Errorf("FinalMessage = %q, want the retry's corrected report", res.FinalMessage)
+	}
+	if res.ReportResumeStalled != "" {
+		t.Errorf("ReportResumeStalled = %q after a successful retry, want none", res.ReportResumeStalled)
+	}
+	if want := 500 + 300 + 900; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d (the stalled attempt's spend is charged too)", res.Tokens, want)
+	}
+	out := console.String()
+	if !strings.Contains(out, "report resume stalled") || !strings.Contains(out, "retrying it with the same steer") {
+		t.Errorf("console did not announce the stall and its retry; got:\n%s", out)
+	}
+	if !strings.Contains(out, "corrected report passes the check") {
+		t.Errorf("console did not report the corrected check; got:\n%s", out)
+	}
+}
+
+// CLA-877: a SECOND stall fails closed. The report stays refused, but the
+// session's own end is preserved — no IdleKilled, the original exit code and
+// final message — and the resume-only marker tells the runner what really
+// failed, so the phase can be retried inside the claim it still holds.
+func TestReportResume_SecondStallFailsClosedAndKeepsTheSessionsOwnEnd(t *testing.T) {
+	old := opencodeReportResumeIdle
+	opencodeReportResumeIdle = 200 * time.Millisecond
+	t.Cleanup(func() { opencodeReportResumeIdle = old })
+
+	logPath := filepath.Join(t.TempDir(), "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"not accepted by the runner"*)
+    echo '`+reportStallStart+`'
+    echo '`+reportStallStep+`'
+    exec sleep 30
+    ;;
+  *)
+    echo '`+reportBadText+`'
+    echo '`+reportBadStep+`'
+    ;;
+esac
+`)
+	console := &bytes.Buffer{}
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "Work.",
+		Console:     console,
+		ResumeClaim: reportClaim,
+		CheckReport: reportRefusesLong,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Invoke took %s — a second stalled resume must be bounded too", elapsed)
+	}
+	if runs := stubRuns(t, logPath); len(runs) != 3 {
+		t.Fatalf("stub ran %d times, want 3 — at most two resume attempts, never a loop:\n%v", len(runs), runs)
+	}
+	if res.ReportResumeStalled == "" {
+		t.Error("ReportResumeStalled is empty; the runner cannot tell a resume-only failure from a dead session")
+	}
+	if !strings.Contains(res.ReportResumeStalled, "no output for") {
+		t.Errorf("ReportResumeStalled = %q, want the idle cause", res.ReportResumeStalled)
+	}
+	if res.IdleKilled != "" {
+		t.Errorf("IdleKilled = %q; the SESSION did not go silent, only its report resume did", res.IdleKilled)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the session's own clean exit preserved", res.ExitCode)
+	}
+	if !strings.Contains(res.FinalMessage, "too long") {
+		t.Errorf("FinalMessage = %q, want the refused report unchanged", res.FinalMessage)
+	}
+	if want := 500 + 300 + 300; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d (both stalled attempts' spend is charged)", res.Tokens, want)
+	}
+	out := console.String()
+	if !strings.Contains(out, "report resume stalled 2 times") || !strings.Contains(out, "session's own end stands") {
+		t.Errorf("console did not state the fail-closed outcome; got:\n%s", out)
+	}
+}
+
+// The resume's bound is its own, but a SHORTER phase dial still wins, and a
+// disabled phase watchdog does not disable it.
+func TestReportResumeIdle(t *testing.T) {
+	if got := reportResumeIdle(30 * time.Second); got != 30*time.Second {
+		t.Errorf("reportResumeIdle(30s) = %s, want the phase's stricter dial", got)
+	}
+	if got := reportResumeIdle(0); got != opencodeReportResumeIdle {
+		t.Errorf("reportResumeIdle(0) = %s, want the resume's own bound", got)
+	}
+	if got := reportResumeIdle(time.Hour); got != opencodeReportResumeIdle {
+		t.Errorf("reportResumeIdle(1h) = %s, want the resume's own bound", got)
 	}
 }
 
