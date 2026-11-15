@@ -19,9 +19,9 @@ func loadIdle(t *testing.T, doc string) *Config {
 }
 
 // The shipped watchdogs: opencode above its 10-minute bash-tool ceiling plus a
-// per-call cap (a step_finish(tool-calls) handoff pauses the idle clock, so the
-// cap is what bounds the call), claude a shorter idle bound plus a per-call cap,
-// and nothing for a harness whose adapter does not enforce the fields.
+// per-call cap (a step_start pauses the idle clock, so the cap is what bounds the
+// call), claude a shorter idle bound plus a per-call cap, and nothing for a
+// harness whose adapter does not enforce the fields.
 func TestSessionIdleDefaults(t *testing.T) {
 	c := &Config{}
 	for _, tc := range []struct {
@@ -39,8 +39,9 @@ func TestSessionIdleDefaults(t *testing.T) {
 		}
 	}
 	// opencode's idle bound must clear the 10-minute bash-tool ceiling, so a
-	// handoff the adapter missed still cannot kill an honest long command before
-	// the (longer) per-call cap does.
+	// 10-minute call survives even if the adapter never sees its step opened. A
+	// longer call with no step_start is still idle-killed - that stream is silence,
+	// not a call.
 	if idle, _ := c.SessionIdleFor("opencode"); idle <= 10*time.Minute {
 		t.Errorf("opencode max_idle = %v, want above the 10m bash-tool ceiling", idle)
 	}

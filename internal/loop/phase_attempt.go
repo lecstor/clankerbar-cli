@@ -330,8 +330,7 @@ func (r *phaseRun) classifyEnd(at *phaseAttempt) {
 	// the idle clock finding a provider that stopped answering. It is still a
 	// dead phase - no delivery came of it - and it still counts toward the fleet
 	// bound, so a fleet-wide stuck call cannot spin sessions forever; what
-	// changes is how the fleet question words it (see trips.go).
-	at.toolCallKill = at.res.IdleKilled != "" && at.res.IdleToolCall
+	// changes is how the fleet question words it (toolCapKill, trips.go).
 	at.producedNothing = at.res.Untrusted == "" && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
 }
 
@@ -493,7 +492,6 @@ func (r *phaseRun) openPhaseEnd(at *phaseAttempt) {
 		r.end.session.Cause = at.toolLoop
 	}
 	r.end.toolLoop = at.toolLoop
-	r.end.toolCallKill = at.toolCallKill
 	// The wider classification rides the end for the fleet record only — see
 	// phaseEnd.producedNothing.
 	r.end.producedNothing = at.producedNothing

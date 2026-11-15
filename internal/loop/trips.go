@@ -48,6 +48,15 @@ func outputCapStallReasoning(res harness.Result) (int, bool) {
 	return n, true
 }
 
+// toolCapKill reports that this session's kill landed while a tool call was
+// open: the TOOL CAP ended a session waiting inside one call, not the idle clock
+// finding a provider that stopped answering. Only the adapter can see that
+// window, so the predicate reads its verdict rather than re-deriving one from the
+// cause string (CLA-900).
+func toolCapKill(res *harness.Result) bool {
+	return res != nil && res.IdleKilled != "" && res.IdleToolCall
+}
+
 // fleetTrip pauses a target whose fleet dead-phase counter has reached
 // fleetDeadBound (CLA-396): that many consecutive dead phases across tasks mean
 // the harness or provider is broken right now, not the tasks, and every further
@@ -95,7 +104,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		switch {
 		case res != nil && res.ReportResumeFailed != "":
 			why = fmt.Sprintf("Each task's session delivered its work but could not re-emit its done report (%s) before this", res.ReportResumeFailed)
-		case res != nil && res.IdleKilled != "" && res.IdleToolCall:
+		case toolCapKill(res):
 			// CLA-900: the death that reached the bound was the driver's own tool
 			// cap firing on an open call. A call that never returned is a stuck
 			// call or a wait longer than the cap, not a provider that went
@@ -103,7 +112,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 			// whether the provider recovered.
 			headline = "the last session was killed waiting inside one open tool call"
 			against = "a call that is not returning"
-			why = fmt.Sprintf("Each task died before delivering anything, and the last was killed by the tool cap (%s) while a tool call it had handed control to never returned", res.IdleKilled)
+			why = fmt.Sprintf("Each task died before delivering anything, and the last was killed by the tool cap (%s) while a tool call it was waiting on never returned", res.IdleKilled)
 		}
 		body := fmt.Sprintf(
 			"**%d consecutive dead phases across tasks — %s.** %s, so the driver paused this project rather than burning more sessions against %s.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
@@ -133,7 +142,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 // (CLA-900): a tool-cap kill names the open call, everything else keeps the
 // provider-broke wording.
 func fleetHeadline(res *harness.Result) string {
-	if res != nil && res.IdleKilled != "" && res.IdleToolCall {
+	if toolCapKill(res) {
 		return "the last session was killed waiting inside one open tool call"
 	}
 	return "the provider or harness looks broken, not the tasks"

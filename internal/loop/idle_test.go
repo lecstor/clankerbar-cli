@@ -21,11 +21,14 @@ func idleKilledResult() harness.Result {
 }
 
 // toolCapKilledResult is the same, killed by the TOOL CAP while a call was open:
-// the cause names the call and IdleToolCall marks the kill as landing on it.
+// the cause names the open window and IdleToolCall marks the kill as landing on
+// it. The cause is the opencode shape - a step whose tool never returned (see
+// idleStepCall) - because that is the death the adapter could not see before
+// CLA-900.
 func toolCapKilledResult() harness.Result {
 	return harness.Result{
 		ExitCode:     -1,
-		IdleKilled:   "tool call step_finish(tool-calls) open for 30m0s",
+		IdleKilled:   "tool call step_start open for 30m0s",
 		IdleToolCall: true,
 		Tokens:       900, CostUSD: 0.09, UsageReported: true,
 	}
@@ -37,6 +40,7 @@ func toolCapKilledResult() harness.Result {
 // last session while it waited inside one open call, which is a stuck call or a
 // wait longer than the cap, not a provider that went silent (CLA-900).
 func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
+	logs := captureLogs(t)
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(toolCapKilledResult(), openClaim())},
 	}}
@@ -56,7 +60,7 @@ func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
 	if !strings.Contains(q.body, "killed waiting inside one open tool call") {
 		t.Errorf("the fleet question does not name what was observed:\n%s", q.body)
 	}
-	if !strings.Contains(q.body, "tool cap (tool call step_finish(tool-calls) open for 30m0s)") {
+	if !strings.Contains(q.body, "tool cap (tool call step_start open for 30m0s)") {
 		t.Errorf("the fleet question does not name the cap that fired:\n%s", q.body)
 	}
 	if strings.Contains(q.body, "provider or harness looks broken") {
@@ -65,11 +69,17 @@ func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
 	if strings.Contains(q.body, "already known to be failing") {
 		t.Errorf("the fleet question calls the provider failing for a tool-cap kill:\n%s", q.body)
 	}
+	// The daemon log line carries the same observation: a regression that drops
+	// the tool-cap wording there leaves the operator grep-hunting (CLA-900).
+	if out := logs.String(); !strings.Contains(out, "killed waiting inside one open tool call") {
+		t.Errorf("the fleet trip's log line does not name what was observed:\n%s", out)
+	}
 }
 
 // The contrast: a kill with NO call open is the idle clock finding a session
-// that stopped answering, so the fleet question keeps the provider-broke
-// wording and counts it (CLA-900).
+// that stopped answering, so the fleet question keeps the provider-broke wording
+// and counts it. That is the death AFTER step_finish - the model's next request
+// never answered - and it must NOT be filed as a stuck tool call (CLA-900).
 func TestDrainPhases_IdleKillStillReadsAsAProviderFailure(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(idleKilledResult(), openClaim())},
@@ -86,8 +96,12 @@ func TestDrainPhases_IdleKillStillReadsAsAProviderFailure(t *testing.T) {
 	if len(rel.questions) != 1 {
 		t.Fatalf("filed %d fleet questions, want 1: %+v", len(rel.questions), rel.questions)
 	}
-	if !strings.Contains(rel.questions[0].body, "provider or harness looks broken") {
-		t.Errorf("the idle-clock fleet question lost its provider-broke wording:\n%s", rel.questions[0].body)
+	body := rel.questions[0].body
+	if !strings.Contains(body, "provider or harness looks broken") {
+		t.Errorf("the idle-clock fleet question lost its provider-broke wording:\n%s", body)
+	}
+	if strings.Contains(body, "killed waiting inside one open tool call") || strings.Contains(body, "tool cap") {
+		t.Errorf("a post-step provider silence was filed as a tool-cap kill — no call was open:\n%s", body)
 	}
 }
 

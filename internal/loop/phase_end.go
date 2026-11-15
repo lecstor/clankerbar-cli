@@ -177,14 +177,6 @@ type phaseEnd struct {
 	// failed with the cause rather than with "died producing nothing".
 	toolLoop string
 
-	// toolCallKill reports that the kill named by toolLoop was the idle
-	// watchdog's TOOL CAP firing while a call was open (CLA-900): the session
-	// was waiting inside one legitimate long call, not hanging on a provider
-	// that stopped answering. It is still a dead phase and still counts toward
-	// the fleet bound; the flag makes the fleet question name what was observed
-	// instead of blaming the provider (trips.go).
-	toolCallKill bool
-
 	// reportResumeFailed is the cause when the pass's ONLY failure was the
 	// adapter's bounded re-emission of a refused done report: it stalled on a
 	// silent provider, or errored before producing a reply (CLA-877). The

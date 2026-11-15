@@ -62,21 +62,32 @@ exec sleep 30
 	}
 }
 
-// CLA-900: `opencode run --format json` emits no request-side tool event - a
-// tool part arrives only once it has SETTLED - so the synthetic open call a
-// step_finish(tool-calls) handoff creates is the only thing that pauses the idle
-// clock for a long call. Silence past the idle bound but under the tool cap must
-// NOT be killed: that is a CI wait or a test run, exactly what used to die.
-func TestOpencodeStepFinishHandoffPausesTheIdleClock(t *testing.T) {
+// The real order of a tool-bearing step, recorded against 2.0.32: step_start ->
+// the tool runs -> tool_use(settled, with its own state.time start/end) ->
+// step_finish(tool-calls). opencode emits no request-side tool event, so the
+// silence of a long call sits between step_start and the settled part - which is
+// why the window opens at step_start (CLA-900).
+const (
+	opencodeStepStartLine = `{"type":"step_start","sessionID":"ses_step","part":{"id":"prt_1","messageID":"msg_1","type":"step-start"}}`
+	opencodeSettledTool   = `{"type":"tool_use","sessionID":"ses_step","part":{"partID":"prt_2","type":"tool","id":"call_1","tool":"bash","state":{"status":"completed","input":{},"output":"ok"}}}`
+	opencodeToolStepEnd   = `{"type":"step_finish","sessionID":"ses_step","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":10,"input":5,"output":5,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`
+)
+
+// CLA-900: a step is silent for as long as its tool runs. Silence past the idle
+// bound but under the tool cap must NOT be killed: that is a CI wait or a test
+// run - the incident this task is about - and the step_start that precedes it is
+// the only line opencode emits before the tool result.
+func TestOpencodeStepStartPausesTheIdleClock(t *testing.T) {
 	opencodeStub(t, `#!/bin/sh
-echo '{"type":"step_finish","sessionID":"ses_handoff","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":10,"input":5,"output":5,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
+echo '`+opencodeStepStartLine+`'
 sleep 4
-echo '{"type":"step_finish","sessionID":"ses_handoff","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":5,"output":5,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
+echo '`+opencodeSettledTool+`'
+echo '`+opencodeToolStepEnd+`'
 `)
 
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:              "work",
-		MaxSessionIdle:      3 * time.Second,
+		MaxSessionIdle:      3 * time.Second, // past this, and below the tool cap
 		MaxToolCallDuration: 15 * time.Second,
 		Console:             io.Discard,
 	})
@@ -84,25 +95,25 @@ echo '{"type":"step_finish","sessionID":"ses_handoff","part":{"type":"step-finis
 		t.Fatalf("Invoke returned an error for a session that was not killed: %v", err)
 	}
 	if res.IdleKilled != "" {
-		t.Errorf("IdleKilled = %q - a step_finish(tool-calls) handoff did not pause the idle clock, so an honest wait was killed as a hang", res.IdleKilled)
+		t.Errorf("IdleKilled = %q - the step window did not pause the idle clock, so an honest wait inside one tool call was killed as a hang", res.IdleKilled)
 	}
 	if res.ExitCode != 0 {
 		t.Errorf("ExitCode = %d, want 0 - the session should have run to its own exit", res.ExitCode)
 	}
 }
 
-// CLA-900: the handoff is still BOUNDED - a call that never returns must be
+// CLA-900: the step window is still BOUNDED - a tool that never returns must be
 // killed by the tool cap, with a cause that names the cap rather than silence.
-func TestOpencodeStepFinishHandoffIsBoundedByTheToolCap(t *testing.T) {
+func TestOpencodeStepStartWindowIsBoundedByTheToolCap(t *testing.T) {
 	opencodeStub(t, `#!/bin/sh
-echo '{"type":"step_finish","sessionID":"ses_handoff","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":10,"input":5,"output":5,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
+echo '`+opencodeStepStartLine+`'
 exec sleep 30
 `)
 
 	start := time.Now()
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:              "work",
-		MaxSessionIdle:      5 * time.Second, // wide: the stub must reach its tool line before this under -race load
+		MaxSessionIdle:      5 * time.Second, // wide: the stub must reach its step line before this under -race load
 		MaxToolCallDuration: 2 * time.Second,
 		Console:             io.Discard,
 	})
@@ -112,8 +123,8 @@ exec sleep 30
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Fatalf("Invoke took %s - the tool cap did not end the session", elapsed)
 	}
-	if res.IdleKilled != "tool call "+idleHandoffCall+" open for 2s" {
-		t.Errorf("IdleKilled = %q, want the tool-cap cause naming the synthetic call", res.IdleKilled)
+	if want := "tool call " + idleStepCall + " open for 2s"; res.IdleKilled != want {
+		t.Errorf("IdleKilled = %q, want the tool-cap cause %q naming the open step", res.IdleKilled, want)
 	}
 	if !res.IdleToolCall {
 		t.Error("IdleToolCall = false - a tool-cap kill must be marked as landing on an open call")
@@ -123,14 +134,14 @@ exec sleep 30
 	}
 }
 
-// CLA-900: output after the handoff closes the synthetic call and restarts the
-// idle clock, so a session that is alive but then goes quiet is still killed for
-// idle rather than waiting out the much longer tool cap.
-func TestOpencodeOutputAfterTheHandoffResumesTheIdleClock(t *testing.T) {
+// CLA-900: output after the step line closes the window and restarts the idle
+// clock, so a session that is alive but then goes quiet is still killed for idle
+// rather than waiting out the much longer tool cap.
+func TestOpencodeOutputAfterTheStepResumesTheIdleClock(t *testing.T) {
 	opencodeStub(t, `#!/bin/sh
-echo '{"type":"step_finish","sessionID":"ses_handoff","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":10,"input":5,"output":5,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
+echo '`+opencodeStepStartLine+`'
 sleep 0.5
-echo '{"type":"text","sessionID":"ses_handoff","part":{"type":"text","text":"still working"}}'
+echo '{"type":"text","sessionID":"ses_step","part":{"type":"text","text":"still working"}}'
 exec sleep 30
 `)
 
@@ -145,16 +156,49 @@ exec sleep 30
 		t.Fatalf("Invoke returned an error for our own kill: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Fatalf("Invoke took %s - the idle clock did not resume after the output; the synthetic call stayed open until the tool cap", elapsed)
+		t.Fatalf("Invoke took %s - the idle clock did not resume after the output; the step window stayed open until the tool cap", elapsed)
 	}
 	if res.IdleKilled != "no output for 2s" {
-		t.Errorf("IdleKilled = %q, want the idle cause - output after the handoff must close the synthetic call", res.IdleKilled)
+		t.Errorf("IdleKilled = %q, want the idle cause - output after the step line must close the window", res.IdleKilled)
 	}
 	if res.FinalMessage != "still working" {
 		t.Errorf("FinalMessage = %q - the text event never parsed, so the kill landed before the output this test is about", res.FinalMessage)
 	}
 	if res.IdleToolCall {
-		t.Error("IdleToolCall = true - this kill was the idle clock after the call was closed, not the tool cap")
+		t.Error("IdleToolCall = true - this kill was the idle clock after the step window was closed, not the tool cap")
+	}
+}
+
+// CLA-900: the gap AFTER step_finish is the model's next request, not a tool.
+// The settled tool closes the step window and step_finish must not open a new
+// one, or a provider that stops answering is filed as a stuck tool call - and
+// with a cap wider than the idle bound the kill would not even happen.
+func TestOpencodeStepFinishLeavesTheIdleClockArmed(t *testing.T) {
+	opencodeStub(t, `#!/bin/sh
+echo '`+opencodeStepStartLine+`'
+echo '`+opencodeSettledTool+`'
+echo '`+opencodeToolStepEnd+`'
+exec sleep 30
+`)
+
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:              "work",
+		MaxSessionIdle:      2 * time.Second,
+		MaxToolCallDuration: 20 * time.Second,
+		Console:             io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Invoke returned an error for our own kill: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Invoke took %s - step_finish opened a window and left the session on the tool cap", elapsed)
+	}
+	if res.IdleKilled != "no output for 2s" {
+		t.Errorf("IdleKilled = %q, want the idle cause: a death after step_finish is the model wait", res.IdleKilled)
+	}
+	if res.IdleToolCall {
+		t.Error("IdleToolCall = true - step_finish must not open a tool window; no tool was running")
 	}
 }
 

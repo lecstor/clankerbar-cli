@@ -168,8 +168,8 @@ func TestIdleGuardRetargetsTheCapToTheNextOldestCall(t *testing.T) {
 }
 
 // A kill on an open call is the TOOL CAP; a kill with none open is the idle
-// clock. The driver keeps the first off the fleet breaker, so the guard has to
-// report which one fired (CLA-900).
+// clock. The driver counts both toward the fleet breaker but words the question
+// by what was observed, so the guard has to report which one fired (CLA-900).
 func TestIdleGuardReportsWhetherACallWasOpenAtTheKill(t *testing.T) {
 	t.Run("tool cap", func(t *testing.T) {
 		rec := &idleRecorder{}
@@ -207,8 +207,8 @@ func TestIdleGuardHandoffNeedsAToolCapToPauseTheClock(t *testing.T) {
 		g := newIdleGuard(time.Second, 40*time.Millisecond, rec.kill)
 		defer g.stop()
 
-		g.toolHandoff("step_finish(tool-calls)")
-		if got := waitIdleCause(t, g, 2*time.Second); got != "tool call step_finish(tool-calls) open for 40ms" {
+		g.toolHandoff(idleStepCall)
+		if got := waitIdleCause(t, g, 2*time.Second); got != "tool call "+idleStepCall+" open for 40ms" {
 			t.Errorf("cause = %q, want the tool-cap cause", got)
 		}
 	})
@@ -217,7 +217,7 @@ func TestIdleGuardHandoffNeedsAToolCapToPauseTheClock(t *testing.T) {
 		g := newIdleGuard(40*time.Millisecond, 0, rec.kill)
 		defer g.stop()
 
-		g.toolHandoff("step_finish(tool-calls)")
+		g.toolHandoff(idleStepCall)
 		if got := waitIdleCause(t, g, 2*time.Second); got != "no output for 40ms" {
 			t.Errorf("cause = %q, want the idle cause — a handoff with no cap must not pause the only bound", got)
 		}

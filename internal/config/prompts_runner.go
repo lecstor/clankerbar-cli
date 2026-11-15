@@ -19,8 +19,15 @@ import (
 // ONE tool call. The adapters kill a call left open past the harness's
 // max_tool_call, so the brief has to name a figure below it: "a bounded wait"
 // with no number is how sessions chose a wait the driver killed (CLA-900).
-// TestRunnerWaitBoundStaysUnderTheToolCallCaps pins it below both shipped caps.
-const runnerToolWaitBound = 15 * time.Minute
+//
+// Ten minutes, because a fixed figure in a package-level brief cannot see the
+// project's config. It has to clear three shipped bounds: both 30m tool caps, and
+// opencode's 15m idle bound, which is still what ends a call the adapter never
+// saw opened (claude's open calls are never idle-bounded, so its 10m idle bound
+// is not a constraint - see idleGuard). A project that lowers max_tool_call below
+// this must lower the brief too, or its sessions will choose a wait the driver
+// kills. TestRunnerWaitBoundStaysUnderTheToolCallCaps pins all three.
+const runnerToolWaitBound = 10 * time.Minute
 
 // runnerWaitRule replaces rerunGuidance's pointer at the served waiting
 // reference: a runner-claimed session is forbidden from fetching skill pages,
