@@ -34,15 +34,24 @@ func sessionCommand(ctx context.Context, niceValue int, name string, args ...str
 	if niceValue <= 0 {
 		return exec.CommandContext(ctx, name, args...), nil
 	}
-	// Resolve nice(1) here rather than letting exec fail on Start, so a machine
-	// without it reports the missing dependency instead of a session that dies
-	// with the harness's name in the error.
+	// Resolve BOTH binaries with the DAEMON's PATH. nice(1) would otherwise
+	// resolve the harness through the CHILD's PATH, and a session env allowlist
+	// that drops PATH (an operator's declared scope) would then fail to start a
+	// harness that resolves perfectly well for the daemon - a behaviour change
+	// the wrapper must not introduce.
+	harness, err := exec.LookPath(name)
+	if err != nil {
+		return nil, err
+	}
+	// Resolving nice(1) here rather than letting exec fail on Start reports a
+	// machine without it as the missing dependency it is, rather than as a
+	// harness that died.
 	bin, err := exec.LookPath("nice")
 	if err != nil {
 		return nil, fmt.Errorf("session_nice %d needs nice(1) on PATH: %w", niceValue, err)
 	}
 	argv := make([]string, 0, len(args)+3)
-	argv = append(argv, "-n", strconv.Itoa(niceValue), name)
+	argv = append(argv, "-n", strconv.Itoa(niceValue), harness)
 	argv = append(argv, args...)
 	return exec.CommandContext(ctx, bin, argv...), nil
 }

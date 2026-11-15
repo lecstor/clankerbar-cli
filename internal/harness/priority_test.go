@@ -116,15 +116,41 @@ func TestSessionCommandZeroIsThePlainSpawn(t *testing.T) {
 // A positive value REQUIRES nice(1); without it the session must fail to start
 // with a message naming the setting, not die looking like a broken harness.
 func TestSessionCommandRefusesNiceWhenItIsMissing(t *testing.T) {
-	// A PATH holding neither nice(1) nor the command: the refusal must come from
-	// our own lookup, and name session_nice.
-	t.Setenv("PATH", t.TempDir())
+	// A PATH holding the harness but no nice(1): the refusal must come from our
+	// own lookup, and name session_nice.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing stub: %v", err)
+	}
+	t.Setenv("PATH", dir)
 	_, err := sessionCommand(context.Background(), 5, "sh", "-c", "true")
 	if err == nil {
 		t.Fatal("sessionCommand with a positive session_nice and no nice(1) returned no error")
 	}
 	if !strings.Contains(err.Error(), "session_nice 5") || !strings.Contains(err.Error(), "nice(1)") {
 		t.Errorf("error = %q, want it to name session_nice and nice(1)", err)
+	}
+}
+
+// The harness is resolved with the DAEMON's PATH, so a session env allowlist
+// that drops PATH from the child's environment cannot break the spawn. Before
+// the wrapper existed the binary was resolved by the daemon for the same reason;
+// passing a bare name to nice(1) would move that resolution into the child.
+func TestSessionCommandResolvesTheHarnessWithTheDaemonsPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "fakeharness"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cmd, err := sessionCommand(context.Background(), 3, "fakeharness")
+	if err != nil {
+		t.Fatalf("sessionCommand: %v", err)
+	}
+	// The child sees a PATH that contains nothing at all.
+	cmd.Env = []string{"PATH=" + t.TempDir()}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("the wrapped harness could not start with the child's PATH empty: %v", err)
 	}
 }
 
