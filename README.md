@@ -2678,9 +2678,8 @@ and the session's `cause` carry the idle cause (`idle: no output for 15m0s`, or
 tool cap still counts toward the fleet dead-phase breaker — a fleet-wide stuck
 call must keep that bound — but the question it raises says the last session was
 killed waiting inside one open call, rather than blaming a provider that went
-silent. `0` disables a
-bound; enforced by the `claude` and `opencode` adapters, inert under `codex` and
-`copilot`.
+silent. `0` disables a bound; enforced by the `claude` and `opencode` adapters,
+inert under `codex` and `copilot`.
 
 **And one more thing is bounded: retries taken on a failure the harness could not
 name.** `opencode`'s error surface changes between versions, so beyond the anchored
