@@ -5,6 +5,7 @@ package harness
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,19 +16,32 @@ import (
 	"time"
 )
 
-// priorityOf reads a live process's scheduling priority from the KERNEL. argv is
-// what the code claims it did; this is what the machine did.
+// priorityOf reads a live process's nice value from the KERNEL. argv is what the
+// code claims it did; this is what the machine did.
 //
-// Only differences between two processes are asserted, never an absolute: the
-// kernel reports 20-nice, and the process running the test may itself be niced
-// by whatever started it.
+// Higher means lower scheduling priority. Only differences between two processes
+// are asserted, never an absolute: the process running the test may itself be
+// niced by whatever started it. kernelNice normalises the raw reading, because
+// Linux's syscall reports 20-nice while the libc-backed unixes report the nice
+// value itself.
 func priorityOf(t *testing.T, pid int) int {
 	t.Helper()
 	prio, err := syscall.Getpriority(syscall.PRIO_PROCESS, pid)
 	if err != nil {
 		t.Fatalf("getpriority(%d): %v", pid, err)
 	}
-	return prio
+	return kernelNice(prio)
+}
+
+// nicedFrom returns the nice value nice(1) gives a child of a process running at
+// parent when asked to go delta lower: it adds delta and the kernel clamps the
+// result at 19. parent is the test daemon's own value, which may not be 0 when the
+// suite itself was started under nice.
+func nicedFrom(parent, delta int) int {
+	if want := parent + delta; want <= 19 {
+		return want
+	}
+	return 19
 }
 
 // sessionTree starts a fake harness that forks a long-lived grandchild (the
@@ -85,15 +99,16 @@ func TestSessionCommandLowersTheTreePriority(t *testing.T) {
 		t.Errorf("a session with no session_nice forked a grandchild at %d, want the daemon's own %d", plainGrandchild, self)
 	}
 
-	// A niced process reports a SMALLER value (getpriority is 20-nice), so the
-	// drop is self minus the session's figure.
+	// A niced process reports a LARGER nice value, so the drop is the session's
+	// figure minus the daemon's.
 	const lowered = 10
+	want := nicedFrom(self, lowered)
 	child, grandchild := sessionTree(t, lowered)
-	if got := self - child; got != lowered {
-		t.Errorf("the session process runs %d below the daemon, want %d", got, lowered)
+	if child != want {
+		t.Errorf("the session process runs at nice %d, want %d (%d below the daemon at nice %d)", child, want, child-self, self)
 	}
-	if got := self - grandchild; got != lowered {
-		t.Errorf("the session's forked grandchild runs %d below the daemon, want %d — the priority is not inherited", got, lowered)
+	if grandchild != want {
+		t.Errorf("the session's forked grandchild runs at nice %d, want %d (%d below the daemon at nice %d) — the priority is not inherited", grandchild, want, grandchild-self, self)
 	}
 }
 
@@ -129,6 +144,32 @@ func TestSessionCommandRefusesNiceWhenItIsMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "session_nice 5") || !strings.Contains(err.Error(), "nice(1)") {
 		t.Errorf("error = %q, want it to name session_nice and nice(1)", err)
+	}
+}
+
+// A negative value must never be treated as "unchanged": config validation
+// refuses it, and the spawn does too, so another caller cannot get an unniced
+// session with no diagnostic.
+func TestSessionCommandRejectsNegative(t *testing.T) {
+	_, err := sessionCommand(context.Background(), -1, "sh", "-c", "true")
+	if err == nil || !strings.Contains(err.Error(), "session_nice -1") {
+		t.Fatalf("sessionCommand(-1) error = %v, want a refusal naming session_nice", err)
+	}
+}
+
+// A launcher that cannot even be built — opencode, or nice(1), missing from PATH —
+// is an MCP preflight miss, the same classification as a failed Start: the loop
+// retries a preflight miss once instead of ending the attempt as a dead session.
+func TestOpencodeServerConstructionErrorIsAPreflightMiss(t *testing.T) {
+	dir := t.TempDir()
+	// The harness resolves, nice(1) does not: exactly the error the dial adds.
+	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("writing stub: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	_, err := startOpencodeServer(context.Background(), 5, []string{"PATH=" + dir}, "")
+	if !errors.Is(err, ErrMCPNotConnected) {
+		t.Fatalf("startOpencodeServer error = %v, want ErrMCPNotConnected so the loop retries the preflight", err)
 	}
 }
 
@@ -191,7 +232,9 @@ func TestClaudeInvokeAppliesTheSessionPriority(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
 
-	if got := priorityOf(t, 0) - priorityOf(t, pid); got != lowered {
-		t.Errorf("the session's forked grandchild runs %d below the daemon, want %d — Invocation.Nice did not reach the spawn", got, lowered)
+	self := priorityOf(t, 0)
+	want := nicedFrom(self, lowered)
+	if got := priorityOf(t, pid); got != want {
+		t.Errorf("the session's forked grandchild runs at nice %d, want %d (%d below the daemon at nice %d) — Invocation.Nice did not reach the spawn", got, want, got-self, self)
 	}
 }

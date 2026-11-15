@@ -30,11 +30,52 @@ func TestSessionNiceDefaultsToUnchanged(t *testing.T) {
 	}
 }
 
+// The dial has to DECODE: a wrong tag name or a lost field leaves every test
+// above green (the default is 0, and the key is absent from a default marshal)
+// while the operator's session_nice is silently inert.
+func TestSessionNiceLoadsFromJSON(t *testing.T) {
+	load := func(t *testing.T, doc string) *Config {
+		t.Helper()
+		var c Config
+		if err := json.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("unmarshal %s: %v", doc, err)
+		}
+		return &c
+	}
+	if got := load(t, `{}`).SessionNice; got != 0 {
+		t.Errorf("unset session_nice = %d, want 0", got)
+	}
+	if got := load(t, `{"session_nice": 10}`).SessionNice; got != 10 {
+		t.Errorf("session_nice 10 decoded as %d", got)
+	}
+}
+
 func TestValidateSessionNice(t *testing.T) {
 	base := func() *Config {
 		return &Config{Harness: "claude", Prompt: "work", BacklogURL: "https://clankerbar.com", WorkDir: t.TempDir()}
 	}
-	for _, nice := range []int{0, 1, 10, maxSessionNice} {
+	// On a platform that cannot honour the dial validation refuses every positive
+	// value; on a supported one it accepts it. Pin whichever side this build is.
+	positives := []int{1, 10, maxSessionNice}
+	if harness.SessionPrioritySupported {
+		for _, nice := range positives {
+			cfg := base()
+			cfg.SessionNice = nice
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("session_nice %d was refused on a supported platform: %v", nice, err)
+			}
+		}
+	} else {
+		for _, nice := range positives {
+			cfg := base()
+			cfg.SessionNice = nice
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "session_nice") {
+				t.Errorf("session_nice %d on an unsupported platform: error = %v, want a refusal naming session_nice", nice, err)
+			}
+		}
+	}
+	for _, nice := range []int{0} {
 		cfg := base()
 		cfg.SessionNice = nice
 		if err := cfg.Validate(); err != nil {

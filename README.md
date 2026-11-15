@@ -1420,7 +1420,8 @@ the loop's own `STOP`/`HALT` switch; under a workdir nothing runs in *yet* it is
 the same trap for the next `projects[]` entry that inherits it), **workdir** (per
 project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **session_nice** (the
-scheduling priority every session will start at, so a dial whose whole point is
+scheduling priority every session will start at, and whether `nice(1)` is on
+PATH to apply it, so a dial whose whole point is
 invisible at runtime is visible before the run), **permissions**
 (harness-specific policy sanity), **opencode_ambient_config** (an opencode
 config the driver never named that a session merges anyway: one whose
@@ -2085,9 +2086,11 @@ covered without a repo opting in). The daemon's own priority is untouched, so
 its plane calls and git work stay at full speed, and the supervisor's
 conflict-resolution sessions spawn through the same path, so they inherit the
 dial too. A positive value is **refused at validation** on a platform with no
-`nice(1)` rather than ignored: an operator who set the dial believes CI is
-protected from their sessions, and a silent no-op would leave them believing it.
-`doctor` reports the effective value.
+scheduling-priority support at all, rather than ignored: an operator who set the
+dial believes CI is protected from their sessions, and a silent no-op would
+leave them believing it. On a unix host the dial also needs `nice(1)` on the
+daemon's PATH — without it every session fails at spawn — so `doctor` checks for
+the binary and reports the effective value.
 
 `clone_url_base` (default `https://github.com/`) is the URL **prefix** the
 supervisor's workdir derivation clones a missing repo from:

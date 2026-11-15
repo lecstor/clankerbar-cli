@@ -116,7 +116,10 @@ func opencodeWorkDir(dir string) string {
 func startOpencodeServer(ctx context.Context, niceValue int, env []string, dir string) (*opencodeServer, error) {
 	cmd, err := sessionCommand(ctx, niceValue, "opencode", "serve", "--port", "0", "--hostname", "127.0.0.1")
 	if err != nil {
-		return nil, err
+		// Building the launcher failed (opencode or nice(1) is not on PATH). That
+		// is the same preflight miss as a failed Start, not a session that ran and
+		// died, so it carries the same classification and gets the loop's retry.
+		return nil, fmt.Errorf("%w: preparing opencode serve: %v", ErrMCPNotConnected, err)
 	}
 	setupProcessGroup(cmd)
 	if dir != "" {
