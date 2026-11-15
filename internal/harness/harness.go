@@ -752,6 +752,14 @@ type Result struct {
 	// session, set after the stream is parsed, never a figure parsed out of it.
 	IdleKilled string
 
+	// IdleToolCall reports that the kill named by IdleKilled landed while a tool
+	// call was open — the TOOL CAP, not the idle clock. The distinction decides
+	// how the death is read: a cap kill says the driver's own bound ended a
+	// session that was waiting inside one call (a CI wait, a long test run), so
+	// it is not evidence that the provider or harness is failing. False before
+	// any kill and for an idle-clock kill.
+	IdleToolCall bool
+
 	// ReportResumeFailed is the cause when the adapter's bounded re-emission of
 	// a refused done report failed: it stalled on a silent provider and was
 	// killed by the REPORT RESUME's own short idle bound, its process errored

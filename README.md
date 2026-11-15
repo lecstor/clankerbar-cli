@@ -2048,7 +2048,7 @@ instance the supervisor reads.
   "retry_cap": "5m",
   "max_zero_spend_attempts": 3,
   "max_repeated_tool_failures": 5,
-  "session_idle": {"opencode": {"max_idle": "15m"}, "claude": {"max_idle": "10m", "max_tool_call": "30m"}},
+  "session_idle": {"opencode": {"max_idle": "15m", "max_tool_call": "30m"}, "claude": {"max_idle": "10m", "max_tool_call": "30m"}},
   "echo_sessions": false,
   "session_nice": 0,
   "budget": {
@@ -2695,14 +2695,26 @@ Enforced by the `claude` and `opencode` adapters, which see tool results as they
 stream; inert under `codex` and `copilot`.
 
 **A session that goes silent is killed.** `session_idle` is the no-output
-watchdog: a session silent for `max_idle` is ended by the driver. Under `claude`
-the clock pauses while a tool call is open, and `max_tool_call` caps that single
-call; `opencode` emits nothing while a tool is running, so its idle bound has to
-stay above its own 10-minute bash-tool ceiling. A killed session is classified
-**dead, no delivery**, exactly as a tool-loop kill is: the daemon log and the
-session's `cause` carry the idle cause (`idle: no output for 15m0s`, or
-`idle: tool call ... open for 30m0s` when the per-call cap fired). `0` disables a
-bound; enforced by the `claude` and `opencode` adapters, inert under `codex` and
+watchdog: a session silent for `max_idle` is ended by the driver. While a tool
+call is open the clock pauses, and `max_tool_call` caps that single call. Under
+`claude` the call window comes from its tool-use/tool-result events. Under
+`opencode`, which forwards a tool part only once it has SETTLED, the window is the
+whole step: `step_start` opens it and `step_finish` closes it, so every line a
+step emits in between — the text that announces a wait, an earlier tool that
+returned — stays inside one bounded window, and a long CI wait or test run is
+bounded by `max_tool_call` instead of being killed as a hang. The silence after
+`step_finish` is the model's next request and stays on the idle clock, so a
+provider that stops answering is still an idle kill. `opencode`'s idle bound still
+sits above its own 10-minute bash-tool ceiling, so a 10-minute call survives even
+if the adapter never sees its step opened; a longer stream with no `step_start` is
+still idle-killed. A killed session is classified **dead, no delivery**, exactly as
+a tool-loop kill is: the daemon log and the session's `cause` carry the idle cause
+(`idle: no output for 15m0s`, or `idle: tool call ... open for 30m0s` when the
+per-call cap fired). A kill that lands while a call is open still counts toward
+the fleet dead-phase breaker — a fleet-wide stuck call must keep that bound — but
+the question it raises says the last session was killed waiting inside one open
+call, rather than blaming a provider that went silent. `0` disables a bound;
+enforced by the `claude` and `opencode` adapters, inert under `codex` and
 `copilot`.
 
 **And one more thing is bounded: retries taken on a failure the harness could not

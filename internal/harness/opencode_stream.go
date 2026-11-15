@@ -207,6 +207,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		res.IdleKilled = ""
 	} else {
 		res.IdleKilled = p.idleCause()
+		res.IdleToolCall = res.IdleKilled != "" && p.idle.trippedWithOpenCall()
 	}
 
 	// Our own deadline, not the caller's: ctx.Err() distinguishes a session we
@@ -530,7 +531,29 @@ func (p *opencodeParse) armIdle(in Invocation) {
 // idleCause is the watchdog's verdict, "" unless it fired.
 func (p *opencodeParse) idleCause() string { return p.idle.tripped() }
 
+// idleStepCall is the synthetic tool call an opencode STEP opens in the idle
+// guard: the step IS the call window this stream exposes.
+//
+// opencode forwards a tool part only once it has settled and gives no
+// request-side tool event at all (see noteTool), so a long call's silence sits
+// somewhere between the step's step_start and its step_finish. The window
+// therefore spans the WHOLE step: step_start opens it and step_finish closes it,
+// and nothing in between does. A text part or an earlier settled tool inside the
+// step can precede another tool run in the same step (the incident: a
+// "Blocking on it with a bounded wait" text line followed by a 15-minute tool
+// wait), so closing on any such line would hand that call's silence back to the
+// idle clock - the bug this task is about.
+//
+// Opening the window at step_finish instead (the obvious-looking signal: reason
+// "tool-calls") would pause the clock for the model's NEXT request, the one thing
+// that must stay on the idle clock (CLA-900).
+const idleStepCall = "step_start"
+
 func (p *opencodeParse) line(line []byte) {
+	// Output restarts the idle clock unless a step window is open. Only
+	// step_finish closes that window (below): every line between step_start and
+	// step_finish belongs to the step that may be running a tool, and a real call
+	// carries its own settled tool part, which noteTool closes.
 	p.idle.seen()
 	trimmed := strings.TrimSpace(string(line))
 	if !strings.HasPrefix(trimmed, "{") {
@@ -563,6 +586,19 @@ func (p *opencodeParse) line(line []byte) {
 		// error; it counts as recovered once something follows it.
 		p.lastEventWasError = ev.Type == "error" || (ev.Type == "retry" && ev.Error != nil)
 	}
+	// CLA-900: the step is the call window this stream exposes. step_start opens
+	// it - the last line before the step's tools run, because a tool's own part
+	// arrives only after it returned - and step_finish closes it. Handled before
+	// the Part check so a step boundary moves the window whatever its part looks
+	// like; a fresh step_start RESTARTS the window, so a step that ended without
+	// a step_finish (a provider retry, the final answer) cannot leave an old start
+	// to cap a live session.
+	switch ev.Type {
+	case "step_start":
+		p.idle.toolHandoff(idleStepCall)
+	case "step_finish":
+		p.idle.toolFinished(idleStepCall)
+	}
 	if ev.Part == nil {
 		return
 	}
@@ -582,6 +618,11 @@ func (p *opencodeParse) line(line []byte) {
 			p.lastText = t
 		}
 	case "step_finish":
+		// CLA-900: the step window is CLOSED above, before the Part check. A
+		// step_finish must never OPEN one: it is published after the step's tools
+		// have returned, so the silence that follows it is the model's NEXT
+		// request - an idle-clock question, never a tool-cap one.
+		//
 		// The reason rides on the same part as the usage. The LAST one wins: it
 		// is the step the session's stream ended on, which is the step that says
 		// whether a final answer was produced.
@@ -652,7 +693,9 @@ func (p *opencodeParse) line(line []byte) {
 //
 // A part still in flight is not a claim, but it DOES open a tool call for the
 // idle watchdog: the session is working rather than hanging, and the call's own
-// cap bounds it (see idleGuard).
+// cap bounds it (see idleGuard). On today's stream this branch never fires —
+// opencode forwards only settled parts — and the call window comes from the step
+// itself instead (step_start .. step_finish; see idleStepCall).
 //
 // A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
 // a re-delivered terminal event for a claim already settled by a later

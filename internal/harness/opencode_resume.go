@@ -248,9 +248,11 @@ func mergeResume(base *Result, add Result) {
 	}
 	// The idle watchdog's verdict folds the same way: a continuation killed for
 	// silence is how the merged session ended, and its cause must survive the
-	// merge or the driver would see an unexplained exit.
+	// merge or the driver would see an unexplained exit. Whether that kill was
+	// the tool CAP (a call was open) is part of the verdict, so it moves with it.
 	if add.IdleKilled != "" && base.IdleKilled == "" {
 		base.IdleKilled = add.IdleKilled
+		base.IdleToolCall = add.IdleToolCall
 	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD

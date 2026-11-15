@@ -20,6 +20,128 @@ func idleKilledResult() harness.Result {
 	return harness.Result{ExitCode: -1, IdleKilled: "no output for 15m0s", Tokens: 900, CostUSD: 0.09, UsageReported: true}
 }
 
+// toolCapKilledResult is the same, killed by the TOOL CAP while a call was open:
+// the cause names the open window and IdleToolCall marks the kill as landing on
+// it. The cause is the opencode shape - a step whose tool never returned (see
+// idleStepCall) - because that is the death the adapter could not see before
+// CLA-900.
+func toolCapKilledResult() harness.Result {
+	return harness.Result{
+		ExitCode:     -1,
+		IdleKilled:   "tool call step_start open for 30m0s",
+		IdleToolCall: true,
+		Tokens:       900, CostUSD: 0.09, UsageReported: true,
+	}
+}
+
+// A tool-cap kill is still a death, so it still counts toward the fleet bound -
+// a fleet-wide stuck call must not spin sessions forever. But the question the
+// trip raises must say what was OBSERVED: the driver's own tool cap ended the
+// last session while it waited inside one open call, which is a stuck call or a
+// wait longer than the cap, not a provider that went silent (CLA-900).
+func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(toolCapKilledResult(), openClaim())},
+	}}
+	d, rel := deadReleaserDriver(t, h)
+	d.fleetDead[0] = fleetDeadBound - 1 // the next death trips it
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if !d.fleetPaused[0] {
+		t.Error("fleet pause not set — a run of deaths must still pause the project, whatever killed them")
+	}
+	if len(rel.questions) != 1 {
+		t.Fatalf("filed %d questions, want 1: %+v", len(rel.questions), rel.questions)
+	}
+	q := rel.questions[0]
+	if !strings.Contains(q.body, "killed waiting inside one open tool call") {
+		t.Errorf("the fleet question does not name what was observed:\n%s", q.body)
+	}
+	if !strings.Contains(q.body, "stayed open (tool call step_start open for 30m0s)") {
+		t.Errorf("the fleet question does not name the cap that fired:\n%s", q.body)
+	}
+	if strings.Contains(q.body, "provider or harness looks broken") {
+		t.Errorf("the fleet question blames the provider for a tool-cap kill:\n%s", q.body)
+	}
+	if strings.Contains(q.body, "already known to be failing") {
+		t.Errorf("the fleet question calls the provider failing for a tool-cap kill:\n%s", q.body)
+	}
+	// The daemon log line carries the same observation: a regression that drops
+	// the tool-cap wording there leaves the operator grep-hunting (CLA-900).
+	if out := logs.String(); !strings.Contains(out, "killed waiting inside one open tool call") {
+		t.Errorf("the fleet trip's log line does not name what was observed:\n%s", out)
+	}
+}
+
+// The adapter's verdict, not the cause string, is what classifies the death: an
+// idle-clock cause that arrived with a call still open is still a session that
+// was waiting inside one call, so the question names the observation and never
+// blames the provider (CLA-900, finding 1.2).
+func TestDrainPhases_IdleKillInsideAnOpenCallNamesTheWaitingCall(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(harness.Result{
+			ExitCode:     -1,
+			IdleKilled:   "no output for 15m0s",
+			IdleToolCall: true,
+			Tokens:       900, CostUSD: 0.09, UsageReported: true,
+		}, openClaim())},
+	}}
+	d, rel := deadReleaserDriver(t, h)
+	d.fleetDead[0] = fleetDeadBound - 1
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if !d.fleetPaused[0] {
+		t.Error("fleet pause not set - a run of deaths must still pause the project, whatever killed them")
+	}
+	if len(rel.questions) != 1 {
+		t.Fatalf("filed %d questions, want 1: %+v", len(rel.questions), rel.questions)
+	}
+	body := rel.questions[0].body
+	if !strings.Contains(body, "killed waiting inside one open tool call") {
+		t.Errorf("the fleet question does not name the open call:\n%s", body)
+	}
+	if !strings.Contains(body, "no output for 15m0s") {
+		t.Errorf("the fleet question does not carry the cause the adapter reported:\n%s", body)
+	}
+	if strings.Contains(body, "provider or harness looks broken") || strings.Contains(body, "already known to be failing") {
+		t.Errorf("an open-call death was filed as a provider failure:\n%s", body)
+	}
+}
+
+// The contrast: a kill with NO call open is the idle clock finding a session
+// that stopped answering, so the fleet question keeps the provider-broke wording
+// and counts it. That is the death AFTER step_finish - the model's next request
+// never answered - and it must NOT be filed as a stuck tool call (CLA-900).
+func TestDrainPhases_IdleKillStillReadsAsAProviderFailure(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(idleKilledResult(), openClaim())},
+	}}
+	d, rel := deadReleaserDriver(t, h)
+	d.fleetDead[0] = fleetDeadBound - 1
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if !d.fleetPaused[0] {
+		t.Error("fleet pause not set — an idle-clock kill is still provider-failure evidence and must trip at the bound")
+	}
+	if len(rel.questions) != 1 {
+		t.Fatalf("filed %d fleet questions, want 1: %+v", len(rel.questions), rel.questions)
+	}
+	body := rel.questions[0].body
+	if !strings.Contains(body, "provider or harness looks broken") {
+		t.Errorf("the idle-clock fleet question lost its provider-broke wording:\n%s", body)
+	}
+	if strings.Contains(body, "killed waiting inside one open tool call") || strings.Contains(body, "tool cap") {
+		t.Errorf("a post-step provider silence was filed as a tool-cap kill — no call was open:\n%s", body)
+	}
+}
+
 func TestDrainPhases_IdleKilledPhaseIsDeadNotACheckpoint(t *testing.T) {
 	logs := captureLogs(t)
 	h := &fakeAdapter{steps: []invokeStep{
@@ -46,8 +168,8 @@ func TestDrainPhases_IdleKilledPhaseIsDeadNotACheckpoint(t *testing.T) {
 }
 
 // The resolved bounds reach the adapter on the invocation, per phase harness:
-// opencode gets the longer idle bound and no per-call cap, claude a shorter idle
-// bound plus a per-call cap, with default config.
+// opencode gets the longer idle bound and its own per-call cap, claude a shorter
+// idle bound plus a per-call cap, with default config.
 func TestInvocationForArmsTheSessionIdleWatchdog(t *testing.T) {
 	phases := []config.Phase{
 		{Name: config.ImplementPhaseName},
@@ -55,14 +177,14 @@ func TestInvocationForArmsTheSessionIdleWatchdog(t *testing.T) {
 	}
 	d, _ := phaseDriver(t, &fakeAdapter{}, phases)
 
-	// claude: 10m idle, 30m per call. opencode: 15m idle, no per-call cap.
+	// claude: 10m idle, 30m per call. opencode: 15m idle, 30m per call.
 	for _, tc := range []struct {
 		idx      int
 		idle     time.Duration
 		toolCall time.Duration
 	}{
 		{0, 10 * time.Minute, 30 * time.Minute},
-		{1, 15 * time.Minute, 0},
+		{1, 15 * time.Minute, 30 * time.Minute},
 	} {
 		inv, err := d.invocationFor(d.targets[0], tc.idx, phases[tc.idx], nil, "", "", phases, nil, "")
 		if err != nil {

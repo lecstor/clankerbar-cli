@@ -102,6 +102,12 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			return seqBreak
 		}
 
+		// CLA-900: a TOOL-CAP kill is still a death, so it still counts - a run
+		// of them across tasks must keep the fleet bound, or a fleet-wide stuck
+		// call (a hung MCP server) would spin sessions forever: the per-task
+		// counter resets whenever a retry lands a different task. What changes is
+		// the QUESTION: fleetTrip words a cap kill by what was observed instead
+		// of blaming the provider (see trips.go).
 		d.fleetDead[ti]++
 		if d.fleetDead[ti] >= fleetDeadBound {
 			d.fleetTrip(ctx, t, ti, drainNum, st.end.claim)

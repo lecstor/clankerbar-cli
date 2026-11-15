@@ -40,6 +40,9 @@ func TestClaudeIdleKillsASilentSession(t *testing.T) {
 	if !strings.HasPrefix(res.IdleKilled, "no output for ") {
 		t.Errorf("IdleKilled = %q, want the no-output cause", res.IdleKilled)
 	}
+	if res.IdleToolCall {
+		t.Error("IdleToolCall = true for an idle-clock kill — no call was open, and the fleet question must not name one")
+	}
 	if res.ExitCode == 0 {
 		t.Error("ExitCode = 0 - the child was not killed")
 	}
@@ -68,6 +71,9 @@ exec sleep 30
 	}
 	if res.IdleKilled != "tool call toolu_1 open for 4s" {
 		t.Errorf("IdleKilled = %q, want the tool-cap cause naming the open call", res.IdleKilled)
+	}
+	if !res.IdleToolCall {
+		t.Error("IdleToolCall = false - a tool-cap kill must be marked as landing on an open call, or the loop files a claude cap kill as a provider failure")
 	}
 	if res.ExitCode == 0 {
 		t.Error("ExitCode = 0 - the child was not killed")
