@@ -83,7 +83,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 			return mcpPreflightFailure(sctx, ctx, err)
 		}
 		if len(names) > 0 {
-			srv, err = startOpencodeServer(sctx, env, workDir)
+			srv, err = startOpencodeServer(sctx, in.Nice, env, workDir)
 			if err != nil {
 				return mcpPreflightFailure(sctx, ctx, err)
 			}
@@ -105,7 +105,10 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// guard is off, so there is one shape of exec context below.
 	lctx, loopKill := context.WithCancel(sctx)
 	defer loopKill()
-	cmd := exec.CommandContext(lctx, "opencode", runArgs...)
+	cmd, err := sessionCommand(lctx, in.Nice, "opencode", runArgs...)
+	if err != nil {
+		return Result{}, err
+	}
 	setupProcessGroup(cmd)
 	if workDir != "" {
 		cmd.Dir = workDir

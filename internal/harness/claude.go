@@ -118,7 +118,10 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// switch the ceiling needs — see consume.
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
+	cmd, err := sessionCommand(sctx, in.Nice, "claude", claudeArgs(in)...)
+	if err != nil {
+		return Result{}, err
+	}
 	setupProcessGroup(cmd)
 	// Kill the whole process group (descendants holding inherited pipes)
 	// rather than only the direct child, on ANY cancellation of sctx - the
@@ -705,7 +708,10 @@ func (u usage) normalised() TokenUsage {
 // answer "am I still limited?" — no streaming, no console.
 func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	args := []string{"-p", ".", "--output-format", "json", "--permission-mode", "dontAsk", "--allowedTools", ""}
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd, err := sessionCommand(ctx, in.Nice, "claude", args...)
+	if err != nil {
+		return Result{}, err
+	}
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}

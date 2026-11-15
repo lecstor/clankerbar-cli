@@ -357,6 +357,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		SettingsPath:  hc.SettingsPath,
 		Env:           env,
 		EnvAllowlist:  d.cfg.SessionEnvAllowlist(harnessName, t.Name),
+		Nice:          d.cfg.SessionNice,
 		Probe:         probe,
 	}, nil
 }

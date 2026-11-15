@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
 	"slices"
 	"time"
 )
@@ -149,7 +148,10 @@ func (o opencode) settleUsage(ctx context.Context, in Invocation, res *Result, s
 func (o opencode) exportSession(ctx context.Context, in Invocation, sid string) (opencodeExport, error) {
 	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opencodeExportTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ectx, "opencode", "session", "export", "--standalone", sid)
+	cmd, err := sessionCommand(ectx, in.Nice, "opencode", "session", "export", "--standalone", sid)
+	if err != nil {
+		return opencodeExport{}, err
+	}
 	setupProcessGroup(cmd)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
