@@ -152,7 +152,10 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	}
 	defer cancel()
 
-	cmd := exec.CommandContext(sctx, "copilot", copilotArgs(in)...)
+	cmd, err := sessionCommand(sctx, in.Nice, "copilot", copilotArgs(in)...)
+	if err != nil {
+		return Result{}, err
+	}
 	setupProcessGroup(cmd)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir

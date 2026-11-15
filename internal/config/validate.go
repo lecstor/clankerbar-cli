@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -14,6 +15,11 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
+
+// maxSessionNice is the highest session_nice the kernel honours: every value
+// above 19 is clamped down to 19, so accepting one would let the config read as
+// a stronger setting than the machine applies.
+const maxSessionNice = 19
 
 // StepHarnessError is Validate's refusal for a configured STEP whose harness
 // this machine cannot run: a phase, or a review-panel member, that names a
@@ -258,6 +264,21 @@ func (c *Config) validateLimits() error {
 	// negative is a typo that would otherwise disable it silently.
 	if c.MaxRepeatedToolFailures != nil && *c.MaxRepeatedToolFailures < 0 {
 		return errors.New("max_repeated_tool_failures is negative")
+	}
+	// The priority offset a session runs at. Negative would mean scheduling the
+	// fleet ABOVE everything else — only a privileged process can do it, and an
+	// unattended fleet is exactly what must not. Above 19 the kernel clamps to
+	// 19, so a larger number would read as a stronger setting than it is.
+	if c.SessionNice < 0 {
+		return errors.New("session_nice is negative (0 = the daemon's own priority, 10 is a reasonable shared-machine value)")
+	}
+	if c.SessionNice > maxSessionNice {
+		return fmt.Errorf("session_nice %d exceeds %d (the kernel clamps every value above it)", c.SessionNice, maxSessionNice)
+	}
+	// Refused, not ignored: an operator who set this believes CI is protected
+	// from their sessions, and a silent no-op leaves them believing it.
+	if c.SessionNice > 0 && !harness.SessionPrioritySupported {
+		return fmt.Errorf("session_nice %d is unsupported on %s: this platform has no nice(1) to lower a session's scheduling priority with", c.SessionNice, runtime.GOOS)
 	}
 	// The plane refuses an instance name over 100 characters (CLA-465's report
 	// bounds), so a beacon carrying one would be dropped on EVERY poll — reporting

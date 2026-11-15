@@ -317,6 +317,20 @@ type Invocation struct {
 	// before exec; Env is still appended in full, because a declared value is
 	// an instruction for the session rather than inherited state.
 	EnvAllowlist []string
+
+	// Nice is how much LOWER than the daemon this session's processes should be
+	// scheduled: 0 (the default) is unchanged, and a positive value runs the
+	// harness and everything it forks — test runners, builds, dev servers — at
+	// that much worse a priority. It is for a machine where the drain fleet
+	// shares cores with something that must not wait, such as a self-hosted CI
+	// runner: the kernel serves the other process first under contention and
+	// still gives the session everything when the machine is idle.
+	//
+	// The driver resolves it from Config.SessionNice. Only a supported platform
+	// accepts a positive value (SessionPrioritySupported); adapters go through
+	// sessionCommand, which applies it at spawn so the whole tree inherits it.
+	Nice int
+
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool
