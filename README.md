@@ -2082,7 +2082,9 @@ machine when CI is idle — which is what separates this from a cgroup CPU quota
 (no ceiling is imposed when nothing else needs the CPU) and from capping test
 workers in an env var (priority is per-process-tree, so every toolchain is
 covered without a repo opting in). The daemon's own priority is untouched, so
-its plane calls and git work stay at full speed. A positive value is **refused at
+its plane calls and git work stay at full speed, and the supervisor's
+conflict-resolution sessions spawn through the same path, so they inherit the
+dial too. A positive value is **refused at
 validation** on a platform with no `nice(1)` rather than ignored: an operator who
 set the dial believes CI is protected from their sessions, and a silent no-op
 would leave them believing it. `doctor` reports the effective value.

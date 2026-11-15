@@ -36,8 +36,6 @@ func checkSessionPriority(cfg *config.Config) check {
 	}
 	c.status = pass
 	c.detail = fmt.Sprintf("%d - every harness session, and everything it spawns, starts %d below the daemon", cfg.SessionNice, cfg.SessionNice)
-	if cfg.SessionNice >= 10 {
-		c.info = append(c.info, "so a CI runner sharing this machine wins the CPU when they contend, and sessions still use all of it when CI is idle")
-	}
+	c.info = append(c.info, "so a CI runner sharing this machine wins the CPU when they contend, and sessions still use all of it when CI is idle")
 	return c
 }
