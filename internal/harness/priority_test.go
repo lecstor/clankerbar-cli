@@ -35,13 +35,14 @@ func priorityOf(t *testing.T, pid int) int {
 
 // nicedFrom returns the nice value nice(1) gives a child of a process running at
 // parent when asked to go delta lower: it adds delta and the kernel clamps the
-// result at 19. parent is the test daemon's own value, which may not be 0 when the
-// suite itself was started under nice.
+// result at the PLATFORM's ceiling, maxNice (19 on Linux, 20 on the BSDs). parent
+// is the test daemon's own value, which may not be 0 when the suite itself was
+// started under nice.
 func nicedFrom(parent, delta int) int {
-	if want := parent + delta; want <= 19 {
+	if want := parent + delta; want <= maxNice {
 		return want
 	}
-	return 19
+	return maxNice
 }
 
 // sessionTree starts a fake harness that forks a long-lived grandchild (the
