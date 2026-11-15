@@ -2084,10 +2084,10 @@ workers in an env var (priority is per-process-tree, so every toolchain is
 covered without a repo opting in). The daemon's own priority is untouched, so
 its plane calls and git work stay at full speed, and the supervisor's
 conflict-resolution sessions spawn through the same path, so they inherit the
-dial too. A positive value is **refused at
-validation** on a platform with no `nice(1)` rather than ignored: an operator who
-set the dial believes CI is protected from their sessions, and a silent no-op
-would leave them believing it. `doctor` reports the effective value.
+dial too. A positive value is **refused at validation** on a platform with no
+`nice(1)` rather than ignored: an operator who set the dial believes CI is
+protected from their sessions, and a silent no-op would leave them believing it.
+`doctor` reports the effective value.
 
 `clone_url_base` (default `https://github.com/`) is the URL **prefix** the
 supervisor's workdir derivation clones a missing repo from:

@@ -26,7 +26,9 @@ const SessionPrioritySupported = true
 //
 // nice(1) raises its own priority and then execs the target, so the child keeps
 // one pid: the adapters' process-group kill, WaitDelay and Cancel all still see
-// exactly the process they started.
+// exactly the process they started. It is used rather than a setpriority call
+// after Start, which would leave a window in which the child runs at the daemon's
+// priority, and rather than a SysProcAttr field, which Linux does not offer.
 //
 // A value of 0 is the byte-for-byte old shape — a plain exec.CommandContext with
 // no wrapper between the daemon and the harness.
