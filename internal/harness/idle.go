@@ -17,7 +17,9 @@ import (
 // While no tool call is open, the guard kills after `idle` without output. While
 // one or more calls are open the idle clock is paused, because a long build or a
 // slow MCP call is legitimate work with no output, and instead the oldest open
-// call is bounded by `toolCap`.
+// call is bounded by `toolCap`. A harness that cannot see a call in flight
+// (opencode forwards only settled tool parts) opens a SYNTHETIC call on its
+// handoff signal; see toolHandoff.
 //
 // Zero idle disables everything, including the tool cap: with no watchdog there
 // is nothing to pause or bound.
@@ -113,6 +115,18 @@ func (g *idleGuard) toolStarted(id string) {
 		return
 	}
 	g.disarmLocked()
+}
+
+// toolHandoff opens a SYNTHETIC call for a harness that cannot see a real call
+// in flight (opencode's step_finish(tool-calls)). It is a no-op when no tool cap
+// is configured: with nothing to bound the call, pausing the idle clock would
+// leave a stuck call with no watchdog at all, so the idle clock stays armed —
+// the same bound the session had before the handoff signal existed.
+func (g *idleGuard) toolHandoff(id string) {
+	if !g.enabled() || g.toolCap <= 0 {
+		return
+	}
+	g.toolStarted(id)
 }
 
 // toolFinished records that a tool call has settled. When it was the oldest open

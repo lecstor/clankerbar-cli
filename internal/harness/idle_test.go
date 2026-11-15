@@ -197,3 +197,29 @@ func TestIdleGuardReportsWhetherACallWasOpenAtTheKill(t *testing.T) {
 		}
 	})
 }
+
+// A synthetic handoff pauses the clock only when a tool cap can bound it. With
+// no cap, pausing would leave the call with no watchdog at all, so the idle
+// clock must stay armed (CLA-900).
+func TestIdleGuardHandoffNeedsAToolCapToPauseTheClock(t *testing.T) {
+	t.Run("with a cap", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(time.Second, 40*time.Millisecond, rec.kill)
+		defer g.stop()
+
+		g.toolHandoff("step_finish(tool-calls)")
+		if got := waitIdleCause(t, g, 2*time.Second); got != "tool call step_finish(tool-calls) open for 40ms" {
+			t.Errorf("cause = %q, want the tool-cap cause", got)
+		}
+	})
+	t.Run("without a cap", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(40*time.Millisecond, 0, rec.kill)
+		defer g.stop()
+
+		g.toolHandoff("step_finish(tool-calls)")
+		if got := waitIdleCause(t, g, 2*time.Second); got != "no output for 40ms" {
+			t.Errorf("cause = %q, want the idle cause — a handoff with no cap must not pause the only bound", got)
+		}
+	})
+}

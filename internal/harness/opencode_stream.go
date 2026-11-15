@@ -620,7 +620,7 @@ func (p *opencodeParse) line(line []byte) {
 		// an honest session as a hang. The next line closes the synthetic
 		// call (see line).
 		if ev.Part.Reason == opencodeReasonToolCalls {
-			p.idle.toolStarted(idleHandoffCall)
+			p.idle.toolHandoff(idleHandoffCall)
 		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
