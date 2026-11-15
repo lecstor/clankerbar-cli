@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // runnerBriefs lists every runner-claimed brief by name, with the prohibition
@@ -425,7 +426,7 @@ func TestRunnerWaitBoundStaysUnderTheToolCallCaps(t *testing.T) {
 	if runnerToolWaitBound >= defaultOpencodeMaxTool {
 		t.Errorf("runnerToolWaitBound = %v, want below opencode's %v tool cap", runnerToolWaitBound, defaultOpencodeMaxTool)
 	}
-	if !strings.Contains(runnerWaitRule, runnerToolWaitBound.String()) {
+	if !strings.Contains(runnerWaitRule, runnerToolWaitBound.Round(time.Minute).String()) {
 		t.Errorf("runnerWaitRule does not state the bound %v:\n%s", runnerToolWaitBound, runnerWaitRule)
 	}
 }

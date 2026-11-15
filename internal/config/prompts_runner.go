@@ -28,7 +28,7 @@ const runnerToolWaitBound = 15 * time.Minute
 // instead.
 var runnerWaitRule = "Waiting on a background job: block inside ONE tool call with a bounded wait " +
 	"instead of polling across turns, and never sleep-poll - keep that one call open for no more than " +
-	runnerToolWaitBound.String() + ", because the driver kills a session whose single tool call stays open " +
+	runnerToolWaitBound.Round(time.Minute).String() + ", because the driver kills a session whose single tool call stays open " +
 	"past its own cap."
 
 // runnerRerunGuidance is rerunGuidance's bound with that pointer replaced. It is
