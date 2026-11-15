@@ -99,6 +99,7 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 	// must not report a kill for a session that had already finished.
 	res.idle.stop()
 	res.IdleKilled = res.idle.tripped()
+	res.IdleToolCall = res.IdleKilled != "" && res.idle.trippedWithOpenCall()
 	err := sc.Err()
 	if err == nil {
 		return

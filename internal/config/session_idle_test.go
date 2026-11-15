@@ -18,9 +18,10 @@ func loadIdle(t *testing.T, doc string) *Config {
 	return &c
 }
 
-// The shipped watchdogs: opencode above its 10-minute bash-tool ceiling,
-// claude a shorter idle bound plus a per-call cap, and nothing for a harness
-// whose adapter does not enforce the fields.
+// The shipped watchdogs: opencode above its 10-minute bash-tool ceiling plus a
+// per-call cap (a step_start pauses the idle clock, so the cap is what bounds the
+// call), claude a shorter idle bound plus a per-call cap, and nothing for a
+// harness whose adapter does not enforce the fields.
 func TestSessionIdleDefaults(t *testing.T) {
 	c := &Config{}
 	for _, tc := range []struct {
@@ -28,7 +29,7 @@ func TestSessionIdleDefaults(t *testing.T) {
 		idle     time.Duration
 		toolCall time.Duration
 	}{
-		{"opencode", 15 * time.Minute, 0},
+		{"opencode", 15 * time.Minute, 30 * time.Minute},
 		{"claude", 10 * time.Minute, 30 * time.Minute},
 		{"codex", 0, 0},
 	} {
@@ -37,8 +38,10 @@ func TestSessionIdleDefaults(t *testing.T) {
 			t.Errorf("%s: bounds = %v/%v, want %v/%v", tc.harness, idle, toolCall, tc.idle, tc.toolCall)
 		}
 	}
-	// opencode's idle bound must clear the 10-minute bash-tool ceiling, because
-	// opencode emits nothing while a tool runs and the clock never pauses.
+	// opencode's idle bound must clear the 10-minute bash-tool ceiling, so a
+	// 10-minute call survives even if the adapter never sees its step opened. A
+	// longer call with no step_start is still idle-killed - that stream is silence,
+	// not a call.
 	if idle, _ := c.SessionIdleFor("opencode"); idle <= 10*time.Minute {
 		t.Errorf("opencode max_idle = %v, want above the 10m bash-tool ceiling", idle)
 	}
@@ -51,8 +54,8 @@ func TestSessionIdleOverrideKeepsTheOtherDefault(t *testing.T) {
 	if idle != 20*time.Minute {
 		t.Errorf("opencode max_idle = %v, want the configured 20m", idle)
 	}
-	if toolCall != 0 {
-		t.Errorf("opencode max_tool_call = %v, want the default 0", toolCall)
+	if toolCall != 30*time.Minute {
+		t.Errorf("opencode max_tool_call = %v, want the default 30m", toolCall)
 	}
 }
 

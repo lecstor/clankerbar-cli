@@ -537,6 +537,9 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 		Model:               "run-model",
 		MaxTurns:            150,
 		MaxSessionWallClock: config.Duration(20 * time.Minute),
+		// A conflict session is a session on the same machine, so it runs at the
+		// same lowered priority as the fleet's phases (CLA-899).
+		SessionNice: 10,
 		// Not .mcp.json: that name is gated out of opencode's hand-off (CLA-318).
 		Projects: []config.Project{{Slug: "acme", MCPConfigPath: "/fleet/acme/opencode-mcp.json"}},
 	}
@@ -575,6 +578,9 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 	}
 	if inv.MaxSessionWallClock != 20*time.Minute {
 		t.Errorf("MaxSessionWallClock = %s, want the config's 20m", inv.MaxSessionWallClock)
+	}
+	if inv.Nice != 10 {
+		t.Errorf("Nice = %d, want the config's 10 (a conflict session is a spawned session too)", inv.Nice)
 	}
 }
 

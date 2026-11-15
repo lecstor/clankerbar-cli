@@ -462,6 +462,21 @@ type Config struct {
 	// identity reason as the dial above.
 	SessionIdle map[string]IdleBounds `json:"session_idle,omitempty"`
 
+	// SessionNice runs every spawned harness session's process tree at a LOWER
+	// scheduling priority: 0 (the default) leaves behaviour unchanged, and a
+	// positive value (1-19) is added to every process the session forks — test
+	// runners, builds, dev servers. It exists for a machine where the drain fleet
+	// shares cores with something that must not wait, such as a self-hosted CI
+	// runner: the kernel serves CI first while they contend, and still gives a
+	// session the whole machine when CI is idle (CLA-899).
+	//
+	// Applied at the harness spawn, by nice(1) on the child, so the whole tree
+	// inherits it and the daemon's own priority is untouched. `omitempty` is
+	// load-bearing for the same identity reason as the dials above; a positive
+	// value on a platform with no nice(1) is REFUSED at validation rather than
+	// ignored, because an operator who set it believes CI is protected.
+	SessionNice int `json:"session_nice,omitempty"`
+
 	// EchoSessions mirrors each session's output stream to the daemon's own
 	// stderr while it runs, as well as to its iteration log. Default FALSE
 	// (CLA-701): the stream is the whole harness transcript — opencode emits

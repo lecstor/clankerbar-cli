@@ -166,3 +166,87 @@ func TestIdleGuardRetargetsTheCapToTheNextOldestCall(t *testing.T) {
 		t.Errorf("cause = %q, want the cap naming the call still open", got)
 	}
 }
+
+// A kill on an open call is the TOOL CAP; a kill with none open is the idle
+// clock. The driver counts both toward the fleet breaker but words the question
+// by what was observed, so the guard has to report which one fired (CLA-900).
+func TestIdleGuardReportsWhetherACallWasOpenAtTheKill(t *testing.T) {
+	t.Run("tool cap", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(time.Second, 30*time.Millisecond, rec.kill)
+		defer g.stop()
+
+		g.toolStarted("call_1")
+		if got := waitIdleCause(t, g, 2*time.Second); got != "tool call call_1 open for 30ms" {
+			t.Fatalf("cause = %q, want the tool-cap cause", got)
+		}
+		if !g.trippedWithOpenCall() {
+			t.Error("trippedWithOpenCall = false for a tool-cap kill")
+		}
+	})
+	t.Run("idle clock", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(30*time.Millisecond, time.Second, rec.kill)
+		defer g.stop()
+
+		if got := waitIdleCause(t, g, 2*time.Second); got != "no output for 30ms" {
+			t.Fatalf("cause = %q, want the idle cause", got)
+		}
+		if g.trippedWithOpenCall() {
+			t.Error("trippedWithOpenCall = true for an idle-clock kill")
+		}
+	})
+}
+
+// A step_start always begins a new step, so a repeated handoff restarts the
+// window: a step that ended without a step_finish (a provider retry) must not
+// leave an old start that caps the step now running (CLA-900).
+func TestIdleGuardHandoffRestartsTheWindow(t *testing.T) {
+	rec := &idleRecorder{}
+	g := newIdleGuard(time.Second, time.Minute, rec.kill)
+	defer g.stop()
+
+	g.toolHandoff(idleStepCall)
+	g.mu.Lock()
+	first := g.open[0].start
+	g.mu.Unlock()
+
+	time.Sleep(20 * time.Millisecond)
+	g.toolHandoff(idleStepCall)
+	g.mu.Lock()
+	second, open := g.open[0].start, len(g.open)
+	g.mu.Unlock()
+
+	if !second.After(first) {
+		t.Errorf("the repeated handoff did not restart the window: first %v, second %v", first, second)
+	}
+	if open != 1 {
+		t.Errorf("open calls = %d, want 1 - a repeated handoff must move the window, not stack another", open)
+	}
+}
+
+// A synthetic handoff pauses the clock only when a tool cap can bound it. With
+// no cap, pausing would leave the call with no watchdog at all, so the idle
+// clock must stay armed (CLA-900).
+func TestIdleGuardHandoffNeedsAToolCapToPauseTheClock(t *testing.T) {
+	t.Run("with a cap", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(time.Second, 40*time.Millisecond, rec.kill)
+		defer g.stop()
+
+		g.toolHandoff(idleStepCall)
+		if got := waitIdleCause(t, g, 2*time.Second); got != "tool call "+idleStepCall+" open for 40ms" {
+			t.Errorf("cause = %q, want the tool-cap cause", got)
+		}
+	})
+	t.Run("without a cap", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(40*time.Millisecond, 0, rec.kill)
+		defer g.stop()
+
+		g.toolHandoff(idleStepCall)
+		if got := waitIdleCause(t, g, 2*time.Second); got != "no output for 40ms" {
+			t.Errorf("cause = %q, want the idle cause — a handoff with no cap must not pause the only bound", got)
+		}
+	})
+}

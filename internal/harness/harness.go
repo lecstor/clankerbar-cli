@@ -317,6 +317,20 @@ type Invocation struct {
 	// before exec; Env is still appended in full, because a declared value is
 	// an instruction for the session rather than inherited state.
 	EnvAllowlist []string
+
+	// Nice is how much LOWER than the daemon this session's processes should be
+	// scheduled: 0 (the default) is unchanged, and a positive value runs the
+	// harness and everything it forks — test runners, builds, dev servers — at
+	// that much worse a priority. It is for a machine where the drain fleet
+	// shares cores with something that must not wait, such as a self-hosted CI
+	// runner: the kernel serves the other process first under contention and
+	// still gives the session everything when the machine is idle.
+	//
+	// The driver resolves it from Config.SessionNice. Only a supported platform
+	// accepts a positive value (SessionPrioritySupported); adapters go through
+	// sessionCommand, which applies it at spawn so the whole tree inherits it.
+	Nice int
+
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool
@@ -737,6 +751,14 @@ type Result struct {
 	// its reader stopped at the trip. Like ToolLoop it is a verdict about the
 	// session, set after the stream is parsed, never a figure parsed out of it.
 	IdleKilled string
+
+	// IdleToolCall reports that the kill named by IdleKilled landed while a tool
+	// call was open — the TOOL CAP, not the idle clock. The distinction decides
+	// how the death is read: a cap kill says the driver's own bound ended a
+	// session that was waiting inside one call (a CI wait, a long test run), so
+	// it is not evidence that the provider or harness is failing. False before
+	// any kill and for an idle-clock kill.
+	IdleToolCall bool
 
 	// ReportResumeFailed is the cause when the adapter's bounded re-emission of
 	// a refused done report failed: it stalled on a silent provider and was

@@ -106,7 +106,10 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if err := refuseTurns("codex", in); err != nil {
 		return Result{}, err
 	}
-	cmd := exec.CommandContext(ctx, "codex", codexArgs(in)...)
+	cmd, err := sessionCommand(ctx, in.Nice, "codex", codexArgs(in)...)
+	if err != nil {
+		return Result{}, err
+	}
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}

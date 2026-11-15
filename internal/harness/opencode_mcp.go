@@ -109,8 +109,18 @@ func opencodeWorkDir(dir string) string {
 // startOpencodeServer launches `opencode serve` on a free loopback port and
 // reads the address and password it announces. The process is put in its own
 // group, so stopping it also reaps any MCP child it spawned.
-func startOpencodeServer(ctx context.Context, env []string, dir string) (*opencodeServer, error) {
-	cmd := exec.CommandContext(ctx, "opencode", "serve", "--port", "0", "--hostname", "127.0.0.1")
+//
+// niceValue is applied here as well as to the run: the SERVER is what executes
+// the session's tool calls, so a bash tool's build or test run is forked from
+// this process, not from the `opencode run` client that asked for it.
+func startOpencodeServer(ctx context.Context, niceValue int, env []string, dir string) (*opencodeServer, error) {
+	cmd, err := sessionCommand(ctx, niceValue, "opencode", "serve", "--port", "0", "--hostname", "127.0.0.1")
+	if err != nil {
+		// Building the launcher failed (opencode or nice(1) is not on PATH). That
+		// is the same preflight miss as a failed Start, not a session that ran and
+		// died, so it carries the same classification and gets the loop's retry.
+		return nil, fmt.Errorf("%w: preparing opencode serve: %v", ErrMCPNotConnected, err)
+	}
 	setupProcessGroup(cmd)
 	if dir != "" {
 		cmd.Dir = dir

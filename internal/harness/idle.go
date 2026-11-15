@@ -17,7 +17,9 @@ import (
 // While no tool call is open, the guard kills after `idle` without output. While
 // one or more calls are open the idle clock is paused, because a long build or a
 // slow MCP call is legitimate work with no output, and instead the oldest open
-// call is bounded by `toolCap`.
+// call is bounded by `toolCap`. A harness that cannot see a call in flight
+// (opencode forwards only settled tool parts) opens a SYNTHETIC call spanning the
+// step that may run one (opencode's step_start .. step_finish); see toolHandoff.
 //
 // Zero idle disables everything, including the tool cap: with no watchdog there
 // is nothing to pause or bound.
@@ -39,6 +41,11 @@ type idleGuard struct {
 	stopped bool
 	fired   bool
 	cause   string
+	// openAtFire records whether a call was open when the timer fired. A kill
+	// landed on an open call is the TOOL CAP ending a session that was waiting,
+	// not the idle clock finding a silent one, and callers classify the two
+	// differently (a cap kill is not evidence the provider broke).
+	openAtFire bool
 
 	// open is the tool calls started and not yet finished, oldest first. Empty
 	// means the idle clock is running; non-empty means it is paused.
@@ -84,8 +91,40 @@ func (g *idleGuard) seen() {
 
 // toolStarted records that a tool call with this id is in flight. The FIRST
 // open call pauses the idle clock and starts the tool cap; a later one leaves the
-// oldest call's deadline in place, because that is the call the cap names.
+// oldest call's deadline in place, because that is the call the cap names. A
+// repeat for an id already open changes nothing: a re-delivered event must not
+// extend a stuck call's cap.
 func (g *idleGuard) toolStarted(id string) {
+	if !g.enabled() || id == "" {
+		return
+	}
+	g.startCall(id, false)
+}
+
+// toolHandoff opens a SYNTHETIC call for a harness that cannot see a real call
+// in flight: opencode's step_start, which begins the step whose tools opencode
+// forwards only after they settle. The caller closes it with toolFinished at the
+// step's step_finish. A repeated handoff for the same id RESTARTS the deadline: a
+// step_start always begins a new step, including one whose predecessor ended
+// without a step_finish (a provider retry), and an old start must not cap the
+// step now running.
+//
+// It is a no-op when no tool cap is configured: with nothing to bound the call,
+// pausing the idle clock would leave a stuck call with no watchdog at all, so the
+// idle clock stays armed — the same bound the session had before the handoff
+// signal existed.
+func (g *idleGuard) toolHandoff(id string) {
+	if !g.enabled() || g.toolCap <= 0 {
+		return
+	}
+	g.startCall(id, true)
+}
+
+// startCall opens id, or with restart moves an already-open id's deadline to now.
+// Only the OLDEST open call owns the cap: a later call's silence is covered by
+// the one already in flight, and retargeting on every call would let a stream of
+// short calls hide the stuck one.
+func (g *idleGuard) startCall(id string, restart bool) {
 	if !g.enabled() || id == "" {
 		return
 	}
@@ -94,12 +133,21 @@ func (g *idleGuard) toolStarted(id string) {
 	if g.stopped || g.fired {
 		return
 	}
-	for _, c := range g.open {
-		if c.id == id {
+	now := time.Now()
+	for i := range g.open {
+		if g.open[i].id != id {
+			continue
+		}
+		if !restart {
 			return
 		}
+		g.open[i].start = now
+		if i == 0 && g.toolCap > 0 {
+			g.armLocked(g.toolCap, fmt.Sprintf("tool call %s open for %s", id, g.toolCap))
+		}
+		return
 	}
-	g.open = append(g.open, idleCall{id: id, start: time.Now()})
+	g.open = append(g.open, idleCall{id: id, start: now})
 	if len(g.open) != 1 {
 		return
 	}
@@ -169,6 +217,18 @@ func (g *idleGuard) tripped() string {
 	return g.cause
 }
 
+// trippedWithOpenCall reports that the kill landed while a tool call was open:
+// the TOOL CAP fired, not the idle clock. False before the guard fires, on a
+// disabled guard, and for an idle-clock kill.
+func (g *idleGuard) trippedWithOpenCall() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fired && g.openAtFire
+}
+
 // armLocked replaces the armed deadline. The generation makes a callback that
 // was already in flight when the deadline moved a no-op.
 func (g *idleGuard) armLocked(d time.Duration, cause string) {
@@ -192,6 +252,7 @@ func (g *idleGuard) fire(gen int64, cause string) {
 		return
 	}
 	g.fired, g.cause, g.timer = true, cause, nil
+	g.openAtFire = len(g.open) > 0
 	g.mu.Unlock()
 	g.kill(cause)
 }

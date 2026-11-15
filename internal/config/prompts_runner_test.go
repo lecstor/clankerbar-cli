@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // runnerBriefs lists every runner-claimed brief by name, with the prohibition
@@ -408,6 +409,44 @@ func TestRunnerRerunGuidanceInlinesTheWaitingRule(t *testing.T) {
 	// Everything else about the bound is rerunGuidance's.
 	if !strings.Contains(runnerRerunGuidance, "two consecutive reruns of the same command") {
 		t.Errorf("runnerRerunGuidance lost the rerun bound:\n%s", runnerRerunGuidance)
+	}
+}
+
+// The brief's wait bound has to sit BELOW the cap the adapter enforces, or a
+// session that follows the brief still gets killed. It is stated as a number
+// precisely because "a bounded wait" with none let sessions pick a wait the
+// driver killed while a tool call was open (CLA-900).
+func TestRunnerWaitBoundStaysUnderTheToolCallCaps(t *testing.T) {
+	if runnerToolWaitBound <= 0 {
+		t.Fatalf("runnerToolWaitBound = %v, want a positive bound", runnerToolWaitBound)
+	}
+	for _, tc := range []struct {
+		name string
+		cap  time.Duration
+	}{
+		{"claude's", defaultClaudeMaxTool},
+		{"opencode's", defaultOpencodeMaxTool},
+	} {
+		if runnerToolWaitBound >= tc.cap {
+			t.Errorf("runnerToolWaitBound = %v, want below %s %v tool cap", runnerToolWaitBound, tc.name, tc.cap)
+		}
+	}
+	// opencode's idle bound still ends a call the adapter never saw opened, so the
+	// brief's figure has to clear it too. claude's open calls are never
+	// idle-bounded (the guard pauses them), so its shorter idle bound is not a
+	// constraint.
+	if runnerToolWaitBound >= defaultOpencodeMaxIdle {
+		t.Errorf("runnerToolWaitBound = %v, want below opencode's %v idle bound, which still bounds an unseen call", runnerToolWaitBound, defaultOpencodeMaxIdle)
+	}
+	// The figure is fixed, so a project that lowers max_tool_call under it is the
+	// operator's to keep in step: this is the case the comment warns about, and
+	// the lowered cap must really be what the adapter gets.
+	lowered := loadIdle(t, `{"session_idle":{"claude":{"max_tool_call":"5m"}}}`)
+	if _, cap := lowered.SessionIdleFor("claude"); cap >= runnerToolWaitBound {
+		t.Errorf("a configured max_tool_call of 5m resolved to %v, want below the brief's %v — the warning in the constant's comment is stale", cap, runnerToolWaitBound)
+	}
+	if !strings.Contains(runnerWaitRule, runnerToolWaitBound.Round(time.Minute).String()) {
+		t.Errorf("runnerWaitRule does not state the bound %v:\n%s", runnerToolWaitBound, runnerWaitRule)
 	}
 }
 

@@ -48,12 +48,27 @@ func outputCapStallReasoning(res harness.Result) (int, bool) {
 	return n, true
 }
 
+// openCallKill reports that this session's kill landed while a tool call was
+// open. In practice that is the TOOL CAP: the guard pauses the idle clock while a
+// call is open precisely so the cap, not the idle clock, ends it, and an adapter
+// reports the open call alongside whatever ended it. Only the adapter can see that
+// window, so the predicate reads its verdict rather than re-deriving one from the
+// cause string (CLA-900).
+func openCallKill(res *harness.Result) bool {
+	return res != nil && res.IdleKilled != "" && res.IdleToolCall
+}
+
 // fleetTrip pauses a target whose fleet dead-phase counter has reached
 // fleetDeadBound (CLA-396): that many consecutive dead phases across tasks mean
 // the harness or provider is broken right now, not the tasks, and every further
 // session would pay the same death rate for nothing. The target stops spawning
 // until the operator answers the raised project-level question (the open-question
 // count falls back to what it was at the raise — see the poll gate in Run).
+//
+// A death that reached the bound while a call was open had a different
+// observation: the last session was waiting inside one open tool call, not silent
+// on a provider. The pause is the same, but the question and the log line name
+// what was seen instead of asserting the provider broke (CLA-900).
 //
 // The question is PROJECT-level — ask_question with no taskId — because a fleet
 // trip is not one task's triage: pinning it to whichever task happened to be in
@@ -86,12 +101,23 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		// count at the last poll, BEFORE the question below raises it by one.
 		d.fleetOpenQ[ti] = d.openQs[ti]
 		why := fmt.Sprintf("Each task died producing nothing (final step reason %q, no branch recorded) before this", deadReason(res))
-		if res != nil && res.ReportResumeFailed != "" {
+		headline, against := "the provider or harness looks broken, not the tasks", "a provider that is already known to be failing"
+		switch {
+		case res != nil && res.ReportResumeFailed != "":
 			why = fmt.Sprintf("Each task's session delivered its work but could not re-emit its done report (%s) before this", res.ReportResumeFailed)
+		case openCallKill(res):
+			// CLA-900: the death that reached the bound landed while a call was
+			// open. A call that never returned is a stuck call or a wait longer
+			// than the cap, not a provider that went silent, and the operator
+			// needs to tell those apart before deciding whether the provider
+			// recovered.
+			headline = "the last session was killed waiting inside one open tool call"
+			against = "a call that is not returning"
+			why = fmt.Sprintf("Each task died before delivering anything, and the last was killed while a tool call it was waiting on stayed open (%s)", res.IdleKilled)
 		}
 		body := fmt.Sprintf(
-			"**%d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks.** %s, so the driver paused this project rather than burning more sessions against a provider that is already known to be failing.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
-			d.fleetDead[ti], why, d.state.Path())
+			"**%d consecutive dead phases across tasks — %s.** %s, so the driver paused this project rather than burning more sessions against %s.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
+			d.fleetDead[ti], headline, why, against, d.state.Path())
 		options := []string{
 			"The provider recovered — resume draining this project",
 			"Still investigating — I will answer when it is safe to resume",
@@ -108,8 +134,19 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		}
 	}
 	d.fleetPaused[ti] = true
-	log.Printf("%siteration %d: %d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks; pausing this project until the operator answers the raised question",
-		d.prefix(ti), drainNum, d.fleetDead[ti])
+	log.Printf("%siteration %d: %d consecutive dead phases across tasks — %s; pausing this project until the operator answers the raised question",
+		d.prefix(ti), drainNum, d.fleetDead[ti], fleetHeadline(res))
+}
+
+// fleetHeadline is the one-clause summary of how the death that reached the
+// bound ended, for fleetTrip's log line. It mirrors the question's headline
+// (CLA-900): a tool-cap kill names the open call, everything else keeps the
+// provider-broke wording.
+func fleetHeadline(res *harness.Result) string {
+	if openCallKill(res) {
+		return "the last session was killed waiting inside one open tool call"
+	}
+	return "the provider or harness looks broken, not the tasks"
 }
 
 // startupTrip pauses a target whose harness-startup counter has reached

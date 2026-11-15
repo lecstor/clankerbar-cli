@@ -556,3 +556,21 @@ func TestReviewRunReportJSONShape(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewRunInvocationCarriesTheSessionNice (CLA-899): a standalone review is
+// a spawned session too, so it runs at the same lowered priority as the fleet's
+// phase sessions when the operator set the dial.
+func TestReviewRunInvocationCarriesTheSessionNice(t *testing.T) {
+	inv, _, err := reviewRunInvocation(ReviewRunOptions{Harness: "opencode"},
+		&config.Config{SessionNice: 10}, config.ReviewMethodSinglePass, t.TempDir(), "base", "head")
+	if err != nil {
+		t.Fatalf("reviewRunInvocation: %v", err)
+	}
+	if inv.Nice != 10 {
+		t.Errorf("Nice = %d, want the config's 10", inv.Nice)
+	}
+	if inv, _, err = reviewRunInvocation(ReviewRunOptions{Harness: "opencode"},
+		&config.Config{}, config.ReviewMethodSinglePass, t.TempDir(), "base", "head"); err != nil || inv.Nice != 0 {
+		t.Errorf("Nice = %d (err %v), want 0 on a config that sets none", inv.Nice, err)
+	}
+}
