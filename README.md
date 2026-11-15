@@ -1399,6 +1399,7 @@ WARN  state_dir    /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549 
                  -> delete it, or the loop acts on it immediately on start: rm /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP
 WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
                 -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
+PASS  session_nice 0 (default) - sessions run at the daemon's own priority
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
 WARN  toolchains   no grant for: go (/Users/you/dev/acme-cli)
                 -> allow the verbs each one needs in /Users/you/.config/clankerbar/headless.json (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified
@@ -1418,7 +1419,9 @@ dir under one a session is spawned in is writable by that session, which hands i
 the loop's own `STOP`/`HALT` switch; under a workdir nothing runs in *yet* it is
 the same trap for the next `projects[]` entry that inherits it), **workdir** (per
 project: it resolves, an `.mcp.json`
-reaches it, and it carries an agent-instructions file), **permissions**
+reaches it, and it carries an agent-instructions file), **session_nice** (the
+scheduling priority every session will start at, so a dial whose whole point is
+invisible at runtime is visible before the run), **permissions**
 (harness-specific policy sanity), **opencode_ambient_config** (an opencode
 config the driver never named that a session merges anyway: one whose
 `clankerbar` server points at another project, or one carrying keys that shape
@@ -2046,6 +2049,7 @@ instance the supervisor reads.
   "max_repeated_tool_failures": 5,
   "session_idle": {"opencode": {"max_idle": "15m"}, "claude": {"max_idle": "10m", "max_tool_call": "30m"}},
   "echo_sessions": false,
+  "session_nice": 0,
   "budget": {
     "max_tokens": 0,
     "max_cost_usd": 0,
@@ -2060,6 +2064,28 @@ instance the supervisor reads.
 stream to the daemon's terminal. Off, the stream goes only to its iteration log,
 which is what keeps the daemon's own lines readable — [Visibility](#visibility)
 has the reasoning and where both logs live.
+
+`session_nice` (default **0**) runs every harness session's process tree at a
+**lower scheduling priority** than the daemon. It exists for a machine where the
+drain fleet shares its cores with something that must not wait — on the operator
+machine that motivated it, a self-hosted CI runner: on 2026-11-15 two sessions
+running full test suites put the load average at 17-18 on 8 cores, and the CI
+job alongside them took 94s to build against 67s quiet (98s to typecheck against
+67s). A session's test run is a self-check that can wait; CI is what close-out
+and promotion block on. `10` is a reasonable headless value.
+
+The value is applied to the harness process **at spawn** (`nice -n N`), so
+everything the session forks inherits it: test runners, builds, dev servers, and
+opencode's private server, which is what actually runs its bash-tool children.
+The kernel then serves CI first while they contend and gives a session the whole
+machine when CI is idle — which is what separates this from a cgroup CPU quota
+(no ceiling is imposed when nothing else needs the CPU) and from capping test
+workers in an env var (priority is per-process-tree, so every toolchain is
+covered without a repo opting in). The daemon's own priority is untouched, so
+its plane calls and git work stay at full speed. A positive value is **refused at
+validation** on a platform with no `nice(1)` rather than ignored: an operator who
+set the dial believes CI is protected from their sessions, and a silent no-op
+would leave them believing it. `doctor` reports the effective value.
 
 `clone_url_base` (default `https://github.com/`) is the URL **prefix** the
 supervisor's workdir derivation clones a missing repo from:
