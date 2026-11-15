@@ -60,7 +60,7 @@ func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
 	if !strings.Contains(q.body, "killed waiting inside one open tool call") {
 		t.Errorf("the fleet question does not name what was observed:\n%s", q.body)
 	}
-	if !strings.Contains(q.body, "tool cap (tool call step_start open for 30m0s)") {
+	if !strings.Contains(q.body, "stayed open (tool call step_start open for 30m0s)") {
 		t.Errorf("the fleet question does not name the cap that fired:\n%s", q.body)
 	}
 	if strings.Contains(q.body, "provider or harness looks broken") {
@@ -73,6 +73,43 @@ func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
 	// the tool-cap wording there leaves the operator grep-hunting (CLA-900).
 	if out := logs.String(); !strings.Contains(out, "killed waiting inside one open tool call") {
 		t.Errorf("the fleet trip's log line does not name what was observed:\n%s", out)
+	}
+}
+
+// The adapter's verdict, not the cause string, is what classifies the death: an
+// idle-clock cause that arrived with a call still open is still a session that
+// was waiting inside one call, so the question names the observation and never
+// blames the provider (CLA-900, finding 1.2).
+func TestDrainPhases_IdleKillInsideAnOpenCallNamesTheWaitingCall(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(harness.Result{
+			ExitCode:     -1,
+			IdleKilled:   "no output for 15m0s",
+			IdleToolCall: true,
+			Tokens:       900, CostUSD: 0.09, UsageReported: true,
+		}, openClaim())},
+	}}
+	d, rel := deadReleaserDriver(t, h)
+	d.fleetDead[0] = fleetDeadBound - 1
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if !d.fleetPaused[0] {
+		t.Error("fleet pause not set - a run of deaths must still pause the project, whatever killed them")
+	}
+	if len(rel.questions) != 1 {
+		t.Fatalf("filed %d questions, want 1: %+v", len(rel.questions), rel.questions)
+	}
+	body := rel.questions[0].body
+	if !strings.Contains(body, "killed waiting inside one open tool call") {
+		t.Errorf("the fleet question does not name the open call:\n%s", body)
+	}
+	if !strings.Contains(body, "no output for 15m0s") {
+		t.Errorf("the fleet question does not carry the cause the adapter reported:\n%s", body)
+	}
+	if strings.Contains(body, "provider or harness looks broken") || strings.Contains(body, "already known to be failing") {
+		t.Errorf("an open-call death was filed as a provider failure:\n%s", body)
 	}
 }
 

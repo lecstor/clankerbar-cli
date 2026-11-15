@@ -48,12 +48,13 @@ func outputCapStallReasoning(res harness.Result) (int, bool) {
 	return n, true
 }
 
-// toolCapKill reports that this session's kill landed while a tool call was
-// open: the TOOL CAP ended a session waiting inside one call, not the idle clock
-// finding a provider that stopped answering. Only the adapter can see that
+// openCallKill reports that this session's kill landed while a tool call was
+// open. In practice that is the TOOL CAP: the guard pauses the idle clock while a
+// call is open precisely so the cap, not the idle clock, ends it, and an adapter
+// reports the open call alongside whatever ended it. Only the adapter can see that
 // window, so the predicate reads its verdict rather than re-deriving one from the
 // cause string (CLA-900).
-func toolCapKill(res *harness.Result) bool {
+func openCallKill(res *harness.Result) bool {
 	return res != nil && res.IdleKilled != "" && res.IdleToolCall
 }
 
@@ -64,10 +65,10 @@ func toolCapKill(res *harness.Result) bool {
 // until the operator answers the raised project-level question (the open-question
 // count falls back to what it was at the raise — see the poll gate in Run).
 //
-// A death that reached the bound on the TOOL CAP had a different observation: the
-// last session was waiting inside one open tool call, not silent on a provider.
-// The pause is the same, but the question and the log line name what was seen
-// instead of asserting the provider broke (CLA-900).
+// A death that reached the bound while a call was open had a different
+// observation: the last session was waiting inside one open tool call, not silent
+// on a provider. The pause is the same, but the question and the log line name
+// what was seen instead of asserting the provider broke (CLA-900).
 //
 // The question is PROJECT-level — ask_question with no taskId — because a fleet
 // trip is not one task's triage: pinning it to whichever task happened to be in
@@ -104,15 +105,15 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		switch {
 		case res != nil && res.ReportResumeFailed != "":
 			why = fmt.Sprintf("Each task's session delivered its work but could not re-emit its done report (%s) before this", res.ReportResumeFailed)
-		case toolCapKill(res):
-			// CLA-900: the death that reached the bound was the driver's own tool
-			// cap firing on an open call. A call that never returned is a stuck
-			// call or a wait longer than the cap, not a provider that went
-			// silent, and the operator needs to tell those apart before deciding
-			// whether the provider recovered.
+		case openCallKill(res):
+			// CLA-900: the death that reached the bound landed while a call was
+			// open. A call that never returned is a stuck call or a wait longer
+			// than the cap, not a provider that went silent, and the operator
+			// needs to tell those apart before deciding whether the provider
+			// recovered.
 			headline = "the last session was killed waiting inside one open tool call"
 			against = "a call that is not returning"
-			why = fmt.Sprintf("Each task died before delivering anything, and the last was killed by the tool cap (%s) while a tool call it was waiting on never returned", res.IdleKilled)
+			why = fmt.Sprintf("Each task died before delivering anything, and the last was killed while a tool call it was waiting on stayed open (%s)", res.IdleKilled)
 		}
 		body := fmt.Sprintf(
 			"**%d consecutive dead phases across tasks — %s.** %s, so the driver paused this project rather than burning more sessions against %s.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
@@ -142,7 +143,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 // (CLA-900): a tool-cap kill names the open call, everything else keeps the
 // provider-broke wording.
 func fleetHeadline(res *harness.Result) string {
-	if toolCapKill(res) {
+	if openCallKill(res) {
 		return "the last session was killed waiting inside one open tool call"
 	}
 	return "the provider or harness looks broken, not the tasks"

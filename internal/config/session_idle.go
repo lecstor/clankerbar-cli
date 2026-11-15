@@ -11,10 +11,10 @@ type IdleBounds struct {
 
 // The shipped watchdogs. Both harnesses that enforce the idle guard get a
 // per-call cap, because each adapter can tell when a call is in flight: claude
-// from its tool_use/tool_result blocks, opencode from the step_start that
-// precedes a tool it cannot see until the tool settles (CLA-900). The cap is what
-// bounds a call that never returns; without one the paused idle clock would leave
-// a stuck call unbounded.
+// from its tool_use/tool_result blocks, opencode from the step whose tools it
+// cannot see until they settle - step_start opens the window and step_finish
+// closes it (CLA-900). The cap is what bounds a call that never returns; without
+// one the paused idle clock would leave a stuck call unbounded.
 //
 // opencode's idle bound sits above its own 10-minute bash-tool ceiling, so a
 // 10-minute call survives even when the adapter never sees the step opened. A

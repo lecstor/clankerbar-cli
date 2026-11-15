@@ -198,6 +198,33 @@ func TestIdleGuardReportsWhetherACallWasOpenAtTheKill(t *testing.T) {
 	})
 }
 
+// A step_start always begins a new step, so a repeated handoff restarts the
+// window: a step that ended without a step_finish (a provider retry) must not
+// leave an old start that caps the step now running (CLA-900).
+func TestIdleGuardHandoffRestartsTheWindow(t *testing.T) {
+	rec := &idleRecorder{}
+	g := newIdleGuard(time.Second, time.Minute, rec.kill)
+	defer g.stop()
+
+	g.toolHandoff(idleStepCall)
+	g.mu.Lock()
+	first := g.open[0].start
+	g.mu.Unlock()
+
+	time.Sleep(20 * time.Millisecond)
+	g.toolHandoff(idleStepCall)
+	g.mu.Lock()
+	second, open := g.open[0].start, len(g.open)
+	g.mu.Unlock()
+
+	if !second.After(first) {
+		t.Errorf("the repeated handoff did not restart the window: first %v, second %v", first, second)
+	}
+	if open != 1 {
+		t.Errorf("open calls = %d, want 1 - a repeated handoff must move the window, not stack another", open)
+	}
+}
+
 // A synthetic handoff pauses the clock only when a tool cap can bound it. With
 // no cap, pausing would leave the call with no watchdog at all, so the idle
 // clock must stay armed (CLA-900).

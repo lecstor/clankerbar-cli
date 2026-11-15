@@ -18,8 +18,8 @@ import (
 // one or more calls are open the idle clock is paused, because a long build or a
 // slow MCP call is legitimate work with no output, and instead the oldest open
 // call is bounded by `toolCap`. A harness that cannot see a call in flight
-// (opencode forwards only settled tool parts) opens a SYNTHETIC call on the
-// signal that precedes one; see toolHandoff.
+// (opencode forwards only settled tool parts) opens a SYNTHETIC call spanning the
+// step that may run one (opencode's step_start .. step_finish); see toolHandoff.
 //
 // Zero idle disables everything, including the tool cap: with no watchdog there
 // is nothing to pause or bound.
@@ -91,8 +91,40 @@ func (g *idleGuard) seen() {
 
 // toolStarted records that a tool call with this id is in flight. The FIRST
 // open call pauses the idle clock and starts the tool cap; a later one leaves the
-// oldest call's deadline in place, because that is the call the cap names.
+// oldest call's deadline in place, because that is the call the cap names. A
+// repeat for an id already open changes nothing: a re-delivered event must not
+// extend a stuck call's cap.
 func (g *idleGuard) toolStarted(id string) {
+	if !g.enabled() || id == "" {
+		return
+	}
+	g.startCall(id, false)
+}
+
+// toolHandoff opens a SYNTHETIC call for a harness that cannot see a real call
+// in flight: opencode's step_start, which begins the step whose tools opencode
+// forwards only after they settle. The caller closes it with toolFinished at the
+// step's step_finish. A repeated handoff for the same id RESTARTS the deadline: a
+// step_start always begins a new step, including one whose predecessor ended
+// without a step_finish (a provider retry), and an old start must not cap the
+// step now running.
+//
+// It is a no-op when no tool cap is configured: with nothing to bound the call,
+// pausing the idle clock would leave a stuck call with no watchdog at all, so the
+// idle clock stays armed — the same bound the session had before the handoff
+// signal existed.
+func (g *idleGuard) toolHandoff(id string) {
+	if !g.enabled() || g.toolCap <= 0 {
+		return
+	}
+	g.startCall(id, true)
+}
+
+// startCall opens id, or with restart moves an already-open id's deadline to now.
+// Only the OLDEST open call owns the cap: a later call's silence is covered by
+// the one already in flight, and retargeting on every call would let a stream of
+// short calls hide the stuck one.
+func (g *idleGuard) startCall(id string, restart bool) {
 	if !g.enabled() || id == "" {
 		return
 	}
@@ -101,12 +133,21 @@ func (g *idleGuard) toolStarted(id string) {
 	if g.stopped || g.fired {
 		return
 	}
-	for _, c := range g.open {
-		if c.id == id {
+	now := time.Now()
+	for i := range g.open {
+		if g.open[i].id != id {
+			continue
+		}
+		if !restart {
 			return
 		}
+		g.open[i].start = now
+		if i == 0 && g.toolCap > 0 {
+			g.armLocked(g.toolCap, fmt.Sprintf("tool call %s open for %s", id, g.toolCap))
+		}
+		return
 	}
-	g.open = append(g.open, idleCall{id: id, start: time.Now()})
+	g.open = append(g.open, idleCall{id: id, start: now})
 	if len(g.open) != 1 {
 		return
 	}
@@ -115,19 +156,6 @@ func (g *idleGuard) toolStarted(id string) {
 		return
 	}
 	g.disarmLocked()
-}
-
-// toolHandoff opens a SYNTHETIC call for a harness that cannot see a real call
-// in flight (opencode's step_start, the last line before its tool runs). It is a
-// no-op when no tool cap is configured: with nothing to bound the call, pausing
-// the idle clock would leave a stuck call with no watchdog at all, so the idle
-// clock stays armed — the same bound the session had before the handoff signal
-// existed.
-func (g *idleGuard) toolHandoff(id string) {
-	if !g.enabled() || g.toolCap <= 0 {
-		return
-	}
-	g.toolStarted(id)
 }
 
 // toolFinished records that a tool call has settled. When it was the oldest open

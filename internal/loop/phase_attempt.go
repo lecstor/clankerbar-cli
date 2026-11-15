@@ -325,12 +325,12 @@ func (r *phaseRun) classifyEnd(at *phaseAttempt) {
 		// A silence kill is a driver kill like a tool loop: dead, never a checkpoint, retried by the dead-phase ladder.
 		at.toolLoop = "idle: " + at.res.IdleKilled
 	}
-	// CLA-900: a kill that landed on an OPEN tool call is the tool cap ending a
-	// session that was waiting inside one call (a CI wait, a long test run), not
-	// the idle clock finding a provider that stopped answering. It is still a
-	// dead phase - no delivery came of it - and it still counts toward the fleet
-	// bound, so a fleet-wide stuck call cannot spin sessions forever; what
-	// changes is how the fleet question words it (toolCapKill, trips.go).
+	// CLA-900: a kill that landed with a tool call OPEN is the call's own cap
+	// ending a session that was waiting inside one call (a CI wait, a long test
+	// run), not the idle clock finding a provider that stopped answering. It is
+	// still a dead phase - no delivery came of it - and it still counts toward
+	// the fleet bound, so a fleet-wide stuck call cannot spin sessions forever;
+	// what changes is how the fleet question words it (openCallKill, trips.go).
 	at.producedNothing = at.res.Untrusted == "" && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
 }
 
