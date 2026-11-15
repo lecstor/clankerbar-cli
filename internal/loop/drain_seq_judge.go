@@ -102,27 +102,20 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			return seqBreak
 		}
 
-		// CLA-900: a TOOL-CAP kill is not provider evidence. It means the driver's
-		// own per-call bound fired while the session was legitimately waiting
-		// inside one call (a CI wait, a long test run), which is exactly the
-		// session the fleet breaker must not blame on the harness. It still went
-		// down the per-task ladder above, so a task that keeps doing it is parked;
-		// it just leaves the fleet counter where it was, like a session that never
-		// got past its claim. Not a reset either: nothing about this death is
-		// evidence the provider is healthy.
-		if st.end.toolCallKill {
-			log.Printf("%siteration %d: the %s phase was killed (%s) after waiting in one open tool call - not counting it toward the fleet dead-phase breaker, which exists to catch a broken provider, not a call that outlived the driver's own cap",
-				labelOf(t), drainNum, st.ph.Label(s.i), st.end.toolLoop)
-		} else {
-			d.fleetDead[ti]++
-			if d.fleetDead[ti] >= fleetDeadBound {
-				d.fleetTrip(ctx, t, ti, drainNum, st.end.claim)
-				s.tripFired = true // CLA-466: a fleet trip ends this drain on a death
-				// The fleet trip pauses this target and this drain is over; the
-				// in-flight task was already released with the dead phase. Not a
-				// stop: the run itself did not fail.
-				return seqBreak
-			}
+		// CLA-900: a TOOL-CAP kill is still a death, so it still counts - a run
+		// of them across tasks must keep the fleet bound, or a fleet-wide stuck
+		// call (a hung MCP server) would spin sessions forever: the per-task
+		// counter resets whenever a retry lands a different task. What changes is
+		// the QUESTION: fleetTrip words a cap kill by what was observed instead
+		// of blaming the provider (see trips.go).
+		d.fleetDead[ti]++
+		if d.fleetDead[ti] >= fleetDeadBound {
+			d.fleetTrip(ctx, t, ti, drainNum, st.end.claim)
+			s.tripFired = true // CLA-466: a fleet trip ends this drain on a death
+			// The fleet trip pauses this target and this drain is over; the
+			// in-flight task was already released with the dead phase. Not a
+			// stop: the run itself did not fail.
+			return seqBreak
 		}
 
 		if retryable {

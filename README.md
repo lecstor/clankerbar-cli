@@ -2675,9 +2675,10 @@ adapter never sees announced is still bounded by `max_idle`. A killed session is
 classified **dead, no delivery**, exactly as a tool-loop kill is: the daemon log
 and the session's `cause` carry the idle cause (`idle: no output for 15m0s`, or
 `idle: tool call ... open for 30m0s` when the per-call cap fired). A kill on the
-tool cap is not counted toward the fleet dead-phase breaker — waiting inside one
-call is not evidence the provider is broken, though the per-task retry ladder
-still bounds a task that keeps doing it. `0` disables a
+tool cap still counts toward the fleet dead-phase breaker — a fleet-wide stuck
+call must keep that bound — but the question it raises says the last session was
+killed waiting inside one open call, rather than blaming a provider that went
+silent. `0` disables a
 bound; enforced by the `claude` and `opencode` adapters, inert under `codex` and
 `copilot`.
 

@@ -31,46 +31,46 @@ func toolCapKilledResult() harness.Result {
 	}
 }
 
-// A tool-cap kill is DEAD, but it is not evidence the provider broke: it means
-// the driver's own per-call bound fired while the session was waiting inside one
-// legitimate call (a CI wait, a long test run). It must not tip the fleet
-// breaker, which pauses a project on the theory that the provider or harness is
-// broken. The per-task ladder still bounds a task that keeps doing it (CLA-900).
-func TestDrainPhases_ToolCapKillDoesNotCountTowardTheFleetBreaker(t *testing.T) {
+// A tool-cap kill is still a death, so it still counts toward the fleet bound -
+// a fleet-wide stuck call must not spin sessions forever. But the question the
+// trip raises must say what was OBSERVED: the driver's own tool cap ended the
+// last session while it waited inside one open call, which is a stuck call or a
+// wait longer than the cap, not a provider that went silent (CLA-900).
+func TestDrainPhases_ToolCapKillTripNamesWhatWasObserved(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
-		{res: held(toolCapKilledResult(), openClaim())},
-		{res: held(toolCapKilledResult(), openClaim())},
-		{res: held(toolCapKilledResult(), openClaim())},
 		{res: held(toolCapKilledResult(), openClaim())},
 	}}
 	d, rel := deadReleaserDriver(t, h)
-	d.fleetDead[0] = fleetDeadBound - 1 // would trip if one more death counted
+	d.fleetDead[0] = fleetDeadBound - 1 // the next death trips it
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
-	// Four tool-cap kills on one task: three retries, then the per-task park.
-	if h.invokeCalls != 4 {
-		t.Fatalf("spawned %d sessions, want 4 (three retries, then the fourth kill parks the task)", h.invokeCalls)
-	}
-	if got := d.fleetDead[0]; got != fleetDeadBound-1 {
-		t.Errorf("fleet counter = %d, want %d — a tool-cap kill is not provider failure evidence and must not increment it", got, fleetDeadBound-1)
-	}
-	if d.fleetPaused[0] {
-		t.Error("the fleet pause was set — a task's tool-cap kills must not pause the project as a provider fault")
+	if !d.fleetPaused[0] {
+		t.Error("fleet pause not set — a run of deaths must still pause the project, whatever killed them")
 	}
 	if len(rel.questions) != 1 {
-		t.Fatalf("filed %d questions, want 1 — the per-task park's clarification, not a fleet question: %+v", len(rel.questions), rel.questions)
+		t.Fatalf("filed %d questions, want 1: %+v", len(rel.questions), rel.questions)
 	}
-	if rel.questions[0].taskID == "" {
-		t.Error("the filed question has no taskId — this was a per-task park, not a project-level fleet trip")
+	q := rel.questions[0]
+	if !strings.Contains(q.body, "killed waiting inside one open tool call") {
+		t.Errorf("the fleet question does not name what was observed:\n%s", q.body)
+	}
+	if !strings.Contains(q.body, "tool cap (tool call step_finish(tool-calls) open for 30m0s)") {
+		t.Errorf("the fleet question does not name the cap that fired:\n%s", q.body)
+	}
+	if strings.Contains(q.body, "provider or harness looks broken") {
+		t.Errorf("the fleet question blames the provider for a tool-cap kill:\n%s", q.body)
+	}
+	if strings.Contains(q.body, "already known to be failing") {
+		t.Errorf("the fleet question calls the provider failing for a tool-cap kill:\n%s", q.body)
 	}
 }
 
 // The contrast: a kill with NO call open is the idle clock finding a session
-// that stopped answering, which IS the provider-failure evidence the fleet
-// breaker exists for — so it still counts and still trips (CLA-900).
-func TestDrainPhases_IdleKillStillCountsTowardTheFleetBreaker(t *testing.T) {
+// that stopped answering, so the fleet question keeps the provider-broke
+// wording and counts it (CLA-900).
+func TestDrainPhases_IdleKillStillReadsAsAProviderFailure(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(idleKilledResult(), openClaim())},
 	}}
@@ -85,6 +85,9 @@ func TestDrainPhases_IdleKillStillCountsTowardTheFleetBreaker(t *testing.T) {
 	}
 	if len(rel.questions) != 1 {
 		t.Fatalf("filed %d fleet questions, want 1: %+v", len(rel.questions), rel.questions)
+	}
+	if !strings.Contains(rel.questions[0].body, "provider or harness looks broken") {
+		t.Errorf("the idle-clock fleet question lost its provider-broke wording:\n%s", rel.questions[0].body)
 	}
 }
 
