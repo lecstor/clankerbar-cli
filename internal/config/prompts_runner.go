@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // The runner-claimed briefs. A runner-claimed session is started for ONE
 // prepared task, in a worktree the runner created, on a branch the runner
@@ -12,11 +15,21 @@ import "strings"
 // constants are added beside the shipped briefs, not in place of them; the
 // driver selects them in a later wiring step.
 
+// runnerToolWaitBound is the longest a runner-claimed session may block inside
+// ONE tool call. The adapters kill a call left open past the harness's
+// max_tool_call, so the brief has to name a figure below it: "a bounded wait"
+// with no number is how sessions chose a wait the driver killed (CLA-900).
+// TestRunnerWaitBoundStaysUnderTheToolCallCaps pins it below both shipped caps.
+const runnerToolWaitBound = 15 * time.Minute
+
 // runnerWaitRule replaces rerunGuidance's pointer at the served waiting
 // reference: a runner-claimed session is forbidden from fetching skill pages,
-// so the polling discipline it needs is stated in the brief instead.
-const runnerWaitRule = "Waiting on a background job: block inside ONE tool call with a bounded wait " +
-	"instead of polling across turns, and never sleep-poll."
+// so the polling discipline and the driver's own bound are stated in the brief
+// instead.
+var runnerWaitRule = "Waiting on a background job: block inside ONE tool call with a bounded wait " +
+	"instead of polling across turns, and never sleep-poll - keep that one call open for no more than " +
+	runnerToolWaitBound.String() + ", because the driver kills a session whose single tool call stays open " +
+	"past its own cap."
 
 // runnerRerunGuidance is rerunGuidance's bound with that pointer replaced. It is
 // derived rather than copied so the bound itself cannot drift between a

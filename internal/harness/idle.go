@@ -39,6 +39,11 @@ type idleGuard struct {
 	stopped bool
 	fired   bool
 	cause   string
+	// openAtFire records whether a call was open when the timer fired. A kill
+	// landed on an open call is the TOOL CAP ending a session that was waiting,
+	// not the idle clock finding a silent one, and callers classify the two
+	// differently (a cap kill is not evidence the provider broke).
+	openAtFire bool
 
 	// open is the tool calls started and not yet finished, oldest first. Empty
 	// means the idle clock is running; non-empty means it is paused.
@@ -169,6 +174,18 @@ func (g *idleGuard) tripped() string {
 	return g.cause
 }
 
+// trippedWithOpenCall reports that the kill landed while a tool call was open:
+// the TOOL CAP fired, not the idle clock. False before the guard fires, on a
+// disabled guard, and for an idle-clock kill.
+func (g *idleGuard) trippedWithOpenCall() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fired && g.openAtFire
+}
+
 // armLocked replaces the armed deadline. The generation makes a callback that
 // was already in flight when the deadline moved a no-op.
 func (g *idleGuard) armLocked(d time.Duration, cause string) {
@@ -192,6 +209,7 @@ func (g *idleGuard) fire(gen int64, cause string) {
 		return
 	}
 	g.fired, g.cause, g.timer = true, cause, nil
+	g.openAtFire = len(g.open) > 0
 	g.mu.Unlock()
 	g.kill(cause)
 }

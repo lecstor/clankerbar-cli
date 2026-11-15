@@ -9,13 +9,18 @@ type IdleBounds struct {
 	MaxToolCall *Duration `json:"max_tool_call,omitempty"`
 }
 
-// The shipped watchdogs. opencode's idle bound sits above its own 10-minute
-// bash-tool ceiling because opencode streams only SETTLED tool parts: a running
-// tool emits nothing, so the idle clock never pauses and a short bound would
-// kill honest long commands. claude's clock does pause while a call is open,
-// which is what lets it take a shorter idle bound plus a per-call cap.
+// The shipped watchdogs. Both harnesses that enforce the idle guard get a
+// per-call cap, because each adapter can tell when a call is in flight: claude
+// from its tool_use/tool_result blocks, opencode from a step_finish(tool-calls)
+// handoff (CLA-900). The cap is what bounds a call that never returns; without
+// one the paused idle clock would leave a stuck call unbounded.
+//
+// opencode's idle bound still sits above its own 10-minute bash-tool ceiling so
+// a call that never gets a handoff (a stream shape the adapter has not seen)
+// cannot kill an honest long command before the cap does.
 const (
 	defaultOpencodeMaxIdle = 15 * time.Minute
+	defaultOpencodeMaxTool = 30 * time.Minute
 	defaultClaudeMaxIdle   = 10 * time.Minute
 	defaultClaudeMaxTool   = 30 * time.Minute
 )
@@ -26,7 +31,7 @@ const (
 func defaultIdleBounds(harnessName string) (idle, toolCall time.Duration) {
 	switch harnessName {
 	case "opencode":
-		return defaultOpencodeMaxIdle, 0
+		return defaultOpencodeMaxIdle, defaultOpencodeMaxTool
 	case "claude":
 		return defaultClaudeMaxIdle, defaultClaudeMaxTool
 	}

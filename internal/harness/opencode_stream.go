@@ -204,6 +204,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		res.IdleKilled = ""
 	} else {
 		res.IdleKilled = p.idleCause()
+		res.IdleToolCall = res.IdleKilled != "" && p.idle.trippedWithOpenCall()
 	}
 
 	// Our own deadline, not the caller's: ctx.Err() distinguishes a session we
@@ -527,7 +528,26 @@ func (p *opencodeParse) armIdle(in Invocation) {
 // idleCause is the watchdog's verdict, "" unless it fired.
 func (p *opencodeParse) idleCause() string { return p.idle.tripped() }
 
+// opencodeReasonToolCalls is the step_finish reason of a step that handed
+// control to one or more tools: the step has finished and the tool calls it
+// requested are the next thing to run. It is the only request-side signal
+// opencode's stream gives (see noteTool), and the idle watchdog uses it as a
+// synthetic open call.
+const opencodeReasonToolCalls = "tool-calls"
+
+// idleHandoffCall is the synthetic tool call a step_finish(tool-calls) opens in
+// the idle guard. opencode forwards a tool part only once it has SETTLED, so a
+// real call is never seen in flight; without this the idle clock never pauses
+// and any call longer than the idle bound reads as a hang (CLA-900). Any later
+// line closes it, because that is output from the call.
+const idleHandoffCall = "step_finish(tool-calls)"
+
 func (p *opencodeParse) line(line []byte) {
+	// Any output ends a synthetic call a step_finish(tool-calls) opened: the
+	// tool that was running has produced an event (most often its own
+	// tool_use), so the session is no longer silent inside the call and the
+	// idle clock can run again. A real open call is untouched.
+	p.idle.toolFinished(idleHandoffCall)
 	p.idle.seen()
 	trimmed := strings.TrimSpace(string(line))
 	if !strings.HasPrefix(trimmed, "{") {
@@ -593,6 +613,15 @@ func (p *opencodeParse) line(line []byte) {
 			// retrospective scan reads as a mere long answer.
 			p.lastStepOut, p.lastStepReason = 0, 0
 		}
+		// CLA-900: a step that ends on "tool-calls" has handed control to a
+		// tool. opencode emits no request-side tool event (noteTool), so this
+		// is the ONLY moment the driver can learn a call is in flight - without
+		// it the idle clock runs through a long CI wait or test run and kills
+		// an honest session as a hang. The next line closes the synthetic
+		// call (see line).
+		if ev.Part.Reason == opencodeReasonToolCalls {
+			p.idle.toolStarted(idleHandoffCall)
+		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
 		//
@@ -649,7 +678,9 @@ func (p *opencodeParse) line(line []byte) {
 //
 // A part still in flight is not a claim, but it DOES open a tool call for the
 // idle watchdog: the session is working rather than hanging, and the call's own
-// cap bounds it (see idleGuard).
+// cap bounds it (see idleGuard). On today's stream this branch never fires —
+// opencode forwards only settled parts — and the call window comes from the
+// synthetic step_finish(tool-calls) handoff instead (see line).
 //
 // A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
 // a re-delivered terminal event for a claim already settled by a later

@@ -411,6 +411,25 @@ func TestRunnerRerunGuidanceInlinesTheWaitingRule(t *testing.T) {
 	}
 }
 
+// The brief's wait bound has to sit BELOW the cap the adapter enforces, or a
+// session that follows the brief still gets killed. It is stated as a number
+// precisely because "a bounded wait" with none let sessions pick a wait the
+// driver killed while a tool call was open (CLA-900).
+func TestRunnerWaitBoundStaysUnderTheToolCallCaps(t *testing.T) {
+	if runnerToolWaitBound <= 0 {
+		t.Fatalf("runnerToolWaitBound = %v, want a positive bound", runnerToolWaitBound)
+	}
+	if runnerToolWaitBound >= defaultClaudeMaxTool {
+		t.Errorf("runnerToolWaitBound = %v, want below claude's %v tool cap", runnerToolWaitBound, defaultClaudeMaxTool)
+	}
+	if runnerToolWaitBound >= defaultOpencodeMaxTool {
+		t.Errorf("runnerToolWaitBound = %v, want below opencode's %v tool cap", runnerToolWaitBound, defaultOpencodeMaxTool)
+	}
+	if !strings.Contains(runnerWaitRule, runnerToolWaitBound.String()) {
+		t.Errorf("runnerWaitRule does not state the bound %v:\n%s", runnerToolWaitBound, runnerWaitRule)
+	}
+}
+
 // A runner-claimed handoff respawn gets the runner's own preamble: no heartbeat,
 // no claim, no skill page - and adapting a shipped continuation rewrites the
 // waiting pointer without dropping the bound.

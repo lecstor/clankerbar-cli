@@ -166,3 +166,34 @@ func TestIdleGuardRetargetsTheCapToTheNextOldestCall(t *testing.T) {
 		t.Errorf("cause = %q, want the cap naming the call still open", got)
 	}
 }
+
+// A kill on an open call is the TOOL CAP; a kill with none open is the idle
+// clock. The driver keeps the first off the fleet breaker, so the guard has to
+// report which one fired (CLA-900).
+func TestIdleGuardReportsWhetherACallWasOpenAtTheKill(t *testing.T) {
+	t.Run("tool cap", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(time.Second, 30*time.Millisecond, rec.kill)
+		defer g.stop()
+
+		g.toolStarted("call_1")
+		if got := waitIdleCause(t, g, 2*time.Second); got != "tool call call_1 open for 30ms" {
+			t.Fatalf("cause = %q, want the tool-cap cause", got)
+		}
+		if !g.trippedWithOpenCall() {
+			t.Error("trippedWithOpenCall = false for a tool-cap kill")
+		}
+	})
+	t.Run("idle clock", func(t *testing.T) {
+		rec := &idleRecorder{}
+		g := newIdleGuard(30*time.Millisecond, time.Second, rec.kill)
+		defer g.stop()
+
+		if got := waitIdleCause(t, g, 2*time.Second); got != "no output for 30ms" {
+			t.Fatalf("cause = %q, want the idle cause", got)
+		}
+		if g.trippedWithOpenCall() {
+			t.Error("trippedWithOpenCall = true for an idle-clock kill")
+		}
+	})
+}

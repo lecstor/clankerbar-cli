@@ -133,6 +133,7 @@ type phaseAttempt struct {
 	wallclock          bool
 	zeroUsage          bool
 	toolLoop           string
+	toolCallKill       bool
 	producedNothing    bool
 	orderlyExit        bool
 	recoveredExit      bool
