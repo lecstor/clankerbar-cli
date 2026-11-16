@@ -142,16 +142,23 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// watcher is wrapped, never replaced: the driver's own callback still fires.
 	var inboxRunIDs chan string
 	if in.Inbox != nil {
-		inboxRunIDs = make(chan string, 1)
+		// A small buffer, not 1: a settle re-notifies the SAME run and a session may claim
+		// again immediately, so the queue must hold the next run while the current poller
+		// finishes. Duplicates are filtered below, not queued.
+		inboxRunIDs = make(chan string, 8)
 		if in.ResumeClaim.RunID != "" {
 			inboxRunIDs <- in.ResumeClaim.RunID
 		}
+		lastRunID := in.ResumeClaim.RunID
 		origOnClaim := in.OnClaim
 		in.OnClaim = func(c Claim) {
-			if c.RunID != "" {
+			// A settle fires this callback with the run id unchanged; only a NEW run is a
+			// delivery target. Never block: this runs on the parser goroutine.
+			if c.RunID != "" && c.RunID != lastRunID {
+				lastRunID = c.RunID
 				select {
 				case inboxRunIDs <- c.RunID:
-				default: // a newer claim is already queued; the newest wins
+				default: // pathological churn; the newest claim will start the next poller
 				}
 			}
 			if origOnClaim != nil {
