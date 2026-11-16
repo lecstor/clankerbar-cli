@@ -7,6 +7,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,7 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -189,6 +192,124 @@ func TestDrainPhases_ScheduledPauseHoldsTheNextPhaseAndResumesIt(t *testing.T) {
 	out := logs.String()
 	if !strings.Contains(out, "scheduled pause ended — resuming t-1 at the review phase") {
 		t.Errorf("the leave line is missing or names the wrong phase:\n%s", out)
+	}
+}
+
+// CLA-908: the hold's presence says what the console's pause banner needs — the
+// schedule reason, the window's end and the task/phase waiting behind it — on
+// the plane beacon AND in the local BEACON file, which the supervisor's fleet
+// listing reads. Same state, two readers, no second writer to drift.
+func TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 10, 0)}
+	rel := &beatReleaser{}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: okResult(5, 0.05)},
+	}}
+	h.onInvoke = func(call int) {
+		if call == 0 {
+			clk.Set(brisbaneAt(t, 9, 11, 30))
+		}
+	}
+	ff := &fakeFleet{}
+	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
+	d.targets[0].Fleet = ff
+	done := startPauseDrain(t, d)
+
+	waitUntil(t, "the held presence beacon", func() bool {
+		sent, _ := ff.reports()
+		if len(sent) == 0 {
+			return false
+		}
+		last := sent[len(sent)-1]
+		return last.State.Kind == fleet.StateDraining && last.State.PauseReason == fleet.PauseReasonSchedule
+	})
+	until := brisbaneAt(t, 9, 14, 0)
+	sent, _ := ff.reports()
+	last := sent[len(sent)-1]
+	if last.State.Kind != fleet.StateDraining {
+		t.Errorf("held beacon kind = %q, want draining (the console banner keys on it)", last.State.Kind)
+	}
+	if last.State.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("held beacon pause reason = %q, want %q", last.State.PauseReason, fleet.PauseReasonSchedule)
+	}
+	if !last.State.PauseUntil.Equal(until) {
+		t.Errorf("held beacon pause until = %v, want %v", last.State.PauseUntil, until)
+	}
+	if last.State.TaskRef != "t-1" || last.State.Phase != "review" {
+		t.Errorf("held beacon names %q at %q, want t-1 at the review phase", last.State.TaskRef, last.State.Phase)
+	}
+
+	data, err := os.ReadFile(filepath.Join(d.state.Path(), LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon during the hold: %v", err)
+	}
+	var b LocalBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("local beacon = state %q reason %q, want draining/%s", b.State, b.PauseReason, fleet.PauseReasonSchedule)
+	}
+	if b.PauseUntil == nil || !b.PauseUntil.Equal(until) {
+		t.Errorf("local beacon pauseUntil = %v, want %v", b.PauseUntil, until)
+	}
+	if b.PauseZone != "Australia/Brisbane" {
+		t.Errorf("local beacon pauseZone = %q, want the schedule's zone so the listing can say AEST", b.PauseZone)
+	}
+	if b.TaskRef != "t-1" || b.Phase != "review" {
+		t.Errorf("local beacon names %q at %q, want t-1 at the review phase", b.TaskRef, b.Phase)
+	}
+
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+	if res := waitPauseDrain(t, done); res.err != nil || res.stop {
+		t.Fatalf("drain after the window: stop=%v err=%v", res.stop, res.err)
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("sessions after the window = %d, want 2", h.invokeCalls)
+	}
+	// The hold marker is cleared on the way out: the next presence seat is the
+	// resumed drain, not a pause left stuck on the row.
+	if got := d.fleetState(0); got.Kind == fleet.StateDraining {
+		t.Errorf("state after the hold = %+v, want the drain's own state (the hold marker must be clear)", got)
+	}
+	if got := d.holdAt(0); got.on {
+		t.Errorf("hold marker survived the hold: %+v", got)
+	}
+}
+
+// The local BEACON is ONE file for the whole daemon, so the running target must
+// be its last writer: while a sequence is held, `supervise` has to read the held
+// task, not whichever sibling project happens to be beaconed after it. The
+// sibling still reaches the plane — its project's row must not go stale.
+func TestBeaconSessionTargets_LocalBeaconCarriesTheHeldTarget(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d, _, _, _ := pauseDriver(t, peakSchedule(t), &at)
+	sibling := &fakeFleet{}
+	d.targets = append(d.targets, Target{Poller: busyPoller(), Fleet: sibling})
+	d.schedPaused = true
+	d.holdPause(0, "t-1", "review")
+
+	d.beaconSessionTargets(0, d.targets[0])
+
+	data, err := os.ReadFile(filepath.Join(d.state.Path(), LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon after the presence lap: %v", err)
+	}
+	var b LocalBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("local beacon = state %q reason %q, want the held target's schedule pause", b.State, b.PauseReason)
+	}
+	if b.TaskRef != "t-1" || b.Phase != "review" {
+		t.Errorf("local beacon names %q at %q, want the HELD target's t-1 at review (not the sibling beaconed last)", b.TaskRef, b.Phase)
+	}
+
+	sent, _ := sibling.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateDraining {
+		t.Errorf("the sibling target was not beaconed on the plane: %+v", sent)
 	}
 }
 
@@ -609,5 +730,89 @@ func TestDrainPhases_ScheduledPauseHoldsTheParallelPanelBeforeAnyMember(t *testi
 	}
 	if fixCalls != 1 {
 		t.Errorf("fix sessions = %d, want 1 after the panel", fixCalls)
+	}
+}
+
+// pollBeaconState is the poll lap's answer to "which project speaks for the
+// daemon in the one local BEACON file". The schedule must survive an idle or
+// console-paused sibling polled after it, and a held schedule must survive a
+// sibling that is paused by the same window but holding nothing (CLA-908).
+func TestPollBeaconState_Precedence(t *testing.T) {
+	idle := fleet.State{Kind: fleet.StateIdle}
+	sched := fleet.State{Kind: fleet.StateDraining, PauseReason: fleet.PauseReasonSchedule}
+	held := fleet.State{Kind: fleet.StateDraining, PauseReason: fleet.PauseReasonSchedule, TaskRef: "t-1", Phase: "review"}
+	console := fleet.State{Kind: fleet.StateDraining, PauseReason: fleet.PauseReasonConsole}
+
+	cases := []struct {
+		name      string
+		cur, next fleet.State
+		want      fleet.State
+	}{
+		{"no pause anywhere stays idle", idle, idle, idle},
+		{"a schedule pause is taken over idle", idle, sched, sched},
+		{"a later console pause cannot overwrite the schedule", sched, console, sched},
+		{"a later idle sibling cannot overwrite the schedule", sched, idle, sched},
+		{"a held schedule outranks a bare one", sched, held, held},
+		{"a bare schedule cannot displace a held one", held, sched, held},
+		{"an operator pause replaces idle", idle, console, console},
+		{"an operator pause is kept over idle", console, idle, console},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pollBeaconState(tc.cur, tc.next); got != tc.want {
+				t.Errorf("pollBeaconState(%+v, %+v) = %+v, want %+v", tc.cur, tc.next, got, tc.want)
+			}
+		})
+	}
+}
+
+// The poll lap writes the ONE local BEACON file from a state chosen across the
+// targets, not from whichever target is polled last: with the schedule active on
+// one project and a console pause on a sibling polled after it, `supervise` must
+// still print the schedule banner the console shows (CLA-908).
+func TestPickTarget_LocalBeaconKeepsTheSchedulePause(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0) // inside the 11:00-14:00 window
+	cfg := fastCfg()
+	cfg.PauseWindows = peakSchedule(t)
+	held := &fakeFleet{}
+	sibling := &fakeFleet{}
+	d := NewMulti(cfg, &fakeAdapter{}, []Target{
+		{Poller: &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}, Fleet: held},
+		{Poller: &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1, Paused: true}}, Fleet: sibling},
+	})
+	openTestStateDir(t, d)
+	d.now = func() time.Time { return at }
+	// The first target is the one a schedule holds; the sibling is paused from
+	// the console and is polled after it.
+	d.holdPause(0, "t-1", "review")
+
+	pick(t, d)
+
+	data, err := os.ReadFile(filepath.Join(d.state.Path(), LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon after the poll lap: %v", err)
+	}
+	var b LocalBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("local beacon = state %q reason %q, want the schedule pause (the sibling polled last must not overwrite it)", b.State, b.PauseReason)
+	}
+	if b.TaskRef != "t-1" || b.Phase != "review" {
+		t.Errorf("local beacon names %q at %q, want the held task t-1 at review", b.TaskRef, b.Phase)
+	}
+
+	// The sibling still reaches the plane: its own project row must say it is
+	// console-paused, and only the daemon-wide file is deduplicated.
+	sent, _ := sibling.reports()
+	if len(sent) != 1 {
+		t.Fatalf("sibling plane beacons = %d, want 1 per poll", len(sent))
+	}
+	if sent[0].State.Kind != fleet.StateDraining || sent[0].State.PauseReason != fleet.PauseReasonConsole {
+		t.Errorf("sibling plane beacon = %+v, want its own console reason", sent[0].State)
+	}
+	if got, _ := held.reports(); len(got) != 1 {
+		t.Errorf("held target plane beacons = %d, want 1 per poll", len(got))
 	}
 }

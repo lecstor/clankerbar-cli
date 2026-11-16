@@ -43,7 +43,9 @@ import (
 //     being worked (empty until a claim has been observed), phase the label of
 //     the phase session about to spawn or running
 //   - draining  alive but not spawning new sessions (console pause, fleet pause,
-//     startup-failure pause, scheduled pause window)
+//     startup-failure pause, budget ceiling, scheduled pause window). It carries
+//     the one cause the operator has to act on (State.PauseReason), and the
+//     schedule alone adds the window's end (PauseUntil).
 //   - stopping  shutting down on purpose (STOP/HALT, a marker restart, budget or
 //     max-iterations reached, signal); sent as the final beacon
 //   - limited   parked by a harness usage limit and waiting it out (CLA-728):
@@ -86,17 +88,52 @@ const (
 	CauseNoMCP = "no_mcp"
 )
 
+// The draining state's stated causes (CLA-908): why spawns are closed, in the
+// token the console renders as "paused by <reason>". The set is closed — the
+// beacon carries ONE reason, and the driver reports the cause the operator has
+// to act on when several apply at once.
+const (
+	// PauseReasonSchedule: an operator-configured pause window (`pause_windows`).
+	// The only reason that also carries a resume instant, and the only one the
+	// console raises its fleet-wide pause banner for.
+	PauseReasonSchedule = "schedule"
+	// PauseReasonConsole: the project is paused from the web console.
+	PauseReasonConsole = "console"
+	// PauseReasonFleet: the fleet counter tripped — a dead-phase question waits
+	// for the operator's answer.
+	PauseReasonFleet = "fleet"
+	// PauseReasonStartup: repeated harness startup failures stopped the target
+	// until the operator answers the harness question.
+	PauseReasonStartup = "startup"
+	// PauseReasonBudget: the target's own budget ceiling was reached.
+	PauseReasonBudget = "budget"
+)
+
 // State is the presence half of a report: what the daemon is doing right now.
 type State struct {
 	Kind    string // one of the State* constants
 	N       int    // iteration number, when Kind is iteration
-	TaskRef string // task being worked ("CLA-466"), when known
-	Phase   string // phase label, when Kind is iteration
+	TaskRef string // task being worked ("CLA-466"), when known; the HELD task on a schedule pause
+	Phase   string // phase label, when Kind is iteration, or the held phase on a schedule pause
 	// ResetAt is the harness's stated limit-reset instant, only meaningful on
 	// Kind == limited (CLA-728). The zero value means the harness stated no
 	// reset — the console then says "probing for a reset" rather than guessing
 	// a moment it was never told.
 	ResetAt time.Time
+
+	// PauseReason/PauseUntil/PauseZone are the draining state's pause payload
+	// (CLA-908): why spawns are closed, and — for the schedule, the only cause
+	// that states one — until when. A beacon carries ONE reason: the cause the
+	// operator has to act on when several apply (see the PauseReason*
+	// constants).
+	//
+	// PauseZone is the schedule's IANA zone. It is LOCAL render metadata only
+	// (the supervisor prints the resume time in the operator's own zone) and is
+	// deliberately absent from the wire: the plane receives an instant with an
+	// explicit offset, which is all it needs.
+	PauseReason string
+	PauseUntil  time.Time
+	PauseZone   string
 }
 
 // Usage is one session's token accounting, normalised across harnesses: the
@@ -444,6 +481,25 @@ func wireResetAt(st State) string {
 	return st.ResetAt.UTC().Format(time.RFC3339)
 }
 
+// wirePauseReason and wirePauseUntil render a draining state's pause payload
+// (CLA-908), or the empty string — which `omitempty` drops — on any other kind.
+// The plane reads the pair only on `draining`, and `pauseUntil` only beside the
+// schedule reason, so a value left on another state is dropped here rather than
+// shipped as a key the plane would ignore.
+func wirePauseReason(st State) string {
+	if st.Kind != StateDraining {
+		return ""
+	}
+	return st.PauseReason
+}
+
+func wirePauseUntil(st State) string {
+	if wirePauseReason(st) != PauseReasonSchedule || st.PauseUntil.IsZero() {
+		return ""
+	}
+	return st.PauseUntil.UTC().Format(time.RFC3339)
+}
+
 // ── Wire shape ────────────────────────────────────────────────────────────────
 // Exactly what apps/web/src/server/fleet-report.ts parseFleetReport reads
 // (CLA-465). Kept as a separate marshalling step with its own tags so the Go
@@ -461,6 +517,13 @@ type wireState struct {
 	// actually omit it: time.Time is a struct, and the encoder never treats
 	// its zero value as empty.
 	ResetAt string `json:"resetAt,omitempty"`
+	// PauseReason/PauseUntil are the `draining` state's payload (CLA-908), in the
+	// shape the plane's parseFleetReport accepts: a bounded reason token
+	// (PauseReason*) and, for the schedule alone, the window's end as RFC 3339
+	// with an explicit zone. Both are omitted on every other kind, exactly like
+	// resetAt, so an old plane sees the bytes it always did.
+	PauseReason string `json:"pauseReason,omitempty"`
+	PauseUntil  string `json:"pauseUntil,omitempty"`
 }
 
 // wireUsage is the normalised breakdown on the wire. Each key is omitted when
@@ -533,11 +596,13 @@ func marshalReport(rep Report) ([]byte, error) {
 		Version:        rep.Version,
 		ConfigIdentity: rep.ConfigIdentity,
 		State: &wireState{
-			Kind:    rep.State.Kind,
-			N:       rep.State.N,
-			TaskRef: rep.State.TaskRef,
-			Phase:   rep.State.Phase,
-			ResetAt: wireResetAt(rep.State),
+			Kind:        rep.State.Kind,
+			N:           rep.State.N,
+			TaskRef:     rep.State.TaskRef,
+			Phase:       rep.State.Phase,
+			ResetAt:     wireResetAt(rep.State),
+			PauseReason: wirePauseReason(rep.State),
+			PauseUntil:  wirePauseUntil(rep.State),
 		},
 	}
 	if w.State.Kind == "" {

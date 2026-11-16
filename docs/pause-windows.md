@@ -61,6 +61,34 @@ it.
   attempt. It is covered by the start gate above, not between routes.
 - The deterministic close-out (above) spawns no session at all.
 
+## What the beacon says
+
+A window-paused daemon reports `draining` with `pauseReason: "schedule"` and
+`pauseUntil` (the window's end, which `PauseWindows.ActiveAt` already returns),
+so the console's banner (CLA-907) can name the window and its resume time instead
+of showing the same bare `draining` any pause used to send. A sequence held at a
+boundary (above) also names the task and the phase waiting:
+`state.taskRef`/`state.phase` on the same draining beacon, which is the pair the
+console's hold reads.
+
+The other causes name themselves too (`console`, `fleet`, `startup`, `budget`)
+and carry no resume time. A console, fleet or startup pause ends when the
+operator acts; a budget trip ends when the run restarts, which reads the ceiling
+again. None ends at a moment a beacon could state. A beacon carries ONE reason:
+when several causes apply at once the console, fleet, startup and budget pauses
+all outrank the schedule, because the schedule clears itself while the others
+wait on a human.
+
+The local `BEACON` file in the state dir carries the same payload (plus the
+schedule's IANA zone, which is local rendering only — the plane gets an instant
+with an explicit offset), so `supervise`'s fleet listing and the console cannot
+disagree. The file is daemon-wide while a pause is per project, so a poll pass
+writes it once, from the schedule-paused target when one has a window — the only
+cause the local line renders — rather than from whichever project was polled
+last:
+
+    clanker1: running (pid 4242, version 0.25.6) - paused by schedule until 14:00 AEST (holding CLA-1 at the review phase)
+
 ## Stop and shutdown semantics
 
 A STOP, RESTART or HALT marker, or a cancelled context, during the hold takes the
@@ -95,6 +123,26 @@ the daemon returns to polling.
   `ErrRunLost` takes the drain-level ending;
 - a hold is not charged to a short `max_wall_clock`: the sequence still resumes;
 - no active window leaves the sequence byte-identical to before.
+
+The beacon payload and the listing are pinned by:
+
+- `internal/loop/pause_boundary_test.go`: the full drain's held beacon and local
+  `BEACON` carry the reason, the end, the zone and the held task
+  (`TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask`); the
+  in-session lap writes the local file from the held target while the sibling
+  still beacons the plane (`TestBeaconSessionTargets_LocalBeaconCarriesTheHeldTarget`);
+  the poll lap's daemon-wide file keeps the schedule pause when a console-paused
+  sibling is polled after it, and the cross-target choice itself
+  (`TestPickTarget_LocalBeaconKeepsTheSchedulePause`, `TestPollBeaconState_Precedence`).
+- `internal/loop/fleet_test.go`: the derivation — schedule reason/end/zone, a
+  console, fleet, startup or budget pause naming itself and outranking the
+  schedule, a stale flag falling back to plain draining.
+- `internal/fleet/fleet_test.go`: the wire shape — `draining` carries the
+  payload, only the schedule carries `pauseUntil`, and that instant is explicit
+  UTC; the other causes are named with no end even if one is set.
+- `internal/supervisor/pause_test.go`: the listing renders the reason, the end
+  in the schedule's own zone, the held task and phase, an overnight window's
+  day, an unstated end, a passed end, and a console pause with no line.
 
 `internal/supervisor/conflict_test.go` pins the conflict-session stand-down, and
 `internal/cli/doctor_pausewindows_test.go` pins the doctor line.
