@@ -1318,7 +1318,7 @@ of the child serving it — so version skew between children (and between a
 child and the supervisor) is observable on the machine, not only on the fleet
 page. A live child held by the pause schedule also says so, from its own local
 beacon: `paused by schedule until 14:00 AEST (holding CLA-1 at the review
-phase)`, the sentence the console's instance row shows (see
+phase)` — the same facts the console's instance row shows (see
 [pause-windows](docs/pause-windows.md#what-the-beacon-says)). Those lines, and
 its refuse/spawn/exit decisions, are also written to
 `<supervisor state dir>/supervise.log` (see [Visibility](#visibility)).

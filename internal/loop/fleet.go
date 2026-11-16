@@ -113,10 +113,9 @@ type holdState struct {
 //     This outranks the iteration marker because the walk's iteration stays open
 //     across the hold while no session is running.
 //   - mid-drain                -> iteration {n, taskRef, phase}
-//   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new),
-//     carrying the cause the operator has to act on: a console, fleet, startup
-//     or budget pause names itself and wins over the schedule.
-//   - budget-exhausted           -> draining with the budget reason
+//   - console-, fleet-, startup- or budget-paused -> draining naming that cause:
+//     it is the one the operator has to act on, and it outranks the schedule.
+//   - schedule-paused            -> draining naming the window and its end
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:
