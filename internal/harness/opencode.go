@@ -1716,7 +1716,7 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // RunsTurnSequences is true: `run -s <session id>` continues a live session, so
 // Invocation.Turns is honoured (CLA-867).
 func (opencode) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {

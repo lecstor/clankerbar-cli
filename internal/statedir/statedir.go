@@ -98,6 +98,11 @@ const MaterializedConfigName = "materialized.json"
 // reset window.
 const RouteMarksName = "ROUTE_MARKS"
 
+// RunEventSeqName is the daemon's per-run agent-event sequence counter (CLA-603):
+// the high-water mark that keeps a second phase of the same run — or a restarted
+// daemon — from replaying numbers the plane would drop as duplicates.
+const RunEventSeqName = "RUN_EVENT_SEQ"
+
 // DaemonLogName is the daemon's own log file in its state dir (CLA-701): the
 // process's `log.Printf` lines, rotated at a size bound by internal/logfile.
 // It is named here because this package's adoption check has to recognise it —
@@ -665,6 +670,9 @@ func (d *Dir) isOurArtifact(name string) bool {
 		// replace; a crash can leave one behind.
 		name == "CURRENT_CLAIM", name == "CURRENT_CLAIM.tmp",
 		name == RouteMarksName, name == RouteMarksName+".tmp",
+		// The agent event channel's per-run sequence counter (CLA-603). A daemon
+		// restart mid-run must resume after the mark, not replay it.
+		name == RunEventSeqName, name == RunEventSeqName+".tmp",
 		// The daemon's own log and its rotated siblings (CLA-701). A pre-sentinel
 		// state dir holding one is still ours, and `doctor` opens the same
 		// directory a daemon writes it into.

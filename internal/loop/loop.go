@@ -18,6 +18,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/events"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
@@ -464,6 +465,16 @@ type Driver struct {
 	// panelFailStreak holds it; nothing that calls out to the plane or a harness
 	// may hold it.
 	stateMu sync.Mutex
+
+	// The agent event channel's wiring (CLA-603): the trusted plane origin, the
+	// account key and the process-wide per-run sequence counter. Set by
+	// SetEventChannel; a zero value is inert (no sessions emit). eventMu guards
+	// the lazy counter because a review panel builds its members from more than
+	// one goroutine.
+	eventMu     sync.Mutex
+	eventOrigin string
+	eventKey    string
+	eventSeq    *events.SeqCounter
 
 	// startRefusals counts consecutive worktree refusals per task id, so a tree
 	// that refuses every claim deterministically reaches the operator instead of

@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/events"
 )
 
 // Adapter is one harness. Implementations register themselves via Register in an
@@ -262,6 +264,15 @@ type Capabilities struct {
 	// instead of letting a run reach a phase that cannot start. opencode is the
 	// adapter with session continuation today.
 	RunsTurnSequences bool
+
+	// EmitsEvents reports whether this adapter normalizes its structured tool
+	// events into the agent event channel's activity tier (CLA-603). False means
+	// the loop must not build a sink for it: the channel has no per-harness
+	// mapping there, and an unused sink would start a batch goroutine that
+	// nobody closes. claude and opencode emit today; codex is explicitly out of
+	// this release's scope and copilot's stream carries no tool events the
+	// driver parses.
+	EmitsEvents bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -447,6 +458,20 @@ type Invocation struct {
 	// one. opencode is the adapter with that capability today (claude and codex
 	// refuse it with ErrTurnsUnsupported).
 	Turns []Turn
+
+	// NewEventSink, when non-nil, builds this session's agent-event sink. The
+	// loop sets it only when the project's events.activity dial is on, the
+	// machine has not opted out, and the adapter emits events (Capabilities).
+	// It is a FACTORY rather than a sink because one Invocation may run more
+	// than one process (an opencode resurrection or a multi-turn sequence), and
+	// each process gets its own bounded batch goroutine while the per-run
+	// sequence counter stays shared.
+	//
+	// The adapter calls it in the same place it builds its parser and MUST close
+	// the result (Result.closeEvents / opencodeParse.closeEvents) when the
+	// session ends. A nil factory means the channel is off: adapters simply get
+	// a nil sink, whose methods are no-ops.
+	NewEventSink func() *events.Emitter
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -832,6 +857,11 @@ type Result struct {
 	// branch recorded as the hand-off, a commit declared landed — for the driver
 	// to check against local git (CLA-253). Order is the order they were made.
 	Reports []Report
+
+	// events is this session's agent-event sink (CLA-603), nil when the channel
+	// is off. It is stream-side state like onClaim: the adapter closes it when
+	// the session ends, and it is never copied onto a Result the caller reads.
+	events *events.Emitter
 
 	// pending maps a tool_use id to what its result will mean. Parser state, not
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,

@@ -1,0 +1,83 @@
+# Agent activity events (CLI emission)
+
+The driver can stream a session's *activity* to the plane's per-run event
+channel: which tools it called, the one identifying string of each call (a
+command, a file path, a task id) and its todo snapshots. It sends **no tool
+output and no assistant text** in this release. The contract lives in the plane
+repo's `docs/proposals/agent-event-channel.md` (CLA-601); this file records what
+the CLI implements (CLA-603).
+
+## What is emitted — v1, activity tier only
+
+| harness | source event | channel event |
+| --- | --- | --- |
+| claude | `assistant`/tool_use, `TodoWrite` | `todo_change` from `input.todos` |
+| claude | `assistant`/tool_use, name `mcp__clankerbar__<tool>` | `clankerbar_mcp_call`, bare `<tool>` |
+| claude | `assistant`/tool_use, any other tool | `tool_call` (target per tool shape) |
+| opencode | terminal `tool_use` part, `todowrite` | `todo_change` from `state.input.todos` |
+| opencode | terminal `tool_use` part, tool `clankerbar_<tool>` | `clankerbar_mcp_call`, bare `<tool>` |
+| opencode | terminal `tool_use` part, any other tool | `tool_call` (target per tool shape) |
+
+The normalizers live in `internal/harness/events.go`; the wire schema, redaction
+and batcher in `internal/events`.
+
+- **Target extraction.** Exec-shaped tools send their `command`; file-shaped
+  tools send `file_path` / `filePath` / `path`; a small table covers the rest.
+  The raw input JSON is never sent. The value is redacted, flattened to one line
+  and truncated to 512 bytes (with the event's `truncated` marker).
+- **clankerbar MCP calls** send the task id (or question id) as `target` and
+  never the call's input. The call's result is an ordinary `tool_result` in the
+  transcript tier, which is a follow-up.
+- **Todos** are the full snapshot, capped at 50 items, each content redacted and
+  cut to 256 bytes.
+
+### Out of v1
+
+- **codex** is explicitly out of v1: its stream carries the same shapes under a
+  different event vocabulary, and the mapping is not wired. `codex` and
+  `copilot` report `Capabilities.EmitsEvents` false, so the driver never builds
+  a sink for them.
+- **Transcript tier** (`tool_result`, `assistant_text`, the 64 KB caps, `.env*`
+  read dropping and the wider redaction breadth) is the follow-up
+  `CLI: transcript-tier events and redaction breadth`. The plane accepts those
+  event types and counts them as dropped until then, so the wire contract is
+  already stable.
+
+## Turning it on and off
+
+- **On** is the project's run-config dial `events.activity`, set by operator+
+  under `set_run_config`. It is off by default and absent reads as off. The CLI
+  applies it with the rest of the stored run config at an iteration boundary.
+- **Off, machine-locally**, with `clankerbar run --no-events`,
+  `clankerbar supervise --no-events` (children get `CLANKERBAR_EVENTS=off`), or
+  `CLANKERBAR_EVENTS=off` (`0` / `false` accepted, case-insensitive). No
+  machine-local signal can turn the channel ON.
+- The plane re-checks the dial per batch: an emitter with a stale copy is
+  refused `403 events_disabled` and stops for that run, saying so once.
+
+## Batching, and why a slow plane cannot hurt a session
+
+- Flush every **2 s**, or when **50 events** are buffered, whichever first; the
+  encoded body is capped at **256 KB** (one event that would overflow flushes the
+  batch before it, never splits it).
+- `Add` never blocks and never returns an error. The buffer is bounded (512
+  events); past it events are dropped with one log line. The HTTP call runs on
+  the emitter's own goroutine with a 5 s timeout; a failed batch is dropped (one
+  line, then every twentieth), never retried in a loop and never surfaced to the
+  session.
+- `Close` attempts one final bounded flush (2 s grace) and then stops.
+
+Sequence numbers are per **run**, from 1, and were made the plane's idempotency
+key: a phased task runs several sessions on the same run id, so the counter is
+shared across sessions and persisted in the state dir (`RUN_EVENT_SEQ`). A
+restart resumes after the high-water mark instead of replaying numbers the plane
+would drop.
+
+## Redaction
+
+CLI-side, before anything leaves the machine, over the full string and **before**
+truncation: `clk_`, `ghp_` / `github_pat_`, `sk-ant-`, `AKIA` and PEM private-key
+blocks become `[redacted]`, and the event carries `redacted: true`. This is best
+effort, not a guarantee — the tiers and the project's dials are the privacy
+boundary, which is why the activity tier carries no output and the transcript
+tier is a second opt-in.

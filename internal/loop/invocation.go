@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/events"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -348,7 +349,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 	if err != nil {
 		return harness.Invocation{}, err
 	}
-	return harness.Invocation{
+	inv := harness.Invocation{
 		Prompt:        d.cfg.Prompt,
 		Model:         hc.Model.First(),
 		WorkDir:       workdir,
@@ -359,7 +360,15 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		EnvAllowlist:  d.cfg.SessionEnvAllowlist(harnessName, t.Name),
 		Nice:          d.cfg.SessionNice,
 		Probe:         probe,
-	}, nil
+	}
+	// The agent event channel (CLA-603). A probe is a one-word liveness check,
+	// not a session doing work, so it never emits; the destination is the
+	// project's run config dial, and the machine can only have opted out.
+	if !probe && d.eventSenderOn(tc, harnessName) {
+		name := harnessName
+		inv.NewEventSink = func() *events.Emitter { return d.newEventEmitter(name) }
+	}
+	return inv, nil
 }
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task

@@ -52,6 +52,15 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // the whole suite.
 func newSessionResult(in Invocation) Result {
 	res := Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
+	if in.NewEventSink != nil {
+		res.events = in.NewEventSink()
+		// A resumed phase is seeded with the run it is continuing, so its events
+		// have somewhere to go from the first call; a fresh phase learns the run
+		// id from noteClaimed when claim_task's result arrives.
+		if in.ResumeClaim.RunID != "" {
+			res.events.SetRunID(in.ResumeClaim.RunID)
+		}
+	}
 	// CLA-739: never on a probe. A probe is a one-word liveness check with its
 	// tools denied, so it has no tool calls to repeat, and a probe killed for a
 	// "loop" would report a session-shaped verdict for something no phase ran.
@@ -193,6 +202,7 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// mid-stream, instead of running to the end and being judged after.
 	stdoutTail := newTail()
 	res := newSessionResult(in)
+	defer res.closeEvents()
 	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, cancel)
 	waitErr := cmd.Wait()
 
@@ -496,6 +506,13 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		HasWIP:   payload.HasWip || payload.Task.Branch != "",
 		Category: payload.Task.Category,
 		Branch:   claimBranch,
+	}
+	// The agent event channel addresses the plane's per-run ingest endpoint with
+	// this id, so the run becomes known exactly here: the claim's request and
+	// result were already buffered (the claim IS a clankerbar_mcp_call event) and
+	// now get a destination (CLA-603).
+	if res.events != nil {
+		res.events.SetRunID(payload.Run.ID)
 	}
 	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
 	// claim the moment the stream carries it, not when the process exits.
@@ -1054,7 +1071,7 @@ func (r *Result) markCeilingHit() {
 // opencode does too as of CLA-365; codex still does not. See
 // Capabilities.TracksClaims.
 func (claude) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true}
+	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true, EmitsEvents: true}
 }
 
 // Diagnostic returns the same CLI-authored text IsTransient judged, so a caller

@@ -113,6 +113,17 @@ type RunConfigPanelMember struct {
 	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
+// RunConfigEvents mirrors the plane's `events` block (CLA-601/603). Absent
+// reads as both dials off; the CLI consumes only Activity in this release, but
+// Transcript is decoded so the document decodes whole and a reader can see what
+// the plane stored. The consumer is resolveRunConfigEvents on the plane; this
+// side must fail closed on its own, and a stored `transcript: true` without
+// activity is only ever read as off.
+type RunConfigEvents struct {
+	Activity   bool `json:"activity"`
+	Transcript bool `json:"transcript"`
+}
+
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
 // keys this build consumes. JSON decoding ignores everything else, so a newer
 // plane's added keys degrade to "unconsumed" rather than unmarshal errors;
@@ -148,6 +159,10 @@ type RunConfigDoc struct {
 	MaxSessionWallClock    Duration                         `json:"max_session_wall_clock"`
 	Budget                 *RunConfigBudget                 `json:"budget"`
 	Escalation             *RunConfigEscalation             `json:"escalation"`
+	// Events is the agent event channel's per-project opt-in. A nil pointer is an
+	// ABSENT key (both dials off, the local rules); a present block — even one
+	// with both false — is the project stating where the dials sit.
+	Events *RunConfigEvents `json:"events"`
 }
 
 // UnmarshalJSON decodes the document and records whether the `prompt` KEY was
@@ -212,7 +227,7 @@ func (d *RunConfigDoc) Empty() bool {
 	return d.Harness == "" && d.Model == "" && d.Models == nil && d.Harnesses == nil &&
 		!d.pipelineSet() &&
 		d.MaxTurns == 0 && d.MaxSessionWallClock == 0 &&
-		d.Budget == nil && d.Escalation == nil
+		d.Budget == nil && d.Escalation == nil && d.Events == nil
 }
 
 // Clone returns a copy safe to overlay a run-config document onto: every map
@@ -436,6 +451,19 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		if e.CategoryRules != nil {
 			c.Escalation.CategoryRules = e.CategoryRules
 		}
+	}
+	// The event channel's dials (CLA-603): the stored, effective document is the
+	// authority, so an absent block means both dials off. No local-file value can
+	// turn one on; the machine can only opt out (NoEvents), which this overlay
+	// never touches.
+	c.Events = RunConfigEvents{}
+	if doc.Events != nil {
+		c.Events = *doc.Events
+	}
+	if c.Events.Transcript && !c.Events.Activity {
+		// The plane refuses this combination at save time; a document that still
+		// carries it (a hand-edited store, a future reader) fails closed.
+		c.Events.Transcript = false
 	}
 	return nil
 }
