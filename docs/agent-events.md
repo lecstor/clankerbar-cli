@@ -96,3 +96,35 @@ blocks become `[redacted]`, and the event carries `redacted: true`. This is best
 effort, not a guarantee — the tiers and the project's dials are the privacy
 boundary, which is why the activity tier carries no output and the transcript
 tier is a second opt-in.
+
+## Inbound console messages (CLI delivery)
+
+The channel's other direction (plane task CLA-606): an operator+ can send a message from a
+run's task page into the live session. The CLI polls `GET
+/api/runs/<runId>/inbox?after=<seq>` every 2 s with the run's own `clk_` credential, writes
+each unacknowledged message to the session's **stdin** as a user turn, and then ACKs the
+highest seq it wrote. The plane records the message as an `inbound_message` feed event, so
+the transcript shows the steering.
+
+- **Harness support is claude only in v1.** `claude -p --input-format stream-json` reads user
+  turns from stdin for the session's lifetime, so a message can arrive between turns. The
+  prompt is no longer an argv argument: it is the first stdin user message, and closing stdin
+  tells the CLI to finish the current turn and exit. `opencode`, `codex` and `copilot` have
+  **no delivery in v1** (`Capabilities.DeliversMessages` is false): they run one-shot prompts
+  with no equivalent input channel. An interactive session also receives nothing in v1; its
+  hook (CLA-605) only emits activity, and polling from a hook is the stated follow-up.
+- **The session's turn accounting keeps the old lifecycle.** Each user message written (the
+  prompt included) is one outstanding turn; each `result` on the stream retires one. When the
+  last one is retired and no message is outstanding, the adapter closes stdin and the CLI
+  exits — exactly when the old `-p <prompt>` form did. A message delivered mid-turn is
+  therefore processed as the next turn before the session ends.
+- **A failed or slow poll cannot fail the session.** The poller is its own goroutine with a
+  per-request timeout; a plane outage is logged once per distinct failure and delivery
+  resumes. A message that could not be written (stdin closed) stays queued on the plane.
+- **Exactly-once within the session.** The cursor advances only after a successful stdin
+  write, and a repeated `seq` is skipped. Across a restart the plane may re-offer a message
+  written but not ACKed (at-least-once at the transport); the ACK is sent immediately after
+  each write to keep that window small.
+- **Wiring.** `SetInboxChannel(origin, apiKey)` uses the same trusted origin and account key
+  as the event sender. The run id is observed from `claim_task` mid-session (or seeded from
+  the resumed claim), because the session claims inside itself.

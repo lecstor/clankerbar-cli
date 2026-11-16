@@ -371,6 +371,12 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		name := harnessName
 		inv.NewEventSink = func() *events.Emitter { return d.newEventEmitter(name) }
 	}
+	// Console -> agent messages (CLA-606): independent of the event dials. The project
+	// activity dial governs what is RECORDED in the feed, not whether an operator's input
+	// can reach the agent, and the machine has no opt-out for input to its own session.
+	if d.inboxOn(harnessName, probe) {
+		inv.Inbox = &harness.InboxConfig{Origin: d.inboxOrigin, APIKey: d.inboxKey}
+	}
 	return inv, nil
 }
 

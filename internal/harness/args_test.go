@@ -25,9 +25,10 @@ import (
 // class) rather than a live injection hole - which is exactly why it is worth one
 // token and a test instead of a parser.
 //
-// claude is not in this table because it has no positional to protect: the prompt
-// is the VALUE of `-p` (claude.go), so a leading `--` is consumed as that flag's
-// argument and there is nothing a terminator would add.
+// claude is not in this table because it has no positional to protect: since CLA-606 the
+// prompt is not an argv element at all — it is the first stream-json user message written to
+// stdin (claude.go), so a flag-shaped prompt can never be parsed as a flag. The argv carries
+// no free text.
 var terminatorAdapters = []struct {
 	name string
 	args func(Invocation) []string

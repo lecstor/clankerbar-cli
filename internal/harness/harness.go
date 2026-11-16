@@ -271,6 +271,15 @@ type Capabilities struct {
 	// would leak its batch goroutine. codex is out of v1 by scope; copilot's tool
 	// events exist but its activity mapping is out of v1 too.
 	EmitsEvents bool
+
+	// DeliversMessages reports whether this adapter can receive console -> agent
+	// messages (CLA-606). True only for claude in v1: its `-p --input-format
+	// stream-json` reads user messages from stdin for the session's lifetime, so
+	// a message can be injected mid-turn. The other harnesses have no delivery in
+	// v1 — opencode/codex run one-shot prompts and copilot has no equivalent — and
+	// an interactive session waits for its hook. The loop sets Invocation.Inbox
+	// only when this is true.
+	DeliversMessages bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -468,6 +477,27 @@ type Invocation struct {
 	// opencodeParse.closeEvents) when the session ends. Nil means the channel is
 	// off.
 	NewEventSink func() *events.Emitter
+
+	// Inbox wires the console -> agent message channel for this session (CLA-606).
+	// The loop sets it only for an adapter whose Capabilities.DeliversMessages is
+	// true and only when the plane origin and key are configured. The adapter polls
+	// the run's inbox and writes each message to the session's stdin; the run id
+	// arrives from ResumeClaim or OnClaim, because the session claims inside itself.
+	//
+	// Nil means no delivery: every other harness in v1, and every probe.
+	Inbox *InboxConfig
+}
+
+// InboxConfig is the plane half of the console -> agent message channel: where the run
+// inbox lives and the account key that authorises the poll. The RUN id is not here because
+// the driver does not know it at spawn time for a fresh claim; the adapter observes it.
+type InboxConfig struct {
+	// Origin is the trusted plane origin, e.g. https://clankerbar.com (no path).
+	Origin string
+	// APIKey is the same account key every other plane write carries.
+	APIKey string
+	// PollInterval overrides the v1 2 s cadence; tests set a short one.
+	PollInterval time.Duration
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -848,6 +878,13 @@ type Result struct {
 	// and deliberately not copied onto the final Result by opencodeParse.finish,
 	// which builds that field-by-field: stream-side state stays stream-side.
 	onClaim func(Claim)
+
+	// onTurnEnd is called by the adapter's parser when a terminal `result` event
+	// arrives: the turn the CLI was working is over. The claude adapter uses it
+	// to close the stream-json stdin when no console message is outstanding, so
+	// the CLI exits exactly when the old prompt-argument form did. Nil on every
+	// other adapter and every test that builds a Result directly.
+	onTurnEnd func()
 
 	// Reports are the delivery claims this session got the plane to ACCEPT — a
 	// branch recorded as the hand-off, a commit declared landed — for the driver
