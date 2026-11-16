@@ -162,6 +162,14 @@ type Options struct {
 	// Nil = the discovered local config, or bare defaults when none exists.
 	BaseCfg *config.Config
 
+	// NoEvents is the supervisor's machine-local agent-event opt-out
+	// (`supervise --no-events`): children are spawned with CLANKERBAR_EVENTS=off
+	// so every daemon under this supervisor has the channel disabled. It can only
+	// turn the channel OFF; the project's dial is still the only way on. A
+	// supervisor launched with CLANKERBAR_EVENTS=off already passes it through
+	// the inherited environment; this makes the flag equivalent.
+	NoEvents bool
+
 	// RosterCacheDir is where the supervisor keeps the last-known-good roster
 	// and the per-instance state dirs (with their materialized configs).
 	// Empty = the default under the loop state root.
@@ -1157,7 +1165,7 @@ func (d *Supervisor) spawn(inst *Instance) {
 	// wrapper can read what the supervisor believes the child runs. The real
 	// daemon ignores it — its beacon reports its own build, which is the
 	// ground truth the roll verifies.
-	cmd.Env = spawnEnv(v)
+	cmd.Env = spawnEnv(v, d.o.NoEvents)
 	// The children's logs stream to the same stdout/stderr the supervisor's
 	// do — the operator watches daemons today by watching one terminal per
 	// daemon, and the fleet must not be quieter than that. Adoption across an
@@ -1318,15 +1326,29 @@ func childVersion(hook func() string) string {
 // reserved name would otherwise shadow the supervisor's value — and the
 // wrapper that "can read what the supervisor believes the child runs" would
 // read a stranger's number instead.
-func spawnEnv(v string) []string {
+//
+// noEvents does the same for CLANKERBAR_EVENTS: the inherited value is dropped
+// and `off` appended, so the flag (the explicit statement) cannot be outranked
+// by a stale value in the other direction.
+func spawnEnv(v string, noEvents bool) []string {
 	prefix := childVersionEnv + "="
-	env := make([]string, 0, len(os.Environ())+1)
+	env := make([]string, 0, len(os.Environ())+2)
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, prefix) {
-			env = append(env, kv)
+		if strings.HasPrefix(kv, prefix) {
+			continue
 		}
+		if noEvents && strings.HasPrefix(kv, "CLANKERBAR_EVENTS=") {
+			// The flag is the explicit statement; a stale inherited value must not
+			// outrank it in the other direction.
+			continue
+		}
+		env = append(env, kv)
 	}
-	return append(env, prefix+v)
+	env = append(env, prefix+v)
+	if noEvents {
+		env = append(env, "CLANKERBAR_EVENTS=off")
+	}
+	return env
 }
 
 // fleetStatus builds the supervisor's status surface (phase 5a): the header

@@ -137,6 +137,11 @@ type Overrides struct {
 	MaxIterations    int
 	PollInterval     time.Duration
 	IdlePollInterval time.Duration
+	// NoEvents is the machine-local agent-event opt-out (--no-events or
+	// CLANKERBAR_EVENTS=off). It is a one-way switch: false means "the flags said
+	// nothing", not "turn the channel back on", because nothing machine-local may
+	// turn it on.
+	NoEvents bool
 }
 
 // ApplyFlagOverrides layers non-zero flag values over the loaded config.
@@ -163,6 +168,9 @@ func (c *Config) ApplyFlagOverrides(o Overrides) {
 	}
 	if o.IdlePollInterval != 0 {
 		c.IdlePollInterval = Duration(o.IdlePollInterval)
+	}
+	if o.NoEvents {
+		c.NoEvents = true
 	}
 }
 

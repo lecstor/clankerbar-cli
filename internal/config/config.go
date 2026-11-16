@@ -633,6 +633,19 @@ type Config struct {
 	// for that project only.
 	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
 
+	// Events is the agent event channel's dials as the project's EFFECTIVE run
+	// config stated them (CLA-603). It is never decoded from the local file
+	// (`json:"-"`): opt-in is the project dial's alone (operator decision
+	// 564a0957), and a machine may only opt OUT — see NoEvents.
+	Events RunConfigEvents `json:"-"`
+
+	// NoEvents is the machine-local opt-out: the `--no-events` flag or
+	// CLANKERBAR_EVENTS=off (`0`/`false` accepted). It can only turn the channel
+	// off; no machine-local signal can turn a tier on. `json:"-"` because it is a
+	// fact about THIS invocation, not part of the fleet-shared config — and in
+	// particular not part of Identity(), which fingerprints the shared policy.
+	NoEvents bool `json:"-"`
+
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
 	// original single-project mode, driven by the top-level fields, exactly as

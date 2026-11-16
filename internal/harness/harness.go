@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/events"
 )
 
 // Adapter is one harness. Implementations register themselves via Register in an
@@ -262,6 +264,13 @@ type Capabilities struct {
 	// instead of letting a run reach a phase that cannot start. opencode is the
 	// adapter with session continuation today.
 	RunsTurnSequences bool
+
+	// EmitsEvents reports whether this adapter normalizes its structured tool
+	// events into the agent event channel's activity tier (CLA-603). False means
+	// the loop must not build a sink: there is no mapping, and an unclosed sink
+	// would leak its batch goroutine. codex is out of v1 by scope; copilot's tool
+	// events exist but its activity mapping is out of v1 too.
+	EmitsEvents bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -447,6 +456,18 @@ type Invocation struct {
 	// one. opencode is the adapter with that capability today (claude and codex
 	// refuse it with ErrTurnsUnsupported).
 	Turns []Turn
+
+	// NewEventSink, when non-nil, builds this session's agent-event sink. The
+	// loop sets it only when the project's events.activity dial is on, the
+	// machine has not opted out, and the adapter emits events. It is a FACTORY
+	// because one Invocation may run several processes (an opencode resurrection
+	// or a multi-turn sequence), each with its own batch goroutine over a shared
+	// per-run sequence counter.
+	//
+	// The adapter MUST close what it builds (Result.closeEvents /
+	// opencodeParse.closeEvents) when the session ends. Nil means the channel is
+	// off.
+	NewEventSink func() *events.Emitter
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -832,6 +853,13 @@ type Result struct {
 	// branch recorded as the hand-off, a commit declared landed — for the driver
 	// to check against local git (CLA-253). Order is the order they were made.
 	Reports []Report
+
+	// events is this session's agent-event sink (CLA-603), nil when the channel
+	// is off. It is stream-side state like onClaim: the adapter closes it when
+	// the session ends (closeEvents, which nils it on the copy it was called on).
+	// A value copy of the Result may still carry the closed pointer — harmless,
+	// since the field is unexported and nothing writes through it after Close.
+	events *events.Emitter
 
 	// pending maps a tool_use id to what its result will mean. Parser state, not
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,

@@ -31,6 +31,7 @@ type runFlags struct {
 	maxIter      int
 	pollInterval time.Duration
 	idlePoll     time.Duration
+	noEvents     bool
 }
 
 // newRunFlagSet registers the `run` flags onto a pflag set bound to f.
@@ -53,6 +54,7 @@ func newRunFlagSet(f *runFlags) *pflag.FlagSet {
 	fs.IntVar(&f.maxIter, "max-iterations", 0, "stop after N drain iterations (0 = run as a daemon until stopped)")
 	fs.DurationVar(&f.pollInterval, "poll-interval", 0, "while paused on a usage limit, re-probe this often to catch an early reset")
 	fs.DurationVar(&f.idlePoll, "idle-poll-interval", 0, "when the backlog has no claimable work, re-check this often (stay running)")
+	fs.BoolVar(&f.noEvents, "no-events", false, "do not emit agent activity events to the plane, whatever the project's events dial says (CLANKERBAR_EVENTS=off does the same)")
 	return fs
 }
 
@@ -80,6 +82,10 @@ func Run(ctx context.Context, args []string) error {
 		MaxIterations:    f.maxIter,
 		PollInterval:     f.pollInterval,
 		IdlePollInterval: f.idlePoll,
+		// The machine-local opt-out: the flag or CLANKERBAR_EVENTS=off. It rides
+		// the overrides because ApplyFlagOverrides re-applies them after every
+		// stored-document overlay, so a run config can never switch it back on.
+		NoEvents: f.noEvents || eventsEnvOff(),
 	}
 	cfg.ApplyFlagOverrides(overrides)
 	if err := cfg.Validate(); err != nil {
@@ -176,14 +182,16 @@ func Run(ctx context.Context, args []string) error {
 				Fleet: fleet.New(cfg.ProjectFleetReportURL(p), apiKey),
 			})
 		}
-		return runDriver(ctx, loop.NewMulti(cfg, adapter, targets), f.cfgPath, overrides)
+		drv := loop.NewMulti(cfg, adapter, targets)
+		drv.SetEventChannel(cfg.CredentialOrigin(), apiKey)
+		return runDriver(ctx, drv, f.cfgPath, overrides)
 	}
 
 	// One unnamed target — NewMulti with a single entry is exactly what New builds,
 	// and it is the only form that can carry a Releaser.
 	rel := plane.New(cfg.BacklogEndpoint(), apiKey)
 	rc := plane.NewRunConfigAPI(cfg.BacklogEndpoint(), apiKey)
-	return runDriver(ctx, loop.NewMulti(cfg, adapter, []loop.Target{{
+	drv := loop.NewMulti(cfg, adapter, []loop.Target{{
 		Poller:      backlog.New(cfg.BacklogSummaryURL(), apiKey),
 		Releaser:    rel,
 		RCfg:        rc,
@@ -192,7 +200,25 @@ func Run(ctx context.Context, args []string) error {
 		PrimaryRepo: cfg.PrimaryRepoFor(""),
 		// See the multi-project branch above.
 		ProjectRoot: cfg.ProjectRoot,
-	}}), f.cfgPath, overrides)
+	}})
+	// The agent event channel's wiring (CLA-603): the trusted origin and the same
+	// account key every other plane write uses. The dial is per project and read
+	// from the effective run config; this only makes the channel possible.
+	drv.SetEventChannel(cfg.CredentialOrigin(), apiKey)
+	return runDriver(ctx, drv, f.cfgPath, overrides)
+}
+
+// eventsEnvOff reports whether the machine-local CLANKERBAR_EVENTS signal
+// disables the agent event channel. Only the three documented OFF spellings
+// count, case-insensitively; any other value — including a truthy-looking one —
+// means "not locally disabled", because no machine-local signal may turn a tier
+// ON (the project dial decides that) and a typo must not be read as one.
+func eventsEnvOff() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CLANKERBAR_EVENTS"))) {
+	case "off", "0", "false":
+		return true
+	}
+	return false
 }
 
 // runDriver drives the loop and turns a requested restart into an actual re-exec

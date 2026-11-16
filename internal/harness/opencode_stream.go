@@ -184,6 +184,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// claim seed, and the tests build the parser the same way so that dropping it
 	// here turns them red.
 	p := newOpencodeParse(in, console)
+	defer p.closeEvents()
 	p.kill = loopKill
 	// The no-output watchdog, on the same cancellation the tool-loop kill uses.
 	// Armed after p.kill so its callback has the kill switch; a probe leaves it
@@ -675,6 +676,11 @@ func (p *opencodeParse) line(line []byte) {
 	}
 }
 
+// closeEvents flushes and stops this session's agent-event sink (CLA-603). The
+// parser's observation holds the sink because the real Result is only built
+// after the process exits; it is nil when the channel is off.
+func (p *opencodeParse) closeEvents() { p.observed.closeEvents() }
+
 // noteTool feeds one tool event into the shared clankerbar observation, which is
 // what populates Result.Claim and the delivery Reports.
 //
@@ -747,6 +753,9 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.settledCalls = map[string]bool{}
 	}
 	p.settledCalls[key] = true
+	// The channel's activity tier hears the call, once, before the clankerbar
+	// observation consumes it (CLA-603). The sink is nil when the channel is off.
+	noteOpencodeToolEvent(p.observed.events, part.Tool, part.ID, st.Input)
 	// CLA-739: the STATUS is the failure flag (see opencodeToolState), and the
 	// error text rides where the output would have been.
 	if p.observed.toolLoop.observe(part.Tool, st.Status == "error", st.Error) && p.kill != nil {

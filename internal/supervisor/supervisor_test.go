@@ -1746,7 +1746,7 @@ func TestBackoffDelay(t *testing.T) {
 func TestSpawnEnvDropsAPreExistingChildVersion(t *testing.T) {
 	t.Setenv(childVersionEnv, "operator-stale")
 	t.Setenv("KEEP_ME", "yes")
-	env := spawnEnv("1.2.3")
+	env := spawnEnv("1.2.3", false)
 	joined := strings.Join(env, "\n")
 	if strings.Contains(joined, childVersionEnv+"=operator-stale") {
 		t.Fatalf("spawnEnv kept a pre-existing %s: %v", childVersionEnv, env)
@@ -1759,6 +1759,37 @@ func TestSpawnEnvDropsAPreExistingChildVersion(t *testing.T) {
 	}
 	if got := len(env); got != len(os.Environ()) {
 		t.Fatalf("spawnEnv changed the variable count: %d entries -> %d", len(os.Environ()), got)
+	}
+}
+
+// --no-events on the supervisor (CLA-603) has to reach every child through the
+// environment, and it is a one-way switch: a stale inherited value must be
+// replaced, never left to outrank the flag.
+func TestSpawnEnvPropagatesNoEvents(t *testing.T) {
+	t.Setenv("CLANKERBAR_EVENTS", "on")
+	env := spawnEnv("1.2.3", true)
+	var seen []string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "CLANKERBAR_EVENTS=") {
+			seen = append(seen, kv)
+		}
+	}
+	if len(seen) != 1 || seen[0] != "CLANKERBAR_EVENTS=off" {
+		t.Fatalf("event opt-out entries = %v, want exactly CLANKERBAR_EVENTS=off", seen)
+	}
+}
+
+func TestSpawnEnvWithoutNoEventsKeepsTheInheritedValue(t *testing.T) {
+	t.Setenv("CLANKERBAR_EVENTS", "off")
+	env := spawnEnv("1.2.3", false)
+	found := false
+	for _, kv := range env {
+		if kv == "CLANKERBAR_EVENTS=off" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("spawnEnv dropped an inherited opt-out: %v", env)
 	}
 }
 
