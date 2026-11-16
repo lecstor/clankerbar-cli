@@ -491,8 +491,12 @@ func TestAdoptedChildExitWithNoRosterDoesNotPanic(t *testing.T) {
 	o.VerifyTimeout = 5 * time.Second
 
 	out := newOutgoingSupervisor(t, o, cacheDir)
-	child := stageReplaceableChild(t, out, "daemon-orphan", "sleep", "1.0.0")
-	waitForBeaconVersion(t, child.stateDir, "1.0.0")
+	// Stage the child on THIS image, so the adopted roll leaves it alone. On an
+	// older version the roll writes RESTART, which the fake daemon treats as a
+	// restart and exits on - the exit this test means to cause itself, just
+	// earlier and only under some timings.
+	child := stageReplaceableChild(t, out, "daemon-orphan", "sleep", version.Current)
+	waitForBeaconVersion(t, child.stateDir, version.Current)
 	if n, err := out.writeReplaceHandoff(); err != nil || n != 1 {
 		t.Fatalf("writeReplaceHandoff = %d, %v; want 1, nil", n, err)
 	}
