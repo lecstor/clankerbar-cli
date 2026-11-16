@@ -82,7 +82,8 @@ func (p *pauseClaimReleaser) beatSnapshot() []string {
 
 // pauseBoundaryDriver is the two-phase fixture with a moveable clock and a
 // renewal cadence a test can wait out. Two milliseconds keeps every wait and
-// beat real (waitOrStop still sleeps real time) without making the suite slow.
+// beat real (the underlying wait still sleeps real time) without making the
+// suite slow.
 func pauseBoundaryDriver(t *testing.T, h harness.Adapter, rel plane.Releaser, clk *pauseHoldClock, pw *config.PauseWindows) *Driver {
 	t.Helper()
 	d := phaseDriverWithReleaser(t, h, twoPhases(), rel)
@@ -152,7 +153,7 @@ func TestDrainPhases_ScheduledPauseHoldsTheNextPhaseAndResumesIt(t *testing.T) {
 	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
 	done := startPauseDrain(t, d)
 
-	waitUntil(t, "the hold at the implement boundary", func() bool {
+	waitUntil(t, "the hold at the review boundary", func() bool {
 		return strings.Contains(logs.String(), "holding t-1 at the review boundary")
 	})
 	if h.invokeCalls != 1 {
@@ -205,7 +206,7 @@ func TestDrainPhases_StopDuringScheduledPauseTakesTheNormalStopPath(t *testing.T
 	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
 	done := startPauseDrain(t, d)
 
-	waitUntil(t, "the hold at the implement boundary", func() bool {
+	waitUntil(t, "the hold at the review boundary", func() bool {
 		return strings.Contains(logs.String(), "holding t-1 at the review boundary")
 	})
 	if err := os.WriteFile(filepath.Join(d.state.Path(), "STOP"), []byte("stop during the pause"), 0o644); err != nil {

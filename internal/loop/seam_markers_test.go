@@ -360,9 +360,14 @@ func TestDrainPhases_NoMarkerStillRunsTheSequenceOnOneClaim(t *testing.T) {
 }
 
 // TestDrainPhases_PauseDoesNotStopAtThePhaseSeam pins the operator decision
-// 6019ea26: a project pause only gates NEW claims, so a pause landing (or
-// already in force) during phase 1 must let every remaining phase run on the
+// 6019ea26 for the CONSOLE pause: it only gates NEW claims, so a pause landing
+// (or already in force) during phase 1 must let every remaining phase run on the
 // held claim. Pausing is how the operator gets in-flight tasks completed.
+//
+// A SCHEDULED pause window is deliberately different (CLA-906, operator ruling
+// 2026-11-16): it holds the sequence at the next phase boundary so peak-priced
+// sessions are not started. That behaviour is pinned in
+// pause_boundary_test.go.
 func TestDrainPhases_PauseDoesNotStopAtThePhaseSeam(t *testing.T) {
 	t.Run("console pause flag", func(t *testing.T) {
 		brief := seamBrief("CLA-885")
@@ -386,35 +391,6 @@ func TestDrainPhases_PauseDoesNotStopAtThePhaseSeam(t *testing.T) {
 		}
 		if out := logs.String(); strings.Contains(out, "at the phase seam") {
 			t.Errorf("a pause must not be read at the phase seam; log was:\n%s", out)
-		}
-	})
-
-	t.Run("scheduled pause window opens mid-sequence", func(t *testing.T) {
-		brief := seamBrief("CLA-886")
-		claim := seamClaim(brief)
-		f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
-			{res: seamCheckpoint(claim)},
-			{res: held(okResult(1, 0), claim)},
-		})
-		logs := captureLogs(t)
-		// peakSchedule is mon-fri 11:00-14:00 Australia/Brisbane; flip the
-		// clock into it from inside phase 1.
-		f.d.cfg.PauseWindows = peakSchedule(t)
-		inside := brisbaneAt(t, 9, 12, 0)
-		f.h.onInvoke = func(call int) {
-			if call == 0 {
-				f.d.now = func() time.Time { return inside }
-			}
-		}
-		_, _, stop, err := drainPhasesOnce(t, f.d)
-		if err != nil || stop {
-			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
-		}
-		if f.h.invokeCalls != 2 {
-			t.Errorf("a scheduled pause window stopped the sequence after %d session(s); every remaining phase must run on the held claim", f.h.invokeCalls)
-		}
-		if out := logs.String(); strings.Contains(out, "at the phase seam") {
-			t.Errorf("a pause window must not be read at the phase seam; log was:\n%s", out)
 		}
 	})
 }

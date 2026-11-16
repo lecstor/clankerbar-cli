@@ -191,10 +191,11 @@ type Driver struct {
 	state   *statedir.Dir
 	blind   bool // no cheap backlog read available — drain then idle-poll
 
-	// now is the clock the scheduled-pause check reads, and ONLY that: the
-	// back-off ladder in progress.go still reads the wall clock. Nil falls back
-	// to time.Now, so a hand-built test Driver works. schedPaused is whether a
-	// window is active — kept so the enter and exit are logged once, not per poll.
+	// now is the clock the scheduled-pause check reads (at the poll gate and at a
+	// phase boundary), and ONLY that: the back-off ladder in progress.go still
+	// reads the wall clock. Nil falls back to time.Now, so a hand-built test
+	// Driver works. schedPaused is whether a window is active — kept so the enter
+	// and exit are logged once, not per poll.
 	now         func() time.Time
 	schedPaused bool
 

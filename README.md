@@ -2179,18 +2179,28 @@ local-time windows — the DeepSeek peak-pricing hours, say:
 }
 ```
 
-It is checked between iterations, like the console pause: an in-flight session,
-and the rest of a phase sequence already under way, always finishes — nothing is
-killed mid-session — and the next claim waits for the window to end. `lead`
-stops new claims that long BEFORE a window too, so a fresh sequence is not
+It is checked between iterations, like the console pause, AND at every phase
+boundary: an in-flight session is never interrupted — nothing is killed
+mid-session — but the next SESSION is held until the window ends. A phase
+sequence that reaches a boundary inside a window keeps its claim (renewing the
+lease at the usual third-of-lease cadence), logs the hold once, and resumes the
+same run at that phase when the window closes. The same boundary rule holds a
+handoff respawn, a review panel's fan-out (the whole panel, not one member), and
+a drain's first phase when the claim was taken just before the window opened.
+`lead` stops new sessions that long BEFORE a window too, so a fresh sequence is not
 started only to run into it; it is capped at 24h, since it is how long before a
-window new work stops. `days` is the day the window STARTS in `timezone`
+window new work stops. The supervisor's conflict-only session obeys the schedule
+as well: it is a new paid session, so it does not start inside a window and the
+task waits for the next close-out pass (the deterministic close-out runs no agent
+session and is unaffected). `days` is the day the window STARTS in `timezone`
 (three-letter names, case-insensitive; a `-` range, which may not wrap, or
 `daily`), so an overnight window reads as one entry — `{"days": "fri", "from":
 "22:00", "to": "06:00"}` runs Friday night into Saturday morning. `to` before
 `from` crosses midnight, and `from` equal to `to` is a whole 24 hours. Windows
 that overlap or abut are one pause. Unset (or an empty `windows` list) means no
-schedule at all; `doctor` reports the schedule, and whether it is holding now.
+schedule at all; `doctor` reports the schedule, whether it is holding now, and
+the boundary rule. See [docs/pause-windows.md](docs/pause-windows.md) for what
+counts as a boundary and which session kinds are covered.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default

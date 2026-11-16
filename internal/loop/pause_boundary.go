@@ -44,9 +44,13 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) (held, sto
 	if claim != nil && claim.Claim.Held() {
 		subject = claimLabel(claim.Claim)
 	}
-	renewal := "keeping the claim for the next phase"
-	if canBeat {
-		renewal = fmt.Sprintf("renewing the lease of %s every %s", subject, interval)
+	renewal := "resuming at that phase when the window ends"
+	if claim != nil && claim.Claim.Held() {
+		if canBeat {
+			renewal = fmt.Sprintf("renewing the lease of %s every %s", subject, interval)
+		} else {
+			renewal = "keeping its claim for the next phase"
+		}
 	}
 
 	// The flag is the same one the poll gate sets, so presence reads `draining`
@@ -87,8 +91,10 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) (held, sto
 			// still answers active; a zero wait would spin.
 			wait = time.Millisecond
 		}
-		// waitOrStop keeps STOP/RESTART/RELOAD responsive between wakes.
-		if d.waitOrStop(ctx, wait) {
+		// waitOrStopHalt keeps STOP, RESTART, HALT and RELOAD responsive between
+		// wakes: a hold can last hours, so an operator's shutdown must not wait
+		// for the window to end.
+		if d.waitOrStopHalt(ctx, wait) {
 			return held, true
 		}
 		if !canBeat {

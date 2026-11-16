@@ -46,13 +46,14 @@ func checkPauseWindowsAt(cfg *config.Config, now time.Time) check {
 	if active, until := p.ActiveAt(now); active {
 		c.info = append(c.info, fmt.Sprintf("now: paused until %s (%s)",
 			until.In(loc).Format("Mon 15:04"), tz))
-		return c
-	}
-	if start, ok := p.NextStart(now); ok {
+	} else if start, ok := p.NextStart(now); ok {
 		c.info = append(c.info, fmt.Sprintf("now: running; next pause %s (%s)",
 			start.In(loc).Format("Mon 15:04"), tz))
-		return c
+	} else {
+		c.info = append(c.info, "now: running")
 	}
-	c.info = append(c.info, "now: running")
+	// CLA-906: the schedule holds a phase SEQUENCE at its next boundary, not
+	// only the next claim. A session in flight is never interrupted.
+	c.info = append(c.info, "a session in flight is never interrupted: a phase sequence holds at its next phase boundary and resumes there when the window ends")
 	return c
 }
