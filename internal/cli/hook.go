@@ -97,9 +97,8 @@ func hookEmit(args []string, stdin io.Reader) error {
 	}
 	apiKey := strings.TrimSpace(os.Getenv("CLANKERBAR_API_KEY"))
 	if apiKey == "" {
-		// The key may be supplied only to the MCP client rather than the shell;
-		// there is nothing to send with, and saying so once is the whole remedy.
-		log.Print("agent events: CLANKERBAR_API_KEY is unset — no event sent")
+		// Quiet like the run-id case: a session without the key sends nothing, and
+		// a line per tool call would be noise the operator cannot act on from here.
 		return nil
 	}
 
