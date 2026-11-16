@@ -8,9 +8,11 @@ import (
 )
 
 // PauseWindows is the operator's recurring "start no new work" schedule: local
-// wall-clock windows in which the loop claims nothing new, checked between
-// iterations exactly like the console pause, so an in-flight session or phase
-// sequence always finishes.
+// wall-clock windows in which the loop spawns no new session. It is checked
+// between iterations exactly like the console pause, and at every phase boundary
+// (CLA-906): a running session is never interrupted, but the next phase, a
+// handoff respawn or a drain's first session waits out the window with the claim
+// held and its lease renewed.
 //
 // It exists for pricing and quiet hours - "do not spend on peak rates" - which
 // is why the windows are wall-clock times in an operator-named zone rather than

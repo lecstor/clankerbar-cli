@@ -406,9 +406,12 @@ type Config struct {
 
 	// PauseWindows is the operator's recurring local-time schedule of hours in
 	// which the loop starts no new work — checked between iterations, like the
-	// console pause, so an in-flight session or phase sequence always finishes.
-	// Nil/empty = no schedule. `omitempty` is load-bearing for the same reason as
-	// ProjectRoot: an unset key must not change a daemon's config identity.
+	// console pause, AND at every phase boundary. A session already running is
+	// never interrupted; the pause holds the NEXT phase/session, keeps the
+	// sequence's claim alive, and resumes the same run there when the window
+	// ends. See docs/pause-windows.md. Nil/empty = no schedule. `omitempty` is
+	// load-bearing for the same reason as ProjectRoot: an unset key must not
+	// change a daemon's config identity.
 	PauseWindows *PauseWindows `json:"pause_windows,omitempty"`
 
 	// BacklogURL is the clankerbar base URL the driver reads backlog counts from

@@ -1,8 +1,10 @@
 package loop
 
 // Scheduled pause windows (config.PauseWindows): during a configured local-time
-// window the loop starts no new sessions — checked between iterations exactly
-// like the console pause, so an in-flight session or sequence always finishes.
+// window the loop starts no new sessions — checked between iterations like the
+// console pause, and at every phase boundary (CLA-906), so a running session
+// always finishes while the next one waits. The poll-gate tests are here; the
+// boundary hold is in pause_boundary_test.go.
 
 import (
 	"context"

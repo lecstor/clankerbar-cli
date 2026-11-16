@@ -121,38 +121,61 @@ func (s *drainSeq) runnerDoneNote() string {
 	return config.RunnerDoneReportFor(resolvedRunnerBrief(ph.Prompt, rb, ph.IsPanelMember(), s.carried))
 }
 
-// checkPhaseBoundary runs the budget breaker at a phase boundary, before a
-// further session (or a handoff respawn) is spawned.
-func (s *drainSeq) checkPhaseBoundary(st *seqStep) seqNext {
-	d := s.d
-	drainNum := s.drainNum
-	prior := s.prior
-	if s.spawned > 0 {
-		// The breaker at a phase boundary — the third place a session ends and
-		// the loop decides whether to spawn another, alongside between-drains and
-		// between-attempts. It is not decoration: one measured task spent 92% of a
-		// whole run's 75M ceiling inside a single session, which a between-drains
-		// check cannot see coming. A handoff respawn gets the same check, BEFORE
-		// the respawn: a session cannot spend its way past the ceiling by handing
-		// off to itself.
-		//
-		// The breaker is the TARGET's account (CLA-480): a stored overlay's
-		// budget over its project's spend, or the local budget over the projects
-		// it still governs. charge() books every counted phase, so the ledger
-		// already carries the phases before this boundary.
-		if v := d.budgetStop(s.ti, time.Since(prior.start)); v.dim != "" {
-			boundary := "the " + st.ph.Label(s.i) + " phase boundary"
-			if st.isHandoff {
-				boundary = "the handoff respawn"
-			}
-			log.Printf("iteration %d: budget reached at %s: %s — ending this drain (tokens=%d cost=$%.2f elapsed=%s)",
-				drainNum, boundary, v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
-			s.stop = true
-			return seqBreak
-		}
+// checkPhaseBoundary runs the budget breaker and the scheduled-pause hold at a
+// phase boundary, before a further session (or a handoff respawn) is spawned.
+func (s *drainSeq) checkPhaseBoundary(ctx context.Context, st *seqStep) seqNext {
+	// The breaker at a phase boundary — the third place a session ends and
+	// the loop decides whether to spawn another, alongside between-drains and
+	// between-attempts. It is not decoration: one measured task spent 92% of a
+	// whole run's 75M ceiling inside a single session, which a between-drains
+	// check cannot see coming. A handoff respawn gets the same check, BEFORE
+	// the respawn: a session cannot spend its way past the ceiling by handing
+	// off to itself.
+	//
+	// The breaker is the TARGET's account (CLA-480): a stored overlay's
+	// budget over its project's spend, or the local budget over the projects
+	// it still governs. charge() books every counted phase, so the ledger
+	// already carries the phases before this boundary.
+	if s.spawned > 0 && s.budgetStopAtBoundary(st) {
+		return seqBreak
+	}
+	// CLA-906: a window holds the next spawn, never a running session. The
+	// claim is kept and its lease renewed while it waits. Nothing is spent
+	// during the hold, so the breaker's pre-hold verdict stands: the wait is
+	// NOT charged to max_wall_clock (see docs/pause-windows.md).
+	switch s.holdThroughPause(ctx, st) {
+	case pauseHoldStop:
+		s.stop = true
+		return seqBreak
+	case pauseHoldRunLost:
+		// A lost run ends THIS drain, not the daemon — the same ending the
+		// mid-drain runLost arm takes (drain_phases.go). The hold dropped the
+		// claim, so the deferred handback has nothing to release; the run
+		// continues to its next poll.
+		log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
+		return seqBreak
 	}
 
 	return seqFall
+}
+
+// budgetStopAtBoundary is checkPhaseBoundary's breaker pass: it logs and stops
+// the drain when the target's budget is spent.
+func (s *drainSeq) budgetStopAtBoundary(st *seqStep) bool {
+	d := s.d
+	drainNum := s.drainNum
+	prior := s.prior
+	if v := d.budgetStop(s.ti, time.Since(prior.start)); v.dim != "" {
+		boundary := "the " + st.ph.Label(s.i) + " phase boundary"
+		if st.isHandoff {
+			boundary = "the handoff respawn"
+		}
+		log.Printf("iteration %d: budget reached at %s: %s — ending this drain (tokens=%d cost=$%.2f elapsed=%s)",
+			drainNum, boundary, v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
+		s.stop = true
+		return true
+	}
+	return false
 }
 
 // runPhase spawns one phase session and folds how it ended into the walk: the

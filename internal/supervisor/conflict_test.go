@@ -185,6 +185,32 @@ func TestConflictHarnessExtraDirAllowlist(t *testing.T) {
 	}
 }
 
+// CLA-906: a conflict-only session is a new paid session, so it must not start
+// inside a scheduled pause window. The task stays approved (no claim is taken)
+// and the next close-out pass after the window retries it.
+func TestConflictSessionWaitsOutAScheduledPause(t *testing.T) {
+	f := conflictingFixture(t)
+	d := f.supervisor(0)
+	// A daily 24h window (from == to) is always active, so the test needs no
+	// wall-clock pin and no clock seam in the supervisor.
+	d.instances[0].cfg.PauseWindows = &config.PauseWindows{
+		Timezone: "UTC",
+		Windows:  []config.PauseWindow{{Days: "daily", From: "00:00", To: "00:00"}},
+	}
+
+	lines := f.run(d)
+
+	if got := len(f.conflictCalls()); got != 0 {
+		t.Errorf("conflict sessions = %d inside a pause window, want none", got)
+	}
+	if got := f.callsFor("claim_task"); len(got) != 0 {
+		t.Errorf("a paused conflict still claimed the task: %v", got)
+	}
+	if !strings.Contains(lines, "scheduled pause window is active until") {
+		t.Errorf("the stand-down does not name the window:\n%s", lines)
+	}
+}
+
 func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	f := conflictingFixture(t)
 	// Two approved tasks in the queue, both conflicting. The second must wait for
