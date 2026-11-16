@@ -7,13 +7,11 @@ import (
 	"time"
 )
 
-// The emitter's sequence numbers are per RUN, from 1, and they are the plane's
+// The emitter's sequence numbers are per RUN, from 1, and are the plane's
 // idempotency key: a (run, seq) it already holds is dropped. A phased task runs
-// several sessions on the SAME run (the claim's run id is carried across the
-// seam), so a fresh counter per session would restart at 1 and every later
-// phase's events would be dropped as duplicates. The counter therefore lives
-// per run and is persisted, so a supervised restart or a crash resumes after the
-// high-water mark rather than replaying the numbers.
+// several sessions on the SAME run, so the counter is per run and persisted —
+// a fresh counter per session would restart at 1 and every later phase's events
+// would be dropped as duplicates, including across a supervised restart.
 
 // RunSeq is one run's counter as persisted: the highest sequence number assigned
 // so far, and when it was last used (so an old entry can be pruned).

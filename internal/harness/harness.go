@@ -267,11 +267,9 @@ type Capabilities struct {
 
 	// EmitsEvents reports whether this adapter normalizes its structured tool
 	// events into the agent event channel's activity tier (CLA-603). False means
-	// the loop must not build a sink for it: the channel has no per-harness
-	// mapping there, and an unused sink would start a batch goroutine that
-	// nobody closes. claude and opencode emit today; codex is explicitly out of
-	// this release's scope and copilot's stream carries no tool events the
-	// driver parses.
+	// the loop must not build a sink: there is no mapping, and an unclosed sink
+	// would leak its batch goroutine. codex is out of v1 by scope; copilot has
+	// no tool-event stream the driver parses.
 	EmitsEvents bool
 }
 
@@ -461,16 +459,14 @@ type Invocation struct {
 
 	// NewEventSink, when non-nil, builds this session's agent-event sink. The
 	// loop sets it only when the project's events.activity dial is on, the
-	// machine has not opted out, and the adapter emits events (Capabilities).
-	// It is a FACTORY rather than a sink because one Invocation may run more
-	// than one process (an opencode resurrection or a multi-turn sequence), and
-	// each process gets its own bounded batch goroutine while the per-run
-	// sequence counter stays shared.
+	// machine has not opted out, and the adapter emits events. It is a FACTORY
+	// because one Invocation may run several processes (an opencode resurrection
+	// or a multi-turn sequence), each with its own batch goroutine over a shared
+	// per-run sequence counter.
 	//
-	// The adapter calls it in the same place it builds its parser and MUST close
-	// the result (Result.closeEvents / opencodeParse.closeEvents) when the
-	// session ends. A nil factory means the channel is off: adapters simply get
-	// a nil sink, whose methods are no-ops.
+	// The adapter MUST close what it builds (Result.closeEvents /
+	// opencodeParse.closeEvents) when the session ends. Nil means the channel is
+	// off.
 	NewEventSink func() *events.Emitter
 }
 

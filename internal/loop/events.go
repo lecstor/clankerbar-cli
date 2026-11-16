@@ -1,17 +1,10 @@
 package loop
 
-// Agent event emission in the driver (CLA-603). The dials live in the project's
-// EFFECTIVE run config (`events.activity`), which the loop already applies at the
-// iteration boundary; the machine can only opt out (`--no-events` /
-// CLANKERBAR_EVENTS=off). When the channel is on, every phase invocation gets a
-// factory that builds a fresh, bounded emitter for the session it is about to
-// run.
-//
-// The emitter's sequence numbers are per RUN, not per session. A phased task
-// runs several sessions on the same run id, so a fresh counter per session would
-// start at 1 again and every later phase's events would be dropped as duplicates.
-// The counter is therefore shared through the driver and persisted in the state
-// dir; a supervised restart resumes after the high-water mark.
+// Agent event emission in the driver (CLA-603). The dials are the project's
+// effective run-config `events` block, which the loop already applies at the
+// iteration boundary; the machine can only opt out. The emitter's sequence
+// numbers are per RUN, not per session: a phased task runs several sessions on
+// one run id, so the counter is shared and persisted in the state dir.
 
 import (
 	"encoding/json"

@@ -8,20 +8,13 @@ import (
 )
 
 // The per-harness normalizers for the agent event channel's activity tier
-// (CLA-603). The design's mapping table is the contract: claude reports a call
-// on `assistant`/tool_use and its result later on `user`/tool_result, opencode
-// reports a tool part once it is terminal with input and output together.
+// (CLA-603): tool_call, todo_change and clankerbar_mcp_call. tool_result and
+// assistant_text are the transcript follow-up's. codex and copilot are not
+// mapped in v1 — their Capabilities report EmitsEvents false — and the design
+// table is docs/agent-events.md.
 //
-// Only the ACTIVITY tier is emitted in v1: tool_call, todo_change and
-// clankerbar_mcp_call. tool_result and assistant_text are the transcript
-// follow-up's, and the plane counts-and-drops them until that lands.
-//
-// The target extractor is the one piece both dialects share: a tool's
-// identifying argument lives under different keys per tool shape, and the raw
-// input JSON is NEVER sent (the schema says so explicitly). codex and copilot
-// are not mapped: codex's stream carries the same shapes under different event
-// names and is out of v1 by the release scope; copilot has no structured tool
-// stream the driver parses at all. Both adapters report EmitsEvents false.
+// The one shared rule: a target is ONE extracted string per tool shape, never
+// the raw input JSON.
 
 // closeEvents flushes and stops this session's agent-event sink. Nil-safe and
 // idempotent; the adapters call it on every path that built a Result.
