@@ -74,6 +74,53 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) (held, sto
 		runID = claim.Claim.RunID
 	}
 	failures := 0
+	// beat renews the lease once and reports whether the hold must end (the run
+	// is gone, or the context was cancelled under the call).
+	beat := func() bool {
+		bctx, cancel := context.WithTimeout(ctx, heartbeatBeatTimeout)
+		err := hb.Heartbeat(bctx, runID)
+		cancel()
+		switch {
+		case err == nil:
+			failures = 0
+			d.beacon(s.ti, t, fleet.State{Kind: fleet.StateDraining})
+			return false
+		case errors.Is(err, plane.ErrNotWired):
+			// The same degradation the in-session renewer documents: the lease
+			// may expire, but the hold itself is still the right answer — the
+			// plane cannot release a session that has already ended.
+			canBeat = false
+			log.Printf("%sscheduled pause: the plane cannot renew a lease (%v) — holding %s without heartbeats; its lease may expire while the window lasts",
+				labelOf(t), err, subject)
+			return false
+		case ctx.Err() != nil:
+			return true
+		case errors.Is(err, plane.ErrRunLost):
+			// The task is someone else's now. Continuing to hold would only
+			// spawn a session whose own heartbeat is refused; drop the claim so
+			// the deferred handback does not try to release another run's task.
+			log.Printf("%sscheduled pause: the plane refused the lease renewal (%v) — %s is no longer this run's, ending the hold",
+				labelOf(t), err, subject)
+			s.carried = nil
+			return true
+		default:
+			// Retried on the next cadence; three consecutive failures means the
+			// plane is unreachable for this window and the beat is hopeless.
+			failures++
+			log.Printf("%sscheduled pause: lease renewal failed (%d in a row): %v", labelOf(t), failures, err)
+			if failures >= heartbeatGiveUp {
+				canBeat = false
+				log.Printf("%sscheduled pause: giving up on lease renewal after %d consecutive failures — holding %s without heartbeats; its lease may expire while the window lasts",
+					labelOf(t), failures, subject)
+			}
+			return false
+		}
+	}
+	// Renew on entry as well as on the cadence: the claim may have been taken,
+	// or last renewed, before a slow start prep.
+	if canBeat && beat() {
+		return held, true
+	}
 	for {
 		now := d.clock()
 		active, until, _ = d.pauseState()
@@ -97,43 +144,8 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) (held, sto
 		if d.waitOrStopHalt(ctx, wait) {
 			return held, true
 		}
-		if !canBeat {
-			continue
-		}
-		bctx, cancel := context.WithTimeout(ctx, heartbeatBeatTimeout)
-		err := hb.Heartbeat(bctx, runID)
-		cancel()
-		switch {
-		case err == nil:
-			failures = 0
-			d.beacon(s.ti, t, fleet.State{Kind: fleet.StateDraining})
-		case errors.Is(err, plane.ErrNotWired):
-			// The same degradation the in-session renewer documents: the lease
-			// may expire, but the hold itself is still the right answer — the
-			// plane cannot release a session that has already ended.
-			canBeat = false
-			log.Printf("%sscheduled pause: the plane cannot renew a lease (%v) — holding %s without heartbeats; its lease may expire while the window lasts",
-				labelOf(t), err, subject)
-		case ctx.Err() != nil:
+		if canBeat && beat() {
 			return held, true
-		case errors.Is(err, plane.ErrRunLost):
-			// The task is someone else's now. Continuing to hold would only
-			// spawn a session whose own heartbeat is refused; drop the claim so
-			// the deferred handback does not try to release another run's task.
-			log.Printf("%sscheduled pause: the plane refused the lease renewal (%v) — %s is no longer this run's, ending the hold",
-				labelOf(t), err, subject)
-			s.carried = nil
-			return held, true
-		default:
-			// Retried on the next cadence; three consecutive failures means the
-			// plane is unreachable for this window and the beat is hopeless.
-			failures++
-			log.Printf("%sscheduled pause: lease renewal failed (%d in a row): %v", labelOf(t), failures, err)
-			if failures >= heartbeatGiveUp {
-				canBeat = false
-				log.Printf("%sscheduled pause: giving up on lease renewal after %d consecutive failures — holding %s without heartbeats; its lease may expire while the window lasts",
-					labelOf(t), failures, subject)
-			}
 		}
 	}
 }
