@@ -233,7 +233,9 @@ func (d *Driver) budgetElapsed(i int, runElapsed time.Duration) time.Duration {
 // notePauseHeld books wall-clock time a scheduled pause held target ti at a
 // phase boundary (CLA-906). It is idle time, not draining time, so the budget
 // clocks credit it back rather than ending a sequence for waiting out a window
-// the operator configured.
+// the operator configured. The run-wide clock the local-file budget reads is
+// shared, so it always carries the credit; the per-target clock a stored
+// overlay reads is credited for the target the hold served.
 func (d *Driver) notePauseHeld(ti int, held time.Duration) {
 	if held <= 0 {
 		return
