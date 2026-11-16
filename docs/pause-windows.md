@@ -47,6 +47,18 @@ approved and the next close-out pass retries it. The **deterministic close-out**
 runs no agent session (it merges with `gh`), so the schedule does not apply to
 it.
 
+## What is NOT a boundary
+
+- A phase's own attempt ladder — a transient retry, a usage-limit probe, a
+  handoff the phase already accepted — is a continuation of the session unit
+  already in flight, not a new phase. Interrupting it mid-phase would leave the
+  phase's deliverable unfinished, so the window applies at the next phase
+  boundary instead.
+- The conflict session's model-route ladder (CLA-890) is the same unit: a fresh
+  session on the next route after a quota refusal, inside one short conflict
+  attempt. It is covered by the start gate above, not between routes.
+- The deterministic close-out (above) spawns no session at all.
+
 ## Stop and shutdown semantics
 
 A STOP, RESTART or HALT marker, or a cancelled context, during the hold takes the
