@@ -3057,6 +3057,7 @@ the catch-all matches last, denying every read.
 ## Docs
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
+- [`docs/pause-windows.md`](./docs/pause-windows.md) - the `pause_windows` boundary rule: a running session is never interrupted, but the next phase or session is held (claim kept, lease renewed) until the window ends.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
 - [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
