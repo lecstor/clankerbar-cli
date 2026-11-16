@@ -39,6 +39,11 @@ func noteClaudeToolEvent(sink events.Sink, name, callID string, input json.RawMe
 		if todos, ok := todoItemsFromInput(input); ok {
 			sink.TodoChange(todos)
 		}
+	case name == "TaskCreate" || name == "TaskUpdate":
+		// Per-item todo tools. The activity tier carries the whole-list snapshot
+		// (TodoWrite), and the design note drops these until a harness change
+		// makes them primary (CLA-601) — sending one as a tool_call would put a
+		// different fact on the wire than the list.
 	case strings.HasPrefix(name, clankerbarToolPrefix):
 		sink.ClankerbarMcpCall(strings.TrimPrefix(name, clankerbarToolPrefix), callID, clankerbarTarget(input))
 	case name != "":
@@ -112,9 +117,10 @@ func clankerbarTarget(input json.RawMessage) string {
 // some versions `path`), and a shell tool takes `command` on both.
 //
 // Unknown tools fall back to the first recognisable among the common keys, and
-// a tool carrying none of them sends no target. That is deliberate: a status
-// line is better with an empty target than with a dump of an arbitrary input
-// object, which is exactly what the "never the raw input JSON" rule forbids.
+// a tool carrying none of them sends an EMPTY target (the wire key is required
+// and always present, not omitted). That is deliberate: a status line is better
+// with an empty target than with a dump of an arbitrary input object, which is
+// exactly what the "never the raw input JSON" rule forbids.
 func toolTarget(tool string, input json.RawMessage) string {
 	var args map[string]json.RawMessage
 	if json.Unmarshal(input, &args) != nil {

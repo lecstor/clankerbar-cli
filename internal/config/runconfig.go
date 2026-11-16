@@ -304,7 +304,9 @@ func cloneStrMap(m map[string]string) map[string]string {
 }
 
 // ApplyRunConfig overlays a stored document onto c IN PLACE: a field the
-// document sets wins, a field it omits keeps the local value. Maps replace
+// document sets wins, a field it omits keeps the local value — except the
+// `events` dials, which belong to the stored document alone (an absent block is
+// both off, fail closed: no local file may turn the channel on). Maps replace
 // wholesale when present — the document is the operator's ratified word for
 // that map, and merging would resurrect entries the ratification dropped.
 // Callers re-run Validate afterwards: an overlay CAN produce a combination the
@@ -334,6 +336,27 @@ func cloneStrMap(m map[string]string) map[string]string {
 func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.SchemaNewer() {
 		return nil
+	}
+	if doc == nil {
+		// No document at all is not a stored `{}`: there is nothing to overlay
+		// and nothing to fail closed on, so leave the config untouched.
+		return nil
+	}
+	// The event channel's dials (CLA-603) are reset FIRST, before the empty
+	// document returns: the stored, effective document is the authority, so an
+	// absent block means both dials off (fail closed) — including the plane's
+	// default `{}` document, so a caller reusing a live config cannot keep the
+	// channel on a project that says nothing. No local-file value can turn one
+	// on; the machine can only opt out (NoEvents), which this overlay never
+	// touches.
+	c.Events = RunConfigEvents{}
+	if doc.Events != nil {
+		c.Events = *doc.Events
+	}
+	if c.Events.Transcript && !c.Events.Activity {
+		// The plane refuses this combination at save time; a document that still
+		// carries it (a hand-edited store, a future reader) fails closed.
+		c.Events.Transcript = false
 	}
 	if doc.Empty() {
 		return nil
@@ -452,19 +475,8 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 			c.Escalation.CategoryRules = e.CategoryRules
 		}
 	}
-	// The event channel's dials (CLA-603): the stored, effective document is the
-	// authority, so an absent block means both dials off. No local-file value can
-	// turn one on; the machine can only opt out (NoEvents), which this overlay
-	// never touches.
-	c.Events = RunConfigEvents{}
-	if doc.Events != nil {
-		c.Events = *doc.Events
-	}
-	if c.Events.Transcript && !c.Events.Activity {
-		// The plane refuses this combination at save time; a document that still
-		// carries it (a hand-edited store, a future reader) fails closed.
-		c.Events.Transcript = false
-	}
+	// The event channel's dials were applied at the top, before the empty
+	// document returned: they are the stored document's alone.
 	return nil
 }
 

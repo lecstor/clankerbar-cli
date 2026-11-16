@@ -44,6 +44,24 @@ func TestRunConfigEventsAbsentMeansOffAndClearsAStaleOverlay(t *testing.T) {
 	}
 }
 
+func TestRunConfigEventsEmptyDocumentAlsoFailsClosed(t *testing.T) {
+	// The plane's default document is `{}`, and it must still turn the dials
+	// off: a caller reusing a live config would otherwise keep sending on a
+	// project whose document says nothing.
+	base := defaults()
+	base.Events = RunConfigEvents{Activity: true}
+	doc := &RunConfigDoc{SchemaVersion: 1}
+	if !doc.Empty() {
+		t.Fatal("test precondition: the document is not empty")
+	}
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if base.Events.Activity {
+		t.Fatal("an empty document left a stale events.activity on")
+	}
+}
+
 func TestRunConfigEventsTranscriptWithoutActivityFailsClosed(t *testing.T) {
 	// The plane refuses this at save time. A document that still carries it (a
 	// hand-edited store) must not leak the full tier.

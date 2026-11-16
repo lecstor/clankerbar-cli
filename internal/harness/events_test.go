@@ -79,9 +79,28 @@ func TestClaudeTodoMapping(t *testing.T) {
 		got[1].Content != "write volume" || got[1].Status != "in_progress" {
 		t.Fatalf("todos = %+v", got)
 	}
-	// The per-harness decoration must not survive into the wire shape.
-	if strings.Contains(s.calls[0], "activeForm") {
-		t.Fatalf("decorations leaked: %v", s.calls)
+	// The per-harness decoration must not survive into the wire shape. Assert on
+	// the recorded TodoItem (and its encoding), not on the sink's call label:
+	// the label is the literal "todo_change" and can never contain activeForm.
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal todos: %v", err)
+	}
+	if strings.Contains(string(encoded), "activeForm") || strings.Contains(string(encoded), "writing") {
+		t.Fatalf("decorations leaked into the todo item: %s", encoded)
+	}
+}
+
+func TestClaudePerItemTodoToolsAreDropped(t *testing.T) {
+	// TodoWrite carries the whole-list snapshot; TaskCreate/TaskUpdate are the
+	// per-item tools the design note drops until a harness change makes them
+	// primary (CLA-601). Mapping one as a tool_call would be a different fact.
+	for _, tool := range []string{"TaskCreate", "TaskUpdate"} {
+		s := &recSink{}
+		noteClaudeToolEvent(s, tool, "c1", raw(`{"subject":"x","description":"y"}`))
+		if len(s.calls) != 0 {
+			t.Fatalf("%s emitted %v, want nothing", tool, s.calls)
+		}
 	}
 }
 

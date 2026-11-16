@@ -29,7 +29,8 @@ and batcher in `internal/events`.
   never the call's input. The call's result is an ordinary `tool_result` in the
   transcript tier, which is a follow-up.
 - **Todos** are the full snapshot, capped at 50 items, each content redacted and
-  cut to 256 bytes.
+  cut to 256 bytes. Per-item todo tools (`TaskCreate` / `TaskUpdate`) are
+  dropped: the tier reports the list, not its individual edits.
 
 ### Out of v1
 
@@ -62,16 +63,30 @@ and batcher in `internal/events`.
   batch before it, never splits it).
 - `Add` never blocks and never returns an error. The buffer is bounded (512
   events); past it events are dropped with one log line. The HTTP call runs on
-  the emitter's own goroutine with a 5 s timeout; a failed batch is dropped (one
-  line, then every twentieth), never retried in a loop and never surfaced to the
-  session.
+  the emitter's own goroutine with a 5 s timeout. A `429` is retried twice with a
+  short bounded wait (honouring `retry-after`, capped at 1 s); every other
+  failure drops the batch (one line, then every twentieth), never retried in a
+  loop and never surfaced to the session.
 - `Close` attempts one final bounded flush (2 s grace) and then stops.
 
-Sequence numbers are per **run**, from 1, and were made the plane's idempotency
-key: a phased task runs several sessions on the same run id, so the counter is
-shared across sessions and persisted in the state dir (`RUN_EVENT_SEQ`). A
-restart resumes after the high-water mark instead of replaying numbers the plane
-would drop.
+Sequence numbers are per **run**, from 1, and are the plane's idempotency key:
+the plane drops any event whose `seq` is at or below the run's high-water mark.
+A phased task runs several sessions on the same run id — and a review panel's
+members run in parallel — so:
+
+- The whole send of one run is **serialized** across the emitters sharing a
+  counter (allocation, POST and commit under one per-run lock). Arrival order is
+  therefore allocation order, which is what stops a later-numbered batch from
+  making an earlier one look like a duplicate and silently losing its events.
+- The counter is persisted in the state dir (`RUN_EVENT_SEQ`) at **allocation**,
+  before the POST, so a clean restart resumes above the high-water mark and a
+  crash replays no numbers either: a batch is either already covered by the
+  durable mark or lost with a gap (which the plane does not mind). The one
+  inversion left is between PROCESSES: a new process's batch can reach the plane
+  before the previous process's final POST (which outlived its `Close` grace)
+  completes, and the plane then drops the older batch as a duplicate. Its
+  events are lost, though nothing is ever doubled; closing that gap needs the
+  plane's dedupe to stop being a single high-water mark.
 
 ## Redaction
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestSeqCounterPersistsAcrossCounters(t *testing.T) {
@@ -82,5 +83,78 @@ func TestSeqCounterDoesNotSaveAfterFailedLoad(t *testing.T) {
 	c.Commit("run-1", 1)
 	if store.saved {
 		t.Fatal("Save ran after the initial Load failed, overwriting an unreadable file")
+	}
+}
+
+func TestSeqCounterPersistsAnAllocationBeforeTheSend(t *testing.T) {
+	store := NewMemorySeqStore()
+	first := NewSeqCounter(store, nil)
+	if got := first.Next("run-1"); got != 1 {
+		t.Fatalf("Next = %d", got)
+	}
+	first.Persist("run-1") // what the emitter does BEFORE the POST
+	// The process dies here, with no Commit. The next process must resume ABOVE
+	// the batch that may have landed, not reuse numbers the plane would drop.
+	second := NewSeqCounter(store, nil)
+	if got := second.Next("run-1"); got != 2 {
+		t.Fatalf("resumed Next = %d, want 2 (the allocation was durable before the send)", got)
+	}
+}
+
+func TestSeqCounterSendLockSerializesOneRunOnly(t *testing.T) {
+	c := NewSeqCounter(NewMemorySeqStore(), nil)
+	unlockA := c.SendLock("run-a")
+	acquired := make(chan struct{})
+	go func() {
+		unlock := c.SendLock("run-a")
+		close(acquired)
+		unlock()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("a second sender acquired the same run's send lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockA()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("the send lock was never released")
+	}
+	// A different run has its own slot.
+	unlockB := c.SendLock("run-b")
+	unlockB()
+}
+
+func TestSeqCounterKeepsMarksOfLiveRuns(t *testing.T) {
+	store := NewMemorySeqStore()
+	c := NewSeqCounter(store, nil)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return now }
+	// More runs than the file cap, all touched just now: evicting any of them
+	// could restart a live run at 1, whose events the plane would drop.
+	total := maxPersistedRuns + 10
+	for i := 0; i < total; i++ {
+		c.Commit(fmt.Sprintf("run-%d", i), 1)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != total {
+		t.Fatalf("persisted marks = %d, want all %d fresh ones", len(loaded), total)
+	}
+	// Once they have aged out, the cap applies again.
+	now = now.Add(2 * minPersistedAge)
+	c.Commit("run-fresh", 1)
+	loaded, err = store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != maxPersistedRuns {
+		t.Fatalf("persisted marks = %d, want the %d cap once the old ones age out", len(loaded), maxPersistedRuns)
+	}
+	if _, ok := loaded["run-fresh"]; !ok {
+		t.Fatal("the fresh mark was evicted")
 	}
 }

@@ -361,9 +361,12 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		Nice:          d.cfg.SessionNice,
 		Probe:         probe,
 	}
-	// The agent event channel (CLA-603). A probe is a one-word liveness check,
-	// not a session doing work, so it never emits; the destination is the
-	// project's run config dial, and the machine can only have opted out.
+	// The agent event channel (CLA-603). The loop's top-level probe is a one-word
+	// liveness check, not a session doing work, so it never emits. A recovery
+	// probe inside an already-started session is different: it inherits this
+	// factory (opencode's resurrection sets Probe on a copy) and its tool calls
+	// are part of that session's activity, so they do emit. The destination is
+	// the project's run config dial, and the machine can only have opted out.
 	if !probe && d.eventSenderOn(tc, harnessName) {
 		name := harnessName
 		inv.NewEventSink = func() *events.Emitter { return d.newEventEmitter(name) }

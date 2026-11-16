@@ -268,8 +268,8 @@ type Capabilities struct {
 	// EmitsEvents reports whether this adapter normalizes its structured tool
 	// events into the agent event channel's activity tier (CLA-603). False means
 	// the loop must not build a sink: there is no mapping, and an unclosed sink
-	// would leak its batch goroutine. codex is out of v1 by scope; copilot has
-	// no tool-event stream the driver parses.
+	// would leak its batch goroutine. codex is out of v1 by scope; copilot's tool
+	// events exist but its activity mapping is out of v1 too.
 	EmitsEvents bool
 }
 
@@ -856,7 +856,9 @@ type Result struct {
 
 	// events is this session's agent-event sink (CLA-603), nil when the channel
 	// is off. It is stream-side state like onClaim: the adapter closes it when
-	// the session ends, and it is never copied onto a Result the caller reads.
+	// the session ends (closeEvents, which nils it on the copy it was called on).
+	// A value copy of the Result may still carry the closed pointer — harmless,
+	// since the field is unexported and nothing writes through it after Close.
 	events *events.Emitter
 
 	// pending maps a tool_use id to what its result will mean. Parser state, not

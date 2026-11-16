@@ -274,6 +274,46 @@ func TestEmitterTodoCaps(t *testing.T) {
 	e.Close()
 }
 
+func TestEmitterDropsInvalidTodoStatuses(t *testing.T) {
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1}`))
+	defer srv.Close()
+	e := newTestEmitter(srv, nil, nil)
+	e.SetRunID("run-1")
+
+	// The plane refuses a status it does not know, so the item is dropped and
+	// the snapshot is marked truncated: it is no longer the harness's answer.
+	e.TodoChange([]TodoItem{
+		{Content: "keep", Status: "pending"},
+		{Content: "drop", Status: "cancelled"},
+		{Content: "keep2", Status: "completed"},
+	})
+	bodies := c.waitFor(t, 1)
+	var b batch
+	if err := json.Unmarshal(bodies[0], &b); err != nil {
+		t.Fatal(err)
+	}
+	var ev TodoChangeEvent
+	if err := json.Unmarshal(b.Events[0], &ev); err != nil {
+		t.Fatal(err)
+	}
+	if len(ev.Todos) != 2 || ev.Todos[0].Content != "keep" || ev.Todos[1].Content != "keep2" {
+		t.Fatalf("todos = %+v, want only the valid statuses", ev.Todos)
+	}
+	if !ev.Truncated {
+		t.Error("truncated marker missing on a dropped item")
+	}
+
+	// An all-invalid list sends NOTHING: an empty list would claim the harness
+	// cleared its todos, which is a different fact from a list we could not use.
+	e.TodoChange([]TodoItem{{Content: "drop", Status: "cancelled"}})
+	time.Sleep(50 * time.Millisecond)
+	if got := c.count(); got != 1 {
+		t.Fatalf("requests = %d, want 1 (an all-invalid list sends no event)", got)
+	}
+	e.Close()
+}
+
 func TestEmitterSendsAnEmptyTodoSnapshot(t *testing.T) {
 	// A cleared list is a real snapshot: the status line must be able to show
 	// "no todos" rather than keeping the last non-empty list forever.
@@ -324,6 +364,90 @@ func TestEmitterBatchBodyStaysUnder256KB(t *testing.T) {
 	}
 	if seen != 40 {
 		t.Errorf("batched %d events, want 40", seen)
+	}
+}
+
+func TestEmitterBatchCountsSeparatorBytes(t *testing.T) {
+	// Fill the body to the BYTE, separators included: rounding to whole events
+	// must still leave the encoded request at or under MaxBatchBytes. The comma
+	// between adjacent events is easy to forget, and the plane refuses an
+	// over-cap body with 413 and the batch is dropped.
+	const harness = "opencode"
+	remaining := MaxBatchBytes - (len(`{"harness":"","events":[]}`) + len(harness))
+	const n = MaxBatchEvents - 1 // leave one pending event to prove the boundary
+	pending := make([]event, 0, n+1)
+	probe := NewSeqCounter(NewMemorySeqStore(), nil)
+	sum := 0
+	for i := 0; i < n; i++ {
+		ev := event{kind: TypeTodoChange, at: "2026-01-01T00:00:00.000Z", todos: []TodoItem{{Status: "pending"}}}
+		raw, err := ev.marshal(probe.Next("size"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum += len(raw)
+		pending = append(pending, ev)
+	}
+	target := remaining - (n - 1) // n-1 commas between n events
+	if sum > target {
+		t.Fatalf("event overhead %d already exceeds the %d-byte body", sum, target)
+	}
+	pending[0].todos[0].Content = strings.Repeat("x", target-sum)
+	pending = append(pending, event{kind: TypeToolCall, at: "2026-01-01T00:00:00.000Z", tool: "Bash", callID: "call-over"})
+
+	body, got, _, consumed, dropped := buildBatch(pending, "run-1", harness, NewSeqCounter(NewMemorySeqStore(), nil))
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want none", dropped)
+	}
+	if got != n || consumed != n {
+		t.Fatalf("batch events = %d, consumed = %d, want %d — the extra event needs one more separator than is left", got, consumed, n)
+	}
+	if len(body) != MaxBatchBytes {
+		t.Fatalf("body = %d bytes, want exactly the %d-byte cap", len(body), MaxBatchBytes)
+	}
+}
+
+func TestEmitterBatchNeverExceedsCapAtTheBoundary(t *testing.T) {
+	// 49 events whose raw bytes alone fit `remaining` but whose commas do not:
+	// the uncounted separator is what let the old buildBatch emit a body over
+	// the cap (413 batch_too_large, and the batch is dropped).
+	const harness = "opencode"
+	remaining := MaxBatchBytes - (len(`{"harness":"","events":[]}`) + len(harness))
+	const n = MaxBatchEvents - 1
+	per := remaining / n // 49 raw events of this size still fit by raw bytes
+	pending := make([]event, 0, n)
+	for i := 0; i < n; i++ {
+		ev := event{kind: TypeTodoChange, at: "2026-01-01T00:00:00.000Z", todos: []TodoItem{{Status: "pending"}}}
+		base, err := ev.marshal(uint64(i + 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ev.todos[0].Content = strings.Repeat("x", per-len(base))
+		pending = append(pending, ev)
+	}
+	sum := 0
+	for i := range pending {
+		raw, err := pending[i].marshal(uint64(i + 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum += len(raw)
+	}
+	if sum != per*n || sum > remaining {
+		t.Fatalf("test sizing is wrong: raw total %d, per-event %d, remaining %d", sum, per, remaining)
+	}
+
+	body, got, _, consumed, dropped := buildBatch(pending, "run-1", harness, NewSeqCounter(NewMemorySeqStore(), nil))
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want none", dropped)
+	}
+	if got == n {
+		t.Fatalf("all %d events were accepted: the %d separators were not counted against the body cap", n, n-1)
+	}
+	if len(body) > MaxBatchBytes {
+		t.Fatalf("body = %d bytes, over the %d cap", len(body), MaxBatchBytes)
+	}
+	if consumed != got {
+		t.Fatalf("consumed = %d, accepted = %d — the boundary must stop adding, not drop", consumed, got)
 	}
 }
 
@@ -412,6 +536,109 @@ func TestEmitterStopsOnEventsDisabled(t *testing.T) {
 	}
 }
 
+func TestEmitterStopsOnRunClosed(t *testing.T) {
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusConflict, `{"error":{"code":"run_closed"}}`))
+	defer srv.Close()
+	var logs []string
+	var logMu sync.Mutex
+	e := newTestEmitter(srv, nil, func(format string, args ...any) {
+		logMu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	})
+	e.SetRunID("run-1")
+	e.ToolCall("Bash", "call-1", "ls")
+	c.waitFor(t, 1)
+	e.ToolCall("Bash", "call-2", "ls")
+	time.Sleep(80 * time.Millisecond)
+	e.Close()
+	if got := c.count(); got != 1 {
+		t.Fatalf("requests = %d, want 1 (a closed run stops sending)", got)
+	}
+	e.mu.Lock()
+	pending, disabled := len(e.pending), e.disabled
+	e.mu.Unlock()
+	if pending != 0 || !disabled {
+		t.Fatalf("pending = %d, disabled = %v: the stop must clear the buffer", pending, disabled)
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if n := strings.Count(strings.Join(logs, "\n"), "refused this run's channel"); n != 1 {
+		t.Fatalf("the stop was said %d time(s), want once: %v", n, logs)
+	}
+}
+
+func TestEmitterRetriesRateLimit(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"code":"rate_limited"}}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"accepted":1}`)
+	}))
+	defer srv.Close()
+	var logs []string
+	var logMu sync.Mutex
+	e := newTestEmitter(srv, nil, func(format string, args ...any) {
+		logMu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	})
+	e.SetRunID("run-1")
+	e.ToolCall("Bash", "call-1", "ls")
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := attempts
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("attempts = %d, want a retry after the 429", n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	e.Close()
+
+	mu.Lock()
+	n := attempts
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("attempts = %d, want 2 (one 429, one retry)", n)
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if strings.Contains(strings.Join(logs, "\n"), "batch send failed") {
+		t.Fatalf("a retried rate limit was reported as a failure: %v", logs)
+	}
+}
+
+func TestEmitterDropsAnEventOverTheWholeBodyCap(t *testing.T) {
+	// One event that cannot fit the body on its own is dropped, not sent to be
+	// refused with 413: the next event still goes.
+	seq := NewSeqCounter(NewMemorySeqStore(), nil)
+	huge := event{kind: TypeTodoChange, at: "2026-01-01T00:00:00.000Z",
+		todos: []TodoItem{{Content: strings.Repeat("x", MaxBatchBytes), Status: "pending"}}}
+	small := event{kind: TypeToolCall, at: "2026-01-01T00:00:00.000Z", tool: "Bash", callID: "call-1"}
+	body, n, _, consumed, dropped := buildBatch([]event{huge, small}, "run-1", "claude", seq)
+	if dropped != 1 || consumed != 2 || n != 1 || len(body) > MaxBatchBytes {
+		t.Fatalf("n = %d, consumed = %d, dropped = %d, body = %d", n, consumed, dropped, len(body))
+	}
+}
+
 func TestEmitterNeverClaimedDropsAndSaysSo(t *testing.T) {
 	c := newCapture()
 	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1}`))
@@ -478,4 +705,122 @@ func TestEmitterDropsOverCapIdentifiers(t *testing.T) {
 		t.Fatalf("events = %d, want only the well-formed call", len(b.Events))
 	}
 	e.Close()
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// highWaterPlane implements the plane's per-run dedupe rule (run-feed-core.ts:
+// `seq <= highWaterSeq` is a duplicate, one high-water mark per run).
+type highWaterPlane struct {
+	mu        sync.Mutex
+	highWater uint64
+	accepted  []uint64
+	dupes     int
+}
+
+func (p *highWaterPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	var b batch
+	_ = json.Unmarshal(body, &b)
+	p.mu.Lock()
+	for _, raw := range b.Events {
+		var env struct {
+			Seq uint64 `json:"seq"`
+		}
+		_ = json.Unmarshal(raw, &env)
+		if env.Seq <= p.highWater {
+			p.dupes++
+			continue
+		}
+		p.highWater = env.Seq
+		p.accepted = append(p.accepted, env.Seq)
+	}
+	p.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, `{"accepted":1}`)
+}
+
+func TestEmittersSerializePerRunSends(t *testing.T) {
+	// Two sessions of one run post from independent goroutines. A allocates
+	// seq 1 and its transport is held open; if B were free to send while A is
+	// in flight it would land seq 2 first, and the plane's high-water rule
+	// would drop A's batch (the default review panel runs members in parallel).
+	plane := &highWaterPlane{}
+	srv := httptest.NewServer(plane)
+	defer srv.Close()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var gateMu sync.Mutex
+	gated := false
+	base := srv.Client().Transport
+	gatedClient := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gateMu.Lock()
+			first := !gated
+			gated = true
+			gateMu.Unlock()
+			if first {
+				entered <- struct{}{}
+				<-release
+			}
+			return base.RoundTrip(req)
+		}),
+	}
+
+	seq := NewSeqCounter(NewMemorySeqStore(), nil)
+	mk := func(client *http.Client) *Emitter {
+		return New(Config{
+			Origin: srv.URL, APIKey: "clk_test_key", Harness: "claude", Seq: seq,
+			Client: client, FlushEvery: time.Hour,
+			SendTimeout: 2 * time.Second, CloseGrace: 500 * time.Millisecond,
+		})
+	}
+	a, b := mk(gatedClient), mk(srv.Client())
+	a.SetRunID("run-1")
+	b.SetRunID("run-1")
+	a.ToolCall("Bash", "a-1", "a")
+	b.ToolCall("Bash", "b-1", "b")
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); a.flush(1, 2*time.Second) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("emitter A never reached the transport")
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); b.flush(1, 2*time.Second) }()
+	// Long enough for an unserialized B to reach the plane while A is held.
+	time.Sleep(150 * time.Millisecond)
+	close(release)
+	waitGroup(t, &wg, 3*time.Second)
+	a.Close()
+	b.Close()
+
+	plane.mu.Lock()
+	defer plane.mu.Unlock()
+	if plane.dupes != 0 {
+		t.Fatalf("plane dropped %d event(s) as duplicates; accepted = %v", plane.dupes, plane.accepted)
+	}
+	if len(plane.accepted) != 2 || plane.accepted[0] != 1 || plane.accepted[1] != 2 {
+		t.Fatalf("accepted = %v, want [1 2] in allocation order", plane.accepted)
+	}
+}
+
+// waitGroup waits for wg with a bound, so a broken send cannot hang the suite.
+func waitGroup(t *testing.T, wg *sync.WaitGroup, d time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatal("send goroutines did not finish")
+	}
 }

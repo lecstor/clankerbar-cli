@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -317,27 +318,104 @@ func (e *Emitter) run() {
 	}
 }
 
-// flush sends at most maxBatches batches. One send attempt per batch; a failed
-// batch is dropped (the sequence numbers are still committed, so the next batch
-// does not collide with a send that may have landed).
+// maxSendAttempts bounds a rate-limited batch: the first try plus two retries.
+// Anything else (a 5xx, a timeout) is not retried at all — one send attempt per
+// batch — so a slow plane cannot queue work behind its own latency.
+const maxSendAttempts = 3
+
+// A 429's wait is bounded: the plane's per-run budget refills over a minute, and
+// a long honour of retry-after would only hold the run's send slot. Riding out a
+// short burst is what this can afford.
+const (
+	defaultRetryWait = 200 * time.Millisecond
+	maxRetryWait     = time.Second
+)
+
+// flush sends at most maxBatches batches. The whole send of one run is
+// serialized across every emitter sharing the SeqCounter: the run's send lock is
+// held from allocation through POST to commit, so a later-numbered batch can
+// never overtake an earlier one (the plane would drop the earlier as a
+// duplicate). A failed batch is dropped, but the sequence numbers are still
+// committed, so the next batch does not collide with a send that may have
+// landed.
 func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 	for i := 0; i < maxBatches; i++ {
-		body, runID, maxSeq, n := e.takeBatch()
-		if n == 0 {
+		runID := e.currentRunID()
+		if runID == "" {
 			return
 		}
-		err, stop := e.post(runID, body, timeout)
-		e.cfg.Seq.Commit(runID, maxSeq)
-		if stop {
+		unlock := e.cfg.Seq.SendLock(runID)
+		body, sentRun, maxSeq, n := e.takeBatch()
+		if n == 0 {
+			unlock()
+			return
+		}
+		// Persist the allocation BEFORE the POST: a process that dies after the
+		// batch lands but before the commit must leave the next process starting
+		// above this batch, not reusing numbers the plane would drop.
+		e.cfg.Seq.Persist(sentRun)
+		res := e.send(sentRun, body, timeout)
+		e.cfg.Seq.Commit(sentRun, maxSeq)
+		unlock()
+		if res.stop {
 			e.disable()
 			return
 		}
-		if err != nil {
-			e.noteFailure(err)
+		if res.err != nil {
+			e.noteFailure(res.err)
 			return
 		}
 		e.noteSuccess()
 	}
+}
+
+// sendResult is one batch send's outcome. retryable marks a rate limit: the
+// batch is worth re-sending once the plane's budget refills. stop means this
+// run's channel is closed for good.
+type sendResult struct {
+	err        error
+	stop       bool
+	retryable  bool
+	retryAfter time.Duration
+}
+
+// send posts one batch, retrying a rate limit a bounded number of times. The
+// body carries seq numbers already allocated and is re-sent unchanged: the plane
+// drops any seq it has already accepted, so a retry cannot double a batch.
+func (e *Emitter) send(runID string, body []byte, timeout time.Duration) sendResult {
+	var res sendResult
+	for attempt := 1; ; attempt++ {
+		res = e.post(runID, body, timeout)
+		if !res.retryable || attempt >= maxSendAttempts {
+			return res
+		}
+		wait := res.retryAfter
+		if wait <= 0 {
+			wait = defaultRetryWait
+		}
+		if wait > maxRetryWait {
+			wait = maxRetryWait
+		}
+		select {
+		case <-time.After(wait):
+		case <-e.done:
+			// Closing: holding the run's send slot for a retry nobody waits for
+			// would only delay the next session.
+			return res
+		}
+	}
+}
+
+// currentRunID reads the run this emitter reports for, or "" when it has none or
+// has been stopped. The id is set once and never changes, so a lock taken on it
+// covers the batch takeBatch builds.
+func (e *Emitter) currentRunID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.disabled {
+		return ""
+	}
+	return e.runID
 }
 
 // takeBatch removes up to MaxBatchEvents events from the front of the buffer
@@ -374,9 +452,10 @@ func (e *Emitter) takeBatch() (body []byte, runID string, maxSeq uint64, n int) 
 
 // buildBatch is takeBatch's pure half: it walks pending in order, assigns
 // sequence numbers, and stops adding once the encoded body would pass
-// MaxBatchBytes or the event count passes MaxBatchEvents. It returns how many
-// events it consumed (including any it dropped as unsendable) so the caller can
-// remove exactly that prefix.
+// MaxBatchBytes (counting the comma each additional event adds) or the event
+// count passes MaxBatchEvents. It returns how many events it consumed
+// (including any it dropped as unsendable) so the caller can remove exactly
+// that prefix.
 func buildBatch(pending []event, runID, harness string, seq *SeqCounter) (body []byte, n int, maxSeq uint64, consumed, dropped int) {
 	// The wrapper's own bytes, including the harness name, before any event.
 	overhead := len(`{"harness":"","events":[]}`) + len(harness)
@@ -395,7 +474,14 @@ func buildBatch(pending []event, runID, harness string, seq *SeqCounter) (body [
 			dropped++
 			continue
 		}
-		if len(raw) > remaining {
+		// The encoder inserts one comma between adjacent events; count it, or
+		// the body can pass MaxBatchBytes by up to MaxBatchEvents-1 bytes and
+		// the plane refuses the whole batch with 413.
+		need := len(raw)
+		if len(raws) > 0 {
+			need++
+		}
+		if need > remaining {
 			if len(raws) == 0 {
 				// One event over the whole body cap: it can never be sent.
 				consumed++
@@ -405,7 +491,7 @@ func buildBatch(pending []event, runID, harness string, seq *SeqCounter) (body [
 			break
 		}
 		raws = append(raws, raw)
-		remaining -= len(raw)
+		remaining -= need
 		maxSeq = assigned
 		consumed++
 	}
@@ -423,36 +509,65 @@ func buildBatch(pending []event, runID, harness string, seq *SeqCounter) (body [
 
 // post sends one batch. stop means this run will not be sent again: the plane
 // refused it for a reason that will not change (the dial is off, the run ended).
-func (e *Emitter) post(runID string, body []byte, timeout time.Duration) (err error, stop bool) {
+// retryable means a rate limit, which the caller retries a bounded number of
+// times with the same body.
+func (e *Emitter) post(runID string, body []byte, timeout time.Duration) sendResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	endpoint := strings.TrimRight(e.cfg.Origin, "/") + "/api/runs/" + url.PathEscape(runID) + "/events"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err, false
+		return sendResult{err: err}
 	}
 	req.Header.Set("Authorization", "Bearer "+e.cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := e.cfg.Client.Do(req)
 	if err != nil {
-		return err, false
+		return sendResult{err: err}
 	}
 	defer resp.Body.Close()
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	msg := strings.TrimSpace(string(detail))
 	if resp.StatusCode == http.StatusOK {
-		return nil, false
+		return sendResult{}
 	}
 	switch {
 	case resp.StatusCode == http.StatusForbidden && strings.Contains(msg, "events_disabled"):
-		return fmt.Errorf("the project's events.activity dial is off (%s)", msg), true
+		return sendResult{err: fmt.Errorf("the project's events.activity dial is off (%s)", msg), stop: true}
 	case resp.StatusCode == http.StatusConflict && strings.Contains(msg, "run_closed"):
-		return fmt.Errorf("the run has ended (%s)", msg), true
+		return sendResult{err: fmt.Errorf("the run has ended (%s)", msg), stop: true}
+	case resp.StatusCode == http.StatusTooManyRequests:
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return sendResult{
+			err:        fmt.Errorf("plane rate-limited the batch: %s", msg),
+			retryable:  true,
+			retryAfter: retryAfter(resp),
+		}
 	}
 	if msg == "" {
 		msg = http.StatusText(resp.StatusCode)
 	}
-	return fmt.Errorf("plane answered %d: %s", resp.StatusCode, msg), false
+	return sendResult{err: fmt.Errorf("plane answered %d: %s", resp.StatusCode, msg)}
+}
+
+// retryAfter reads the header in either form it may take (seconds or a date),
+// and reports 0 when it names no usable wait.
+func retryAfter(resp *http.Response) time.Duration {
+	raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		if d := time.Until(at); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func (e *Emitter) disable() {

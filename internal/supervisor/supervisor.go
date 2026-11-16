@@ -1326,6 +1326,10 @@ func childVersion(hook func() string) string {
 // reserved name would otherwise shadow the supervisor's value — and the
 // wrapper that "can read what the supervisor believes the child runs" would
 // read a stranger's number instead.
+//
+// noEvents does the same for CLANKERBAR_EVENTS: the inherited value is dropped
+// and `off` appended, so the flag (the explicit statement) cannot be outranked
+// by a stale value in the other direction.
 func spawnEnv(v string, noEvents bool) []string {
 	prefix := childVersionEnv + "="
 	env := make([]string, 0, len(os.Environ())+2)
