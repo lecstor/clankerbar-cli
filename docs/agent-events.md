@@ -49,11 +49,73 @@ and batcher in `internal/events`.
   under `set_run_config`. It is off by default and absent reads as off. The CLI
   applies it with the rest of the stored run config at an iteration boundary.
 - **Off, machine-locally**, with `clankerbar run --no-events`,
-  `clankerbar supervise --no-events` (children get `CLANKERBAR_EVENTS=off`), or
-  `CLANKERBAR_EVENTS=off` (`0` / `false` accepted, case-insensitive). No
-  machine-local signal can turn the channel ON.
+  `clankerbar supervise --no-events` (children get `CLANKERBAR_EVENTS=off`),
+  `clankerbar hook emit --no-events`, or `CLANKERBAR_EVENTS=off` (`0` / `false`
+  accepted, case-insensitive). No machine-local signal can turn the channel ON.
 - The plane re-checks the dial per batch: an emitter with a stale copy is
   refused `403 events_disabled` and stops for that run, saying so once.
+
+## Interactive Claude Code sessions (hooks, CLA-605)
+
+A session the driver did not spawn has no stream to read, so the same activity
+tier is fed by Claude Code's own `PostToolUse` hook:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "clankerbar hook emit", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`clankerbar hook emit` reads one hook payload on stdin and sends exactly one
+event. The mapping is the same one `internal/harness` applies to a spawned
+session's stream: `TodoWrite` becomes `todo_change`, an
+`mcp__clankerbar__<tool>` call becomes `clankerbar_mcp_call` with the bare name,
+and anything else becomes `tool_call` with the target extracted per tool shape.
+Redaction and truncation are `internal/events`' own, unchanged. `TodoWrite` is
+a tool inside `PostToolUse`, not a separate hook event, so one matcher covers
+both; `PreToolUse` and every other hook event are ignored, because wiring both
+would double every call.
+
+**The session must be bound to a run.** The hook reads `CLANKERBAR_RUN_ID` (the
+run credential `claim_task` returned — the bare uuid or the compound
+`<uuid>.<secret>` form) and `CLANKERBAR_API_KEY` from its environment; if either
+is absent it exits 0 without reading stdin. Hooks inherit the session process's
+environment, so export both before starting `claude`. The plane origin comes
+from the operator's config (`backlog_url`), never from a URL discovered in the
+checkout.
+
+**It never fails the session.** Every path exits 0 and writes nothing to stdout
+— Claude Code feeds a hook's stdout back into the conversation. A malformed
+payload, an unreadable config, another hook holding the sequence lock for over
+**2 s**, a send that errors or returns non-200, and a send still open at its
+**2 s** timeout all drop the event with at most one stderr line. The project
+dial is the plane's to enforce: `events.activity` off refuses the batch
+(`403 events_disabled`) and the hook treats that as a no-op. `--no-events` and
+`CLANKERBAR_EVENTS=off` mute it machine-locally, exactly as for
+`run`/`supervise`.
+
+**Sequence numbers survive the process boundary.** Each invocation is a new
+process, so the per-run counter is persisted at
+`<XDG state home>/clankerbar/hook/run-event-seq.json` — counters only, no
+content — and an exclusive lock held across the send makes concurrent hooks
+(parallel tool calls) reserve *and arrive* in ascending order. The plane drops
+any seq at or below its high-water mark, so a lower one arriving after a higher
+would be a silent loss. Point the hook at the run the session claimed; do not
+point it at a run a driver is already emitting for, or the two counters collide
+and the plane drops one stream.
+
+The installed wiring, including where `settings.json` lives and how to mute it,
+is the served setup skill's
+`clankerbar.com/skills/clankerbar-setup/claude-code-hooks.md`.
 
 ## Batching, and why a slow plane cannot hurt a session
 

@@ -33,11 +33,12 @@ func (r *Result) closeEvents() {
 	r.events = nil
 }
 
-// noteClaudeToolEvent maps one claude `assistant`/tool_use block onto the
-// activity tier. The tool name is kept as claude reports it (Bash, Read, ...);
-// only the clankerbar namespace is normalized, exactly as the mapping table
-// says.
-func noteClaudeToolEvent(sink events.Sink, name, callID string, input json.RawMessage) {
+// NoteClaudeToolEvent maps one claude tool use onto the activity tier. The two
+// callers see the same shape: the driver's `assistant`/tool_use stream block,
+// and an interactive session's PostToolUse hook payload (CLA-605). The tool name
+// is kept as claude reports it (Bash, Read, ...); only the clankerbar namespace
+// is normalized, exactly as the mapping table says.
+func NoteClaudeToolEvent(sink events.Sink, name, callID string, input json.RawMessage) {
 	if sink == nil {
 		return
 	}

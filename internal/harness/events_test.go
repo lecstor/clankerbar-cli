@@ -57,7 +57,7 @@ func TestClaudeActivityMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &recSink{}
-			noteClaudeToolEvent(s, tc.tool, "c1", raw(tc.in))
+			NoteClaudeToolEvent(s, tc.tool, "c1", raw(tc.in))
 			if len(s.calls) != 1 || s.calls[0] != tc.want {
 				t.Fatalf("calls = %v, want [%q]", s.calls, tc.want)
 			}
@@ -67,7 +67,7 @@ func TestClaudeActivityMapping(t *testing.T) {
 
 func TestClaudeTodoMapping(t *testing.T) {
 	s := &recSink{}
-	noteClaudeToolEvent(s, "TodoWrite", "c1", raw(`{"todos":[
+	NoteClaudeToolEvent(s, "TodoWrite", "c1", raw(`{"todos":[
 		{"content":"write schema","status":"completed","activeForm":"writing schema"},
 		{"content":"write volume","status":"in_progress","activeForm":"writing volume"}
 	]}`))
