@@ -299,12 +299,19 @@ func waitForNextBeacon(ctx context.Context, dir, name, target string, timeout ti
 // localBeacon mirrors internal/loop's LocalBeaconName JSON shape (the same
 // roster-style lockstep: two packages, one contract). ResetAt is carried, not
 // read: it is the `limited` state's stated instant (CLA-728), and the roll
-// verifies a version, not a pause.
+// verifies a version, not a pause. The pause fields (CLA-908) ARE read, by the
+// fleet listing, so `supervise` says why spawns are closed and until when
+// without a plane read.
 type localBeacon struct {
-	Version string     `json:"version"`
-	State   string     `json:"state"`
-	At      time.Time  `json:"at"`
-	ResetAt *time.Time `json:"resetAt,omitempty"`
+	Version     string     `json:"version"`
+	State       string     `json:"state"`
+	At          time.Time  `json:"at"`
+	ResetAt     *time.Time `json:"resetAt,omitempty"`
+	PauseReason string     `json:"pauseReason,omitempty"`
+	PauseUntil  *time.Time `json:"pauseUntil,omitempty"`
+	PauseZone   string     `json:"pauseZone,omitempty"`
+	TaskRef     string     `json:"taskRef,omitempty"`
+	Phase       string     `json:"phase,omitempty"`
 }
 
 // readLocalBeacon reads one child's local beacon. Absent, corrupt, or

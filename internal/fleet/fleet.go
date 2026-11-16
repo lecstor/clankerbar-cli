@@ -86,17 +86,38 @@ const (
 	CauseNoMCP = "no_mcp"
 )
 
+// PauseReasonSchedule is the `draining` state's reason for an operator-configured
+// pause window (`pause_windows`, CLA-908). It is the only reason the console
+// raises its pause banner, so it must mean exactly "the schedule is holding
+// spawns closed" and nothing else: a console, fleet, startup or budget pause
+// sends no reason at all (see State.PauseReason).
+const PauseReasonSchedule = "schedule"
+
 // State is the presence half of a report: what the daemon is doing right now.
 type State struct {
 	Kind    string // one of the State* constants
 	N       int    // iteration number, when Kind is iteration
-	TaskRef string // task being worked ("CLA-466"), when known
-	Phase   string // phase label, when Kind is iteration
+	TaskRef string // task being worked ("CLA-466"), when known; the HELD task on a schedule pause
+	Phase   string // phase label, when Kind is iteration, or the held phase on a schedule pause
 	// ResetAt is the harness's stated limit-reset instant, only meaningful on
 	// Kind == limited (CLA-728). The zero value means the harness stated no
 	// reset — the console then says "probing for a reset" rather than guessing
 	// a moment it was never told.
 	ResetAt time.Time
+
+	// PauseReason/PauseUntil/PauseZone are the draining state's schedule payload
+	// (CLA-908): why spawns are closed and when the window ends. Only the
+	// schedule sets a reason — a console, fleet, startup or budget pause leaves
+	// it empty, because those are the causes the operator has to act on and a
+	// beacon can carry one reason.
+	//
+	// PauseZone is the schedule's IANA zone. It is LOCAL render metadata only
+	// (the supervisor prints the resume time in the operator's own zone) and is
+	// deliberately absent from the wire: the plane receives an instant with an
+	// explicit offset, which is all it needs.
+	PauseReason string
+	PauseUntil  time.Time
+	PauseZone   string
 }
 
 // Usage is one session's token accounting, normalised across harnesses: the
@@ -444,6 +465,25 @@ func wireResetAt(st State) string {
 	return st.ResetAt.UTC().Format(time.RFC3339)
 }
 
+// wirePauseReason and wirePauseUntil render a scheduled pause's payload
+// (CLA-908), or the empty string — which `omitempty` drops — on any state but
+// `draining` and any reason but the schedule. The plane reads the pair only on
+// `draining`, and `pauseUntil` only beside a reason, so a value left on another
+// state is dropped here rather than shipped as a key the plane would ignore.
+func wirePauseReason(st State) string {
+	if st.Kind != StateDraining || st.PauseReason != PauseReasonSchedule {
+		return ""
+	}
+	return st.PauseReason
+}
+
+func wirePauseUntil(st State) string {
+	if wirePauseReason(st) == "" || st.PauseUntil.IsZero() {
+		return ""
+	}
+	return st.PauseUntil.UTC().Format(time.RFC3339)
+}
+
 // ── Wire shape ────────────────────────────────────────────────────────────────
 // Exactly what apps/web/src/server/fleet-report.ts parseFleetReport reads
 // (CLA-465). Kept as a separate marshalling step with its own tags so the Go
@@ -461,6 +501,13 @@ type wireState struct {
 	// actually omit it: time.Time is a struct, and the encoder never treats
 	// its zero value as empty.
 	ResetAt string `json:"resetAt,omitempty"`
+	// PauseReason/PauseUntil are the `draining` state's schedule payload
+	// (CLA-908), in the shape the plane's parseFleetReport accepts: the reason
+	// is free text (only the operator's schedule sets one today), the instant
+	// RFC 3339 with an explicit zone. Both are omitted on every other kind,
+	// exactly like resetAt, so an old plane sees the bytes it always did.
+	PauseReason string `json:"pauseReason,omitempty"`
+	PauseUntil  string `json:"pauseUntil,omitempty"`
 }
 
 // wireUsage is the normalised breakdown on the wire. Each key is omitted when
@@ -533,11 +580,13 @@ func marshalReport(rep Report) ([]byte, error) {
 		Version:        rep.Version,
 		ConfigIdentity: rep.ConfigIdentity,
 		State: &wireState{
-			Kind:    rep.State.Kind,
-			N:       rep.State.N,
-			TaskRef: rep.State.TaskRef,
-			Phase:   rep.State.Phase,
-			ResetAt: wireResetAt(rep.State),
+			Kind:        rep.State.Kind,
+			N:           rep.State.N,
+			TaskRef:     rep.State.TaskRef,
+			Phase:       rep.State.Phase,
+			ResetAt:     wireResetAt(rep.State),
+			PauseReason: wirePauseReason(rep.State),
+			PauseUntil:  wirePauseUntil(rep.State),
 		},
 	}
 	if w.State.Kind == "" {

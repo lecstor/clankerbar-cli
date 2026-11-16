@@ -80,6 +80,15 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold 
 	// The flag is the same one the poll gate sets, so presence reads `draining`
 	// and the next poll does not repeat a generic entry line.
 	d.schedPaused = true
+	// Presence names what is waiting: the held claim and the phase that will run
+	// when the window ends (CLA-908). Set before the first beacon below, and
+	// cleared on every way out of the hold, so no stale hold outlives it.
+	heldRef := ""
+	if claim != nil && claim.Claim.Held() {
+		heldRef = claimLabel(claim.Claim)
+	}
+	d.holdPause(s.ti, heldRef, st.ph.Label(s.i))
+	defer d.clearHoldPause(s.ti)
 	// until carries the window's own zone, so the line names the operator's
 	// local resume time rather than the daemon's.
 	log.Printf("%sscheduled pause active until %s (%s) — holding %s at the %s boundary; %s",
@@ -87,8 +96,9 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold 
 	// The poll that normally carries presence does not run mid-drain, and the
 	// phase's own renewer stopped when its session ended: without this a window
 	// hours long would make a healthy instance — and every sibling project this
-	// daemon serves — read as dead. fleetState still names the iteration's task
-	// and phase, because the walk's iteration stays open across the hold.
+	// daemon serves — read as dead. The held target's row is a `draining` state
+	// carrying the schedule reason, the window's end and the held ref and phase,
+	// which is what the console's pause banner reads.
 	d.beaconSessionTargets(s.ti, t)
 
 	leave := func() {

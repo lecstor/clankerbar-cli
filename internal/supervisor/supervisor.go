@@ -1370,12 +1370,20 @@ func (d *Supervisor) fleetStatus() string {
 		}
 		v := inst.childVersion
 		restartAt := inst.restartAt
+		dir := inst.stateDir
 		b.WriteString("\n  " + inst.name + ": ")
 		switch {
 		case alive && inst.stopRequested:
 			fmt.Fprintf(&b, "stopping (pid %d, version %s)", pid, v)
 		case alive:
 			fmt.Fprintf(&b, "running (pid %d, version %s)", pid, v)
+			// The child is alive but its loop is holding spawns closed: say why
+			// and until when, from the same beacon payload the console reads
+			// (CLA-908). A stale beacon cannot claim a pause the child has left,
+			// because the next poll rewrites the file.
+			if pause := schedulePauseText(dir, time.Now()); pause != "" {
+				b.WriteString(" - " + pause)
+			}
 		case inst.removed:
 			b.WriteString("removed")
 		case inst.refused:

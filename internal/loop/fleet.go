@@ -95,11 +95,27 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 	}
 }
 
+// holdState is a phase boundary the schedule is holding for one target
+// (CLA-908): the task whose claim is kept and the phase that will run when the
+// window ends. Presence names both, the way the console banner does.
+type holdState struct {
+	on    bool
+	ref   string
+	phase string
+}
+
 // fleetState derives the presence State for target ti from what the loop already
-// tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases:
+// tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases and
+// the hold marker set in holdThroughPause:
 //
+//   - held at a phase boundary by a pause window -> draining with the schedule
+//     reason, the window's end, and the held task's ref and phase (CLA-908).
+//     This outranks the iteration marker because the walk's iteration stays open
+//     across the hold while no session is running.
 //   - mid-drain                -> iteration {n, taskRef, phase}
-//   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new)
+//   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new);
+//     a console, fleet, startup or budget pause sends no reason, and wins over
+//     the schedule: it is the cause the operator has to act on.
 //   - budget-exhausted           -> draining, indistinguishable from a pause HERE:
 //     the wire State carries no reason field, so the console shows a project that
 //     reached its ceiling exactly as it shows one an operator paused. The log line
@@ -113,18 +129,48 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 func (d *Driver) fleetState(ti int) fleet.State {
 	d.iterMu.Lock()
 	s := d.iterAt(ti)
+	h := d.holdAt(ti)
 	d.iterMu.Unlock()
-	if s.on {
+	// A running session outranks every pause flag: the flags only ever hold the
+	// NEXT spawn, and the iteration is what the Fleet page shows while work is
+	// in flight. The one exception is the hold, above, where no session runs.
+	if s.on && !h.on {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
-	// A scheduled pause is reported after the iteration check: a session still in
-	// flight reports its iteration, and the window holds only the NEXT spawn. An
-	// exhausted target (CLA-480) reads the same as a paused one: alive, spawning
-	// nothing new, because its own budget has been reached.
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.exhaustedAt(ti) || d.schedPaused {
+	// A pause the operator has to act on wins over the schedule: report one
+	// reason, and it is the one waiting on a human.
+	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.exhaustedAt(ti) {
 		return fleet.State{Kind: fleet.StateDraining}
 	}
+	if d.schedPaused {
+		return d.scheduleState(h)
+	}
 	return fleet.State{Kind: fleet.StateIdle}
+}
+
+// scheduleState is the scheduled pause's presence: draining, why, until when,
+// and — when a phase sequence is held — what is waiting behind it.
+//
+// The window is re-read rather than trusted from the flag: schedPaused is
+// daemon bookkeeping updated at the poll gate and at a boundary, so it can
+// still be set for one idle interval after the window ended (and after a STOP
+// landed during a hold). A stale flag reports plain draining, never a reason
+// with no resume instant.
+func (d *Driver) scheduleState(h holdState) fleet.State {
+	st := fleet.State{Kind: fleet.StateDraining}
+	active, until, pw := d.pauseState()
+	if !active {
+		return st
+	}
+	st.PauseReason = fleet.PauseReasonSchedule
+	st.PauseUntil = until
+	if pw != nil {
+		st.PauseZone = pw.Timezone
+	}
+	if h.on {
+		st.TaskRef, st.Phase = h.ref, h.phase
+	}
+	return st
 }
 
 // iterAt/pausedAt/fleetPausedAt/startupPausedAt are bounds-checked reads of the per-target
@@ -135,6 +181,37 @@ func (d *Driver) iterAt(ti int) iterState {
 		return iterState{}
 	}
 	return d.iter[ti]
+}
+
+// holdAt is the bounds-checked read of the per-target hold marker, mirroring
+// iterAt: a hand-built test Driver carries an empty slice and reports no hold.
+func (d *Driver) holdAt(ti int) holdState {
+	if ti < 0 || ti >= len(d.hold) {
+		return holdState{}
+	}
+	return d.hold[ti]
+}
+
+// holdPause and clearHoldPause mark a target as held at a phase boundary by the
+// schedule and drop the mark when it ends (CLA-908). The caller owns the pair:
+// holdThroughPause defers the clear, so every way the hold can end — resume,
+// STOP, a lost run — leaves no stale hold on the presence row.
+func (d *Driver) holdPause(ti int, ref, phase string) {
+	d.iterMu.Lock()
+	defer d.iterMu.Unlock()
+	if ti < 0 || ti >= len(d.hold) {
+		return
+	}
+	d.hold[ti] = holdState{on: true, ref: ref, phase: phase}
+}
+
+func (d *Driver) clearHoldPause(ti int) {
+	d.iterMu.Lock()
+	defer d.iterMu.Unlock()
+	if ti < 0 || ti >= len(d.hold) {
+		return
+	}
+	d.hold[ti] = holdState{}
 }
 
 func (d *Driver) pausedAt(ti int) bool {
@@ -215,13 +292,19 @@ func (d *Driver) beaconLimited(resetAt time.Time) {
 // running and runningTarget are handed in rather than indexed out of d.targets
 // so a hand-built driver - the unit tests - still beacons the target it was
 // given; the lap then adds any other target, skipping that index.
+//
+// Only the running target writes the local BEACON file: it takes no target, and
+// its last writer wins. The running target's row is the informative one - the
+// iteration, or the task and phase a schedule is holding (CLA-908) - so the
+// siblings' beacons are plane-only rather than letting whichever project is
+// last in the list decide what `supervise` prints about this daemon.
 func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
 	d.beacon(running, runningTarget, d.fleetState(running))
 	for i := range d.targets {
 		if i == running {
 			continue
 		}
-		d.beacon(i, d.targets[i], d.fleetState(i))
+		d.sendBeacon(i, d.targets[i], d.fleetState(i))
 	}
 }
 
@@ -242,11 +325,23 @@ const LocalBeaconName = "BEACON"
 // than saying `limited` with no moment while the console shows a countdown. A
 // pointer rather than a time.Time so `omitempty` can actually omit it (the
 // encoder never treats a time.Time's zero value as empty).
+//
+// PauseReason/PauseUntil are the same contract for a scheduled pause (CLA-908):
+// the reason and the window's end, so `supervise` prints what the console's
+// banner shows without a plane read. PauseZone is the schedule's IANA zone —
+// local only, so the listing can say "14:00 AEST" as the operator configured it
+// rather than the machine's zone. TaskRef/Phase name the task and phase a hold
+// is waiting behind the window.
 type localBeacon struct {
-	Version string     `json:"version"`
-	State   string     `json:"state"`
-	At      time.Time  `json:"at"`
-	ResetAt *time.Time `json:"resetAt,omitempty"`
+	Version     string     `json:"version"`
+	State       string     `json:"state"`
+	At          time.Time  `json:"at"`
+	ResetAt     *time.Time `json:"resetAt,omitempty"`
+	PauseReason string     `json:"pauseReason,omitempty"`
+	PauseUntil  *time.Time `json:"pauseUntil,omitempty"`
+	PauseZone   string     `json:"pauseZone,omitempty"`
+	TaskRef     string     `json:"taskRef,omitempty"`
+	Phase       string     `json:"phase,omitempty"`
 }
 
 // localBeaconResetAt is the reset instant the local file carries: the stated
@@ -260,6 +355,22 @@ func localBeaconResetAt(st fleet.State) *time.Time {
 	return &at
 }
 
+// localBeaconPause is the schedule payload the local file carries: the reason,
+// the window's end and its zone on a schedule pause, and nothing on any other
+// state — the same restriction the wire applies, so the file and the next POST
+// cannot disagree about whether a pause is on.
+func localBeaconPause(st fleet.State) (reason string, until *time.Time, zone string) {
+	if st.Kind != fleet.StateDraining || st.PauseReason != fleet.PauseReasonSchedule {
+		return "", nil, ""
+	}
+	reason = st.PauseReason
+	if !st.PauseUntil.IsZero() {
+		at := st.PauseUntil.UTC()
+		until = &at
+	}
+	return reason, until, st.PauseZone
+}
+
 // writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
 // plane beacon: telemetry is never control flow, so a write failure is logged
 // (once per streak) and dropped — the daemon's own life never depends on it.
@@ -270,14 +381,20 @@ func (d *Driver) writeLocalBeacon(st fleet.State) {
 	if d.state == nil {
 		return
 	}
+	reason, until, zone := localBeaconPause(st)
 	body, err := json.Marshal(localBeacon{
-		Version: version.Current,
-		State:   st.Kind,
-		At:      time.Now().UTC(),
-		ResetAt: localBeaconResetAt(st),
+		Version:     version.Current,
+		State:       st.Kind,
+		At:          time.Now().UTC(),
+		ResetAt:     localBeaconResetAt(st),
+		PauseReason: reason,
+		PauseUntil:  until,
+		PauseZone:   zone,
+		TaskRef:     st.TaskRef,
+		Phase:       st.Phase,
 	})
 	if err != nil {
-		return // the four state kinds and a version string cannot fail to marshal
+		return // the state kinds and string fields cannot fail to marshal
 	}
 	_ = d.state.Remove(LocalBeaconName)
 	if err := d.state.WriteFile(LocalBeaconName, body); err != nil {

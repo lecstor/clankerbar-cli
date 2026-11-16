@@ -551,6 +551,13 @@ type Driver struct {
 	iter   []iterState
 	iterMu sync.Mutex
 
+	// hold is each target's phase-boundary hold (CLA-908): the task and phase a
+	// scheduled pause is holding, so presence can say what waits behind the
+	// window. It is separate from iter because the walk's iteration stays open
+	// across the hold and names the phase that just ENDED, while the console
+	// needs the phase that is about to run. Guarded by iterMu, like iter.
+	hold []holdState
+
 	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
 	hostname string
 	hostOnce sync.Once
@@ -667,6 +674,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		startupRaised:       make([]bool, n),
 		startupOpenQ:        make([]int, n),
 		iter:                make([]iterState, n),
+		hold:                make([]holdState, n),
 		rcVersions:          make([]int, n),
 		rcAttempt:           make([]time.Time, n),
 		rcAttemptVer:        make([]int, n),
