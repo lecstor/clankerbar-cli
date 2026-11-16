@@ -7,6 +7,8 @@ package loop
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,18 +41,20 @@ func (c *pauseHoldClock) Set(t time.Time) {
 }
 
 // beatReleaser is fakeReleaser plus the lease renewal the hold needs, recording
-// every run id it was asked to renew.
+// every run id it was asked to renew. err, when set, is what each renewal
+// answers — the seam the hold's failure branches are driven through.
 type beatReleaser struct {
 	fakeReleaser
 	mu    sync.Mutex
 	beats []string
+	err   error
 }
 
 func (b *beatReleaser) Heartbeat(_ context.Context, runID string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.beats = append(b.beats, runID)
-	return nil
+	return b.err
 }
 
 func (b *beatReleaser) beatSnapshot() []string {
@@ -298,5 +302,312 @@ func TestDrainPhases_ScheduledPauseHoldsAClaimedDrainsFirstPhase(t *testing.T) {
 	}
 	if got := h.invocations[0].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != walkClaimRunID {
 		t.Errorf("the first phase resumed %+v, want the claim the runner took (%s/%s)", got, walkClaimTaskID, walkClaimRunID)
+	}
+}
+
+// holdClaimResult is the carried result a boundary hold renews: the task and
+// run a preceding phase left in flight.
+func holdClaimResult() *harness.Result {
+	return &harness.Result{Claim: harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}}
+}
+
+// holdSeq is the smallest drain state holdThroughPause needs, driven directly:
+// nothing here spawns, so the hold's own branches are what the assertions read.
+func holdSeq(t *testing.T, d *Driver, carried *harness.Result) (*drainSeq, *seqStep) {
+	t.Helper()
+	phases := d.cfg.EffectivePhases()
+	s := &drainSeq{d: d, t: d.targets[0], ti: 0, i: len(phases) - 1, phases: phases, carried: carried}
+	return s, &seqStep{ph: phases[len(phases)-1]}
+}
+
+func startHoldThroughPause(s *drainSeq, st *seqStep, ctx context.Context) <-chan pauseHold {
+	ch := make(chan pauseHold, 1)
+	go func() { ch <- s.holdThroughPause(ctx, st) }()
+	return ch
+}
+
+func waitHoldOutcome(t *testing.T, ch <-chan pauseHold) pauseHold {
+	t.Helper()
+	select {
+	case out := <-ch:
+		return out
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the hold")
+		return pauseHoldNone
+	}
+}
+
+// CLA-906 review 1.review-1.3: ErrNotWired degrades the beat exactly as the
+// in-session renewer does — one line, no further heartbeats — but the hold keeps
+// waiting and never releases the claim.
+func TestHoldThroughPause_NotWiredKeepsHoldingWithoutBeats(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 11, 30)}
+	rel := &beatReleaser{err: fmt.Errorf("%w: no api key", plane.ErrNotWired)}
+	d := pauseBoundaryDriver(t, &fakeAdapter{}, rel, clk, peakSchedule(t))
+	logs := captureLogs(t)
+	s, st := holdSeq(t, d, holdClaimResult())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := startHoldThroughPause(s, st, ctx)
+	waitUntil(t, "the lease stand-down", func() bool {
+		return strings.Contains(logs.String(), "cannot renew a lease")
+	})
+	if beats := rel.beatSnapshot(); len(beats) != 1 {
+		t.Fatalf("heartbeats = %v, want the single entry beat before standing down", beats)
+	}
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+	if out := waitHoldOutcome(t, done); out != pauseHoldResumed {
+		t.Fatalf("hold outcome = %v, want a resume after the window", out)
+	}
+	if len(rel.calls) != 0 || len(rel.expireCalls) != 0 {
+		t.Errorf("the claim was handed back during the hold: release %v expire %v", rel.calls, rel.expireCalls)
+	}
+	if d.schedPaused {
+		t.Error("schedPaused must be clear once the hold resumes")
+	}
+}
+
+// CLA-906 review 1.review-1.3: three consecutive generic renewal failures log
+// the give-up and the hold continues without heartbeats — it must not end the
+// drain.
+func TestHoldThroughPause_GivesUpAfterThreeFailedRenewalsAndKeepsHolding(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 11, 30)}
+	rel := &beatReleaser{err: errors.New("plane unreachable")}
+	d := pauseBoundaryDriver(t, &fakeAdapter{}, rel, clk, peakSchedule(t))
+	logs := captureLogs(t)
+	s, st := holdSeq(t, d, holdClaimResult())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := startHoldThroughPause(s, st, ctx)
+	waitUntil(t, "the give-up line", func() bool {
+		return strings.Contains(logs.String(), "giving up on lease renewal after 3 consecutive failures")
+	})
+	if beats := rel.beatSnapshot(); len(beats) != 3 {
+		t.Fatalf("heartbeats = %v, want the three consecutive failures then no more", beats)
+	}
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+	if out := waitHoldOutcome(t, done); out != pauseHoldResumed {
+		t.Fatalf("hold outcome = %v, want the sequence to resume", out)
+	}
+	if len(rel.calls) != 0 || len(rel.expireCalls) != 0 {
+		t.Errorf("the claim was handed back during the hold: release %v expire %v", rel.calls, rel.expireCalls)
+	}
+}
+
+// CLA-906 review 1.review-1.1/1.review-1.3: a lost run during the hold drops the
+// claim (it is someone else's task) and reports the DRAIN ending, leaving the
+// pause flag clear for the run's next poll.
+func TestHoldThroughPause_RunLostDropsTheClaimAndEndsTheHold(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 11, 30)}
+	rel := &beatReleaser{err: fmt.Errorf("%w: run_superseded", plane.ErrRunLost)}
+	d := pauseBoundaryDriver(t, &fakeAdapter{}, rel, clk, peakSchedule(t))
+	logs := captureLogs(t)
+	s, st := holdSeq(t, d, holdClaimResult())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if out := waitHoldOutcome(t, startHoldThroughPause(s, st, ctx)); out != pauseHoldRunLost {
+		t.Fatalf("hold outcome = %v, want the run-lost drain ending", out)
+	}
+	if s.carried != nil {
+		t.Errorf("the hold kept a claim that is no longer this run's: %+v", s.carried)
+	}
+	if d.schedPaused {
+		t.Error("schedPaused must be cleared for the run's next poll")
+	}
+	if len(rel.calls) != 0 || len(rel.expireCalls) != 0 {
+		t.Errorf("a lost run must not be handed back: release %v expire %v", rel.calls, rel.expireCalls)
+	}
+	if out := logs.String(); !strings.Contains(out, "is no longer this run's, ending the hold") {
+		t.Errorf("the lost-run line is missing:\n%s", out)
+	}
+}
+
+// The drain-level half of the run-lost disposition: the hold ends THIS drain
+// without setting the run's stop flag, spawns no next phase and hands nothing
+// back — the contract TestDrainPhases_RunLostEndsTheSessionAndTheDrain pins for
+// a lost run mid-phase.
+func TestDrainPhases_RunLostDuringScheduledPauseEndsTheDrainWithoutTheRun(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 10, 0)}
+	rel := &beatReleaser{err: fmt.Errorf("%w: run_superseded", plane.ErrRunLost)}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: okResult(1, 0)},
+	}}
+	h.onInvoke = func(call int) {
+		if call == 0 {
+			clk.Set(brisbaneAt(t, 9, 11, 30))
+		}
+	}
+	logs := captureLogs(t)
+	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
+
+	res := waitPauseDrain(t, startPauseDrain(t, d))
+	if res.err != nil || res.stop {
+		t.Fatalf("drainPhases: err=%v stop=%v, want a drain that ends without stopping the run", res.err, res.stop)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("sessions = %d, want 1: no phase may spawn after the run was refused", h.invokeCalls)
+	}
+	if len(rel.calls) != 0 || len(rel.expireCalls) != 0 {
+		t.Errorf("handback calls = release %v expire %v; want none for a task this run no longer holds", rel.calls, rel.expireCalls)
+	}
+	if d.schedPaused {
+		t.Error("schedPaused must be cleared so the next poll can announce the window again")
+	}
+	if out := logs.String(); !strings.Contains(out, "ending the drain: the task is no longer this run's") {
+		t.Errorf("the drain-level lost-run line is missing:\n%s", out)
+	}
+}
+
+// A cancelled context during the hold takes the ordinary stop path: the drain
+// stops and the deferred handback releases the claim.
+func TestDrainPhases_CancelledContextDuringScheduledPauseTakesTheNormalStopPath(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 10, 0)}
+	rel := &beatReleaser{}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: okResult(1, 0)},
+	}}
+	h.onInvoke = func(call int) {
+		if call == 0 {
+			clk.Set(brisbaneAt(t, 9, 11, 30))
+		}
+	}
+	logs := captureLogs(t)
+	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan pauseDrainResult, 1)
+	go func() {
+		_, _, _, stop, err := d.drainPhases(ctx, 1, 0, d.targets[0], spend{start: time.Now()})
+		done <- pauseDrainResult{stop: stop, err: err}
+	}()
+	waitUntil(t, "the hold at the review boundary", func() bool {
+		return strings.Contains(logs.String(), "holding t-1 at the review boundary")
+	})
+	cancel()
+
+	res := waitPauseDrain(t, done)
+	if res.err != nil || !res.stop {
+		t.Fatalf("cancelled hold: stop=%v err=%v, want a graceful stop", res.stop, res.err)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("the review phase spawned after the cancel: %d sessions", h.invokeCalls)
+	}
+	if len(rel.calls) != 1 || rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
+		t.Errorf("the held claim was not handed back by the normal stop path: %+v", rel.calls)
+	}
+}
+
+// CLA-906 review 1.review-1.5: a hold is idle time, not draining time, so it is
+// not charged to max_wall_clock — a short ceiling must not end the sequence at
+// the boundary the window held.
+func TestDrainPhases_ScheduledPauseIsNotChargedToTheWallClockBudget(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 10, 0)}
+	rel := &beatReleaser{}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: okResult(1, 0)},
+	}}
+	h.onInvoke = func(call int) {
+		if call == 0 {
+			clk.Set(brisbaneAt(t, 9, 11, 30))
+		}
+	}
+	logs := captureLogs(t)
+	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
+	// The implement phase finishes well inside the ceiling; the held wall clock
+	// then outruns it. A post-hold breaker that charged the hold would stop the
+	// drain and never spawn the review.
+	d.cfg.Budget.MaxWallClock = config.Duration(time.Second)
+
+	done := startPauseDrain(t, d)
+	waitUntil(t, "the hold at the review boundary", func() bool {
+		return strings.Contains(logs.String(), "holding t-1 at the review boundary")
+	})
+	time.Sleep(1200 * time.Millisecond)
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+
+	res := waitPauseDrain(t, done)
+	if res.err != nil || res.stop {
+		t.Fatalf("drain after a held window: stop=%v err=%v, want the sequence to resume", res.stop, res.err)
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("sessions = %d, want 2: the review must run after the hold", h.invokeCalls)
+	}
+}
+
+// CLA-906 review 1.review-1.2: the boundary check runs BEFORE the parallel
+// panel's fan-out, so a window active at the panel boundary holds the WHOLE
+// panel — no member starts — and all of them run when it ends. Moving the check
+// back after runPanelFanOut lets every member spawn inside the window and fails
+// this test.
+type pausePanelAdapter struct {
+	*panelParallelAdapter
+	enterWindow func()
+}
+
+func (a *pausePanelAdapter) Invoke(ctx context.Context, in harness.Invocation) (harness.Result, error) {
+	// The implement phase is the only call that is neither a panel review nor
+	// the fix; moving the clock there puts the next boundary inside the window.
+	if !strings.Contains(in.Prompt, "REVIEW-ONLY gate") && !strings.Contains(in.Prompt, "the FIX phase") {
+		a.enterWindow()
+	}
+	return a.panelParallelAdapter.Invoke(ctx, in)
+}
+
+func TestDrainPhases_ScheduledPauseHoldsTheParallelPanelBeforeAnyMember(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers() // three members: the fan-out really is parallel
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 10, 0)}
+	var once sync.Once
+	inner := newPanelParallelAdapter(rel, branch, tip, len(members))
+	a := &pausePanelAdapter{
+		panelParallelAdapter: inner,
+		enterWindow:          func() { once.Do(func() { clk.Set(brisbaneAt(t, 9, 11, 30)) }) },
+	}
+	d, _ := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d.cfg.PauseWindows = peakSchedule(t)
+	d.now = clk.Now
+	d.leaseRenewalInterval = 2 * time.Millisecond
+	logs := captureLogs(t)
+
+	done := startPauseDrain(t, d)
+	waitUntil(t, "the hold at the panel boundary", func() bool {
+		return strings.Contains(logs.String(), "holding t-1 at the review-1 boundary")
+	})
+	inner.mu.Lock()
+	memberCalls := inner.reviewCalls
+	inner.mu.Unlock()
+	if memberCalls != 0 {
+		t.Fatalf("the panel fan-out spawned %d member(s) inside the window", memberCalls)
+	}
+	if len(rel.calls) != 0 {
+		t.Errorf("the panel's claim was handed back while holding: %+v", rel.calls)
+	}
+
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+	res := waitPauseDrain(t, done)
+	if res.err != nil || res.stop {
+		t.Fatalf("drain after the window: stop=%v err=%v", res.stop, res.err)
+	}
+	inner.mu.Lock()
+	memberCalls = inner.reviewCalls
+	maxInFlight := inner.maxInFlight
+	fixCalls := inner.fixCalls
+	inner.mu.Unlock()
+	if memberCalls != len(members) {
+		t.Errorf("panel members run = %d, want %d after the window", memberCalls, len(members))
+	}
+	if maxInFlight != len(members) {
+		t.Errorf("max members in flight = %d, want %d — the panel must still fan out", maxInFlight, len(members))
+	}
+	if fixCalls != 1 {
+		t.Errorf("fix sessions = %d, want 1 after the panel", fixCalls)
 	}
 }

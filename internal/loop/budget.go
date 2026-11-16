@@ -211,22 +211,63 @@ func (d *Driver) noteTargetStart(i int) {
 }
 
 // budgetElapsed is the clock the budget in force for target i runs on: the
-// target's own when a stored overlay sets its ceiling, else the run's.
+// target's own when a stored overlay sets its ceiling, else the run's. Scheduled
+// pause holds are subtracted (CLA-906): the operator configured that wait, so it
+// must not count against a ceiling as if the project had been draining.
 func (d *Driver) budgetElapsed(i int, runElapsed time.Duration) time.Duration {
+	runPaused, targetPaused := d.pauseCredit(i)
 	if d.overlayBudgetAt(i) {
-		return d.targetElapsed(i)
+		elapsed := d.targetElapsed(i) - targetPaused
+		if elapsed < 0 {
+			return 0
+		}
+		return elapsed
+	}
+	runElapsed -= runPaused
+	if runElapsed < 0 {
+		return 0
 	}
 	return runElapsed
+}
+
+// notePauseHeld books wall-clock time a scheduled pause held target ti at a
+// phase boundary (CLA-906). It is idle time, not draining time, so the budget
+// clocks credit it back rather than ending a sequence for waiting out a window
+// the operator configured.
+func (d *Driver) notePauseHeld(ti int, held time.Duration) {
+	if held <= 0 {
+		return
+	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.pausedRun += held
+	if ti >= 0 && ti < len(d.pausedTargets) {
+		d.pausedTargets[ti] += held
+	}
+}
+
+// pauseCredit is how much wall clock to subtract from the budget clocks for
+// target ti: the run-wide total and that target's own. Read under stateMu for
+// the same reason targetElapsed writes there — a parallel panel's members run
+// budget checks on their own goroutines.
+func (d *Driver) pauseCredit(ti int) (run, target time.Duration) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	run = d.pausedRun
+	if ti >= 0 && ti < len(d.pausedTargets) {
+		target = d.pausedTargets[ti]
+	}
+	return run, target
 }
 
 // targetBudgetTrip judges target i's account against the budget in force for
 // it: its stored document's budget when one is in force, else the local file's
 // budget over every target the local file still governs.
 func (d *Driver) targetBudgetTrip(i int, runElapsed time.Duration) budgetVerdict {
+	elapsed := d.budgetElapsed(i, runElapsed)
 	if i >= 0 && i < len(d.targets) && d.overlayBudgetAt(i) {
 		if eff := d.targets[i].Cfg; eff != nil {
 			s := d.targetSpendAt(i)
-			elapsed := d.targetElapsed(i)
 			return budgetVerdict{
 				dim:     tripBudget(eff.Budget, s.tokens, s.cost, elapsed, s.byHarness),
 				tokens:  s.tokens,
@@ -237,10 +278,10 @@ func (d *Driver) targetBudgetTrip(i int, runElapsed time.Duration) budgetVerdict
 	}
 	tokens, cost := d.localSpend()
 	return budgetVerdict{
-		dim:     d.budgetTrip(tokens, cost, runElapsed),
+		dim:     d.budgetTrip(tokens, cost, elapsed),
 		tokens:  tokens,
 		cost:    cost,
-		elapsed: runElapsed,
+		elapsed: elapsed,
 	}
 }
 

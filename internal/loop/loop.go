@@ -584,6 +584,14 @@ type Driver struct {
 	// members run on their own goroutines read it while they do.
 	tgtStart []time.Time
 
+	// pausedRun and pausedTargets are wall-clock time spent held at a scheduled
+	// pause boundary (CLA-906): idle time, not draining time, so every budget
+	// clock credits it back. pausedRun corrects the run-wide clock the local-file
+	// budget reads; pausedTargets corrects the per-target clock a stored overlay's
+	// max_wall_clock reads. Guarded by stateMu, like the clocks they correct.
+	pausedRun     time.Duration
+	pausedTargets []time.Duration
+
 	// overlayBudget marks a target whose stored run-config document SET a
 	// budget: only that target's own spend is judged by it. A document that
 	// sets no budget leaves the target in the local pool, because the README's
@@ -665,6 +673,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		rcFails:             make([]int, n),
 		tgtSpend:            make([]targetSpend, n),
 		tgtStart:            make([]time.Time, n),
+		pausedTargets:       make([]time.Duration, n),
 		overlayBudget:       make([]bool, n),
 		exhausted:           make([]bool, n),
 		budgetStopped:       make([]bool, n),

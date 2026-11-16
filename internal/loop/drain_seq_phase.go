@@ -140,15 +140,19 @@ func (s *drainSeq) checkPhaseBoundary(ctx context.Context, st *seqStep) seqNext 
 		return seqBreak
 	}
 	// CLA-906: a window holds the next spawn, never a running session. The
-	// claim is kept and its lease renewed while it waits.
-	held, stop := s.holdThroughPause(ctx, st)
-	if stop {
+	// claim is kept and its lease renewed while it waits. Nothing is spent
+	// during the hold, so the breaker's pre-hold verdict stands: the wait is
+	// NOT charged to max_wall_clock (see docs/pause-windows.md).
+	switch s.holdThroughPause(ctx, st) {
+	case pauseHoldStop:
 		s.stop = true
 		return seqBreak
-	}
-	// A four-hour hold can outlast a wall-clock ceiling the between-drains gate
-	// judged before it; judge it again before spending on the awaited phase.
-	if held && s.budgetStopAtBoundary(st) {
+	case pauseHoldRunLost:
+		// A lost run ends THIS drain, not the daemon — the same ending the
+		// mid-drain runLost arm takes (drain_phases.go). The hold dropped the
+		// claim, so the deferred handback has nothing to release; the run
+		// continues to its next poll.
+		log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
 		return seqBreak
 	}
 
