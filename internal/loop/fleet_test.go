@@ -222,21 +222,21 @@ func TestRun_ABeaconCarriesThatPollsPauseState(t *testing.T) {
 }
 
 // The state mapping, directly: paused targets read draining (alive, spawning
-// nothing new), mid-drain reads iteration {n, taskRef, phase}, everything else
-// idle.
+// nothing new) and name their cause, mid-drain reads iteration {n, taskRef,
+// phase}, everything else idle.
 func TestFleetState_MapsWhatTheLoopKnows(t *testing.T) {
 	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller()}})
 	if got := d.fleetState(0); got.Kind != fleet.StateIdle {
 		t.Errorf("fresh target state = %v, want idle", got)
 	}
 	d.paused[0] = true
-	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
-		t.Errorf("console-paused state = %v, want draining", got)
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonConsole {
+		t.Errorf("console-paused state = %v, want draining with the console reason", got)
 	}
 	d.paused[0] = false
 	d.fleetPaused[0] = true
-	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
-		t.Errorf("fleet-paused state = %v, want draining", got)
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonFleet {
+		t.Errorf("fleet-paused state = %v, want draining with the fleet reason", got)
 	}
 	d.fleetPaused[0] = false
 	d.iter = []iterState{{on: true, n: 7, ref: "CLA-9", phase: "review"}}

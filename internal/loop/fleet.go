@@ -113,13 +113,10 @@ type holdState struct {
 //     This outranks the iteration marker because the walk's iteration stays open
 //     across the hold while no session is running.
 //   - mid-drain                -> iteration {n, taskRef, phase}
-//   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new);
-//     a console, fleet, startup or budget pause sends no reason, and wins over
-//     the schedule: it is the cause the operator has to act on.
-//   - budget-exhausted           -> draining, indistinguishable from a pause HERE:
-//     the wire State carries no reason field, so the console shows a project that
-//     reached its ceiling exactly as it shows one an operator paused. The log line
-//     from markBudgetExhausted is the operator's signal until a reason is carried.
+//   - console-, fleet-, startup- or schedule-paused -> draining (alive, spawning nothing new),
+//     carrying the cause the operator has to act on: a console, fleet, startup
+//     or budget pause names itself and wins over the schedule.
+//   - budget-exhausted           -> draining with the budget reason
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:
@@ -138,14 +135,33 @@ func (d *Driver) fleetState(ti int) fleet.State {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
 	// A pause the operator has to act on wins over the schedule: report one
-	// reason, and it is the one waiting on a human.
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) || d.exhaustedAt(ti) {
-		return fleet.State{Kind: fleet.StateDraining}
+	// cause, and it is the one waiting on a human. A scheduled window clears
+	// itself; these do not.
+	if reason := d.operatorPauseReason(ti); reason != "" {
+		return fleet.State{Kind: fleet.StateDraining, PauseReason: reason}
 	}
 	if d.schedPaused {
 		return d.scheduleState(h)
 	}
 	return fleet.State{Kind: fleet.StateIdle}
+}
+
+// operatorPauseReason names the strongest non-schedule cause holding target ti's
+// spawns closed, or "" when none does. Console outranks fleet outranks startup
+// outranks budget: that is the order an operator works through, from the lever on
+// the page they are looking at to the one that needs a decision or a config edit.
+func (d *Driver) operatorPauseReason(ti int) string {
+	switch {
+	case d.pausedAt(ti):
+		return fleet.PauseReasonConsole
+	case d.fleetPausedAt(ti):
+		return fleet.PauseReasonFleet
+	case d.startupPausedAt(ti):
+		return fleet.PauseReasonStartup
+	case d.exhaustedAt(ti):
+		return fleet.PauseReasonBudget
+	}
+	return ""
 }
 
 // scheduleState is the scheduled pause's presence: draining, why, until when,
@@ -355,15 +371,18 @@ func localBeaconResetAt(st fleet.State) *time.Time {
 	return &at
 }
 
-// localBeaconPause is the schedule payload the local file carries: the reason,
-// the window's end and its zone on a schedule pause, and nothing on any other
-// state — the same restriction the wire applies, so the file and the next POST
-// cannot disagree about whether a pause is on.
+// localBeaconPause is the pause payload the local file carries: the stated
+// reason and, for the schedule, the window's end and zone, and nothing on any
+// other state — the same restriction the wire applies, so the file and the next
+// POST cannot disagree about whether a pause is on.
 func localBeaconPause(st fleet.State) (reason string, until *time.Time, zone string) {
-	if st.Kind != fleet.StateDraining || st.PauseReason != fleet.PauseReasonSchedule {
+	if st.Kind != fleet.StateDraining || st.PauseReason == "" {
 		return "", nil, ""
 	}
 	reason = st.PauseReason
+	if reason != fleet.PauseReasonSchedule {
+		return reason, nil, ""
+	}
 	if !st.PauseUntil.IsZero() {
 		at := st.PauseUntil.UTC()
 		until = &at

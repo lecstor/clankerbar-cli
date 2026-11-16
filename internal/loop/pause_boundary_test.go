@@ -7,6 +7,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -189,6 +191,88 @@ func TestDrainPhases_ScheduledPauseHoldsTheNextPhaseAndResumesIt(t *testing.T) {
 	out := logs.String()
 	if !strings.Contains(out, "scheduled pause ended — resuming t-1 at the review phase") {
 		t.Errorf("the leave line is missing or names the wrong phase:\n%s", out)
+	}
+}
+
+// CLA-908: the hold's presence says what the console's pause banner needs — the
+// schedule reason, the window's end and the task/phase waiting behind it — on
+// the plane beacon AND in the local BEACON file, which the supervisor's fleet
+// listing reads. Same state, two readers, no second writer to drift.
+func TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 10, 0)}
+	rel := &beatReleaser{}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: okResult(5, 0.05)},
+	}}
+	h.onInvoke = func(call int) {
+		if call == 0 {
+			clk.Set(brisbaneAt(t, 9, 11, 30))
+		}
+	}
+	ff := &fakeFleet{}
+	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
+	d.targets[0].Fleet = ff
+	logs := captureLogs(t)
+	done := startPauseDrain(t, d)
+
+	waitUntil(t, "the hold at the review boundary", func() bool {
+		return strings.Contains(logs.String(), "holding t-1 at the review boundary")
+	})
+	until := brisbaneAt(t, 9, 14, 0)
+	sent, _ := ff.reports()
+	if len(sent) == 0 {
+		t.Fatal("no presence beacon was sent for the hold")
+	}
+	last := sent[len(sent)-1]
+	if last.State.Kind != fleet.StateDraining {
+		t.Errorf("held beacon kind = %q, want draining (the console banner keys on it)", last.State.Kind)
+	}
+	if last.State.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("held beacon pause reason = %q, want %q", last.State.PauseReason, fleet.PauseReasonSchedule)
+	}
+	if !last.State.PauseUntil.Equal(until) {
+		t.Errorf("held beacon pause until = %v, want %v", last.State.PauseUntil, until)
+	}
+	if last.State.TaskRef != "t-1" || last.State.Phase != "review" {
+		t.Errorf("held beacon names %q at %q, want t-1 at the review phase", last.State.TaskRef, last.State.Phase)
+	}
+
+	data, err := os.ReadFile(filepath.Join(d.state.Path(), LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon during the hold: %v", err)
+	}
+	var b localBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("local beacon = state %q reason %q, want draining/%s", b.State, b.PauseReason, fleet.PauseReasonSchedule)
+	}
+	if b.PauseUntil == nil || !b.PauseUntil.Equal(until) {
+		t.Errorf("local beacon pauseUntil = %v, want %v", b.PauseUntil, until)
+	}
+	if b.PauseZone != "Australia/Brisbane" {
+		t.Errorf("local beacon pauseZone = %q, want the schedule's zone so the listing can say AEST", b.PauseZone)
+	}
+	if b.TaskRef != "t-1" || b.Phase != "review" {
+		t.Errorf("local beacon names %q at %q, want t-1 at the review phase", b.TaskRef, b.Phase)
+	}
+
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+	if res := waitPauseDrain(t, done); res.err != nil || res.stop {
+		t.Fatalf("drain after the window: stop=%v err=%v", res.stop, res.err)
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("sessions after the window = %d, want 2", h.invokeCalls)
+	}
+	// The hold marker is cleared on the way out: the next beacon is the resumed
+	// iteration, not a pause left stuck on the row.
+	if got := d.fleetState(0); got.Kind != fleet.StateIteration && got.Kind != fleet.StateIdle {
+		t.Errorf("state after the hold = %+v, want the iteration or idle (the hold marker must be clear)", got)
+	}
+	if got := d.holdAt(0); got.on {
+		t.Errorf("hold marker survived the hold: %+v", got)
 	}
 }
 

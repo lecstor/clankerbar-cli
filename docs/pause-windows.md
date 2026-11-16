@@ -61,6 +61,29 @@ it.
   attempt. It is covered by the start gate above, not between routes.
 - The deterministic close-out (above) spawns no session at all.
 
+## What the beacon says
+
+A window-paused daemon reports `draining` with `pauseReason: "schedule"` and
+`pauseUntil` (the window's end, which `PauseWindows.ActiveAt` already returns),
+so the console's banner (CLA-907) can name the window and its resume time instead
+of showing the same bare `draining` a console, fleet or startup pause shows. A
+sequence held at a boundary (above) also names the task and the phase waiting:
+`state.taskRef`/`state.phase` on the same draining beacon, which is the pair the
+console's hold reads.
+
+The other causes name themselves too (`console`, `fleet`, `startup`, `budget`)
+and carry no resume time — they end when the operator acts, not at a moment. A
+beacon carries ONE reason: when several causes apply at once the console, fleet,
+startup and budget pauses all outrank the schedule, because the schedule clears
+itself while the others wait on a human.
+
+The local `BEACON` file in the state dir carries the same payload (plus the
+schedule's IANA zone, which is local rendering only — the plane gets an instant
+with an explicit offset), so `supervise`'s fleet listing and the console cannot
+disagree:
+
+    clanker1: running (pid 4242, version 0.25.6) - paused by schedule until 14:00 AEST (holding CLA-1 at the review phase)
+
 ## Stop and shutdown semantics
 
 A STOP, RESTART or HALT marker, or a cancelled context, during the hold takes the
