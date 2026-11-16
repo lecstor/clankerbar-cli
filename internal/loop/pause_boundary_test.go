@@ -277,6 +277,41 @@ func TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask(t *testing.T
 	}
 }
 
+// The local BEACON is ONE file for the whole daemon, so the running target must
+// be its last writer: while a sequence is held, `supervise` has to read the held
+// task, not whichever sibling project happens to be beaconed after it. The
+// sibling still reaches the plane — its project's row must not go stale.
+func TestBeaconSessionTargets_LocalBeaconCarriesTheHeldTarget(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d, _, _, _ := pauseDriver(t, peakSchedule(t), &at)
+	sibling := &fakeFleet{}
+	d.targets = append(d.targets, Target{Poller: busyPoller(), Fleet: sibling})
+	d.schedPaused = true
+	d.holdPause(0, "t-1", "review")
+
+	d.beaconSessionTargets(0, d.targets[0])
+
+	data, err := os.ReadFile(filepath.Join(d.state.Path(), LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon after the presence lap: %v", err)
+	}
+	var b localBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("local beacon = state %q reason %q, want the held target's schedule pause", b.State, b.PauseReason)
+	}
+	if b.TaskRef != "t-1" || b.Phase != "review" {
+		t.Errorf("local beacon names %q at %q, want the HELD target's t-1 at review (not the sibling beaconed last)", b.TaskRef, b.Phase)
+	}
+
+	sent, _ := sibling.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateDraining {
+		t.Errorf("the sibling target was not beaconed on the plane: %+v", sent)
+	}
+}
+
 // A STOP marker during the hold takes the ordinary drain-stop path: the next
 // phase never spawns and the deferred handback releases the claim from the queue.
 func TestDrainPhases_StopDuringScheduledPauseTakesTheNormalStopPath(t *testing.T) {
