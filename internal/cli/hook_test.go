@@ -216,6 +216,41 @@ func TestHookEmitNoOpsOnANonPostToolUsePayload(t *testing.T) {
 	}
 }
 
+func TestHookEmitNoOpsWhenTheConfigCannotBeRead(t *testing.T) {
+	c := newHookCapture()
+	srv := c.server(t)
+	hookHome(t, srv)
+	bindSession(t, "run-1", "clk_test_key_12345678")
+
+	// An explicit --config that does not exist is an error, not the "discovered
+	// default absent" default: the hook still must send nothing and exit 0.
+	missing := filepath.Join(t.TempDir(), "absent-config.json")
+	if err := hookEmit([]string{"--config", missing}, strings.NewReader(hookPayload)); err != nil {
+		t.Fatalf("an unreadable config must not fail the hook: %v", err)
+	}
+	if n := c.count(); n != 0 {
+		t.Fatalf("sent %d request(s) with an unreadable config, want 0", n)
+	}
+}
+
+func TestHookEmitNoOpsWhenTheConfigNamesNoOrigin(t *testing.T) {
+	c := newHookCapture()
+	srv := c.server(t)
+	hookHome(t, srv)
+	bindSession(t, "run-1", "clk_test_key_12345678")
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"backlog_url":"not a url"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := hookEmit([]string{"--config", cfgPath}, strings.NewReader(hookPayload)); err != nil {
+		t.Fatalf("a config with no trusted origin must not fail the hook: %v", err)
+	}
+	if n := c.count(); n != 0 {
+		t.Fatalf("sent %d request(s) with no trusted origin, want 0", n)
+	}
+}
+
 func TestHookRoutesEmitAndHelp(t *testing.T) {
 	c := newHookCapture()
 	srv := c.server(t)

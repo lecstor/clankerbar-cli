@@ -299,6 +299,50 @@ func TestEmitNoOpsOnMalformedJSON(t *testing.T) {
 	}
 }
 
+// The lock wait is a stated bound: a hook that cannot take the lock drops its
+// event rather than queueing behind a slow send, and it must not touch the wire
+// before the drop. flock is per open file description, so this same process
+// contends with itself.
+func TestEmitDropsTheEventWhenTheLockIsHeld(t *testing.T) {
+	c := newCapture()
+	srv := c.server(t)
+	cfg := testConfig(t, srv)
+	cfg.LockWait = 50 * time.Millisecond
+
+	unlock, ok := acquireLock(cfg.SeqPath+".lock", time.Second)
+	if !ok {
+		t.Fatal("could not take the sequence lock for the test")
+	}
+	defer unlock()
+
+	start := time.Now()
+	if emit(t, cfg, payload("Bash", `{"command":"x"}`, "t")) {
+		t.Error("Emit reported an event while another hook held the lock")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Emit waited %s for the lock, want it bounded by the 50ms LockWait", elapsed)
+	}
+	if got := c.all(); len(got) != 0 {
+		t.Fatalf("sent %d request(s) while the lock was held, want 0", len(got))
+	}
+}
+
+// A session with nowhere to keep the per-run counter cannot number an event,
+// so it must not send an unnumbered one.
+func TestEmitNoOpsWithoutASequenceFile(t *testing.T) {
+	c := newCapture()
+	srv := c.server(t)
+	cfg := testConfig(t, srv)
+	cfg.SeqPath = ""
+
+	if emit(t, cfg, payload("Bash", `{"command":"x"}`, "t")) {
+		t.Error("Emit reported an event with no sequence file")
+	}
+	if got := c.all(); len(got) != 0 {
+		t.Fatalf("sent %d request(s) with no sequence file, want 0", len(got))
+	}
+}
+
 func TestEmitBoundsASlowSend(t *testing.T) {
 	c := newCapture()
 	c.block = make(chan struct{})
