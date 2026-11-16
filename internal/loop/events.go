@@ -93,7 +93,12 @@ func (s stateSeqStore) Load() (map[string]events.RunSeq, error) {
 	}
 	var runs map[string]events.RunSeq
 	if err := json.Unmarshal(raw, &runs); err != nil {
-		return nil, err
+		// The file is already unusable. Treating it as empty lets the next Save
+		// rewrite it; returning the parse error would leave the counter unable to
+		// persist anything, so every restart would replay sequence numbers the
+		// plane drops. A plain READ error is different and stays an error: a
+		// transient fault must not overwrite a file we could not read.
+		return nil, nil
 	}
 	return runs, nil
 }

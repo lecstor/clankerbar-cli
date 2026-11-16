@@ -121,9 +121,9 @@ type Emitter struct {
 	closeOne sync.Once
 }
 
-// New builds an emitter and starts its sender goroutine lazily (on the first
-// event or run id). The caller MUST eventually Close it; adapters do so when the
-// session ends.
+// New builds an emitter. Its sender goroutine starts on the first enqueued
+// event; an emitter that never sees one costs nothing. The caller MUST
+// eventually Close it; adapters do so when the session ends.
 func New(cfg Config) *Emitter {
 	cfg.defaults()
 	return &Emitter{
@@ -515,6 +515,7 @@ func (e *Emitter) Close() {
 		e.mu.Lock()
 		orphaned := len(e.pending)
 		noRun := e.runID == ""
+		dropped := e.dropped
 		e.pending = nil
 		e.approxBytes = 0
 		e.mu.Unlock()
@@ -524,6 +525,9 @@ func (e *Emitter) Close() {
 			} else {
 				e.cfg.Logf("agent events: %d activity event(s) were still unsent when the session ended", orphaned)
 			}
+		}
+		if dropped > 0 && e.cfg.Logf != nil {
+			e.cfg.Logf("agent events: %d activity event(s) were dropped this session (buffer full or unsendable)", dropped)
 		}
 	})
 }

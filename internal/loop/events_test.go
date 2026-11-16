@@ -1,6 +1,9 @@
 package loop
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -77,6 +80,46 @@ func TestEventSeqCounterIsProcessWide(t *testing.T) {
 	}
 }
 
+func TestEventSinkUsesTheConfiguredOriginAndKey(t *testing.T) {
+	// The driver's wiring has to reach the emitter: the origin is the plane's,
+	// the bearer is the operator's key, and the path is the run's ingest URL.
+	type captured struct{ auth, path string }
+	hit := make(chan captured, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		hit <- captured{auth: r.Header.Get("Authorization"), path: r.URL.Path}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"accepted":1}`)
+	}))
+	defer srv.Close()
+
+	d := eventTestDriver(true, false)
+	d.SetEventChannel(srv.URL, "clk_wired")
+	in, err := d.invocationOn(Target{}, "claude", false)
+	if err != nil {
+		t.Fatalf("invocationOn: %v", err)
+	}
+	if in.NewEventSink == nil {
+		t.Fatal("no sink with every gate open")
+	}
+	sink := in.NewEventSink()
+	sink.SetRunID("uuid-1.secret")
+	sink.ToolCall("Bash", "call-1", "ls")
+	sink.Close()
+
+	select {
+	case got := <-hit:
+		if got.auth != "Bearer clk_wired" {
+			t.Errorf("Authorization = %q", got.auth)
+		}
+		if got.path != "/api/runs/uuid-1.secret/events" {
+			t.Errorf("path = %q", got.path)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the emitter built by the driver never reached the plane")
+	}
+}
+
 func TestStateSeqStoreRoundTrip(t *testing.T) {
 	st, err := statedir.Open(t.TempDir())
 	if err != nil {
@@ -100,6 +143,29 @@ func TestStateSeqStoreRoundTrip(t *testing.T) {
 	}
 	if got["run-1"].Seq != 7 {
 		t.Fatalf("loaded seq = %d, want 7", got["run-1"].Seq)
+	}
+}
+
+func TestStateSeqStoreRepairsACorruptFile(t *testing.T) {
+	st, err := statedir.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open state dir: %v", err)
+	}
+	defer st.Close()
+	if err := st.WriteFile(statedir.RunEventSeqName, []byte("{not json")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	store := stateSeqStore{st: st}
+	got, err := store.Load()
+	if err != nil || len(got) != 0 {
+		t.Fatalf("Load of a corrupt file = %v, %v; want empty and no error so the next Save repairs it", got, err)
+	}
+	if err := store.Save(map[string]events.RunSeq{"run-1": {Seq: 2, At: time.Now().UTC()}}); err != nil {
+		t.Fatalf("Save after a corrupt read: %v", err)
+	}
+	got, err = store.Load()
+	if err != nil || got["run-1"].Seq != 2 {
+		t.Fatalf("repaired Load = %v, %v", got, err)
 	}
 }
 
