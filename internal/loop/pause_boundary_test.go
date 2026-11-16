@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -243,7 +244,7 @@ func TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask(t *testing.T
 	if err != nil {
 		t.Fatalf("no local beacon during the hold: %v", err)
 	}
-	var b localBeacon
+	var b LocalBeacon
 	if err := json.Unmarshal(data, &b); err != nil {
 		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
 	}
@@ -295,7 +296,7 @@ func TestBeaconSessionTargets_LocalBeaconCarriesTheHeldTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no local beacon after the presence lap: %v", err)
 	}
-	var b localBeacon
+	var b LocalBeacon
 	if err := json.Unmarshal(data, &b); err != nil {
 		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
 	}
@@ -729,5 +730,89 @@ func TestDrainPhases_ScheduledPauseHoldsTheParallelPanelBeforeAnyMember(t *testi
 	}
 	if fixCalls != 1 {
 		t.Errorf("fix sessions = %d, want 1 after the panel", fixCalls)
+	}
+}
+
+// pollBeaconState is the poll lap's answer to "which project speaks for the
+// daemon in the one local BEACON file". The schedule must survive an idle or
+// console-paused sibling polled after it, and a held schedule must survive a
+// sibling that is paused by the same window but holding nothing (CLA-908).
+func TestPollBeaconState_Precedence(t *testing.T) {
+	idle := fleet.State{Kind: fleet.StateIdle}
+	sched := fleet.State{Kind: fleet.StateDraining, PauseReason: fleet.PauseReasonSchedule}
+	held := fleet.State{Kind: fleet.StateDraining, PauseReason: fleet.PauseReasonSchedule, TaskRef: "t-1", Phase: "review"}
+	console := fleet.State{Kind: fleet.StateDraining, PauseReason: fleet.PauseReasonConsole}
+
+	cases := []struct {
+		name      string
+		cur, next fleet.State
+		want      fleet.State
+	}{
+		{"no pause anywhere stays idle", idle, idle, idle},
+		{"a schedule pause is taken over idle", idle, sched, sched},
+		{"a later console pause cannot overwrite the schedule", sched, console, sched},
+		{"a later idle sibling cannot overwrite the schedule", sched, idle, sched},
+		{"a held schedule outranks a bare one", sched, held, held},
+		{"a bare schedule cannot displace a held one", held, sched, held},
+		{"an operator pause replaces idle", idle, console, console},
+		{"an operator pause is kept over idle", console, idle, console},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pollBeaconState(tc.cur, tc.next); got != tc.want {
+				t.Errorf("pollBeaconState(%+v, %+v) = %+v, want %+v", tc.cur, tc.next, got, tc.want)
+			}
+		})
+	}
+}
+
+// The poll lap writes the ONE local BEACON file from a state chosen across the
+// targets, not from whichever target is polled last: with the schedule active on
+// one project and a console pause on a sibling polled after it, `supervise` must
+// still print the schedule banner the console shows (CLA-908).
+func TestPickTarget_LocalBeaconKeepsTheSchedulePause(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0) // inside the 11:00-14:00 window
+	cfg := fastCfg()
+	cfg.PauseWindows = peakSchedule(t)
+	held := &fakeFleet{}
+	sibling := &fakeFleet{}
+	d := NewMulti(cfg, &fakeAdapter{}, []Target{
+		{Poller: &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}, Fleet: held},
+		{Poller: &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1, Paused: true}}, Fleet: sibling},
+	})
+	openTestStateDir(t, d)
+	d.now = func() time.Time { return at }
+	// The first target is the one a schedule holds; the sibling is paused from
+	// the console and is polled after it.
+	d.holdPause(0, "t-1", "review")
+
+	pick(t, d)
+
+	data, err := os.ReadFile(filepath.Join(d.state.Path(), LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon after the poll lap: %v", err)
+	}
+	var b LocalBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("local beacon = state %q reason %q, want the schedule pause (the sibling polled last must not overwrite it)", b.State, b.PauseReason)
+	}
+	if b.TaskRef != "t-1" || b.Phase != "review" {
+		t.Errorf("local beacon names %q at %q, want the held task t-1 at review", b.TaskRef, b.Phase)
+	}
+
+	// The sibling still reaches the plane: its own project row must say it is
+	// console-paused, and only the daemon-wide file is deduplicated.
+	sent, _ := sibling.reports()
+	if len(sent) != 1 {
+		t.Fatalf("sibling plane beacons = %d, want 1 per poll", len(sent))
+	}
+	if sent[0].State.Kind != fleet.StateDraining || sent[0].State.PauseReason != fleet.PauseReasonConsole {
+		t.Errorf("sibling plane beacon = %+v, want its own console reason", sent[0].State)
+	}
+	if got, _ := held.reports(); len(got) != 1 {
+		t.Errorf("held target plane beacons = %d, want 1 per poll", len(got))
 	}
 }

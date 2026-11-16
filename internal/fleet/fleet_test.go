@@ -916,6 +916,30 @@ func TestMarshalReport_PauseOnlyOnTheDrainingState(t *testing.T) {
 		}
 	}
 
+	// The reason guard, not just the zero-value one: a non-schedule cause must
+	// not carry an end even when the state sets one, so the wire keeps saying
+	// "the schedule is the only cause with a moment" (CLA-908).
+	nonSched, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateDraining, PauseReason: PauseReasonConsole,
+			PauseUntil: time.Date(2026, 11, 9, 14, 0, 0, 0, time.UTC)},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var nonSchedState struct {
+		State map[string]any `json:"state"`
+	}
+	if err := json.Unmarshal(nonSched, &nonSchedState); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, nonSched)
+	}
+	if nonSchedState.State["pauseReason"] != PauseReasonConsole {
+		t.Errorf("console reason = %v, want the cause named", nonSchedState.State["pauseReason"])
+	}
+	if v, ok := nonSchedState.State["pauseUntil"]; ok {
+		t.Errorf("a console pause carried pauseUntil %v; only the schedule states an end", v)
+	}
+
 	b, err := marshalReport(Report{
 		Identity: Identity{Instance: "x"},
 		State: State{Kind: StateIteration,

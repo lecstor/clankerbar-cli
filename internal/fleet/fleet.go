@@ -121,11 +121,11 @@ type State struct {
 	// a moment it was never told.
 	ResetAt time.Time
 
-	// PauseReason/PauseUntil/PauseZone are the draining state's schedule payload
-	// (CLA-908): why spawns are closed and, for the schedule, until when. A
-	// beacon carries ONE reason — the cause the operator has to act on when
-	// several apply (see the PauseReason* constants) — and only the schedule has
-	// a stated end.
+	// PauseReason/PauseUntil/PauseZone are the draining state's pause payload
+	// (CLA-908): why spawns are closed, and — for the schedule, the only cause
+	// that states one — until when. A beacon carries ONE reason: the cause the
+	// operator has to act on when several apply (see the PauseReason*
+	// constants).
 	//
 	// PauseZone is the schedule's IANA zone. It is LOCAL render metadata only
 	// (the supervisor prints the resume time in the operator's own zone) and is

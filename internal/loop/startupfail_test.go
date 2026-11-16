@@ -328,8 +328,8 @@ func TestStartupPaused_PresenceReadsDraining(t *testing.T) {
 		t.Fatalf("fresh target state = %v, want idle", got)
 	}
 	d.startupPaused[0] = true
-	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
-		t.Errorf("startup-paused state = %v, want draining", got)
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonStartup {
+		t.Errorf("startup-paused state = %+v, want draining naming the startup reason", got)
 	}
 	d.startupPaused[0] = false
 	if got := d.fleetState(0); got.Kind != fleet.StateIdle {

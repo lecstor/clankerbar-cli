@@ -239,6 +239,18 @@ func TestFleetState_MapsWhatTheLoopKnows(t *testing.T) {
 		t.Errorf("fleet-paused state = %v, want draining with the fleet reason", got)
 	}
 	d.fleetPaused[0] = false
+	d.startupPaused[0] = true
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonStartup {
+		t.Errorf("startup-paused state = %+v, want draining with the startup reason", got)
+	}
+	d.startupPaused[0] = false
+	d.markExhausted([]int{0})
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonBudget {
+		t.Errorf("budget-exhausted state = %+v, want draining with the budget reason", got)
+	}
+	d.stateMu.Lock()
+	d.exhausted[0] = false
+	d.stateMu.Unlock()
 	d.iter = []iterState{{on: true, n: 7, ref: "CLA-9", phase: "review"}}
 	got := d.fleetState(0)
 	if got.Kind != fleet.StateIteration || got.N != 7 || got.TaskRef != "CLA-9" || got.Phase != "review" {
@@ -1460,7 +1472,7 @@ func TestRun_LocalBeaconAccompaniesEachBeacon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no local beacon file after a beaconed run: %v", err)
 	}
-	var b localBeacon
+	var b LocalBeacon
 	if err := json.Unmarshal(data, &b); err != nil {
 		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
 	}

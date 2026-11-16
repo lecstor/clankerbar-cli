@@ -30,8 +30,12 @@ func brisbaneLoc(t *testing.T) *time.Location {
 	return loc
 }
 
-// writeBeacon plants one local BEACON file, in the shape internal/loop writes.
-func writeBeacon(t *testing.T, dir string, b map[string]any) {
+func atPtr(t time.Time) *time.Time { return &t }
+
+// writeBeacon plants one local BEACON file, marshalled from the type
+// internal/loop writes it with — so this fixture cannot state a field or a tag
+// the reader does not know, and a rename cannot pass both suites (CLA-908).
+func writeBeacon(t *testing.T, dir string, b loop.LocalBeacon) {
 	t.Helper()
 	data, err := json.Marshal(b)
 	if err != nil {
@@ -49,41 +53,41 @@ func TestSchedulePauseText(t *testing.T) {
 
 	cases := []struct {
 		name   string
-		beacon map[string]any
+		beacon loop.LocalBeacon
 		want   string
 	}{
 		{
 			name: "schedule with an end and a held task",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "draining", "at": now.UTC(),
-				"pauseReason": "schedule", "pauseUntil": until.UTC(), "pauseZone": brisbaneZone,
-				"taskRef": "CLA-1", "phase": "review",
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "draining", At: now,
+				PauseReason: "schedule", PauseUntil: atPtr(until.UTC()), PauseZone: brisbaneZone,
+				TaskRef: "CLA-1", Phase: "review",
 			},
 			want: "paused by schedule until 14:00 AEST (holding CLA-1 at the review phase)",
 		},
 		{
 			name: "schedule with no held task",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "draining", "at": now.UTC(),
-				"pauseReason": "schedule", "pauseUntil": until.UTC(), "pauseZone": brisbaneZone,
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "draining", At: now,
+				PauseReason: "schedule", PauseUntil: atPtr(until.UTC()), PauseZone: brisbaneZone,
 			},
 			want: "paused by schedule until 14:00 AEST",
 		},
 		{
 			name: "overnight window names the day",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "draining", "at": now.UTC(),
-				"pauseReason": "schedule",
-				"pauseUntil":  time.Date(2026, time.November, 10, 6, 0, 0, 0, loc).UTC(),
-				"pauseZone":   brisbaneZone,
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "draining", At: now,
+				PauseReason: "schedule",
+				PauseUntil:  atPtr(time.Date(2026, time.November, 10, 6, 0, 0, 0, loc).UTC()),
+				PauseZone:   brisbaneZone,
 			},
 			want: "paused by schedule until Tue 06:00 AEST",
 		},
 		{
 			name: "schedule with an unstated end keeps the reason alone",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "draining", "at": now.UTC(),
-				"pauseReason": "schedule",
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "draining", At: now,
+				PauseReason: "schedule",
 			},
 			want: "paused by schedule",
 		},
@@ -91,11 +95,11 @@ func TestSchedulePauseText(t *testing.T) {
 			// The plane's instance view treats a passed end as a window that
 			// ended while the beacon has not caught up; the listing agrees.
 			name: "a window whose stated end has passed is over",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "draining", "at": now.UTC(),
-				"pauseReason": "schedule",
-				"pauseUntil":  now.Add(-time.Minute).UTC(),
-				"pauseZone":   brisbaneZone,
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "draining", At: now,
+				PauseReason: "schedule",
+				PauseUntil:  atPtr(now.Add(-time.Minute).UTC()),
+				PauseZone:   brisbaneZone,
 			},
 			want: "",
 		},
@@ -103,16 +107,16 @@ func TestSchedulePauseText(t *testing.T) {
 			// The console/fleet/startup/budget causes are not the schedule: the
 			// listing's line is the schedule's, so none of them invents one.
 			name: "a console pause is not the schedule",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "draining", "at": now.UTC(),
-				"pauseReason": "console",
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "draining", At: now,
+				PauseReason: "console",
 			},
 			want: "",
 		},
 		{
 			name: "an idle child has no pause",
-			beacon: map[string]any{
-				"version": "1.2.3", "state": "idle", "at": now.UTC(),
+			beacon: loop.LocalBeacon{
+				Version: "1.2.3", State: "idle", At: now,
 			},
 			want: "",
 		},
@@ -140,12 +144,12 @@ func TestSchedulePauseText(t *testing.T) {
 func TestFleetStatusNamesASchedulePause(t *testing.T) {
 	loc := brisbaneLoc(t)
 	dir := t.TempDir()
-	writeBeacon(t, dir, map[string]any{
-		"version": "0.25.6", "state": "draining", "at": time.Now().UTC(),
-		"pauseReason": "schedule",
-		"pauseUntil":  time.Now().Add(90 * time.Minute).UTC(),
-		"pauseZone":   brisbaneZone,
-		"taskRef":     "CLA-1", "phase": "review",
+	writeBeacon(t, dir, loop.LocalBeacon{
+		Version: "0.25.6", State: "draining", At: time.Now(),
+		PauseReason: "schedule",
+		PauseUntil:  atPtr(time.Now().Add(90 * time.Minute).UTC()),
+		PauseZone:   brisbaneZone,
+		TaskRef:     "CLA-1", Phase: "review",
 	})
 
 	inst := &Instance{
@@ -172,8 +176,8 @@ func TestFleetStatusNamesASchedulePause(t *testing.T) {
 	}
 
 	// No pause line when the child's beacon says idle: the listing is unchanged.
-	writeBeacon(t, dir, map[string]any{
-		"version": "0.25.6", "state": "idle", "at": time.Now().UTC(),
+	writeBeacon(t, dir, loop.LocalBeacon{
+		Version: "0.25.6", State: "idle", At: time.Now(),
 	})
 	if text := d.fleetStatus(); strings.Contains(text, "paused by") {
 		t.Errorf("an idle child grew a pause line:\n%s", text)

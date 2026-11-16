@@ -323,6 +323,33 @@ func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
 	}
 }
 
+// pollBeaconState folds one target's presence into the daemon-wide state the
+// poll pass writes to the local BEACON. The file takes no target, so with
+// several projects one of them has to speak for the daemon, and target order
+// must not decide which (CLA-908): a scheduled pause states the resume instant
+// the console's banner shows, so an idle or console-paused sibling polled later
+// must not overwrite it. A schedule state that names a held task outranks one
+// that does not; every other draining cause explains a pause the operator
+// already sees in the console and renders no local line, so the first stands.
+func pollBeaconState(cur, next fleet.State) fleet.State {
+	switch {
+	case !isSchedulePause(cur) && isSchedulePause(next):
+		return next
+	case isSchedulePause(cur) && isSchedulePause(next) && cur.TaskRef == "" && next.TaskRef != "":
+		return next
+	case cur.Kind == fleet.StateIdle && next.Kind != fleet.StateIdle:
+		return next
+	}
+	return cur
+}
+
+// isSchedulePause reports whether st is the schedule's draining payload. The
+// schedule is the one cause the local file has a sentence for (supervise's
+// listing), which is why it outranks the others there.
+func isSchedulePause(st fleet.State) bool {
+	return st.Kind == fleet.StateDraining && st.PauseReason == fleet.PauseReasonSchedule
+}
+
 // LocalBeaconName is the local presence file the daemon keeps beside its plane
 // beacons: the same identity+state the next POST carries, written into the
 // state dir so the supervisor's roll (phase 5b) can verify a restarted child
@@ -330,9 +357,9 @@ func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
 // roll's verify-before-next gate reads.
 const LocalBeaconName = "BEACON"
 
-// localBeacon is the JSON shape of LocalBeaconName. The supervisor's roll
-// mirrors it for reading (the same roster-style lockstep: two packages, one
-// contract), so a new field here must land in internal/supervisor/roll.go too.
+// LocalBeacon is the JSON shape of LocalBeaconName. The supervisor's roll reads
+// it with this same type — one contract, not two mirrored structs — so a field
+// or tag renamed here cannot leave the reader behind.
 //
 // ResetAt is the `limited` state's payload (CLA-728): the instant the harness
 // stated, present only while the wait still believes it — exactly the field the
@@ -348,7 +375,7 @@ const LocalBeaconName = "BEACON"
 // rather than the machine's zone. TaskRef/Phase mirror the plane POST's pair
 // (the running iteration's, or the task and phase a hold is waiting behind the
 // window).
-type localBeacon struct {
+type LocalBeacon struct {
 	Version     string     `json:"version"`
 	State       string     `json:"state"`
 	At          time.Time  `json:"at"`
@@ -401,7 +428,7 @@ func (d *Driver) writeLocalBeacon(st fleet.State) {
 		return
 	}
 	reason, until, zone := localBeaconPause(st)
-	body, err := json.Marshal(localBeacon{
+	body, err := json.Marshal(LocalBeacon{
 		Version:     version.Current,
 		State:       st.Kind,
 		At:          time.Now().UTC(),
