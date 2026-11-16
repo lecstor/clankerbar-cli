@@ -82,8 +82,8 @@ session's stream: `TodoWrite` becomes `todo_change`, an
 and anything else becomes `tool_call` with the target extracted per tool shape.
 Redaction and truncation are `internal/events`' own, unchanged. `TodoWrite` is
 a tool inside `PostToolUse`, not a separate hook event, so one matcher covers
-both; `PreToolUse` and every other hook event are ignored, because wiring both
-would double every call.
+both; `PreToolUse` and every other hook event are ignored: the hook reads only
+`PostToolUse` payloads.
 
 **The session must be bound to a run.** The hook reads `CLANKERBAR_RUN_ID` (the
 run credential `claim_task` returned — the bare uuid or the compound
