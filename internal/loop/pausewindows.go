@@ -21,14 +21,12 @@ func (d *Driver) clock() time.Time {
 // (config.PauseWindows), logging the entry and the exit once each so a window
 // hours long does not repeat the line on every poll.
 //
-// Like the console pause it is read BETWEEN iterations, so a window opening or
-// closing never interrupts a session or a phase sequence already in flight.
+// It is read BETWEEN iterations and at every phase boundary (CLA-906). A session
+// already running is never interrupted; a window holds the NEXT spawn — the next
+// phase, a handoff respawn, or a drain's first session — and holdThroughPause is
+// what keeps the claim alive while that waits.
 func (d *Driver) scheduledPause() bool {
-	var pw *config.PauseWindows
-	if d.cfg != nil {
-		pw = d.cfg.PauseWindows
-	}
-	active, until := pw.ActiveAt(d.clock())
+	active, until, pw := d.pauseState()
 	switch {
 	case active && !d.schedPaused:
 		d.schedPaused = true
@@ -41,6 +39,17 @@ func (d *Driver) scheduledPause() bool {
 		log.Print("scheduled pause ended — resuming")
 	}
 	return active
+}
+
+// pauseState is scheduledPause's read without its transition logging: whether a
+// window is in force now, the instant it ends, and its schedule for a log line.
+// A nil config or schedule is inactive.
+func (d *Driver) pauseState() (active bool, until time.Time, pw *config.PauseWindows) {
+	if d.cfg != nil {
+		pw = d.cfg.PauseWindows
+	}
+	active, until = pw.ActiveAt(d.clock())
+	return active, until, pw
 }
 
 // idleThroughPause is the blind-mode answer to an active window: pick no target
