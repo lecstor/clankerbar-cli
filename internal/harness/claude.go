@@ -247,17 +247,22 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	stdoutTail := newTail()
 	res := newSessionResult(in)
 	defer res.closeEvents()
-	// A result retires one outstanding user turn; the last one closes stdin so the CLI
-	// exits. stopDelivery is called from either side.
-	if inboxRunIDs != nil {
-		res.onTurnEnd = func() {
-			if input.endTurn() {
-				stopDelivery()
-			}
+	// A result retires one outstanding user turn; the LAST one closes stdin so the CLI exits.
+	// This is installed even with no console channel: stream-json input stays open until its
+	// stream closes, so without it every session would finish its turn and then wait for
+	// stdin forever. It is what preserves the old `-p <prompt>` lifecycle.
+	res.onTurnEnd = func() {
+		if input.endTurn() {
+			stopDelivery()
 		}
+	}
+	if inboxRunIDs != nil {
 		go runDelivery(deliveryCtx, console, *in.Inbox, input, inboxRunIDs)
 	}
 	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, cancel)
+	// The stream is over for us (EOF, a kill, or an unreadable line): close stdin so a child
+	// still waiting on it cannot hold Wait open past its own stream.
+	input.close()
 	stopDelivery()
 	waitErr := cmd.Wait()
 
