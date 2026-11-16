@@ -111,6 +111,25 @@ func newTestEmitterEvery(srv *httptest.Server, seq *SeqCounter, logf func(string
 	})
 }
 
+func TestFlushDefaultsMatchTheDesignNote(t *testing.T) {
+	// Pinned because the numbers are the contract, not tuning: 2 s / 50 events /
+	// 256 KB, whichever is reached first.
+	if FlushInterval != 2*time.Second {
+		t.Errorf("FlushInterval = %s, want 2s", FlushInterval)
+	}
+	if MaxBatchEvents != 50 {
+		t.Errorf("MaxBatchEvents = %d, want 50", MaxBatchEvents)
+	}
+	if MaxBatchBytes != 256<<10 {
+		t.Errorf("MaxBatchBytes = %d, want 256 KiB", MaxBatchBytes)
+	}
+	var cfg Config
+	cfg.defaults()
+	if cfg.FlushEvery != FlushInterval {
+		t.Errorf("default FlushEvery = %s, want %s", cfg.FlushEvery, FlushInterval)
+	}
+}
+
 func TestEmitterBatchesFiftyEvents(t *testing.T) {
 	c := newCapture()
 	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":50}`))
@@ -251,6 +270,30 @@ func TestEmitterTodoCaps(t *testing.T) {
 	}
 	if !ev.Truncated {
 		t.Error("truncated marker missing")
+	}
+	e.Close()
+}
+
+func TestEmitterSendsAnEmptyTodoSnapshot(t *testing.T) {
+	// A cleared list is a real snapshot: the status line must be able to show
+	// "no todos" rather than keeping the last non-empty list forever.
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1}`))
+	defer srv.Close()
+	e := newTestEmitter(srv, nil, nil)
+	e.SetRunID("run-1")
+	e.TodoChange(nil)
+	bodies := c.waitFor(t, 1)
+	var b batch
+	if err := json.Unmarshal(bodies[0], &b); err != nil {
+		t.Fatal(err)
+	}
+	var ev TodoChangeEvent
+	if err := json.Unmarshal(b.Events[0], &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Todos == nil || len(ev.Todos) != 0 {
+		t.Fatalf("todos = %v, want a present empty list", ev.Todos)
 	}
 	e.Close()
 }

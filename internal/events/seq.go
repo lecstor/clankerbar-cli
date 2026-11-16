@@ -1,6 +1,7 @@
 package events
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -188,14 +189,7 @@ func (c *SeqCounter) saveLocked() {
 		for k, v := range out {
 			all = append(all, kv{k, v.At})
 		}
-		// Oldest first; drop the excess.
-		for i := 0; i < len(all); i++ {
-			for j := i + 1; j < len(all); j++ {
-				if all[j].at.Before(all[i].at) {
-					all[i], all[j] = all[j], all[i]
-				}
-			}
-		}
+		sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
 		for _, e := range all[:len(all)-maxPersistedRuns] {
 			delete(out, e.key)
 		}

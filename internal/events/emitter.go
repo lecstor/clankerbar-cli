@@ -200,9 +200,15 @@ func (e *Emitter) ClankerbarMcpCall(tool, callID, target string) {
 // TodoChange records a full todo-list snapshot: capped at 50 items, each
 // content redacted then cut to 256 bytes. Items with a status the plane would
 // refuse are dropped (the event is marked truncated, because the snapshot is no
-// longer the harness's whole answer).
+// longer the harness's whole answer). An EMPTY list is a real snapshot — the
+// harness cleared its todos — and is sent as one; only an absent list sends
+// nothing, which the mapping layer decides.
 func (e *Emitter) TodoChange(todos []TodoItem) {
-	if e == nil || len(todos) == 0 {
+	if e == nil {
+		return
+	}
+	if len(todos) == 0 {
+		e.enqueue(event{kind: TypeTodoChange, at: e.timestamp(), todos: []TodoItem{}})
 		return
 	}
 	out := make([]TodoItem, 0, len(todos))
@@ -223,6 +229,8 @@ func (e *Emitter) TodoChange(todos []TodoItem) {
 		out = append(out, TodoItem{Content: content, Status: t.Status})
 	}
 	if len(out) == 0 {
+		// Every item carried a status the plane refuses. Sending an empty list
+		// would claim the harness has no todos, which is a different fact.
 		return
 	}
 	e.enqueue(event{kind: TypeTodoChange, at: e.timestamp(), todos: out, truncated: truncated, redacted: redacted})
@@ -510,8 +518,12 @@ func (e *Emitter) Close() {
 		e.pending = nil
 		e.approxBytes = 0
 		e.mu.Unlock()
-		if orphaned > 0 && noRun && e.cfg.Logf != nil {
-			e.cfg.Logf("agent events: dropped %d activity event(s) — this session never claimed a run", orphaned)
+		if orphaned > 0 && e.cfg.Logf != nil {
+			if noRun {
+				e.cfg.Logf("agent events: dropped %d activity event(s) — this session never claimed a run", orphaned)
+			} else {
+				e.cfg.Logf("agent events: %d activity event(s) were still unsent when the session ended", orphaned)
+			}
 		}
 	})
 }
