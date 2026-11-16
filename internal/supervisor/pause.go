@@ -18,14 +18,25 @@ import (
 // "" when it states none: "paused by schedule until 14:00 AEST", plus the held
 // task when the daemon named one.
 //
-// Only a `draining` beacon carrying the schedule reason counts: every other
-// pause (console, fleet, startup, budget) deliberately sends no reason, so the
-// listing does not invent one. now is the reference for "today" in the
-// schedule's own zone; the instant is rendered in the zone the daemon wrote
-// beside it, which is the operator's configured wall clock, not this process's.
+// Only a `draining` beacon carrying the schedule reason counts. A console, fleet,
+// startup or budget pause names itself on the wire, but its wait has no stated
+// end and is not this listing's sentence to write: the console shows it on the
+// instance the operator paused, which this daemon-wide line cannot attribute.
+// now is the reference for "today" in the schedule's own zone; the instant is
+// rendered in the zone the daemon wrote beside it, which is the operator's
+// configured wall clock, not this process's.
 func schedulePauseText(dir string, now time.Time) string {
+	if dir == "" {
+		return ""
+	}
 	b := readLocalBeacon(dir)
 	if b == nil || b.State != fleet.StateDraining || b.PauseReason != fleet.PauseReasonSchedule {
+		return ""
+	}
+	// A stated end already past is a window that ENDED while the child's beacon
+	// has not caught up: the plane's instance view treats that pause as over, so
+	// the listing does too rather than showing a resume time in the past.
+	if b.PauseUntil != nil && !b.PauseUntil.After(now) {
 		return ""
 	}
 	text := "paused by schedule"

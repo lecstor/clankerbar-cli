@@ -88,6 +88,18 @@ func TestSchedulePauseText(t *testing.T) {
 			want: "paused by schedule",
 		},
 		{
+			// The plane's instance view treats a passed end as a window that
+			// ended while the beacon has not caught up; the listing agrees.
+			name: "a window whose stated end has passed is over",
+			beacon: map[string]any{
+				"version": "1.2.3", "state": "draining", "at": now.UTC(),
+				"pauseReason": "schedule",
+				"pauseUntil":  now.Add(-time.Minute).UTC(),
+				"pauseZone":   brisbaneZone,
+			},
+			want: "",
+		},
+		{
 			// The console/fleet/startup/budget causes are not the schedule: the
 			// listing's line is the schedule's, so none of them invents one.
 			name: "a console pause is not the schedule",

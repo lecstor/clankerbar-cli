@@ -346,8 +346,9 @@ const LocalBeaconName = "BEACON"
 // the reason and the window's end, so `supervise` prints what the console's
 // banner shows without a plane read. PauseZone is the schedule's IANA zone —
 // local only, so the listing can say "14:00 AEST" as the operator configured it
-// rather than the machine's zone. TaskRef/Phase name the task and phase a hold
-// is waiting behind the window.
+// rather than the machine's zone. TaskRef/Phase mirror the plane POST's pair
+// (the running iteration's, or the task and phase a hold is waiting behind the
+// window).
 type localBeacon struct {
 	Version     string     `json:"version"`
 	State       string     `json:"state"`

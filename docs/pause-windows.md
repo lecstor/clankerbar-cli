@@ -66,8 +66,8 @@ it.
 A window-paused daemon reports `draining` with `pauseReason: "schedule"` and
 `pauseUntil` (the window's end, which `PauseWindows.ActiveAt` already returns),
 so the console's banner (CLA-907) can name the window and its resume time instead
-of showing the same bare `draining` a console, fleet or startup pause shows. A
-sequence held at a boundary (above) also names the task and the phase waiting:
+of showing the same bare `draining` any pause used to send. A sequence held at a
+boundary (above) also names the task and the phase waiting:
 `state.taskRef`/`state.phase` on the same draining beacon, which is the pair the
 console's hold reads.
 

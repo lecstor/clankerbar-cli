@@ -44,10 +44,18 @@ func (d *Driver) scheduledPause() bool {
 // pauseState is scheduledPause's read without its transition logging: whether a
 // window is in force now, the instant it ends, and its schedule for a log line.
 // A nil config or schedule is inactive.
+//
+// d.cfg is read under controlMu because a RELOAD swaps it on another goroutine (a
+// panel member parked in waitResponsive), and since CLA-908 this is reachable
+// from the lease renewer's presence lap as well as the loop. The returned
+// schedule is immutable: a reload installs a new config rather than editing this
+// one, so reading it after the unlock is safe.
 func (d *Driver) pauseState() (active bool, until time.Time, pw *config.PauseWindows) {
+	d.controlMu.Lock()
 	if d.cfg != nil {
 		pw = d.cfg.PauseWindows
 	}
+	d.controlMu.Unlock()
 	active, until = pw.ActiveAt(d.clock())
 	return active, until, pw
 }

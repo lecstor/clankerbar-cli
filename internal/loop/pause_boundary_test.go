@@ -213,17 +213,18 @@ func TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask(t *testing.T
 	ff := &fakeFleet{}
 	d := pauseBoundaryDriver(t, h, rel, clk, peakSchedule(t))
 	d.targets[0].Fleet = ff
-	logs := captureLogs(t)
 	done := startPauseDrain(t, d)
 
-	waitUntil(t, "the hold at the review boundary", func() bool {
-		return strings.Contains(logs.String(), "holding t-1 at the review boundary")
+	waitUntil(t, "the held presence beacon", func() bool {
+		sent, _ := ff.reports()
+		if len(sent) == 0 {
+			return false
+		}
+		last := sent[len(sent)-1]
+		return last.State.Kind == fleet.StateDraining && last.State.PauseReason == fleet.PauseReasonSchedule
 	})
 	until := brisbaneAt(t, 9, 14, 0)
 	sent, _ := ff.reports()
-	if len(sent) == 0 {
-		t.Fatal("no presence beacon was sent for the hold")
-	}
 	last := sent[len(sent)-1]
 	if last.State.Kind != fleet.StateDraining {
 		t.Errorf("held beacon kind = %q, want draining (the console banner keys on it)", last.State.Kind)
@@ -266,10 +267,10 @@ func TestDrainPhases_ScheduledPauseBeaconsTheReasonUntilAndHeldTask(t *testing.T
 	if h.invokeCalls != 2 {
 		t.Errorf("sessions after the window = %d, want 2", h.invokeCalls)
 	}
-	// The hold marker is cleared on the way out: the next beacon is the resumed
-	// iteration, not a pause left stuck on the row.
-	if got := d.fleetState(0); got.Kind != fleet.StateIteration && got.Kind != fleet.StateIdle {
-		t.Errorf("state after the hold = %+v, want the iteration or idle (the hold marker must be clear)", got)
+	// The hold marker is cleared on the way out: the next presence seat is the
+	// resumed drain, not a pause left stuck on the row.
+	if got := d.fleetState(0); got.Kind == fleet.StateDraining {
+		t.Errorf("state after the hold = %+v, want the drain's own state (the hold marker must be clear)", got)
 	}
 	if got := d.holdAt(0); got.on {
 		t.Errorf("hold marker survived the hold: %+v", got)
