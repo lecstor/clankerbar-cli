@@ -30,6 +30,7 @@ type reviewRunFlags struct {
 	method, harness                  string
 	model, notesModel, findingsModel string
 	chunkSize, flowMax               int
+	embedHunks                       bool
 	jsonOut, title, descriptionFile  string
 }
 
@@ -45,6 +46,7 @@ func newReviewRunFlagSet(f *reviewRunFlags) *pflag.FlagSet {
 	fs.StringVar(&f.findingsModel, "findings-model", "", "maps-session only: model for the findings turn (empty inherits --model, else the notes model)")
 	fs.IntVar(&f.chunkSize, "chunk-size", 0, fmt.Sprintf("maps-session only: map items per notes turn (0 = %d)", config.DefaultMapsSessionChunkSize))
 	fs.IntVar(&f.flowMax, "flow-max", 0, fmt.Sprintf("maps-session only: cap on the flow map's items (0 = %d)", config.DefaultMapsSessionFlowMax))
+	fs.BoolVar(&f.embedHunks, "embed-hunks", false, "maps-session only: put each change-map item's hunk in the prompt (maps_session.embed_hunks, default budgets)")
 	fs.StringVar(&f.jsonOut, "json", "", "write the findings JSON to this file instead of stdout")
 	fs.StringVar(&f.title, "title", "", "optional title of the change, shown to the reviewer")
 	fs.StringVar(&f.descriptionFile, "description-file", "", "optional file whose contents describe the change, shown to the reviewer")
@@ -118,6 +120,7 @@ func reviewRunOptions(f reviewRunFlags) (loop.ReviewRunOptions, string, error) {
 			"--findings-model": strings.TrimSpace(f.findingsModel) != "",
 			"--chunk-size":     f.chunkSize != 0,
 			"--flow-max":       f.flowMax != 0,
+			"--embed-hunks":    f.embedHunks,
 		} {
 			if set {
 				knobs = append(knobs, name)
@@ -156,6 +159,7 @@ func reviewRunOptions(f reviewRunFlags) (loop.ReviewRunOptions, string, error) {
 		FindingsModel: f.findingsModel,
 		ChunkSize:     f.chunkSize,
 		FlowMax:       f.flowMax,
+		EmbedHunks:    f.embedHunks,
 		Title:         f.title,
 		Description:   description,
 	}, f.jsonOut, nil
@@ -209,6 +213,8 @@ edited, committed or pushed.
   --findings-model <alias>  maps-session: model for the findings turn
   --chunk-size <n>          maps-session: map items per notes turn (default: 25)
   --flow-max <n>            maps-session: flow-map item cap (default: 40)
+  --embed-hunks             maps-session: embed each map item's hunk in the
+                            prompt, as maps_session.embed_hunks does
   --title <text>            optional title of the change
   --description-file <f>    optional file describing the change
   --json <file>             write the JSON to a file (default: stdout)
@@ -217,7 +223,5 @@ The JSON carries the resolved base/head commits, the method, the model per
 stage, the findings, the omitted count, the maps-session notes and the session's
 usage. A session that ends without a usable done report fails the command
 (non-zero), after the harness's one re-emit.
-
---embed-hunks is not accepted yet: the embedded-hunk map lands with CLA-871.
 `)
 }

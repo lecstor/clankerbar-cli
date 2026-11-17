@@ -558,9 +558,7 @@ stripping the prefix yields a marker the done-report parser accepts. With
 `enabled: false` (or no `embed_hunks` key at all) the items are byte for byte
 what the method produced before.
 
-`clankerbar review run` (CLA-870) does not exist in this build yet; when it
-lands it should expose `embed_hunks` as a flag, since that command's whole
-point is a one-off review profile.
+`clankerbar review run` exposes it as `--embed-hunks` (default budgets).
 
 **Two requirements, both refused rather than degraded.** The method applies to
 the review-only gate — the built-in `review` phase with a phase after it —
@@ -617,16 +615,13 @@ Flags: `--repo` (default `.`), `--base` (required), `--head` (default `HEAD`),
 `--method` (`single-pass` or its `single` shorthand, the default, or
 `maps-session`), `--harness` (default `opencode`; maps-session needs a harness
 that can continue one session), `--model`, and for maps-session
-`--notes-model`, `--findings-model`, `--chunk-size` (default 25) and
-`--flow-max` (default 40). `--title` and `--description-file` give the reviewer
-the context a task body would otherwise carry. The maps knobs are refused with
+`--notes-model`, `--findings-model`, `--chunk-size` (default 25),
+`--flow-max` (default 40) and `--embed-hunks` (each map item carries its hunk,
+as `maps_session.embed_hunks` with the default budgets). `--title` and
+`--description-file` give the reviewer the context a task body would otherwise
+carry. The maps knobs are refused with
 `--method single-pass` rather than silently ignored. `--json <file>` writes the
 report to a file; without it the JSON goes to stdout and human lines to stderr.
-
-`--embed-hunks` is **not accepted yet**: the embedded-hunk map lands with
-CLA-871 (`maps_session.embed_hunks`), so passing it today fails as an unknown
-flag. An eval harness should leave it out until that method option is in the
-build rather than passing a flag this command would have to fake.
 
 The JSON document:
 
@@ -635,6 +630,7 @@ The JSON document:
   "base": "<resolved base commit>",
   "head": "<resolved head commit>",
   "method": "single-pass | maps-session",
+  "embed_hunks": false,
   "models": { "review": "..." },
   "findings": [ { "severity": "must", "summary": "...", "file": "...", "line": 1 } ],
   "omitted": 0,
@@ -648,7 +644,10 @@ The JSON document:
 }
 ```
 
-For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead.
+For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead,
+and `embed_hunks` says whether hunk embedding was on (always `false` for
+single-pass); the budgets described above can still stop it part-way, and
+the items from that point carry no diff.
 `base` and `head` are the full commit SHAs git resolved, never the flag values.
 `findings` uses the review record's own shape (`severity`, `summary`,
 `evidenceKind`, `evidence`, `file`, `line`, `kind`, `requiredFix`), and
