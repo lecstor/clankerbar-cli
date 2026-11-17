@@ -201,7 +201,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 	defer p.closeEvents()
 	p.kill = loopKill
 	// The parser is where the session id first appears; it hands the id to the
-	// delivery target (see line).
+	// delivery target (see opencodeParse.line).
 	p.inbox = delivery
 	// The no-output watchdog, on the same cancellation the tool-loop kill uses.
 	// Armed after p.kill so its callback has the kill switch; a probe leaves it
@@ -214,6 +214,15 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 	// that window (a resumed session's export also carries the earlier runs).
 	started := time.Now()
 	runErr := cmd.Run()
+
+	// The process is over, so its server must stop being a delivery target NOW:
+	// settleUsage below reads the session export over HTTP (and can take
+	// seconds), and a message polled in that window would be ACKed into a
+	// session with no process left to act on it. The deferred detach is a no-op
+	// by the time it runs, and covers the early returns above.
+	if delivery != nil && srv != nil {
+		delivery.detach(srv)
+	}
 
 	// Disarmed BEFORE the verdict is read: a timer that lands as the process
 	// exits must not report a kill for a session that had already finished.
