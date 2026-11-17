@@ -27,8 +27,10 @@ const HandoffPromptMax = 4096
 // prompt bare. A phase resume (reviewPhaseName, above) works only because its
 // brief spells out "do not claim, call heartbeat first": a session-authored
 // prompt cannot be trusted to carry that instruction forward on its own, and
-// without it a successor calls next_task/claim_task on a fresh task, or its
-// run's lease lapses because nothing tells it to hold it. Placed FIRST, not
+// without it a successor calls next_task/claim_task on a fresh task, or never
+// re-enters its run — the single heartbeat is the resume/settlement check,
+// while the run's lease itself is renewed by the driver from Go while the
+// session runs. Placed FIRST, not
 // appended, so the driver's own constraints bound the prompt that follows
 // rather than being one more thing a self-authored prompt could bury or
 // contradict — the same reasoning behind refusing to truncate an over-cap

@@ -2799,9 +2799,9 @@ stack trace — and the MCP SDK names its own classes `StdioClientTransport` and
 `SSEClientTransport`, so a bare `transport` would read a dead MCP server (a config
 fault that must stop the run) as a network blip to retry.
 
-**Handing the task back.** A claim carries a 30-minute lease that the session
-heartbeats. When a session ends mid-task, that lease is left ticking with nobody
-renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
+**Handing the task back.** A claim carries a 30-minute lease that the driver
+renews while the session runs. When a session ends mid-task, the lease is left
+unrenewed — and clankerbar charges the task a *reclaim* to sweep it up, of which
 there are only two before the task is parked for a human. So the driver watches
 the session's stream for what it claimed, and hands the task straight back
 (`release_task`, the driver-marked variant) on **every** exit: usage limit, transient blip,
