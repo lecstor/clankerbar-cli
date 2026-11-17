@@ -266,10 +266,11 @@ type Capabilities struct {
 	RunsTurnSequences bool
 
 	// EmitsEvents reports whether this adapter normalizes its structured tool
-	// events into the agent event channel's activity tier (CLA-603). False means
-	// the loop must not build a sink: there is no mapping, and an unclosed sink
-	// would leak its batch goroutine. codex is out of v1 by scope; copilot's tool
-	// events exist but its activity mapping is out of v1 too.
+	// events into the agent event channel (CLA-603, transcript tier CLA-887)
+	// — the activity tier always, and the transcript tier while its dial is on.
+	// False means the loop must not build a sink: there is no mapping, and an
+	// unclosed sink would leak its batch goroutine. codex is out of v1 by scope;
+	// copilot's tool events exist but its activity mapping is out of v1 too.
 	EmitsEvents bool
 
 	// DeliversMessages reports whether this adapter can receive console -> agent
@@ -468,7 +469,9 @@ type Invocation struct {
 
 	// NewEventSink, when non-nil, builds this session's agent-event sink. The
 	// loop sets it only when the project's events.activity dial is on, the
-	// machine has not opted out, and the adapter emits events. It is a FACTORY
+	// machine has not opted out, and the adapter emits events; the sink's own
+	// Config carries the events.transcript dial, which is what decides whether
+	// tool_result and assistant_text are sent at all. It is a FACTORY
 	// because one Invocation may run several processes (an opencode resurrection
 	// or a multi-turn sequence), each with its own batch goroutine over a shared
 	// per-run sequence counter.
@@ -937,6 +940,12 @@ type Result struct {
 	// output, like pending above. opencode keeps its own guard on its parser.
 	toolLoop  *toolLoopGuard
 	toolNames map[string]string
+
+	// envReadCalls names the tool_use ids that read a `.env*` path, so their
+	// results can be withheld from the transcript tier. Only populated while
+	// that tier is on, and each entry is taken when the result arrives, so the
+	// map is bounded by the calls still in flight.
+	envReadCalls map[string]bool
 
 	// idle is claude's no-output watchdog, armed by consume() from the bounds
 	// below; nil in tests that build a Result by hand, where every method is a

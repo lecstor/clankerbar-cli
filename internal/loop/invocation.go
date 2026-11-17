@@ -369,7 +369,8 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 	// the project's run config dial, and the machine can only have opted out.
 	if !probe && d.eventSenderOn(tc, harnessName) {
 		name := harnessName
-		inv.NewEventSink = func() *events.Emitter { return d.newEventEmitter(name) }
+		transcript := tc.Events.Transcript
+		inv.NewEventSink = func() *events.Emitter { return d.newEventEmitter(name, transcript) }
 	}
 	// Console -> agent messages (CLA-606): independent of the event dials. The project
 	// activity dial governs what is RECORDED in the feed, not whether an operator's input

@@ -2609,8 +2609,10 @@ one that sets none) share this file's budget as one instance-wide pool.
 A project's `events.activity` dial (off by default, set by operator+) turns on
 the **agent activity channel**: the daemon streams each session's tool calls,
 their one identifying argument and its todo snapshots to the plane, redacted on
-this machine before anything leaves it. It sends no tool output and no assistant
-text in this release. This machine can refuse the channel with `--no-events` on
+this machine before anything leaves it. A second dial, `events.transcript` (only
+valid beside activity), adds a completed call's output and each assistant text
+block, capped at 64 KB per event; the plane stops that tier at 50 MB per run and
+activity continues. This machine can refuse the channel with `--no-events` on
 `clankerbar run` / `clankerbar supervise`, or with `CLANKERBAR_EVENTS=off`; no
 local signal can turn it on. See [`docs/agent-events.md`](./docs/agent-events.md).
 
@@ -3070,7 +3072,7 @@ the catch-all matches last, denying every read.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 - [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
-- [`docs/agent-events.md`](./docs/agent-events.md) - the agent activity channel the CLI feeds: what the claude and opencode adapters emit, the project dial and the machine-local opt-out, batching, sequence numbering and CLI-side redaction.
+- [`docs/agent-events.md`](./docs/agent-events.md) - the agent event channel the CLI feeds: what the claude and opencode adapters emit in the activity and transcript tiers, the project dials and the machine-local opt-out, batching, sequence numbering, the 50 MB transcript cap and CLI-side redaction.
 
 ## License
 

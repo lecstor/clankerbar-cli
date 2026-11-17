@@ -28,8 +28,10 @@ func (d *Driver) SetEventChannel(origin, apiKey string) {
 }
 
 // eventSenderOn reports whether this target's sessions may emit: wired, the
-// project dial is on, the machine has not opted out, and the adapter has a
-// mapping (codex and copilot do not in v1).
+// project activity dial is on, the machine has not opted out, and the adapter has
+// a mapping (codex and copilot do not in v1). The transcript dial rides on the
+// sink this gates, and is only ever on beside activity (the plane refuses the
+// pair at save time).
 func (d *Driver) eventSenderOn(tc *config.Config, harnessName string) bool {
 	if d.eventOrigin == "" || d.eventKey == "" {
 		return false
@@ -43,13 +45,16 @@ func (d *Driver) eventSenderOn(tc *config.Config, harnessName string) bool {
 
 // newEventEmitter builds one session's sink. Batching and the HTTP call run on
 // the emitter's own goroutine; the parser only ever appends to a bounded buffer.
-func (d *Driver) newEventEmitter(harnessName string) *events.Emitter {
+// transcript is the project's events.transcript dial, which only the activity
+// dial can be on beside.
+func (d *Driver) newEventEmitter(harnessName string, transcript bool) *events.Emitter {
 	return events.New(events.Config{
-		Origin:  d.eventOrigin,
-		APIKey:  d.eventKey,
-		Harness: harnessName,
-		Seq:     d.eventSeqCounter(),
-		Logf:    log.Printf,
+		Origin:     d.eventOrigin,
+		APIKey:     d.eventKey,
+		Harness:    harnessName,
+		Transcript: transcript,
+		Seq:        d.eventSeqCounter(),
+		Logf:       log.Printf,
 	})
 }
 

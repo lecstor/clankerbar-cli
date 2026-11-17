@@ -1,22 +1,28 @@
 # Agent activity events (CLI emission)
 
-The driver can stream a session's *activity* to the plane's per-run event
-channel: which tools it called, the one identifying string of each call (a
-command, a file path, a task id) and its todo snapshots. It sends **no tool
-output and no assistant text** in this release. The contract lives in the plane
-repo's `docs/proposals/agent-event-channel.md` (CLA-601); this file records what
-the CLI implements (CLA-603).
+The driver can stream a session to the plane's per-run event channel in two
+tiers. The **activity** tier (`events.activity`) carries which tools the session
+called, the one identifying string of each call (a command, a file path, a task
+id) and its todo snapshots. The **transcript** tier (a second opt-in,
+`events.transcript`) adds a completed call's output and each assistant text
+block, capped at 64 KB per event. The contract lives in the plane repo's
+`docs/proposals/agent-event-channel.md` (CLA-601); this file records what the CLI
+implements (CLA-603, transcript tier CLA-887).
 
-## What is emitted — v1, activity tier only
+## What is emitted
 
 | harness | source event | channel event |
 | --- | --- | --- |
 | claude | `assistant`/tool_use, `TodoWrite` | `todo_change` from `input.todos` |
 | claude | `assistant`/tool_use, name `mcp__clankerbar__<tool>` | `clankerbar_mcp_call`, bare `<tool>` |
 | claude | `assistant`/tool_use, any other tool | `tool_call` (target per tool shape) |
+| claude | `assistant`, block `text` | `assistant_text` (transcript) |
+| claude | `user`, block `tool_result` | `tool_result` (transcript), `callId` = `tool_use_id`, `ok` = `!is_error` |
 | opencode | terminal `tool_use` part, `todowrite` | `todo_change` from `state.input.todos` |
 | opencode | terminal `tool_use` part, tool `clankerbar_<tool>` | `clankerbar_mcp_call`, bare `<tool>` |
 | opencode | terminal `tool_use` part, any other tool | `tool_call` (target per tool shape) |
+| opencode | `text` part | `assistant_text` (transcript) |
+| opencode | terminal `tool_use` part, any tool | `tool_result` (transcript) from `state.output` / `state.error`, same `callId` |
 
 The normalizers live in `internal/harness/events.go`; the wire schema, redaction
 and batcher in `internal/events`.
@@ -27,10 +33,32 @@ and batcher in `internal/events`.
   and truncated to 512 bytes (with the event's `truncated` marker).
 - **clankerbar MCP calls** send the task id (or question id) as `target` and
   never the call's input. The call's result is an ordinary `tool_result` in the
-  transcript tier, which is a follow-up.
+  transcript tier.
 - **Todos** are the full snapshot, capped at 50 items, each content redacted and
   cut to 256 bytes. Per-item todo tools (`TaskCreate` / `TaskUpdate`) are
   dropped: the tier reports the list, not its individual edits.
+- **Transcript events are a second opt-in.** With `events.transcript` off, the
+  normalizers still feed the activity tier and the transcript methods do
+  nothing. With it on, each `tool_result` carries `output` (head bytes at the
+  64 KB cap, `truncated` when cut), `outputBytes` (the length measured after
+  redaction and before truncation, so with an output present
+  `outputBytes > len(output)` means exactly "bytes were cut"; a withheld `.env*`
+  output has no `output` and its count is what was withheld) and `ok`. Each
+  `assistant_text` carries `text` and `textBytes` on the same rule. One event
+  per non-blank assistant text block, in order; consecutive blocks are not
+  merged, and a whitespace-only block is skipped as stream framing. A payload is
+  additionally cut shorter when JSON escaping (a control byte, `<`, `>` or `&`
+  expands to six) would push the single event past the 256 KB batch cap, so an
+  escape-heavy output still arrives rather than being dropped whole.
+- **`.env*` reads are withheld.** The output of a read of any `.env*` path is
+  dropped entirely: the `tool_result` carries no `output`, only `redacted: true`
+  (`outputBytes` is still present, as the wire requires). "Read" means the
+  read-shaped tool (`Read` on claude, `read` on opencode); a shell `cat .env` is
+  not visible to this rule.
+- **Spilled results are rehydrated.** Claude Code and opencode sometimes replace
+  an oversized tool result with a pointer to a file. When that file is readable
+  under the adapter's existing guards, the transcript event carries the output
+  itself, not the pointer.
 
 ### Out of v1
 
@@ -38,23 +66,27 @@ and batcher in `internal/events`.
   different event vocabulary, and the mapping is not wired. `codex` and
   `copilot` report `Capabilities.EmitsEvents` false, so the driver never builds
   a sink for them.
-- **Transcript tier** (`tool_result`, `assistant_text`, the 64 KB caps, `.env*`
-  read dropping and the wider redaction breadth) is the follow-up
-  `CLI: transcript-tier events and redaction breadth`. The plane accepts those
-  event types and counts them as dropped until then, so the wire contract is
-  already stable.
+- **Interactive Claude Code sessions (hooks)** emit the activity tier only. A
+  `PostToolUse` hook has no assistant text to report, and the transcript tier's
+  tool output is left to a spawned session for now.
 
 ## Turning it on and off
 
 - **On** is the project's run-config dial `events.activity`, set by operator+
-  under `set_run_config`. It is off by default and absent reads as off. The CLI
-  applies it with the rest of the stored run config at an iteration boundary.
+  under `set_run_config`. It is off by default and absent reads as off, and the
+  transcript tier is a second dial beside it: `events.transcript` may only be
+  true when activity is true (the plane refuses the pair otherwise, and the CLI
+  reads a stored transcript-only block as off). The CLI applies both with the
+  rest of the stored run config at an iteration boundary.
 - **Off, machine-locally**, with `clankerbar run --no-events`,
   `clankerbar supervise --no-events` (children get `CLANKERBAR_EVENTS=off`),
   `clankerbar hook emit --no-events`, or `CLANKERBAR_EVENTS=off` (`0` / `false`
-  accepted, case-insensitive). No machine-local signal can turn the channel ON.
-- The plane re-checks the dial per batch: an emitter with a stale copy is
-  refused `403 events_disabled` and stops for that run, saying so once.
+  accepted, case-insensitive). It mutes both tiers. No machine-local signal can
+  turn either on.
+- The plane re-checks the dials per batch: an emitter with a stale copy is
+  refused `403 events_disabled` and stops for that run, saying so once. A
+  transcript event sent while the transcript dial is off is counted under the
+  ACK's `dropped.transcript`; the CLI treats that as a stop (below).
 
 ## Interactive Claude Code sessions (hooks, CLA-605)
 
@@ -150,14 +182,38 @@ members run in parallel — so:
   events are lost, though nothing is ever doubled; closing that gap needs the
   plane's dedupe to stop being a single high-water mark.
 
+### The transcript tier's 50 MB run cap
+
+The plane is the authority on volume: a run's transcript prefix stops at
+**50 MB**, and the first event that would cross it is dropped while the plane
+appends a `run_cap` `marker` to the feed. Markers are **plane-sourced** (a
+`feedSeq`, no emitter `seq`) — a harness never emits one, and the CLI does not
+try to.
+
+The CLI's half of the cooperation is the ACK: every ingest response carries
+`dropped: { transcript: N }`, which is non-zero when the cap stopped the tier
+(or when a stale emitter sent transcript events with the dial off). On the first
+non-zero count the emitter **stops the transcript tier for that session**: queued
+transcript events are dropped, later ones are refused before they are buffered,
+and one log line says so. The stop is per session/emitter, not durable: a later
+session on the same run starts sending again and re-learns the cap from its own
+first ACK. Activity keeps flowing — a runaway run degrades, it never bills
+unbounded.
+
 ## Redaction
 
 CLI-side, before anything leaves the machine, over the full string and **before**
 truncation: `clk_`, `ghp_` / `github_pat_`, `sk-ant-`, `AKIA` and PEM private-key
-blocks become `[redacted]`, and the event carries `redacted: true`. This is best
-effort, not a guarantee — the tiers and the project's dials are the privacy
-boundary, which is why the activity tier carries no output and the transcript
-tier is a second opt-in.
+blocks become `[redacted]`, and the event carries `redacted: true`. The same pass
+runs over every string field the channel carries — `target`, todo content, a
+`tool_result`'s `output` and an `assistant_text`'s `text` — and it runs before
+the 64 KB cut, so a secret near the cap boundary is not half-missed.
+
+On top of that, the output of a read of any `.env*` path is dropped entirely
+(`tool_result` with no `output`, `redacted: true`). Both are best effort, not a
+guarantee — an unrecognised credential shape passes through — which is why the
+tiers and the project's dials are the privacy boundary and the transcript tier is
+a separate opt-in.
 
 ## Inbound console messages (CLI delivery)
 

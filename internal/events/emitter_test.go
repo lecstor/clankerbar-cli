@@ -66,6 +66,29 @@ func (c *capture) waitFor(t *testing.T, want int) [][]byte {
 	return nil
 }
 
+// waitForEvents polls until at least want events have arrived across every
+// captured batch, and returns them in arrival order. waitFor counts requests;
+// a flush may carry several events or split them, so the transcript tests need
+// the event count instead.
+func (c *capture) waitForEvents(t *testing.T, want int) []json.RawMessage {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		bodies, _, _ := c.snapshot()
+		var out []json.RawMessage
+		for _, body := range bodies {
+			out = append(out, decodeBatch(t, body).Events...)
+		}
+		if len(out) >= want {
+			return out
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d channel event(s); got %d", want, len(out))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func decodeBatch(t *testing.T, body []byte) batch {
 	t.Helper()
 	var b batch
@@ -109,6 +132,13 @@ func newTestEmitterEvery(srv *httptest.Server, seq *SeqCounter, logf func(string
 		SendTimeout: 300 * time.Millisecond,
 		CloseGrace:  500 * time.Millisecond,
 	})
+}
+
+// newTranscriptEmitter is newTestEmitter with the transcript dial on.
+func newTranscriptEmitter(srv *httptest.Server, seq *SeqCounter, logf func(string, ...any)) *Emitter {
+	e := newTestEmitter(srv, seq, logf)
+	e.cfg.Transcript = true
+	return e
 }
 
 func TestFlushDefaultsMatchTheDesignNote(t *testing.T) {
@@ -703,6 +733,34 @@ func TestEmitterDropsOverCapIdentifiers(t *testing.T) {
 	b := decodeBatch(t, bodies[0])
 	if len(b.Events) != 1 {
 		t.Fatalf("events = %d, want only the well-formed call", len(b.Events))
+	}
+	e.Close()
+}
+
+func TestEmitterToolResultDropsInvalidCallIDs(t *testing.T) {
+	// The plane refuses an over-cap identifier with the WHOLE batch, and a
+	// tool_result without a callId cannot join its call. Both must be dropped
+	// here; only the well-formed event may reach the plane.
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1}`))
+	defer srv.Close()
+	e := newTranscriptEmitter(srv, nil, nil)
+	e.SetRunID("run-1")
+
+	e.ToolResult("", true, "no id", false)
+	e.ToolResult(strings.Repeat("c", MaxCallIDBytes+1), true, "too long", false)
+	e.ToolResult("ok", true, "kept", false)
+
+	events := c.waitForEvents(t, 1)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want only the well-formed result", len(events))
+	}
+	var ev ToolResultEvent
+	if err := json.Unmarshal(events[0], &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.CallID != "ok" || ev.Output == nil || *ev.Output != "kept" {
+		t.Fatalf("event = %+v, want the well-formed result only", ev)
 	}
 	e.Close()
 }

@@ -193,3 +193,25 @@ func TestStateDirAdoptsTheEventSequenceFile(t *testing.T) {
 		t.Fatalf("the counter file is gone: %v", err)
 	}
 }
+
+// TestInvocationEventSinkCarriesTranscriptDial pins the second dial's route
+// from the project's effective run config onto the sink: with only activity on,
+// transcript methods are no-ops; with both on, the sink sends the tier.
+func TestInvocationEventSinkCarriesTranscriptDial(t *testing.T) {
+	for _, transcriptOn := range []bool{false, true} {
+		d := eventTestDriver(true, false)
+		d.cfg.Events.Transcript = transcriptOn
+		in, err := d.invocationOn(Target{}, "claude", false)
+		if err != nil {
+			t.Fatalf("invocationOn: %v", err)
+		}
+		if in.NewEventSink == nil {
+			t.Fatal("no sink with activity on")
+		}
+		sink := in.NewEventSink()
+		if got := sink.TranscriptEnabled(); got != transcriptOn {
+			t.Errorf("TranscriptEnabled = %v, want %v", got, transcriptOn)
+		}
+		sink.Close()
+	}
+}
