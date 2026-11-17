@@ -3072,7 +3072,7 @@ the catch-all matches last, denying every read.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 - [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
-- [`docs/agent-events.md`](./docs/agent-events.md) - the agent activity channel the CLI feeds: what the claude and opencode adapters emit, the project dial and the machine-local opt-out, batching, sequence numbering and CLI-side redaction.
+- [`docs/agent-events.md`](./docs/agent-events.md) - the agent event channel the CLI feeds: what the claude and opencode adapters emit in the activity and transcript tiers, the project dials and the machine-local opt-out, batching, sequence numbering, the 50 MB transcript cap and CLI-side redaction.
 
 ## License
 
