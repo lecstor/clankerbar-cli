@@ -17,7 +17,8 @@ const noCodeReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + P
 	"in, no PR to open. The empty branch field is NOT a failed hand-off: the driver recorded this " +
 	"checkpoint on exactly that record. You are RESUMING that run, not starting a new one: do not call " +
 	"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
-	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"run." + driverRenewsLease + resumeHeartbeatStays +
+	" If the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
 	"expected: the settlement IS the delivery, so proceed to the review below. Then get_task with " +
 	"includeDecisions: true to re-read the bar and the standing decisions. Run the adversarial review gate " +
 	"over the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the decisions " +
@@ -49,7 +50,8 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
 	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
 	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. " +
-	"Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true " +
+	"Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease + resumeHeartbeatStays +
+	" Then get_task with includeDecisions: true " +
 	"to re-read the bar and the standing decisions. FIRST verify the hand-off yourself, before any review: read " +
 	"branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote origin " + PhaseBranchPlaceholder +
 	", or fetch it) and confirm it carries phase 1's work. If the branch is not on the origin remote, phase 1 did " +
@@ -156,7 +158,8 @@ const reviewHandoffUnverified = "but the driver could NOT verify that branch on 
 	"and pushed."
 
 var reviewOnlyBriefResume = " You are RESUMING that run, not starting a new one: do not call next_task, and do " +
-	"not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with " +
+	"not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease +
+	resumeHeartbeatStays + " Then get_task with " +
 	"includeDecisions: true to re-read the bar and the standing decisions. An empty branch field on the task is " +
 	"a FAILED hand-off to report in the record below, not work to silently adopt and implement."
 
@@ -220,7 +223,8 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
 	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
 	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
-	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease +
+	resumeHeartbeatStays + " Then get_task with " +
 	"includeDecisions: true to re-read the bar and the standing decisions. FIRST verify the hand-off yourself, " +
 	"before any review: read branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote " +
 	"origin " + PhaseBranchPlaceholder + ", or fetch it) and confirm it carries phase 1's work. If the branch " +
@@ -269,7 +273,8 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 	"correct delivery is no code - nothing to check out, no worktree to work in, no PR to open. The empty " +
 	"branch field is NOT a failed hand-off: the driver recorded this checkpoint on exactly that record. You " +
 	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
-	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease + resumeHeartbeatStays +
+	" If the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed " +
 	"to the review below. Then get_task with includeDecisions: true to re-read the bar and the standing " +
 	"decisions. Review the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the " +
@@ -336,7 +341,8 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
 	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. You are " +
 	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
-	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true. " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease + resumeHeartbeatStays +
+	" Then get_task with includeDecisions: true. " +
 	fixCore +
 	" If the review found nothing " +
 	"(verdict: pass), there is nothing to fix: still open the PR if none exists and hand over." +
@@ -357,7 +363,8 @@ var fixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"runs after you: it re-reviews your fix delta and adjudicates the prior open MUSTs, and IT opens the PR " +
 	"and hands the task to in_review once no MUST remains open. You are RESUMING that run, not starting a " +
 	"new one: do not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder +
-	"\") to resume the run, then get_task with includeDecisions: true. " +
+	"\") to resume the run." + driverRenewsLease + resumeHeartbeatStays +
+	" Then get_task with includeDecisions: true. " +
 	fixCore +
 	" If the review found nothing (verdict: pass), there is nothing to fix: commit nothing, leave the branch " +
 	"as it is, and end holding the task — the verification round still runs and carries the terminal step." +
@@ -396,7 +403,8 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"PLANE'S RECORD of what the implement phase did - there is NO branch, because this task's correct " +
 	"delivery is no code. You " +
 	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
-	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease + resumeHeartbeatStays +
+	" If the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
 	"Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading + "` block in the " +
 	"outcome — an earlier one is an earlier round, so read past it. That block IS the round's record: the " +
@@ -421,7 +429,8 @@ var noCodeFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + 
 	"implement phase did - there is NO branch, because this task's correct delivery is no code. A " +
 	"VERIFICATION round runs after you and adjudicates the open MUSTs, so it, not you, decides the " +
 	"hand-over. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
-	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease +
+	resumeHeartbeatStays + " If the plane REFUSES the " +
 	"heartbeat because the task already left in_progress, that refusal is expected: the settlement IS the " +
 	"delivery, so proceed. Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading +
 	"` block in the outcome — an earlier one is an earlier round, so read past it. That block IS the round's " +
@@ -519,7 +528,8 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"them; your job is to verify the FIXES, not to review the whole diff again. The driver has closed the " +
 	"previous round, so get_task releases the records. You are RESUMING that run, not starting a new one: do " +
 	"not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume " +
-	"the run, then get_task with includeDecisions: true. The driver has prepended the PRIOR OPEN MUST ids with " +
+	"the run." + driverRenewsLease + resumeHeartbeatStays +
+	" Then get_task with includeDecisions: true. The driver has prepended the PRIOR OPEN MUST ids with " +
 	"their findings, and every MUST of this review cycle already MARKED settled; if that block is missing, read " +
 	"the released records yourself and list every finding with severity must, both those with status open and " +
 	"those of this cycle marked fixed, refuted or filed. Work in the worktree for branch " + PhaseBranchPlaceholder +
@@ -568,7 +578,8 @@ var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	ReviewRecordHeading + "` block of the task's outcome — that block, not a durable record, is this shape's " +
 	"round record (question 03a12578, option 1). You are RESUMING that run, not starting a new one: do not " +
 	"call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
-	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"run." + driverRenewsLease + resumeHeartbeatStays + " If the plane REFUSES the heartbeat because the task " +
+	"already left in_progress, that refusal is " +
 	"expected: the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review " +
 	"the amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, " +
 	"does the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST in the BLOCK's own " +

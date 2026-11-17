@@ -27,16 +27,19 @@ const HandoffPromptMax = 4096
 // prompt bare. A phase resume (reviewPhaseName, above) works only because its
 // brief spells out "do not claim, call heartbeat first": a session-authored
 // prompt cannot be trusted to carry that instruction forward on its own, and
-// without it a successor calls next_task/claim_task on a fresh task, or its
-// run's lease lapses because nothing tells it to hold it. Placed FIRST, not
+// without it a successor calls next_task/claim_task on a fresh task, or never
+// re-enters its run — the single heartbeat is the resume/settlement check,
+// while the run's lease itself is renewed by the driver from Go while the
+// session runs. Placed FIRST, not
 // appended, so the driver's own constraints bound the prompt that follows
 // rather than being one more thing a self-authored prompt could bury or
 // contradict — the same reasoning behind refusing to truncate an over-cap
 // prompt rather than editing it.
 const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on task " + PhaseTaskPlaceholder +
 	", handed to you by the previous session on this task via a self-chosen handoff. Do NOT call next_task, and " +
-	"do NOT claim anything: call heartbeat(\"" + PhaseRunPlaceholder + "\") first to resume the run, then stay " +
-	"within this phase's scope. What follows is the previous session's own continuation prompt:\n\n"
+	"do NOT claim anything: call heartbeat(\"" + PhaseRunPlaceholder + "\") first to resume the run." +
+	driverRenewsLease + resumeHeartbeatStays + " Then stay within this phase's scope. What follows is the " +
+	"previous session's own continuation prompt:\n\n"
 
 // HandoffContinuation is appended, by the driver, to a handoff respawn's prompt
 // (CLA-353) so a phase's own contract survives a session-authored hand-off.
@@ -148,6 +151,23 @@ func NoCodeFixVerifyHandoffContinuation() string {
 	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
 		rerunGuidance + noCodeFixVerifyRecord + noCodeFixOnlyTerminalStep
 }
+
+// driverRenewsLease tells a session-claimed phase that its lease is renewed by
+// the driver, not by the session (CLA-917). Every shipped session-claimed phase
+// runs under internal/loop's leaseRenewer, which beats from Go every third of
+// the 30-minute lease for as long as the session runs, so the served
+// protocol's "heartbeat every ~10 min" would make the session a redundant
+// second holder. The runner-claimed briefs carry their own prohibition. The
+// supervisor's conflict-only step has NO driver-side renewer (it runs outside
+// the loop package), so ConflictBrief keeps its own heartbeat cadence.
+const driverRenewsLease = " The driver renews the run's lease from Go every third of the lease while this " +
+	"session runs, so do NOT call heartbeat for renewal."
+
+// resumeHeartbeatStays keeps the ONE heartbeat a resumed brief still needs: the
+// heartbeat(runId) that resumes (or, on a settled task, settles) the run. A
+// reader who took driverRenewsLease as "never call heartbeat" would skip it and
+// never re-enter the run, so the two always ride together.
+const resumeHeartbeatStays = " That first heartbeat(runId) is the resume/settlement check and stays."
 
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
 // may hand the rest of its job to a fresh successor, and how. The trigger is
