@@ -2609,8 +2609,10 @@ one that sets none) share this file's budget as one instance-wide pool.
 A project's `events.activity` dial (off by default, set by operator+) turns on
 the **agent activity channel**: the daemon streams each session's tool calls,
 their one identifying argument and its todo snapshots to the plane, redacted on
-this machine before anything leaves it. It sends no tool output and no assistant
-text in this release. This machine can refuse the channel with `--no-events` on
+this machine before anything leaves it. A second dial, `events.transcript` (only
+valid beside activity), adds a completed call's output and each assistant text
+block, capped at 64 KB per event; the plane stops that tier at 50 MB per run and
+activity continues. This machine can refuse the channel with `--no-events` on
 `clankerbar run` / `clankerbar supervise`, or with `CLANKERBAR_EVENTS=off`; no
 local signal can turn it on. See [`docs/agent-events.md`](./docs/agent-events.md).
 

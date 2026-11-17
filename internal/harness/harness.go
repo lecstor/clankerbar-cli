@@ -266,10 +266,11 @@ type Capabilities struct {
 	RunsTurnSequences bool
 
 	// EmitsEvents reports whether this adapter normalizes its structured tool
-	// events into the agent event channel's activity tier (CLA-603). False means
-	// the loop must not build a sink: there is no mapping, and an unclosed sink
-	// would leak its batch goroutine. codex is out of v1 by scope; copilot's tool
-	// events exist but its activity mapping is out of v1 too.
+	// events into the agent event channel (CLA-603, transcript tier CLA-887)
+	// — the activity tier always, and the transcript tier while its dial is on.
+	// False means the loop must not build a sink: there is no mapping, and an
+	// unclosed sink would leak its batch goroutine. codex is out of v1 by scope;
+	// copilot's tool events exist but its activity mapping is out of v1 too.
 	EmitsEvents bool
 
 	// DeliversMessages reports whether this adapter can receive console -> agent

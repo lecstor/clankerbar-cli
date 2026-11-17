@@ -221,12 +221,19 @@ func (p *eventPlane) waitForEvents(t *testing.T, want int) []capturedBatch {
 
 func eventSinkFactory(t *testing.T, srv *httptest.Server, harnessName string) func() *events.Emitter {
 	t.Helper()
+	return eventSinkFactoryWith(t, srv, harnessName, false)
+}
+
+// eventSinkFactoryWith is the factory with the transcript dial explicit.
+func eventSinkFactoryWith(t *testing.T, srv *httptest.Server, harnessName string, transcript bool) func() *events.Emitter {
+	t.Helper()
 	seq := events.NewSeqCounter(events.NewMemorySeqStore(), nil)
 	return func() *events.Emitter {
 		return events.New(events.Config{
 			Origin:      srv.URL,
 			APIKey:      "clk_test_key",
 			Harness:     harnessName,
+			Transcript:  transcript,
 			Seq:         seq,
 			Client:      srv.Client(),
 			FlushEvery:  10 * time.Millisecond,
@@ -320,5 +327,281 @@ func TestOpencodeParserEmitsActivityEvents(t *testing.T) {
 	}
 	if events[2]["tool"] != "shell" || events[2]["target"] != "go test ./..." {
 		t.Errorf("shell event = %v", events[2])
+	}
+}
+
+func TestClaudeTranscriptMapping(t *testing.T) {
+	s := &recSink{transcript: true}
+	noteClaudeAssistantText(s, "working on it")
+	noteClaudeAssistantText(s, "  \n") // framing, not a message
+	if len(s.texts) != 1 || s.texts[0] != "working on it" {
+		t.Fatalf("texts = %q", s.texts)
+	}
+
+	noteClaudeToolResult(s, "c1", false, raw(`"package main"`), false)
+	noteClaudeToolResult(s, "c2", true, raw(`"boom"`), false)
+	noteClaudeToolResult(s, "c3", false, raw(`"SECRET=1"`), true)
+	want := []string{
+		"tool_result|c1|true|package main|false",
+		"tool_result|c2|false|boom|false",
+		"tool_result|c3|true|SECRET=1|true",
+	}
+	if strings.Join(s.results, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("results = %v, want %v", s.results, want)
+	}
+}
+
+func TestOpencodeTranscriptMapping(t *testing.T) {
+	s := &recSink{transcript: true}
+	noteOpencodeAssistantText(s, "step one")
+	noteOpencodeAssistantText(s, "")
+	noteOpencodeToolResult(s, "read", "c1", raw(`{"filePath":"a.go"}`), true, "package a")
+	noteOpencodeToolResult(s, "read", "c2", raw(`{"filePath":".env.local"}`), true, "SECRET=1")
+	noteOpencodeToolResult(s, "shell", "c3", raw(`{"command":"false"}`), false, "exit 1")
+	if len(s.texts) != 1 || s.texts[0] != "step one" {
+		t.Fatalf("texts = %q", s.texts)
+	}
+	want := []string{
+		"tool_result|c1|true|package a|false",
+		"tool_result|c2|true|SECRET=1|true",
+		"tool_result|c3|false|exit 1|false",
+	}
+	if strings.Join(s.results, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("results = %v, want %v", s.results, want)
+	}
+}
+
+func TestTranscriptDialOffRecordsNothing(t *testing.T) {
+	// The dial is checked in the mapping, not only in the emitter: an off sink
+	// must not do transcript-only work or record an event to discard.
+	s := &recSink{} // transcript off
+	noteClaudeAssistantText(s, "hi")
+	noteClaudeToolResult(s, "c1", false, raw(`"x"`), false)
+	noteOpencodeAssistantText(s, "hi")
+	noteOpencodeToolResult(s, "read", "c1", raw(`{"filePath":"x"}`), true, "x")
+	if len(s.texts)+len(s.results) != 0 {
+		t.Fatalf("texts = %q, results = %v; want nothing with the dial off", s.texts, s.results)
+	}
+}
+
+func TestEnvReadTarget(t *testing.T) {
+	cases := []struct {
+		tool, target string
+		want         bool
+	}{
+		{"read", ".env", true},
+		{"Read", "/repo/.env", true},
+		{"read", "/repo/.env.local", true},
+		{"read", "/repo/.env.production", true},
+		{`read`, `C:\repo\.env`, true},
+		{"read", "a.go", false},
+		{"read", "env.local", false},
+		{"read", "/repo/notes.env", false},
+		{"bash", ".env", false}, // not a read-shaped tool
+		{"write", "/repo/.env", false},
+	}
+	for _, tc := range cases {
+		if got := envReadTarget(tc.tool, tc.target); got != tc.want {
+			t.Errorf("envReadTarget(%q, %q) = %v, want %v", tc.tool, tc.target, got, tc.want)
+		}
+	}
+}
+
+func TestClaudeEnvReadIsRememberedUntilItsResult(t *testing.T) {
+	res := Result{events: events.New(events.Config{Transcript: true})}
+	res.noteEnvRead("Read", "c1", raw(`{"file_path":"/repo/.env"}`))
+	if !res.takeEnvRead("c1") {
+		t.Fatal("a .env read was not remembered")
+	}
+	if res.takeEnvRead("c1") {
+		t.Fatal("the verdict was not forgotten after its result")
+	}
+	res.noteEnvRead("Read", "c2", raw(`{"file_path":"a.go"}`))
+	res.noteEnvRead("Bash", "c3", raw(`{"command":"cat .env"}`))
+	if res.takeEnvRead("c2") || res.takeEnvRead("c3") {
+		t.Fatal("a non-.env read or a shell call was withheld")
+	}
+
+	// With the transcript dial off nothing is remembered: the map is
+	// transcript-only state.
+	off := Result{events: events.New(events.Config{})}
+	off.noteEnvRead("Read", "c4", raw(`{"file_path":".env"}`))
+	if off.takeEnvRead("c4") {
+		t.Fatal("an off sink recorded transcript-only state")
+	}
+}
+
+// eventTypeCounts folds captured batches into a type -> count map.
+func eventTypeCounts(batches []capturedBatch) map[string]int {
+	out := map[string]int{}
+	for _, b := range batches {
+		for _, ev := range b.events {
+			out[fmt.Sprint(ev["type"])]++
+		}
+	}
+	return out
+}
+
+// TestClaudeParserEmitsTranscriptEvents drives the real claude parser with the
+// transcript dial on: assistant text, a normal read's output, and a `.env`
+// read whose output must not reach the wire.
+func TestClaudeParserEmitsTranscriptEvents(t *testing.T) {
+	plane, srv := newEventPlane(t)
+	defer srv.Close()
+	in := Invocation{
+		ResumeClaim:  Claim{RunID: "run-1.secret"},
+		NewEventSink: eventSinkFactoryWith(t, srv, "claude", true),
+	}
+	res := newSessionResult(in)
+	defer res.closeEvents()
+
+	lines := []string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}],"usage":{}}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call-read","name":"Read","input":{"file_path":"/repo/a.go"}}],"usage":{}}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-read","content":"package main"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call-env","name":"Read","input":{"file_path":"/repo/.env"}}],"usage":{}}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-env","content":"SECRET=1"}]}}`,
+	}
+	for _, line := range lines {
+		(claude{}).renderAndParse([]byte(line), io.Discard, &res)
+	}
+	batches := plane.waitForEvents(t, 5)
+
+	counts := eventTypeCounts(batches)
+	if counts["assistant_text"] != 1 || counts["tool_result"] != 2 || counts["tool_call"] != 2 {
+		t.Fatalf("event counts = %v", counts)
+	}
+	var text, normal, env map[string]any
+	for _, b := range batches {
+		for _, ev := range b.events {
+			switch ev["type"] {
+			case "assistant_text":
+				text = ev
+			case "tool_result":
+				if ev["callId"] == "call-read" {
+					normal = ev
+				}
+				if ev["callId"] == "call-env" {
+					env = ev
+				}
+			}
+		}
+	}
+	if text == nil || text["text"] != "working on it" || text["textBytes"].(float64) != 13 {
+		t.Errorf("assistant_text = %v", text)
+	}
+	if normal == nil || normal["ok"] != true || normal["output"] != "package main" ||
+		normal["outputBytes"].(float64) != 12 || normal["truncated"] != nil {
+		t.Errorf("normal tool_result = %v", normal)
+	}
+	if env == nil {
+		t.Fatal("the .env read produced no tool_result")
+	}
+	if _, present := env["output"]; present {
+		t.Fatalf("the .env output reached the wire: %v", env)
+	}
+	if env["redacted"] != true {
+		t.Fatalf(".env tool_result lacks redacted:true: %v", env)
+	}
+}
+
+// TestOpencodeParserEmitsTranscriptEvents does the same through opencode's
+// terminal tool parts and text parts.
+func TestOpencodeParserEmitsTranscriptEvents(t *testing.T) {
+	plane, srv := newEventPlane(t)
+	defer srv.Close()
+	in := Invocation{
+		ResumeClaim:  Claim{RunID: "run-1.secret"},
+		NewEventSink: eventSinkFactoryWith(t, srv, "opencode", true),
+	}
+	p := newOpencodeParse(in, io.Discard)
+	defer p.closeEvents()
+
+	lines := []string{
+		`{"type":"text","sessionID":"ses_1","part":{"id":"prt_0","type":"text","text":"step one"}}`,
+		`{"type":"tool_use","sessionID":"ses_1","part":{"partID":"prt_1","type":"tool","id":"call_1","tool":"read","state":{"status":"completed","input":{"filePath":"a.go"},"output":"package main"}}}`,
+		`{"type":"tool_use","sessionID":"ses_1","part":{"partID":"prt_2","type":"tool","id":"call_2","tool":"read","state":{"status":"completed","input":{"filePath":".env"},"output":"SECRET=1"}}}`,
+		`{"type":"tool_use","sessionID":"ses_1","part":{"partID":"prt_3","type":"tool","id":"call_3","tool":"shell","state":{"status":"error","input":{"command":"false"},"error":"exit 1"}}}`,
+	}
+	for _, line := range lines {
+		p.line([]byte(line))
+	}
+	batches := plane.waitForEvents(t, 7)
+
+	counts := eventTypeCounts(batches)
+	if counts["assistant_text"] != 1 || counts["tool_result"] != 3 || counts["tool_call"] != 3 {
+		t.Fatalf("event counts = %v", counts)
+	}
+	results := map[string]map[string]any{}
+	for _, b := range batches {
+		for _, ev := range b.events {
+			if ev["type"] == "tool_result" {
+				results[fmt.Sprint(ev["callId"])] = ev
+			}
+		}
+	}
+	if r := results["call_1"]; r == nil || r["ok"] != true || r["output"] != "package main" {
+		t.Errorf("call_1 result = %v", r)
+	}
+	if r := results["call_2"]; r == nil || r["redacted"] != true {
+		t.Errorf("call_2 result = %v (want the .env output withheld)", r)
+	} else if _, present := r["output"]; present {
+		t.Errorf("the .env output reached the wire: %v", r)
+	}
+	if r := results["call_3"]; r == nil || r["ok"] != false || r["output"] != "exit 1" {
+		t.Errorf("call_3 result = %v (want the error text as a failed result)", r)
+	}
+}
+
+// TestTranscriptDialOffSendsActivityOnly runs both parsers with the transcript
+// factory off and asserts the wire carries none of the new types.
+func TestTranscriptDialOffSendsActivityOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(in Invocation, res *Result)
+	}{
+		{
+			name: "claude",
+			run: func(in Invocation, res *Result) {
+				for _, line := range []string{
+					`{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}],"usage":{}}}`,
+					`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}],"usage":{}}}`,
+					`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"a.go"}]}}`,
+				} {
+					(claude{}).renderAndParse([]byte(line), io.Discard, res)
+				}
+			},
+		},
+		{
+			name: "opencode",
+			run: func(in Invocation, res *Result) {
+				p := newOpencodeParse(in, io.Discard)
+				defer p.closeEvents()
+				p.line([]byte(`{"type":"text","sessionID":"ses_1","part":{"id":"prt_0","type":"text","text":"hello"}}`))
+				p.line([]byte(`{"type":"tool_use","sessionID":"ses_1","part":{"partID":"prt_1","type":"tool","id":"call_1","tool":"shell","state":{"status":"completed","input":{"command":"ls"},"output":"a.go"}}}`))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plane, srv := newEventPlane(t)
+			defer srv.Close()
+			in := Invocation{
+				ResumeClaim:  Claim{RunID: "run-1.secret"},
+				NewEventSink: eventSinkFactoryWith(t, srv, tc.name, false),
+			}
+			res := newSessionResult(in)
+			tc.run(in, &res)
+			res.closeEvents()
+			plane.mu.Lock()
+			batches := append([]capturedBatch(nil), plane.batches...)
+			plane.mu.Unlock()
+			counts := eventTypeCounts(batches)
+			if counts["tool_result"] != 0 || counts["assistant_text"] != 0 {
+				t.Fatalf("transcript events sent with the dial off: %v", counts)
+			}
+			if counts["tool_call"] != 1 {
+				t.Fatalf("activity events = %v, want one tool_call", counts)
+			}
+		})
 	}
 }

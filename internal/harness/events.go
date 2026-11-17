@@ -103,19 +103,15 @@ func noteOpencodeToolResult(sink events.Sink, tool, callID string, input json.Ra
 
 // noteClaudeToolResult maps one claude `user`/tool_result block onto the
 // transcript tier. The stream reports a result on a LATER event than the call,
-// which is why the `.env*` decision was recorded against the call id at
+// which is why the `.env*` decision (drop) is taken from the call id at
 // tool_use time (Result.noteEnvRead).
 //
 // A result Claude Code spilled to a file is rehydrated before sending — the
 // model saw the output, not the pointer, and the transcript is a record of the
 // session. The path is honoured under persistedOutputPath's own guard; if the
 // read fails, the envelope text is what we have and is sent.
-func noteClaudeToolResult(res *Result, toolUseID string, isError bool, content json.RawMessage) {
-	if res == nil || res.events == nil || toolUseID == "" {
-		return
-	}
-	drop := res.takeEnvRead(toolUseID)
-	if !res.events.TranscriptEnabled() {
+func noteClaudeToolResult(sink events.Sink, toolUseID string, isError bool, content json.RawMessage, drop bool) {
+	if sink == nil || !sink.TranscriptEnabled() || toolUseID == "" {
 		return
 	}
 	text := toolResultText(content)
@@ -124,7 +120,7 @@ func noteClaudeToolResult(res *Result, toolUseID string, isError bool, content j
 			text = toolResultText(json.RawMessage(b))
 		}
 	}
-	res.events.ToolResult(toolUseID, !isError, text, drop)
+	sink.ToolResult(toolUseID, !isError, text, drop)
 }
 
 // noteEnvRead records that a claude call read a `.env*` path, so the transcript

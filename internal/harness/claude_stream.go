@@ -209,7 +209,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			noteToolResult(res, b.ToolUseID, b.IsError, b.Content, console)
 			// Transcript tier (CLA-887): the output itself, or its `.env*`
 			// redaction verdict, before the clankerbar observation consumes it.
-			noteClaudeToolResult(res, b.ToolUseID, b.IsError, b.Content)
+			noteClaudeToolResult(res.events, b.ToolUseID, b.IsError, b.Content, res.takeEnvRead(b.ToolUseID))
 			res.idle.toolFinished(b.ToolUseID)
 			// CLA-739: every tool, not only clankerbar's - a loop on any tool
 			// re-sends the context just the same. The error text is only read
