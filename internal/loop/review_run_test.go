@@ -270,6 +270,52 @@ func TestRunReviewMapsSessionTurnsAndModels(t *testing.T) {
 	}
 }
 
+// TestRunReviewMapsSessionEmbedsHunks: --embed-hunks reaches the planner, so
+// the change-map items carry their hunks the way maps_session.embed_hunks does
+// in the review phase - and without it the prompt carries no hunk at all.
+func TestRunReviewMapsSessionEmbedsHunks(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("sample.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 1\n}\n")
+	base := r.commit("base")
+	r.write("sample.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 10\n}\n")
+	head := r.commit("head")
+
+	for _, embed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("embed=%v", embed), func(t *testing.T) {
+			var got harness.Invocation
+			report, err := RunReview(context.Background(), ReviewRunOptions{
+				Repo:       r.dir,
+				Base:       base,
+				Head:       head,
+				Method:     config.ReviewMethodMapsSession,
+				Harness:    "opencode",
+				Model:      "test/model",
+				EmbedHunks: embed,
+				cfg:        &config.Config{},
+				invoke: func(_ context.Context, inv harness.Invocation) (harness.Result, error) {
+					got = inv
+					messages := []string{}
+					for range inv.Turns {
+						messages = append(messages, "notes")
+					}
+					messages = append(messages, reviewRunDone(head, reviewRunMustFinding))
+					return harness.Result{TurnMessages: messages, FinalMessage: messages[len(messages)-1]}, nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("RunReview: %v", err)
+			}
+			hunk := "+\treturn x + 10"
+			if strings.Contains(got.Prompt, hunk) != embed {
+				t.Errorf("hunk %q in the first turn = %v, want %v:\n%s", hunk, !embed, embed, got.Prompt)
+			}
+			if report.EmbedHunks != embed {
+				t.Errorf("report.embed_hunks = %v, want %v", report.EmbedHunks, embed)
+			}
+		})
+	}
+}
+
 // TestRunReviewRefusesNonOrderlyEnd (CLA-870 round 1 1.review-1.1): a parseable
 // done report is not a completed review when the session ended non-orderly —
 // the same gate the review phase's done_apply applies to a report.

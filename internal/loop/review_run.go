@@ -42,9 +42,12 @@ type ReviewRunOptions struct {
 	FindingsModel string
 	ChunkSize     int
 	FlowMax       int
-	Title         string
-	Description   string
-	Console       io.Writer
+	// EmbedHunks puts each change-map item's hunk in the prompt, as the review
+	// phase's maps_session.embed_hunks does, at the default budgets.
+	EmbedHunks  bool
+	Title       string
+	Description string
+	Console     io.Writer
 
 	// Seams for the tests; production leaves them nil and gets the real harness,
 	// the discovered config and a real `git worktree remove`.
@@ -61,6 +64,7 @@ type ReviewRunReport struct {
 	Base       string               `json:"base"`
 	Head       string               `json:"head"`
 	Method     string               `json:"method"`
+	EmbedHunks bool                 `json:"embed_hunks"`
 	Models     map[string]string    `json:"models"`
 	Findings   []config.DoneFinding `json:"findings"`
 	Omitted    int                  `json:"omitted"`
@@ -179,6 +183,7 @@ func reviewRunSession(ctx context.Context, opts ReviewRunOptions, cfg *config.Co
 		Base:       base,
 		Head:       head,
 		Method:     method,
+		EmbedHunks: method == config.ReviewMethodMapsSession && opts.EmbedHunks,
 		Models:     stage.models,
 		Findings:   []config.DoneFinding{},
 		NotesTurns: []string{},
@@ -277,7 +282,11 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 		NotesModel:    opts.NotesModel,
 		FindingsModel: opts.FindingsModel,
 		FlowMax:       opts.FlowMax,
-	}.Resolved()
+	}
+	if opts.EmbedHunks {
+		mapOpts.EmbedHunks = &config.EmbedHunksOptions{Enabled: true}
+	}
+	mapOpts = mapOpts.Resolved()
 	flow, err := reviewmap.FlowMap(diff, rng, mapOpts.FlowMax)
 	if err != nil {
 		return inv, stage, fmt.Errorf("map the changed definitions: %w", err)

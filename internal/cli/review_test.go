@@ -66,7 +66,7 @@ func TestReviewRunFlagMapsKnobs(t *testing.T) {
 	f, err := parseReviewRun(t,
 		"--base", "base", "--head", "head", "--method", "maps-session",
 		"--repo", "/tmp/checkout", "--model", "phase", "--notes-model", "notes",
-		"--findings-model", "findings", "--chunk-size", "7", "--flow-max", "9",
+		"--findings-model", "findings", "--chunk-size", "7", "--flow-max", "9", "--embed-hunks",
 		"--title", "Fix it", "--description-file", desc, "--json", "out.json")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -75,7 +75,7 @@ func TestReviewRunFlagMapsKnobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reviewRunOptions: %v", err)
 	}
-	if opts.Method != config.ReviewMethodMapsSession || opts.ChunkSize != 7 || opts.FlowMax != 9 {
+	if opts.Method != config.ReviewMethodMapsSession || opts.ChunkSize != 7 || opts.FlowMax != 9 || !opts.EmbedHunks {
 		t.Errorf("maps options = %+v, want the method and its knobs", opts)
 	}
 	if opts.NotesModel != "notes" || opts.FindingsModel != "findings" || opts.Model != "phase" {
@@ -117,6 +117,7 @@ func TestReviewRunFlagRefusals(t *testing.T) {
 		{"findings model on single", []string{"--base", "b", "--findings-model", "x"}, "--findings-model"},
 		{"chunk on single", []string{"--base", "b", "--chunk-size", "3"}, "--chunk-size"},
 		{"flow on single", []string{"--base", "b", "--flow-max", "3"}, "--flow-max"},
+		{"embed hunks on single", []string{"--base", "b", "--embed-hunks"}, "--embed-hunks"},
 		{"negative chunk", []string{"--base", "b", "--method", "maps-session", "--chunk-size", "-1"}, "must not be negative"},
 		{"negative flow", []string{"--base", "b", "--method", "maps-session", "--flow-max", "-1"}, "must not be negative"},
 	}
