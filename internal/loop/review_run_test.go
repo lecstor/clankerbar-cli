@@ -306,13 +306,90 @@ func TestRunReviewMapsSessionEmbedsHunks(t *testing.T) {
 				t.Fatalf("RunReview: %v", err)
 			}
 			hunk := "+\treturn x + 10"
-			if strings.Contains(got.Prompt, hunk) != embed {
-				t.Errorf("hunk %q in the first turn = %v, want %v:\n%s", hunk, !embed, embed, got.Prompt)
+			if gotHunk := strings.Contains(got.Prompt, hunk); gotHunk != embed {
+				t.Errorf("hunk %q in the first turn = %v, want %v:\n%s", hunk, gotHunk, embed, got.Prompt)
 			}
 			if report.EmbedHunks != embed {
 				t.Errorf("report.embed_hunks = %v, want %v", report.EmbedHunks, embed)
 			}
 		})
+	}
+}
+
+// TestRunReviewRefusesEmbedHunksOnSinglePass: the CLI refuses --embed-hunks with
+// single-pass, so the exported driver must refuse it too rather than run a
+// review that silently ignores the option.
+func TestRunReviewRefusesEmbedHunksOnSinglePass(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("sample.go", "package sample\n")
+	base := r.commit("base")
+	r.write("sample.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 1\n}\n")
+	r.commit("head")
+
+	_, err := RunReview(context.Background(), ReviewRunOptions{
+		Repo:       r.dir,
+		Base:       base,
+		Method:     config.ReviewMethodSinglePass,
+		Harness:    "opencode",
+		EmbedHunks: true,
+		cfg:        &config.Config{},
+		invoke: func(context.Context, harness.Invocation) (harness.Result, error) {
+			t.Fatal("must not spawn a session")
+			return harness.Result{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "embed hunks only applies") {
+		t.Fatalf("error = %v, want a refusal that names embed hunks", err)
+	}
+}
+
+// TestRunReviewEmbedHunksUsesDefaultBudget: --embed-hunks names no budgets, so
+// the per-item cap it runs under must be the resolved default rather than none.
+func TestRunReviewEmbedHunksUsesDefaultBudget(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("sample.go", "package sample\n")
+	base := r.commit("base")
+	var b strings.Builder
+	b.WriteString("package sample\n")
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&b, "var v%03d = %q\n", i, strings.Repeat("x", 52))
+	}
+	r.write("sample.go", b.String())
+	head := r.commit("head")
+
+	var got harness.Invocation
+	report, err := RunReview(context.Background(), ReviewRunOptions{
+		Repo:       r.dir,
+		Base:       base,
+		Head:       head,
+		Method:     config.ReviewMethodMapsSession,
+		Harness:    "opencode",
+		Model:      "test/model",
+		EmbedHunks: true,
+		cfg:        &config.Config{},
+		invoke: func(_ context.Context, inv harness.Invocation) (harness.Result, error) {
+			got = inv
+			messages := []string{}
+			for range inv.Turns {
+				messages = append(messages, "notes")
+			}
+			messages = append(messages, reviewRunDone(head, reviewRunMustFinding))
+			return harness.Result{TurnMessages: messages, FinalMessage: messages[len(messages)-1]}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunReview: %v", err)
+	}
+	if !report.EmbedHunks {
+		t.Fatalf("report.embed_hunks = false, want true")
+	}
+	marker := config.MapsSessionHunkTruncatedMarker(base, "sample.go", config.DefaultMapsSessionHunkBytesPerItem)
+	prompts := got.Prompt
+	for _, turn := range got.Turns {
+		prompts += "\n" + turn.Prompt
+	}
+	if !strings.Contains(prompts, marker) {
+		t.Fatalf("the prompts carry no per-item truncation marker, want %q", marker)
 	}
 }
 

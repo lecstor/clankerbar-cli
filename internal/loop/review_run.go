@@ -109,6 +109,9 @@ func RunReview(ctx context.Context, opts ReviewRunOptions) (*ReviewRunReport, er
 	if err != nil {
 		return nil, err
 	}
+	if opts.EmbedHunks && method != config.ReviewMethodMapsSession {
+		return nil, fmt.Errorf("embed hunks only applies to the %q method, and the method is %q: set it or drop the option", config.ReviewMethodMapsSession, method)
+	}
 	repo, err := reviewRunRepo(opts.Repo)
 	if err != nil {
 		return nil, err

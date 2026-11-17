@@ -645,8 +645,9 @@ The JSON document:
 ```
 
 For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead,
-and `embed_hunks` says whether the map items carried their hunks (always
-`false` for single-pass).
+and `embed_hunks` says whether hunk embedding was on (always `false` for
+single-pass); the budgets described above can still stop it part-way, and
+the items from that point carry no diff.
 `base` and `head` are the full commit SHAs git resolved, never the flag values.
 `findings` uses the review record's own shape (`severity`, `summary`,
 `evidenceKind`, `evidence`, `file`, `line`, `kind`, `requiredFix`), and
