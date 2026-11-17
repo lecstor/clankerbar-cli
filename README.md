@@ -75,10 +75,12 @@ against the merged tip before touching what it found: superseded means record
 the decision and park the task with an outcome saying so, or salvage only what
 still adds value - never verify-and-push stale work.
 
-The **`review`** phase starts on a **fresh context**, resumes the *same* run (the
-driver substitutes the task and run ids into its brief, so it calls `heartbeat`
-instead of claiming), re-reads the bar and the standing decisions from the
-plane, works in that same worktree — never on the integration branch itself —
+The **`review`** phase starts on a **fresh context** and resumes the *same* run
+without claiming: on the runner-claimed path the runner holds the lease and the
+session calls neither `claim_task` nor `heartbeat`; on the session-claimed path
+the brief substitutes the task and run ids and the session calls
+`heartbeat(runId)` instead. It re-reads the bar and the standing decisions from
+the plane, works in that same worktree — never on the integration branch itself —
 reads the diff and runs the adversarial review gate. It does **not** re-run the
 repo's gates: the implement phase self-verified at this tip and the fix and
 verify phases run them again over what they change, so a command here is only a
@@ -2799,8 +2801,9 @@ stack trace — and the MCP SDK names its own classes `StdioClientTransport` and
 `SSEClientTransport`, so a bare `transport` would read a dead MCP server (a config
 fault that must stop the run) as a network blip to retry.
 
-**Handing the task back.** A claim carries a 30-minute lease that the session
-heartbeats. When a session ends mid-task, that lease is left ticking with nobody
+**Handing the task back.** A claim carries a 30-minute lease that the driver
+renews from Go while the session runs, stopping when that session exits. A
+session that ends mid-task therefore leaves the lease ticking with nobody
 renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
 there are only two before the task is parked for a human. So the driver watches
 the session's stream for what it claimed, and hands the task straight back
