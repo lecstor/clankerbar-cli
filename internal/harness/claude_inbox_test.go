@@ -62,6 +62,9 @@ echo '{"type":"result","subtype":"success","result":"second done","usage":{}}'
 				Seq int64 `json:"seq"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			// A slow plane: the session ends while this ACK is in flight, and Invoke must
+			// not return before it lands. Keep it between Invoke's exit latency and requestTimeout.
+			time.Sleep(time.Second)
 			mu.Lock()
 			acks = append(acks, body.Seq)
 			mu.Unlock()

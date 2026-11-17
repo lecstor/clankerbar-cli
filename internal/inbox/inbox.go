@@ -266,9 +266,11 @@ func (p *Poller) Run(ctx context.Context, deliver func(Message) error) {
 			delivered = m.Seq
 			// Acknowledge the write NOW, not only on the next cycle: the session can end
 			// immediately after a steer (a final result), and a watermark left for the retry
-			// would re-offer this message to the next process. A failed ACK is harmless — the
+			// would re-offer this message to the next process. That same session end cancels
+			// ctx, so the ACK of bytes already written must not inherit the cancellation; the
+			// client's requestTimeout still bounds it. A failed ACK is harmless — the
 			// top-of-loop retry (and the next process) carries it.
-			if err := p.client.Ack(ctx, p.cfg.RunID, delivered); err != nil {
+			if err := p.client.Ack(context.WithoutCancel(ctx), p.cfg.RunID, delivered); err != nil {
 				p.log("inbox: could not acknowledge message #%d (will retry): %v", delivered, err)
 			} else {
 				acked = delivered
@@ -279,7 +281,7 @@ func (p *Poller) Run(ctx context.Context, deliver func(Message) error) {
 			// The run is closed: acknowledge what we wrote and stop. The session's own end
 			// closes stdin independently.
 			if delivered > acked {
-				_ = p.client.Ack(ctx, p.cfg.RunID, delivered)
+				_ = p.client.Ack(ctx, p.cfg.RunID, delivered) // a retry: cancellable, so shutdown waits on at most one ACK
 			}
 			return
 		}

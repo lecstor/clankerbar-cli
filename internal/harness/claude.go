@@ -263,14 +263,24 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			stopDelivery()
 		}
 	}
+	deliveryDone := make(chan struct{})
 	if inboxRunIDs != nil {
-		go runDelivery(deliveryCtx, console, *in.Inbox, input, inboxRunIDs)
+		go func() {
+			defer close(deliveryDone)
+			runDelivery(deliveryCtx, console, *in.Inbox, input, inboxRunIDs)
+		}()
+	} else {
+		close(deliveryDone)
 	}
 	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, cancel)
 	// The stream is over for us (EOF, a kill, or an unreadable line): close stdin so a child
 	// still waiting on it cannot hold Wait open past its own stream.
 	input.close()
 	stopDelivery()
+	// Join delivery so the ACK of a message written just before the session ended reaches the
+	// plane before we return. Polls and retry ACKs use the cancelled ctx and return at once;
+	// only that one ACK outlives it, bounded by inbox's requestTimeout.
+	<-deliveryDone
 	waitErr := cmd.Wait()
 
 	res.Stdout = stdoutTail.String()
