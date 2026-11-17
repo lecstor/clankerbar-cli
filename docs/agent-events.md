@@ -163,30 +163,40 @@ tier is a second opt-in.
 
 The channel's other direction (plane task CLA-606): an operator+ can send a message from a
 run's task page into the live session. The CLI polls `GET
-/api/runs/<runId>/inbox?after=<seq>` every 2 s with the run's own `clk_` credential, writes
-each unacknowledged message to the session's **stdin** as a user turn, and then ACKs the
-highest seq it wrote. The plane records the message as an `inbound_message` feed event, so
-the transcript shows the steering.
+/api/runs/<runId>/inbox?after=<seq>` every 2 s with the run's own `clk_` credential, delivers
+each unacknowledged message, and then ACKs the highest seq it delivered. The plane records the
+message as an `inbound_message` feed event, so the transcript shows the steering.
 
-- **Harness support is claude only in v1.** `claude -p --input-format stream-json` reads user
-  turns from stdin for the session's lifetime, so a message can arrive between turns. The
-  prompt is no longer an argv argument: it is the first stdin user message, and closing stdin
-  tells the CLI to finish the current turn and exit. `opencode`, `codex` and `copilot` have
-  **no delivery in v1** (`Capabilities.DeliversMessages` is false): they run one-shot prompts
-  with no equivalent input channel. An interactive session also receives nothing in v1; its
-  hook (CLA-605) only emits activity, and polling from a hook is the stated follow-up.
+- **Two adapters deliver, each the only way its CLI can take input.** `claude -p
+  --input-format stream-json` reads user turns from stdin for the session's lifetime, so a
+  message arrives between turns: the prompt is no longer an argv argument but the first stdin
+  user message, and closing stdin tells the CLI to finish the current turn and exit. opencode
+  has no stdin channel, so a message is steered into the live session through the private
+  `opencode serve` the adapter already runs for every non-probe session with a clankerbar MCP
+  server (CLA-911): `POST /api/session/<sessionID>/prompt` with `{"text": ..., "delivery":
+  "steer"}` and the server's basic auth. `steer`, not `queue`: a queued item waits for
+  execution to end, which in a headless run is the moment the process exits. A session with no
+  private server — a probe, or one whose config declares no clankerbar MCP server — receives
+  nothing, and its messages stay queued on the plane. `codex` and `copilot` have **no
+  delivery** (`Capabilities.DeliversMessages` is false): they run one-shot prompts with no
+  equivalent channel. An interactive session also receives nothing in v1; its hook (CLA-605)
+  only emits activity, and polling from a hook is the stated follow-up.
+- **A failed or slow poll cannot fail the session.** The poller is its own goroutine with a
+  per-request timeout; a plane outage is logged once per distinct failure and delivery
+  resumes. A message that could not be delivered (stdin closed, or opencode's server refusing
+  the prompt) stays queued on the plane. opencode's delivery target is the LIVE process: each
+  run, resurrection or turn continuation starts its own private server, the target is attached
+  to it for that process's lifetime, and a message arriving while no process is live waits
+  rather than being posted to a stopped server.
 - **The session's turn accounting keeps the old lifecycle.** Each user message written (the
   prompt included) is one outstanding turn; each `result` on the stream retires one. When the
   last one is retired and no message is outstanding, the adapter closes stdin and the CLI
   exits — exactly when the old `-p <prompt>` form did. A message delivered mid-turn is
   therefore processed as the next turn before the session ends.
-- **A failed or slow poll cannot fail the session.** The poller is its own goroutine with a
-  per-request timeout; a plane outage is logged once per distinct failure and delivery
-  resumes. A message that could not be written (stdin closed) stays queued on the plane.
-- **Exactly-once within the session.** The cursor advances only after a successful stdin
-  write, and a repeated `seq` is skipped. Across a restart the plane may re-offer a message
-  written but not ACKed (at-least-once at the transport); the ACK is sent immediately after
-  each write to keep that window small.
+- **Exactly-once within the session.** The cursor advances only after a successful delivery —
+  a stdin write, or a 2xx from opencode's prompt endpoint — and a repeated `seq` is skipped.
+  Across a restart the plane may re-offer a message delivered but not ACKed (at-least-once at
+  the transport); the ACK is sent immediately after each delivery to keep that window small.
 - **Wiring.** `SetInboxChannel(origin, apiKey)` uses the same trusted origin and account key
   as the event sender. The run id is observed from `claim_task` mid-session (or seeded from
   the resumed claim), because the session claims inside itself.

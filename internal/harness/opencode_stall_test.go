@@ -301,7 +301,7 @@ printf '%s\n%s\n' '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"to
 
 	rec := &failWriter{}
 	res := opencodeParsed(stallClaimEvent + "\n" + outputCapStallLine)
-	(opencode{}).resumeOutputCapStall(context.Background(), Invocation{Prompt: "Work.", Console: rec}, &res, time.Time{})
+	(opencode{}).resumeOutputCapStall(context.Background(), Invocation{Prompt: "Work.", Console: rec}, &res, time.Time{}, nil)
 
 	// Precondition: the resume must really have taken the ERROR arm, or this
 	// test would pass through mergeResume without exercising the fold at all.
@@ -345,7 +345,7 @@ echo '`+outputCapStallLine+`'
 	cancel()
 	console := &bytes.Buffer{}
 	res := opencodeParsed(stallClaimEvent + "\n" + outputCapStallLine)
-	(opencode{}).resumeOutputCapStall(ctx, Invocation{Prompt: "Work.", Console: console}, &res, time.Time{})
+	(opencode{}).resumeOutputCapStall(ctx, Invocation{Prompt: "Work.", Console: console}, &res, time.Time{}, nil)
 
 	if data, err := os.ReadFile(logPath); err == nil && strings.TrimSpace(string(data)) != "" {
 		t.Errorf("a cancelled run must not spawn a resume; the stub ran:\n%s", data)

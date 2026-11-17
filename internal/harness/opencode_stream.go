@@ -17,7 +17,12 @@ import (
 // the original session — same env, same permission policy, same capture — and
 // merge the results, rather than maintaining a second code path that would
 // drift the first time either half changed.
-func (o opencode) runSession(ctx context.Context, in Invocation, args []string) (Result, error) {
+//
+// delivery is this Invocation's console -> agent channel, or nil when the
+// adapter is not delivering messages (see opencode_inbox.go). A process with a
+// private server attaches it for the life of the process, so a message is only
+// ever posted to the server that is actually running.
+func (o opencode) runSession(ctx context.Context, in Invocation, args []string, delivery *opencodeInbox) (Result, error) {
 
 	// The per-session wall-clock cap, enforced on the exec context so the kill
 	// needs nothing from the stream: opencode reports no turn count and takes no
@@ -90,6 +95,15 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 			defer srv.stop()
 			if err := srv.waitForMCP(sctx, names, workDir); err != nil {
 				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			// The delivery target is this process's own server. Attach AFTER
+			// the MCP preflight so the target is live only for a session whose
+			// tools are actually there, and defer the detach behind srv.stop's
+			// own defer: LIFO runs detach FIRST, so the target is cleared
+			// before the server is killed.
+			if delivery != nil {
+				delivery.attach(srv)
+				defer delivery.detach(srv)
 			}
 			runArgs = withOpencodeServer(args, srv.url)
 			// The run must authenticate to the server the adapter started,
@@ -186,6 +200,9 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	p := newOpencodeParse(in, console)
 	defer p.closeEvents()
 	p.kill = loopKill
+	// The parser is where the session id first appears; it hands the id to the
+	// delivery target (see line).
+	p.inbox = delivery
 	// The no-output watchdog, on the same cancellation the tool-loop kill uses.
 	// Armed after p.kill so its callback has the kill switch; a probe leaves it
 	// disabled.
@@ -452,6 +469,10 @@ type opencodeParse struct {
 	// past, so anything written into it during the stream would be discarded.
 	observed Result
 	console  io.Writer
+	// inbox is where this session's console -> agent target is announced, or
+	// nil when the adapter is not delivering messages (see opencode_inbox.go).
+	// Set by runSession after the parser is built.
+	inbox *opencodeInbox
 	// settledCalls is the tool parts already acted on (by partID), so a
 	// re-delivered terminal event cannot rebuild a claim that a later call has
 	// since settled.
@@ -566,9 +587,13 @@ func (p *opencodeParse) line(line []byte) {
 	}
 	// Every event names its session; the first one seen wins (they all agree
 	// within a run). Taken before the Part check, because an error event carries
-	// no part and can be the only event a failed run emits.
+	// no part and can be the only event a failed run emits. The delivery target
+	// needs this id before it can post anything, so it is told as it arrives.
 	if p.sessionID == "" && ev.SessionID != "" {
 		p.sessionID = ev.SessionID
+		if p.inbox != nil {
+			p.inbox.setSession(p.sessionID)
+		}
 	}
 	if ev.Type == "error" && ev.Error != nil && ev.Error.Type != "" {
 		p.errorType = ev.Error.Type

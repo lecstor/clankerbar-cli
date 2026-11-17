@@ -43,7 +43,7 @@ func (o opencode) interruptResumeSkipped(ctx context.Context, in Invocation, res
 // resumeInterrupted resumes a session that exited 130 silently, ONCE, on the
 // route it already ran: the resume exists to surface the error the stream
 // missed (a quota error), which the route switch then judges on evidence.
-func (o opencode) resumeInterrupted(ctx context.Context, in Invocation, res *Result, deadline time.Time) {
+func (o opencode) resumeInterrupted(ctx context.Context, in Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) {
 	if o.interruptResumeSkipped(ctx, in, res) {
 		return
 	}
@@ -66,7 +66,7 @@ func (o opencode) resumeInterrupted(ctx context.Context, in Invocation, res *Res
 	if !deadline.IsZero() {
 		contIn.MaxSessionWallClock = time.Until(deadline)
 	}
-	contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, interruptResumePrompt))
+	contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, interruptResumePrompt), delivery)
 	if contErr != nil {
 		// Spend first, even on the error path: a resume re-sends the transcript.
 		res.Tokens += contRes.Tokens

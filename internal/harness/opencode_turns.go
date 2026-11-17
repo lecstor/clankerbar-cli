@@ -30,14 +30,14 @@ import (
 // turn running the invocation's route list first follows the existing
 // switchRoutesOnLimit rules. The first turn that fails a guard stops the
 // sequence: Result.TurnStopped names it and no later turn runs.
-func (o opencode) runTurns(ctx context.Context, in Invocation, res *Result, deadline time.Time) (Invocation, bool, error) {
+func (o opencode) runTurns(ctx context.Context, in Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) (Invocation, bool, error) {
 	res.TurnMessages = nil
 
 	// Turn 1 is a non-final turn whenever a follow-up follows it, so its end is
 	// judged on exactly the terms a later turn's would be. Its message is
 	// recorded AFTER that judgement: a route switch on this turn is a
 	// continuation of it, so the switched answer is the turn's message.
-	base, reason, err := o.afterNonFinalTurn(ctx, in, in, res, deadline)
+	base, reason, err := o.afterNonFinalTurn(ctx, in, in, res, deadline, delivery)
 	res.TurnMessages = append(res.TurnMessages, res.FinalMessage)
 	if err != nil || reason != "" {
 		o.stopTurns(in, res, 1, reason)
@@ -69,7 +69,7 @@ func (o opencode) runTurns(ctx context.Context, in Invocation, res *Result, dead
 		// continuation emits none, which would make an empty turn report its
 		// predecessor's answer as its own.
 		res.FinalMessage = ""
-		turnRes, err := o.runSession(ctx, turnIn, opencodeResumeArgs(turnIn, sid, turn.Prompt))
+		turnRes, err := o.runSession(ctx, turnIn, opencodeResumeArgs(turnIn, sid, turn.Prompt), delivery)
 		if err != nil {
 			chargeTurn(res, turnRes)
 			res.FinalMessage = turnRes.FinalMessage
@@ -88,7 +88,7 @@ func (o opencode) runTurns(ctx context.Context, in Invocation, res *Result, dead
 			res.TurnMessages = append(res.TurnMessages, res.FinalMessage)
 			return turnIn, true, nil
 		}
-		base, reason, err = o.afterNonFinalTurn(ctx, turnIn, base, res, deadline)
+		base, reason, err = o.afterNonFinalTurn(ctx, turnIn, base, res, deadline, delivery)
 		res.TurnMessages = append(res.TurnMessages, res.FinalMessage)
 		if err != nil || reason != "" {
 			o.stopTurns(in, res, turnNo, reason)
@@ -109,9 +109,9 @@ func (o opencode) runTurns(ctx context.Context, in Invocation, res *Result, dead
 // swapped. Only a turn that ran the invocation's route list advances base onto
 // the route that finished it. Every other bad end is resumeSkippedReason's
 // decision, named with its own vocabulary.
-func (o opencode) afterNonFinalTurn(ctx context.Context, turnIn, base Invocation, res *Result, deadline time.Time) (Invocation, string, error) {
+func (o opencode) afterNonFinalTurn(ctx context.Context, turnIn, base Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) (Invocation, string, error) {
 	if o.DetectLimit(*res).Limited && res.Untrusted == "" {
-		if err := o.switchRoutesOnLimit(ctx, turnIn, turnIn.RouteList(), res, deadline); err != nil {
+		if err := o.switchRoutesOnLimit(ctx, turnIn, turnIn.RouteList(), res, deadline, delivery); err != nil {
 			return base, "run_error", err
 		}
 		if o.DetectLimit(*res).Limited {
