@@ -115,9 +115,11 @@ func noteClaudeToolResult(sink events.Sink, toolUseID string, isError bool, cont
 		return
 	}
 	text := toolResultText(content)
-	if path, ok := persistedOutputPath(text, toolUseID); ok {
-		if b, err := readSpilled(path); err == nil {
-			text = toolResultText(json.RawMessage(b))
+	if !drop {
+		if path, ok := persistedOutputPath(text, toolUseID); ok {
+			if b, err := readSpilled(path); err == nil {
+				text = toolResultText(json.RawMessage(b))
+			}
 		}
 	}
 	sink.ToolResult(toolUseID, !isError, text, drop)

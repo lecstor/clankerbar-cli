@@ -1098,3 +1098,32 @@ func TestEmitterTranscriptAddAndCloseNeverBlock(t *testing.T) {
 		t.Fatalf("Close blocked for %s", elapsed)
 	}
 }
+
+func TestToolResultWireShapeDistinguishesEmptyFromWithheld(t *testing.T) {
+	// The plane requires outputBytes always and `redacted:true` whenever output
+	// is absent, so an empty-but-present output must NOT be omitted: an omitted
+	// one reads as a redaction that never happened and refuses the whole batch.
+	empty := event{kind: TypeToolResult, callID: "c1", output: "", outputBytes: 0}
+	raw, err := empty.marshal(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"output":""`) {
+		t.Fatalf("an empty output was omitted: %s", raw)
+	}
+	if strings.Contains(string(raw), `"redacted"`) {
+		t.Fatalf("an empty output was marked redacted: %s", raw)
+	}
+
+	withheld := event{kind: TypeToolResult, callID: "c1", dropOutput: true, redacted: true, outputBytes: 9}
+	raw, err = withheld.marshal(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"output"`) {
+		t.Fatalf("a withheld output was sent: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"redacted":true`) || !strings.Contains(string(raw), `"outputBytes":9`) {
+		t.Fatalf("a withheld output lacks its markers: %s", raw)
+	}
+}

@@ -158,22 +158,6 @@ is the served setup skill's
   loop and never surfaced to the session.
 - `Close` attempts one final bounded flush (2 s grace) and then stops.
 
-### The transcript tier's 50 MB run cap
-
-The plane is the authority on volume: a run's transcript prefix stops at
-**50 MB**, and the first event that would cross it is dropped while the plane
-appends a `run_cap` `marker` to the feed. Markers are **plane-sourced** (a
-`feedSeq`, no emitter `seq`) — a harness never emits one, and the CLI does not
-try to.
-
-The CLI's half of the cooperation is the ACK: every ingest response carries
-`dropped: { transcript: N }`, which is non-zero when the cap stopped the tier
-(or when a stale emitter sent transcript events with the dial off). On the first
-non-zero count the emitter **stops the transcript tier for that run**: queued
-transcript events are dropped, later ones are refused before they are buffered,
-and one log line says so. Activity keeps flowing — a runaway run degrades, it
-never bills unbounded.
-
 Sequence numbers are per **run**, from 1, and are the plane's idempotency key:
 the plane drops any event whose `seq` is at or below the run's high-water mark.
 A phased task runs several sessions on the same run id — and a review panel's
@@ -192,6 +176,22 @@ members run in parallel — so:
   completes, and the plane then drops the older batch as a duplicate. Its
   events are lost, though nothing is ever doubled; closing that gap needs the
   plane's dedupe to stop being a single high-water mark.
+
+### The transcript tier's 50 MB run cap
+
+The plane is the authority on volume: a run's transcript prefix stops at
+**50 MB**, and the first event that would cross it is dropped while the plane
+appends a `run_cap` `marker` to the feed. Markers are **plane-sourced** (a
+`feedSeq`, no emitter `seq`) — a harness never emits one, and the CLI does not
+try to.
+
+The CLI's half of the cooperation is the ACK: every ingest response carries
+`dropped: { transcript: N }`, which is non-zero when the cap stopped the tier
+(or when a stale emitter sent transcript events with the dial off). On the first
+non-zero count the emitter **stops the transcript tier for that run**: queued
+transcript events are dropped, later ones are refused before they are buffered,
+and one log line says so. Activity keeps flowing — a runaway run degrades, it
+never bills unbounded.
 
 ## Redaction
 

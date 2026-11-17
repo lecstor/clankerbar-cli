@@ -799,12 +799,17 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.kill()
 	}
 	name := opencodeClankerbarTool(part.Tool)
+	transcript := p.observed.events != nil && p.observed.events.TranscriptEnabled()
+	// The `.env*` verdict is transcript-only; computing it once keeps the
+	// spilled output from being re-read only to be withheld.
+	dropOutput := transcript && envReadTarget(part.Tool, toolTarget(part.Tool, st.Input))
 	// The result is rehydrated when EITHER consumer needs it: the clankerbar
 	// observation (a claim refused inside a spilled payload) and the transcript
-	// tier (the model saw the output, not the pointer). One read serves both.
-	transcript := p.observed.events != nil && p.observed.events.TranscriptEnabled()
+	// tier (the model saw the output, not the pointer). One read serves both. A
+	// `.env*` read is the exception: its output is withheld, so it is never
+	// pulled into memory for a byte count.
 	rehydrated, rehydratedOK := "", false
-	if name != "" || transcript {
+	if name != "" || (transcript && !dropOutput) {
 		var err error
 		if rehydrated, rehydratedOK, err = opencodeTruncatedOutput(st, p.toolOutputDir); err != nil {
 			// Fail safe: the envelope goes on as the result, which no consumer can
