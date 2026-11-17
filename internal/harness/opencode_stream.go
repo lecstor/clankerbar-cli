@@ -652,6 +652,8 @@ func (p *opencodeParse) line(line []byte) {
 		if t := strings.TrimSpace(ev.Part.Text); t != "" {
 			p.lastText = t
 		}
+		// Transcript tier (CLA-887): one event per text part.
+		noteOpencodeAssistantText(p.observed.events, ev.Part.Text)
 	case "step_finish":
 		// CLA-900: the step window is CLOSED above, before the Part check. A
 		// step_finish must never OPEN one: it is published after the step's tools
@@ -797,6 +799,32 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.kill()
 	}
 	name := opencodeClankerbarTool(part.Tool)
+	// The result is rehydrated when EITHER consumer needs it: the clankerbar
+	// observation (a claim refused inside a spilled payload) and the transcript
+	// tier (the model saw the output, not the pointer). One read serves both.
+	transcript := p.observed.events != nil && p.observed.events.TranscriptEnabled()
+	rehydrated, rehydratedOK := "", false
+	if name != "" || transcript {
+		var err error
+		if rehydrated, rehydratedOK, err = opencodeTruncatedOutput(st, p.toolOutputDir); err != nil {
+			// Fail safe: the envelope goes on as the result, which no consumer can
+			// parse, so a claim is NOT tracked - the same outcome as any unreadable
+			// claim result, with the reason said first.
+			fmt.Fprintf(p.diag(), "  · %s result was truncated by opencode and could not be read back: %v\n", part.Tool, err)
+		}
+	}
+	if transcript {
+		// Transcript tier (CLA-887): the status is the ok flag, and the error
+		// text stands in for the output on a failed call.
+		output := st.Output
+		if st.Status == "error" {
+			output = st.Error
+		}
+		if rehydratedOK {
+			output = rehydrated
+		}
+		noteOpencodeToolResult(p.observed.events, part.Tool, part.ID, st.Input, st.Status != "error", output)
+	}
 	if name == "" {
 		return
 	}
@@ -808,13 +836,8 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	// swallowed rather than returned on purpose: bailing here would strand the
 	// delivery Report noteToolUse just armed, unresolved and silently dropped.
 	output := st.Output
-	if full, ok, err := opencodeTruncatedOutput(st, p.toolOutputDir); err != nil {
-		// Fail safe: the envelope goes on as the result, which no consumer can
-		// parse, so a claim is NOT tracked - the same outcome as any unreadable
-		// claim result, with the reason said first.
-		fmt.Fprintf(p.diag(), "  · %s result was truncated by opencode and could not be read back: %v\n", part.Tool, err)
-	} else if ok {
-		output = full
+	if rehydratedOK {
+		output = rehydrated
 	}
 	content, _ := json.Marshal(output)
 	noteToolResult(&p.observed, part.ID, st.Status == "error", content, p.diag())

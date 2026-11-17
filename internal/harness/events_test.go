@@ -15,10 +15,14 @@ import (
 )
 
 // recSink records the normalizer's calls, so the mapping table is asserted
-// without an HTTP hop.
+// without an HTTP hop. transcript mirrors the emitter's dial: the transcript
+// methods record only while it is on, exactly as the real sink sends only then.
 type recSink struct {
-	calls []string
-	todos [][]events.TodoItem
+	calls      []string
+	todos      [][]events.TodoItem
+	transcript bool
+	results    []string
+	texts      []string
 }
 
 func (s *recSink) ToolCall(tool, callID, target string) {
@@ -31,7 +35,20 @@ func (s *recSink) TodoChange(todos []events.TodoItem) {
 	s.todos = append(s.todos, todos)
 	s.calls = append(s.calls, "todo_change")
 }
-func (s *recSink) SetRunID(string) {}
+func (s *recSink) ToolResult(callID string, ok bool, output string, dropOutput bool) {
+	if !s.transcript {
+		return
+	}
+	s.results = append(s.results, fmt.Sprintf("tool_result|%s|%v|%s|%v", callID, ok, output, dropOutput))
+}
+func (s *recSink) AssistantText(text string) {
+	if !s.transcript {
+		return
+	}
+	s.texts = append(s.texts, text)
+}
+func (s *recSink) SetRunID(string)         {}
+func (s *recSink) TranscriptEnabled() bool { return s.transcript }
 
 func raw(s string) json.RawMessage { return json.RawMessage(s) }
 

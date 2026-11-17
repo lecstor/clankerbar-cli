@@ -7,11 +7,10 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/events"
 )
 
-// The per-harness normalizers for the agent event channel's activity tier
-// (CLA-603): tool_call, todo_change and clankerbar_mcp_call. tool_result and
-// assistant_text are the transcript follow-up's. codex and copilot are not
-// mapped in v1 — their Capabilities report EmitsEvents false — and the design
-// table is docs/agent-events.md.
+// The per-harness normalizers for the agent event channel (CLA-603, transcript
+// tier CLA-887): tool_call, todo_change, clankerbar_mcp_call, tool_result and
+// assistant_text. codex and copilot are not mapped in v1 — their Capabilities
+// report EmitsEvents false — and the design table is docs/agent-events.md.
 //
 // The one shared rule: a target is ONE extracted string per tool shape, never
 // the raw input JSON.
@@ -70,6 +69,102 @@ func noteOpencodeToolEvent(sink events.Sink, tool, callID string, input json.Raw
 	default:
 		sink.ToolCall(tool, callID, toolTarget(tool, input))
 	}
+}
+
+// noteClaudeAssistantText maps one claude `assistant` text block onto the
+// transcript tier. A whitespace-only block is NOT an event: it is the stream's
+// framing, not something the model said.
+func noteClaudeAssistantText(sink events.Sink, text string) {
+	if sink == nil || strings.TrimSpace(text) == "" {
+		return
+	}
+	sink.AssistantText(text)
+}
+
+// noteOpencodeAssistantText is the opencode half: one `text` part is one block.
+func noteOpencodeAssistantText(sink events.Sink, text string) {
+	if sink == nil || strings.TrimSpace(text) == "" {
+		return
+	}
+	sink.AssistantText(text)
+}
+
+// noteOpencodeToolResult maps one TERMINAL opencode tool part onto the
+// transcript tier. opencode delivers the arguments and the result together, so
+// this needs no correlation state. output is `state.output`, or the error text
+// when the harness marked the call failed; a `.env*` read's output is withheld
+// (see envReadTarget).
+func noteOpencodeToolResult(sink events.Sink, tool, callID string, input json.RawMessage, ok bool, output string) {
+	if sink == nil || !sink.TranscriptEnabled() || tool == "" || callID == "" {
+		return
+	}
+	sink.ToolResult(callID, ok, output, envReadTarget(tool, toolTarget(tool, input)))
+}
+
+// noteClaudeToolResult maps one claude `user`/tool_result block onto the
+// transcript tier. The stream reports a result on a LATER event than the call,
+// which is why the `.env*` decision was recorded against the call id at
+// tool_use time (Result.noteEnvRead).
+//
+// A result Claude Code spilled to a file is rehydrated before sending — the
+// model saw the output, not the pointer, and the transcript is a record of the
+// session. The path is honoured under persistedOutputPath's own guard; if the
+// read fails, the envelope text is what we have and is sent.
+func noteClaudeToolResult(res *Result, toolUseID string, isError bool, content json.RawMessage) {
+	if res == nil || res.events == nil || toolUseID == "" {
+		return
+	}
+	drop := res.takeEnvRead(toolUseID)
+	if !res.events.TranscriptEnabled() {
+		return
+	}
+	text := toolResultText(content)
+	if path, ok := persistedOutputPath(text, toolUseID); ok {
+		if b, err := readSpilled(path); err == nil {
+			text = toolResultText(json.RawMessage(b))
+		}
+	}
+	res.events.ToolResult(toolUseID, !isError, text, drop)
+}
+
+// noteEnvRead records that a claude call read a `.env*` path, so the transcript
+// tier withholds its output when the result arrives. Only remembered while the
+// tier is on: it is transcript-only state, and the map is dropped entry-by-entry
+// as results land.
+func (r *Result) noteEnvRead(tool, callID string, input json.RawMessage) {
+	if r == nil || r.events == nil || callID == "" || !r.events.TranscriptEnabled() {
+		return
+	}
+	if !envReadTarget(tool, toolTarget(tool, input)) {
+		return
+	}
+	if r.envReadCalls == nil {
+		r.envReadCalls = map[string]bool{}
+	}
+	r.envReadCalls[callID] = true
+}
+
+// takeEnvRead returns and forgets the `.env*` verdict for a call.
+func (r *Result) takeEnvRead(callID string) bool {
+	drop := r.envReadCalls[callID]
+	delete(r.envReadCalls, callID)
+	return drop
+}
+
+// envReadTarget reports whether a call is a READ of a `.env*` path, whose output
+// the design note says must be dropped entirely. The family is deliberately
+// limited to read-shaped tools: the verdict is taken from the call's extracted
+// target (a path), not from parsing a shell command, and a Bash `cat .env` is
+// the activity dial's residue, not something this rule can see.
+func envReadTarget(tool, target string) bool {
+	if !strings.EqualFold(tool, "read") {
+		return false
+	}
+	base := strings.TrimSpace(target)
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	return strings.HasPrefix(base, ".env")
 }
 
 // todoItemsFromInput reads the whole-list snapshot from a todo tool's input.

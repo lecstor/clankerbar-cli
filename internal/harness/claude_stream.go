@@ -168,10 +168,17 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				if s := strings.TrimSpace(b.Text); s != "" {
 					fmt.Fprintln(console, s)
 				}
+				// Transcript tier (CLA-887): one event per text block, unmerged
+				// and un-trimmed. The sink is off-safe, and the mapping skips a
+				// whitespace-only block.
+				noteClaudeAssistantText(res.events, b.Text)
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)
 				NoteClaudeToolEvent(res.events, b.Name, b.ID, b.Input)
+				// The `.env*` rule needs the ARGUMENTS, and claude reports the
+				// result on a later event that carries only the id — decide now.
+				res.noteEnvRead(b.Name, b.ID, b.Input)
 				res.noteToolName(b.ID, b.Name)
 				res.idle.toolStarted(b.ID)
 			}
@@ -200,6 +207,9 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				continue
 			}
 			noteToolResult(res, b.ToolUseID, b.IsError, b.Content, console)
+			// Transcript tier (CLA-887): the output itself, or its `.env*`
+			// redaction verdict, before the clankerbar observation consumes it.
+			noteClaudeToolResult(res, b.ToolUseID, b.IsError, b.Content)
 			res.idle.toolFinished(b.ToolUseID)
 			// CLA-739: every tool, not only clankerbar's - a loop on any tool
 			// re-sends the context just the same. The error text is only read

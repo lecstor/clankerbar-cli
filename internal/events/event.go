@@ -1,14 +1,16 @@
-// Package events is the CLI's half of the agent event channel (CLA-603): the
-// activity-tier wire schema from docs/proposals/agent-event-channel.md (the
-// plane's repository), CLI-side redaction, and the batched sender that posts to
-// the plane's per-run ingest endpoint.
+// Package events is the CLI's half of the agent event channel (CLA-603,
+// transcript tier CLA-887): the wire schema from
+// docs/proposals/agent-event-channel.md (the plane's repository), CLI-side
+// redaction, and the batched sender that posts to the plane's per-run ingest
+// endpoint.
 //
-// The contract this package serves is deliberately narrow. The activity tier
-// carries tool names, one identifying string per call, and todo snapshots — no
-// tool output and no assistant text. Redaction runs BEFORE truncation and BEFORE
-// anything leaves the machine, and it is best effort, not a guarantee: that is
-// why the project's dials are the privacy boundary and this is only the second
-// line.
+// Two tiers share one sender. The ACTIVITY tier carries tool names, one
+// identifying string per call, and todo snapshots — no tool output and no
+// assistant text. The TRANSCRIPT tier is a second, separate opt-in and adds a
+// completed call's output and each assistant text block, both capped at 64 KB
+// per event. Redaction runs BEFORE truncation and BEFORE anything leaves the
+// machine, and it is best effort, not a guarantee: that is why the project's
+// dials are the privacy boundary and this is only the second line.
 //
 // Sending is off the session's critical path. Callers hand events to an Emitter,
 // which never blocks them: it buffers within a bound, a goroutine batches and
@@ -21,11 +23,15 @@ import (
 	"time"
 )
 
-// The activity-tier event types (CLA-601's schema).
+// The channel's event types (CLA-601's schema). The first three are the activity
+// tier; the last two are the transcript tier and are sent only while its dial is
+// on.
 const (
 	TypeToolCall          = "tool_call"
 	TypeTodoChange        = "todo_change"
 	TypeClankerbarMcpCall = "clankerbar_mcp_call"
+	TypeToolResult        = "tool_result"
+	TypeAssistantText     = "assistant_text"
 )
 
 // Wire caps from the design note. They are duplicated here because the CLI must
@@ -40,6 +46,12 @@ const (
 	MaxTodos            = 50
 	MaxToolBytes        = 128
 	MaxCallIDBytes      = 256
+
+	// MaxTranscriptBytes is the transcript tier's per-event cap on `output` and
+	// `text`. It is the R2 copy's cap AND the emitter's wire cap: no layer keeps
+	// more, one event always fits a batch, and `outputBytes` / `textBytes` make
+	// the loss explicit rather than silent.
+	MaxTranscriptBytes = 64 << 10
 
 	// MaxBatchEvents / MaxBatchBytes are the flush caps: whichever is reached
 	// first. The body cap is the plane's whole-body limit, so one event that
@@ -96,6 +108,37 @@ type TodoChangeEvent struct {
 	Redacted  bool       `json:"redacted,omitempty"`
 }
 
+// ToolResultEvent is one completed tool call's output — TRANSCRIPT TIER ONLY.
+// It is the counterpart of a ToolCallEvent, joined by CallID.
+//
+// Output is a POINTER so an empty-but-present output encodes as `"output":""`.
+// The plane requires the key unless the output was withheld by redaction, and
+// an omitted empty output would read as a redaction that never happened.
+type ToolResultEvent struct {
+	Seq         uint64  `json:"seq"`
+	At          string  `json:"at"`
+	Type        string  `json:"type"`
+	CallID      string  `json:"callId"`
+	OK          bool    `json:"ok"`
+	Output      *string `json:"output,omitempty"`
+	OutputBytes int     `json:"outputBytes"`
+	Truncated   bool    `json:"truncated,omitempty"`
+	Redacted    bool    `json:"redacted,omitempty"`
+}
+
+// AssistantTextEvent is one assistant text block — TRANSCRIPT TIER ONLY.
+// Consecutive blocks are not merged: a viewer that wants paragraphs can join
+// them, and merging would make the stored feed ranges lie about the source.
+type AssistantTextEvent struct {
+	Seq       uint64 `json:"seq"`
+	At        string `json:"at"`
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	TextBytes int    `json:"textBytes"`
+	Truncated bool   `json:"truncated,omitempty"`
+	Redacted  bool   `json:"redacted,omitempty"`
+}
+
 // batch is the request body the plane's POST /api/runs/<runId>/events accepts.
 type batch struct {
 	Harness string            `json:"harness"`
@@ -113,6 +156,22 @@ type event struct {
 	todos     []TodoItem
 	truncated bool
 	redacted  bool
+
+	// Transcript tier. outputBytes/textBytes are the ORIGINAL lengths measured
+	// before truncation (after redaction, so the difference from len(output) /
+	// len(text) means exactly "bytes were cut"). dropOutput is the `.env*` read
+	// rule: the output is withheld entirely and the event carries no output.
+	ok          bool
+	output      string
+	outputBytes int
+	text        string
+	textBytes   int
+	dropOutput  bool
+}
+
+// transcript reports whether this event belongs to the transcript tier.
+func (e event) transcript() bool {
+	return e.kind == TypeToolResult || e.kind == TypeAssistantText
 }
 
 // wire renders the event with its per-run sequence number, in the exact shape
@@ -136,6 +195,24 @@ func (e event) wire(seq uint64) any {
 			Seq: seq, At: e.at, Type: e.kind,
 			Todos: e.todos, Truncated: e.truncated, Redacted: e.redacted,
 		}
+	case TypeToolResult:
+		out := ToolResultEvent{
+			Seq: seq, At: e.at, Type: e.kind,
+			CallID: e.callID, OK: e.ok,
+			OutputBytes: e.outputBytes,
+			Truncated:   e.truncated, Redacted: e.redacted,
+		}
+		if !e.dropOutput {
+			output := e.output
+			out.Output = &output
+		}
+		return out
+	case TypeAssistantText:
+		return AssistantTextEvent{
+			Seq: seq, At: e.at, Type: e.kind,
+			Text: e.text, TextBytes: e.textBytes,
+			Truncated: e.truncated, Redacted: e.redacted,
+		}
 	}
 	return nil
 }
@@ -147,7 +224,7 @@ func (e event) approxBytes() int {
 	for _, t := range e.todos {
 		n += len(t.Content) + len(t.Status) + 24
 	}
-	return n
+	return n + len(e.output) + len(e.text) + 48
 }
 
 // marshal is json.Marshal for the tests and the batcher; an event always

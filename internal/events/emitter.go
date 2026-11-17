@@ -35,6 +35,13 @@ type Config struct {
 	// Harness is the batch's `harness` field: "claude" or "opencode".
 	Harness string
 
+	// Transcript is the project's `events.transcript` dial. False — its zero
+	// value — makes the transcript-tier methods no-ops, so an adapter calls them
+	// unconditionally and the activity tier is unaffected. `events.transcript`
+	// is only ever on beside `events.activity` (the plane refuses the pair
+	// otherwise), which is why this flag does not gate the activity methods.
+	Transcript bool
+
 	// Seq is the per-run sequence counter. Nil builds a process-local one.
 	Seq *SeqCounter
 
@@ -93,7 +100,22 @@ type Sink interface {
 	ToolCall(tool, callID, target string)
 	TodoChange(todos []TodoItem)
 	ClankerbarMcpCall(tool, callID, target string)
+
+	// ToolResult records one completed tool call's output (transcript tier).
+	// dropOutput means the output must not leave the machine at all — a `.env*`
+	// read — and the event then carries redacted:true and no output.
+	ToolResult(callID string, ok bool, output string, dropOutput bool)
+
+	// AssistantText records one assistant text block (transcript tier).
+	AssistantText(text string)
+
 	SetRunID(runID string)
+
+	// TranscriptEnabled reports whether transcript-tier events are being sent
+	// right now: the dial is on, and the plane has not stopped the tier for this
+	// run. Adapters check it before doing transcript-only work (re-reading a
+	// spilled tool result, say) that would otherwise be discarded.
+	TranscriptEnabled() bool
 }
 
 var _ Sink = (*Emitter)(nil)
@@ -115,6 +137,12 @@ type Emitter struct {
 	dropped     int
 	dropNoted   bool
 	failures    int
+
+	// transcriptStopped is set for good when the plane reports that transcript
+	// events were dropped: the 50 MB per-run cap was hit, or the project's
+	// transcript dial is off. Activity keeps flowing — the cap is the tier's
+	// only, and a runaway run must degrade rather than bill unbounded.
+	transcriptStopped bool
 
 	wake     chan struct{}
 	done     chan struct{}
@@ -241,6 +269,103 @@ func validTodoStatus(s string) bool {
 	return s == "pending" || s == "in_progress" || s == "completed"
 }
 
+// ToolResult records one completed tool call's output (transcript tier).
+// callID joins it to the activity tier's tool_call. output is the flattened
+// result text; dropOutput withholds it entirely — a `.env*` read — and the
+// event then says `redacted: true` and carries no output at all.
+//
+// The order is the design note's: redact the FULL string, then truncate to the
+// 64 KB wire cap. outputBytes is measured between the two (after redaction,
+// before truncation), so `outputBytes > len(output)` means exactly "bytes were
+// cut" and nothing else is being claimed.
+func (e *Emitter) ToolResult(callID string, ok bool, output string, dropOutput bool) {
+	if e == nil || !e.TranscriptEnabled() {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" || len(callID) > MaxCallIDBytes {
+		// The plane refuses an over-cap identifier with the WHOLE batch; a
+		// transcript event is never worth that.
+		e.drop()
+		return
+	}
+	ev := event{kind: TypeToolResult, at: e.timestamp(), callID: callID, ok: ok}
+	if dropOutput {
+		ev.dropOutput = true
+		ev.redacted = true
+		ev.outputBytes = len(output)
+	} else {
+		redactedText, redacted := Redact(output)
+		cut, truncated := truncateUTF8(redactedText, MaxTranscriptBytes)
+		ev.output = cut
+		ev.outputBytes = len(redactedText)
+		ev.redacted = redacted
+		ev.truncated = truncated
+	}
+	e.enqueue(ev)
+}
+
+// AssistantText records one assistant text block (transcript tier). Consecutive
+// blocks are separate events; the redact-then-truncate order and the textBytes
+// rule are ToolResult's.
+func (e *Emitter) AssistantText(text string) {
+	if e == nil || !e.TranscriptEnabled() {
+		return
+	}
+	redactedText, redacted := Redact(text)
+	cut, truncated := truncateUTF8(redactedText, MaxTranscriptBytes)
+	e.enqueue(event{
+		kind: TypeAssistantText, at: e.timestamp(), text: cut,
+		textBytes: len(redactedText), redacted: redacted, truncated: truncated,
+	})
+}
+
+// TranscriptEnabled reports whether transcript-tier events are being sent right
+// now: the dial is on, the run's channel is alive, and the plane has not stopped
+// the tier. Nil-safe, like every other Sink method.
+func (e *Emitter) TranscriptEnabled() bool {
+	if e == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg.Transcript && !e.transcriptStopped && !e.disabled && !e.stopped
+}
+
+// stopTranscript ends this run's transcript tier for this emitter's lifetime:
+// queued transcript events are dropped and later ones are refused at enqueue.
+// Activity is untouched.
+//
+// The plane has already appended the feed's `run_cap` marker itself — markers
+// are plane-sourced, never emitted by a harness — and reports the dropped count
+// on the batch's ACK. This is the CLI's half of the cooperation: stop paying to
+// send what the plane will refuse, and say so once.
+func (e *Emitter) stopTranscript(dropped int) {
+	e.mu.Lock()
+	if e.transcriptStopped {
+		e.mu.Unlock()
+		return
+	}
+	e.transcriptStopped = true
+	kept := e.pending[:0]
+	for _, q := range e.pending {
+		if q.transcript() {
+			dropped++
+			continue
+		}
+		kept = append(kept, q)
+	}
+	e.pending = kept
+	e.approxBytes = 0
+	for _, q := range e.pending {
+		e.approxBytes += q.approxBytes()
+	}
+	e.mu.Unlock()
+	if e.cfg.Logf != nil {
+		e.cfg.Logf("agent events: the plane stopped this run's transcript tier (%d transcript event(s) dropped — the 50 MB run cap or the transcript dial) — activity continues", dropped)
+	}
+}
+
 // identifiersOK enforces the plane's identifier caps by dropping the event
 // rather than sending it to be refused: a cut callId cannot join a call to its
 // result, and an over-cap tool name is a mapping bug, not prose.
@@ -262,13 +387,20 @@ func (e *Emitter) enqueue(ev event) {
 		e.mu.Unlock()
 		return
 	}
+	// A transcript event can lose the race with the plane's stop (the check in
+	// ToolResult ran just before the ACK landed). Refuse it here too, or it
+	// would be sent once more to be refused again.
+	if ev.transcript() && e.transcriptStopped {
+		e.mu.Unlock()
+		return
+	}
 	if len(e.pending) >= e.cfg.MaxBuffered {
 		e.dropped++
 		note := !e.dropNoted
 		e.dropNoted = true
 		e.mu.Unlock()
 		if note && e.cfg.Logf != nil {
-			e.cfg.Logf("agent events: buffer full (%d events) — dropping further activity events for this session", e.cfg.MaxBuffered)
+			e.cfg.Logf("agent events: buffer full (%d events) — dropping further events for this session", e.cfg.MaxBuffered)
 		}
 		return
 	}
@@ -357,6 +489,12 @@ func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 		res := e.send(sentRun, body, timeout)
 		e.cfg.Seq.Commit(sentRun, maxSeq)
 		unlock()
+		if res.transcriptDropped > 0 {
+			// The plane hit the run's 50 MB transcript cap (or the project's
+			// transcript dial is off) and appended its own `run_cap` marker.
+			// Stop the tier here; activity in this and later batches continues.
+			e.stopTranscript(res.transcriptDropped)
+		}
 		if res.stop {
 			e.disable()
 			return
@@ -371,12 +509,15 @@ func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 
 // sendResult is one batch send's outcome. retryable marks a rate limit: the
 // batch is worth re-sending once the plane's budget refills. stop means this
-// run's channel is closed for good.
+// run's channel is closed for good. transcriptDropped is how many transcript
+// events the plane discarded in this batch — the 50 MB run cap, or the tier's
+// dial being off — and non-zero means the tier is over for this run.
 type sendResult struct {
-	err        error
-	stop       bool
-	retryable  bool
-	retryAfter time.Duration
+	err               error
+	stop              bool
+	retryable         bool
+	retryAfter        time.Duration
+	transcriptDropped int
 }
 
 // send posts one batch, retrying a rate limit a bounded number of times. The
@@ -529,7 +670,17 @@ func (e *Emitter) post(runID string, body []byte, timeout time.Duration) sendRes
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	msg := strings.TrimSpace(string(detail))
 	if resp.StatusCode == http.StatusOK {
-		return sendResult{}
+		// The ACK's dropped counts are how a stale emitter (or one that has
+		// crossed the run's 50 MB transcript cap) learns to stop the tier. A
+		// body that does not parse means "nothing was reported": the batch was
+		// accepted, and the next one will tell us if there is a stop to make.
+		var ack struct {
+			Dropped struct {
+				Transcript int `json:"transcript"`
+			} `json:"dropped"`
+		}
+		_ = json.Unmarshal(detail, &ack)
+		return sendResult{transcriptDropped: ack.Dropped.Transcript}
 	}
 	switch {
 	case resp.StatusCode == http.StatusForbidden && strings.Contains(msg, "events_disabled"):
@@ -636,13 +787,13 @@ func (e *Emitter) Close() {
 		e.mu.Unlock()
 		if orphaned > 0 && e.cfg.Logf != nil {
 			if noRun {
-				e.cfg.Logf("agent events: dropped %d activity event(s) — this session never claimed a run", orphaned)
+				e.cfg.Logf("agent events: dropped %d event(s) — this session never claimed a run", orphaned)
 			} else {
-				e.cfg.Logf("agent events: %d activity event(s) were still unsent when the session ended", orphaned)
+				e.cfg.Logf("agent events: %d event(s) were still unsent when the session ended", orphaned)
 			}
 		}
 		if dropped > 0 && e.cfg.Logf != nil {
-			e.cfg.Logf("agent events: %d activity event(s) were dropped this session (buffer full or unsendable)", dropped)
+			e.cfg.Logf("agent events: %d event(s) were dropped this session (buffer full or unsendable)", dropped)
 		}
 	})
 }
