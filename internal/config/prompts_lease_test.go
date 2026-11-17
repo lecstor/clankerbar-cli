@@ -15,21 +15,21 @@ import (
 // const: an edit to the const that no one decided the wording of fails here.
 func TestSessionClaimedBriefsCarryTheDriverLeaseRenewal(t *testing.T) {
 	briefs := map[string]string{
-		"implement":                     builtinPhasePrompts[ImplementPhaseName],
-		"review (final)":                builtinPhasePrompts[ReviewPhaseName],
-		"review (no-code)":              noCodeReviewBrief,
-		"review (unverified)":           unverifiedReviewBrief,
-		"review-only":                   reviewOnlyBrief,
-		"review-only (panel member)":    panelMemberReviewOnlyBrief,
-		"review-only (panel unverify)":  panelMemberUnverifiedReviewOnlyBrief,
-		"review-only (unverified)":      unverifiedReviewOnlyBrief,
-		"review-only (no-code)":         noCodeReviewOnlyBrief,
-		"fix":                           fixBrief,
-		"fix (verify follows)":          fixVerifyBrief,
-		"fix (no-code)":                 noCodeFixBrief,
-		"fix (no-code, verify follows)": noCodeFixVerifyBrief,
-		"verify":                        verifyBrief,
-		"verify (no-code)":              noCodeVerifyBrief,
+		"implement":                      builtinPhasePrompts[ImplementPhaseName],
+		"review (final)":                 builtinPhasePrompts[ReviewPhaseName],
+		"review (no-code)":               noCodeReviewBrief,
+		"review (unverified)":            unverifiedReviewBrief,
+		"review-only":                    reviewOnlyBrief,
+		"review-only (panel member)":     panelMemberReviewOnlyBrief,
+		"review-only (panel unverified)": panelMemberUnverifiedReviewOnlyBrief,
+		"review-only (unverified)":       unverifiedReviewOnlyBrief,
+		"review-only (no-code)":          noCodeReviewOnlyBrief,
+		"fix":                            fixBrief,
+		"fix (verify follows)":           fixVerifyBrief,
+		"fix (no-code)":                  noCodeFixBrief,
+		"fix (no-code, verify follows)":  noCodeFixVerifyBrief,
+		"verify":                         verifyBrief,
+		"verify (no-code)":               noCodeVerifyBrief,
 	}
 
 	const renewal = "The driver renews the run's lease from Go every third of the lease while this session " +
@@ -47,20 +47,20 @@ func TestSessionClaimedBriefsCarryTheDriverLeaseRenewal(t *testing.T) {
 // a later edit cannot keep the prohibition and drop the way back in.
 func TestResumedSessionClaimedBriefsKeepTheResumeHeartbeat(t *testing.T) {
 	briefs := map[string]string{
-		"review (final)":                builtinPhasePrompts[ReviewPhaseName],
-		"review (no-code)":              noCodeReviewBrief,
-		"review (unverified)":           unverifiedReviewBrief,
-		"review-only":                   reviewOnlyBrief,
-		"review-only (panel member)":    panelMemberReviewOnlyBrief,
-		"review-only (panel unverify)":  panelMemberUnverifiedReviewOnlyBrief,
-		"review-only (unverified)":      unverifiedReviewOnlyBrief,
-		"review-only (no-code)":         noCodeReviewOnlyBrief,
-		"fix":                           fixBrief,
-		"fix (verify follows)":          fixVerifyBrief,
-		"fix (no-code)":                 noCodeFixBrief,
-		"fix (no-code, verify follows)": noCodeFixVerifyBrief,
-		"verify":                        verifyBrief,
-		"verify (no-code)":              noCodeVerifyBrief,
+		"review (final)":                 builtinPhasePrompts[ReviewPhaseName],
+		"review (no-code)":               noCodeReviewBrief,
+		"review (unverified)":            unverifiedReviewBrief,
+		"review-only":                    reviewOnlyBrief,
+		"review-only (panel member)":     panelMemberReviewOnlyBrief,
+		"review-only (panel unverified)": panelMemberUnverifiedReviewOnlyBrief,
+		"review-only (unverified)":       unverifiedReviewOnlyBrief,
+		"review-only (no-code)":          noCodeReviewOnlyBrief,
+		"fix":                            fixBrief,
+		"fix (verify follows)":           fixVerifyBrief,
+		"fix (no-code)":                  noCodeFixBrief,
+		"fix (no-code, verify follows)":  noCodeFixVerifyBrief,
+		"verify":                         verifyBrief,
+		"verify (no-code)":               noCodeVerifyBrief,
 	}
 
 	const (
