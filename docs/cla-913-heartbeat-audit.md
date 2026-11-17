@@ -75,9 +75,10 @@ fetched `https://clankerbar.com/skills/clankerbar.md`, whose diagram says
 ## Answer
 
 Current runner-claimed sessions do **not** heartbeat themselves: their briefs
-(`internal/config/prompts_runner.go`: `runnerForbidden`, `runnerResumeNoClaim`)
-say "do NOT call heartbeat - the lease is the runner's", and every sampled run
-from 2026-11-13 onward confirms it.
+(`internal/config/prompts_runner.go`) tell the session to leave the lease to the
+runner — `runnerResumeNoClaim` says "do NOT call heartbeat - the lease is the
+runner's" and `runnerForbidden` says "do NOT call heartbeat (the lease is the
+runner's)" — and every sampled run from 2026-11-13 onward confirms it.
 
 The last session-claimed runs (2026-11-12, before the runner took over) **did**
 issue one self-issued renewal each, while the driver's `leaseRenewer`
