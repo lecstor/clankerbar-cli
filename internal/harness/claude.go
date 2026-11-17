@@ -76,8 +76,14 @@ func newSessionResult(in Invocation) Result {
 // asserted directly: a flag that silently stops being emitted is invisible to
 // every other test, and one of these is a dependency on an UNDOCUMENTED flag
 // (see claudeMaxTurnsReason), where a version bump is exactly how it would go.
+//
+// The prompt is NOT an argument (CLA-606). `--input-format stream-json` makes the CLI read
+// user turns from stdin for the session's lifetime, which is what lets a console message
+// become the session's next turn. The old `-p <prompt>` form could not accept one. The
+// prompt is written as the first stream-json user message by Invoke; closing stdin tells the
+// CLI to finish the current turn and exit, which is how the session ends.
 func claudeArgs(in Invocation) []string {
-	args := []string{"-p", in.Prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"}
+	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}
@@ -127,6 +133,40 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// switch the ceiling needs — see consume.
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	deliveryCtx, stopDelivery := context.WithCancel(sctx)
+	defer stopDelivery()
+
+	// Console -> agent delivery (CLA-606). The RUN id is not known at spawn for a fresh
+	// claim — the session claims inside itself — so the adapter learns it from ResumeClaim
+	// (a resumed phase) or the OnClaim watcher, exactly as the lease renewer does. The
+	// watcher is wrapped, never replaced: the driver's own callback still fires.
+	var inboxRunIDs chan string
+	if in.Inbox != nil {
+		// A small buffer, not 1: a settle re-notifies the SAME run and a session may claim
+		// again immediately, so the queue must hold the next run while the current poller
+		// finishes. Duplicates are filtered below, not queued.
+		inboxRunIDs = make(chan string, 8)
+		if in.ResumeClaim.RunID != "" {
+			inboxRunIDs <- in.ResumeClaim.RunID
+		}
+		lastRunID := in.ResumeClaim.RunID
+		origOnClaim := in.OnClaim
+		in.OnClaim = func(c Claim) {
+			// A settle fires this callback with the run id unchanged; only a NEW run is a
+			// delivery target. Never block: this runs on the parser goroutine.
+			if c.RunID != "" && c.RunID != lastRunID {
+				lastRunID = c.RunID
+				select {
+				case inboxRunIDs <- c.RunID:
+				default: // pathological churn; the newest claim will start the next poller
+				}
+			}
+			if origOnClaim != nil {
+				origOnClaim(c)
+			}
+		}
+	}
+
 	cmd, err := sessionCommand(sctx, in.Nice, "claude", claudeArgs(in)...)
 	if err != nil {
 		return Result{}, err
@@ -189,11 +229,22 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return Result{}, err
+	}
 	stderrTail := newTail()
 	cmd.Stderr = io.MultiWriter(stderrTail, console) // surface errors live too
 
 	if err := cmd.Start(); err != nil {
 		return Result{}, err
+	}
+	input := newSessionInput(stdinPipe)
+	defer input.close()
+	// The prompt is the first user turn. A write failure here is reported, not fatal: the
+	// child may have exited on a bad flag, and Wait's exit status is the better verdict.
+	if err := input.writeUser(in.Prompt); err != nil {
+		fmt.Fprintf(console, "!! could not write the prompt to claude's stream-json stdin: %v\n", err)
 	}
 
 	// Stream stdout line-by-line: parse each event as it arrives, render readable
@@ -203,7 +254,33 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	stdoutTail := newTail()
 	res := newSessionResult(in)
 	defer res.closeEvents()
+	// A result retires one outstanding user turn; the LAST one closes stdin so the CLI exits.
+	// This is installed even with no console channel: stream-json input stays open until its
+	// stream closes, so without it every session would finish its turn and then wait for
+	// stdin forever. It is what preserves the old `-p <prompt>` lifecycle.
+	res.onTurnEnd = func() {
+		if input.endTurn() {
+			stopDelivery()
+		}
+	}
+	deliveryDone := make(chan struct{})
+	if inboxRunIDs != nil {
+		go func() {
+			defer close(deliveryDone)
+			runDelivery(deliveryCtx, console, *in.Inbox, input, inboxRunIDs)
+		}()
+	} else {
+		close(deliveryDone)
+	}
 	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, cancel)
+	// The stream is over for us (EOF, a kill, or an unreadable line): close stdin so a child
+	// still waiting on it cannot hold Wait open past its own stream.
+	input.close()
+	stopDelivery()
+	// Join delivery so the ACK of a message written just before the session ended reaches the
+	// plane before we return. Polls and retry ACKs use the cancelled ctx and return at once;
+	// only that one ACK outlives it, bounded by inbox's requestTimeout.
+	<-deliveryDone
 	waitErr := cmd.Wait()
 
 	res.Stdout = stdoutTail.String()
@@ -1071,7 +1148,7 @@ func (r *Result) markCeilingHit() {
 // opencode does too as of CLA-365; codex still does not. See
 // Capabilities.TracksClaims.
 func (claude) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true, EmitsEvents: true}
+	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true, EmitsEvents: true, DeliversMessages: true}
 }
 
 // Diagnostic returns the same CLI-authored text IsTransient judged, so a caller

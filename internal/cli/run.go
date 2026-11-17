@@ -184,6 +184,7 @@ func Run(ctx context.Context, args []string) error {
 		}
 		drv := loop.NewMulti(cfg, adapter, targets)
 		drv.SetEventChannel(cfg.CredentialOrigin(), apiKey)
+		drv.SetInboxChannel(cfg.CredentialOrigin(), apiKey)
 		return runDriver(ctx, drv, f.cfgPath, overrides)
 	}
 
@@ -205,6 +206,9 @@ func Run(ctx context.Context, args []string) error {
 	// account key every other plane write uses. The dial is per project and read
 	// from the effective run config; this only makes the channel possible.
 	drv.SetEventChannel(cfg.CredentialOrigin(), apiKey)
+	// Console -> agent delivery (CLA-606) shares that origin and key; the adapter
+	// capability decides which harnesses can receive.
+	drv.SetInboxChannel(cfg.CredentialOrigin(), apiKey)
 	return runDriver(ctx, drv, f.cfgPath, overrides)
 }
 

@@ -477,6 +477,12 @@ type Driver struct {
 	eventKey    string
 	eventSeq    *events.SeqCounter
 
+	// The console -> agent message channel's wiring (CLA-606): the trusted plane
+	// origin and the same account key. Set by SetInboxChannel; empty = no
+	// delivery, which is every driver built without it.
+	inboxOrigin string
+	inboxKey    string
+
 	// startRefusals counts consecutive worktree refusals per task id, so a tree
 	// that refuses every claim deterministically reaches the operator instead of
 	// the queue. Lazily built for a Driver built without the constructor.

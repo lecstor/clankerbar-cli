@@ -214,6 +214,11 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		}
 	case "result":
 		res.FinalMessage = ev.Result
+		// The turn this user message started is over. The claude adapter uses this to retire
+		// one outstanding stdin turn (CLA-606); every other adapter leaves it nil.
+		if res.onTurnEnd != nil {
+			res.onTurnEnd()
+		}
 		// The session's DOLLARS arrive here and nowhere else, so the flag that says
 		// "a cost figure was seen" (CLA-691) is set here too: a session killed
 		// before this event reported tokens but no money, and the durable record
