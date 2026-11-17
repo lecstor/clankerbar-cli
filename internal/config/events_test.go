@@ -62,6 +62,17 @@ func TestRunConfigEventsEmptyDocumentAlsoFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRunConfigEventsTranscriptAppliesBesideActivity(t *testing.T) {
+	base := defaults()
+	doc := &RunConfigDoc{SchemaVersion: 1, Events: &RunConfigEvents{Activity: true, Transcript: true}}
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if !base.Events.Activity || !base.Events.Transcript {
+		t.Fatalf("events = %+v, want both dials on", base.Events)
+	}
+}
+
 func TestRunConfigEventsTranscriptWithoutActivityFailsClosed(t *testing.T) {
 	// The plane refuses this at save time. A document that still carries it (a
 	// hand-edited store) must not leak the full tier.

@@ -75,10 +75,12 @@ against the merged tip before touching what it found: superseded means record
 the decision and park the task with an outcome saying so, or salvage only what
 still adds value - never verify-and-push stale work.
 
-The **`review`** phase starts on a **fresh context**, resumes the *same* run (the
-driver substitutes the task and run ids into its brief, so it calls `heartbeat`
-instead of claiming), re-reads the bar and the standing decisions from the
-plane, works in that same worktree — never on the integration branch itself —
+The **`review`** phase starts on a **fresh context** and resumes the *same* run
+without claiming: on the runner-claimed path the runner holds the lease and the
+session calls neither `claim_task` nor `heartbeat`; on the session-claimed path
+the brief substitutes the task and run ids and the session calls
+`heartbeat(runId)` instead. It re-reads the bar and the standing decisions from
+the plane, works in that same worktree — never on the integration branch itself —
 reads the diff and runs the adversarial review gate. It does **not** re-run the
 repo's gates: the implement phase self-verified at this tip and the fix and
 verify phases run them again over what they change, so a command here is only a
@@ -556,9 +558,7 @@ stripping the prefix yields a marker the done-report parser accepts. With
 `enabled: false` (or no `embed_hunks` key at all) the items are byte for byte
 what the method produced before.
 
-`clankerbar review run` (CLA-870) does not exist in this build yet; when it
-lands it should expose `embed_hunks` as a flag, since that command's whole
-point is a one-off review profile.
+`clankerbar review run` exposes it as `--embed-hunks` (default budgets).
 
 **Two requirements, both refused rather than degraded.** The method applies to
 the review-only gate — the built-in `review` phase with a phase after it —
@@ -615,16 +615,13 @@ Flags: `--repo` (default `.`), `--base` (required), `--head` (default `HEAD`),
 `--method` (`single-pass` or its `single` shorthand, the default, or
 `maps-session`), `--harness` (default `opencode`; maps-session needs a harness
 that can continue one session), `--model`, and for maps-session
-`--notes-model`, `--findings-model`, `--chunk-size` (default 25) and
-`--flow-max` (default 40). `--title` and `--description-file` give the reviewer
-the context a task body would otherwise carry. The maps knobs are refused with
+`--notes-model`, `--findings-model`, `--chunk-size` (default 25),
+`--flow-max` (default 40) and `--embed-hunks` (each map item carries its hunk,
+as `maps_session.embed_hunks` with the default budgets). `--title` and
+`--description-file` give the reviewer the context a task body would otherwise
+carry. The maps knobs are refused with
 `--method single-pass` rather than silently ignored. `--json <file>` writes the
 report to a file; without it the JSON goes to stdout and human lines to stderr.
-
-`--embed-hunks` is **not accepted yet**: the embedded-hunk map lands with
-CLA-871 (`maps_session.embed_hunks`), so passing it today fails as an unknown
-flag. An eval harness should leave it out until that method option is in the
-build rather than passing a flag this command would have to fake.
 
 The JSON document:
 
@@ -633,6 +630,7 @@ The JSON document:
   "base": "<resolved base commit>",
   "head": "<resolved head commit>",
   "method": "single-pass | maps-session",
+  "embed_hunks": false,
   "models": { "review": "..." },
   "findings": [ { "severity": "must", "summary": "...", "file": "...", "line": 1 } ],
   "omitted": 0,
@@ -646,7 +644,10 @@ The JSON document:
 }
 ```
 
-For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead.
+For maps-session `models` is `{ "notes": "...", "findings": "..." }` instead,
+and `embed_hunks` says whether hunk embedding was on (always `false` for
+single-pass); the budgets described above can still stop it part-way, and
+the items from that point carry no diff.
 `base` and `head` are the full commit SHAs git resolved, never the flag values.
 `findings` uses the review record's own shape (`severity`, `summary`,
 `evidenceKind`, `evidence`, `file`, `line`, `kind`, `requiredFix`), and
@@ -2607,8 +2608,10 @@ one that sets none) share this file's budget as one instance-wide pool.
 A project's `events.activity` dial (off by default, set by operator+) turns on
 the **agent activity channel**: the daemon streams each session's tool calls,
 their one identifying argument and its todo snapshots to the plane, redacted on
-this machine before anything leaves it. It sends no tool output and no assistant
-text in this release. This machine can refuse the channel with `--no-events` on
+this machine before anything leaves it. A second dial, `events.transcript` (only
+valid beside activity), adds a completed call's output and each assistant text
+block, capped at 64 KB per event; the plane stops that tier at 50 MB per run and
+activity continues. This machine can refuse the channel with `--no-events` on
 `clankerbar run` / `clankerbar supervise`, or with `CLANKERBAR_EVENTS=off`; no
 local signal can turn it on. See [`docs/agent-events.md`](./docs/agent-events.md).
 
@@ -2799,8 +2802,9 @@ stack trace — and the MCP SDK names its own classes `StdioClientTransport` and
 `SSEClientTransport`, so a bare `transport` would read a dead MCP server (a config
 fault that must stop the run) as a network blip to retry.
 
-**Handing the task back.** A claim carries a 30-minute lease that the session
-heartbeats. When a session ends mid-task, that lease is left ticking with nobody
+**Handing the task back.** A claim carries a 30-minute lease that the driver
+renews from Go while the session runs, stopping when that session exits. A
+session that ends mid-task therefore leaves the lease ticking with nobody
 renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
 there are only two before the task is parked for a human. So the driver watches
 the session's stream for what it claimed, and hands the task straight back
@@ -3067,7 +3071,7 @@ the catch-all matches last, denying every read.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 - [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
-- [`docs/agent-events.md`](./docs/agent-events.md) - the agent activity channel the CLI feeds: what the claude and opencode adapters emit, the project dial and the machine-local opt-out, batching, sequence numbering and CLI-side redaction.
+- [`docs/agent-events.md`](./docs/agent-events.md) - the agent event channel the CLI feeds: what the claude and opencode adapters emit in the activity and transcript tiers, the project dials and the machine-local opt-out, batching, sequence numbering, the 50 MB transcript cap and CLI-side redaction.
 
 ## License
 

@@ -45,7 +45,7 @@ const routeFallbackPrompt = "The previous model route hit a usage limit. " +
 //
 // A runSession error on a next route is returned after its spend is charged: a
 // launch failure is the driver's failure to act on, not a limit to hide.
-func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes []string, res *Result, deadline time.Time) error {
+func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes []string, res *Result, deadline time.Time, delivery *opencodeInbox) error {
 	if len(routes) < 2 {
 		return nil
 	}
@@ -95,7 +95,7 @@ func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes
 		if !deadline.IsZero() {
 			contIn.MaxSessionWallClock = time.Until(deadline)
 		}
-		contRes, err := o.runSession(ctx, contIn, opencodeResumeArgs(contIn, sid, routeFallbackPrompt))
+		contRes, err := o.runSession(ctx, contIn, opencodeResumeArgs(contIn, sid, routeFallbackPrompt), delivery)
 		fallbacks = append(fallbacks, RouteFallback{Route: current, Next: to, Reason: lim.Reason, ResetAt: lim.ResetAt})
 		if err != nil {
 			// Charge a continuation that failed to start before reporting the

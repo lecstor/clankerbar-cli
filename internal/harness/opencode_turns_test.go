@@ -614,7 +614,7 @@ func TestOpencodeRunTurnsStopsWhenTheWallClockIsSpent(t *testing.T) {
 	}
 	console := &strings.Builder{}
 	in.Console = console
-	_, completed, err := (opencode{}).runTurns(context.Background(), in, &res, time.Now())
+	_, completed, err := (opencode{}).runTurns(context.Background(), in, &res, time.Now(), nil)
 	if err != nil {
 		t.Fatalf("runTurns: %v", err)
 	}

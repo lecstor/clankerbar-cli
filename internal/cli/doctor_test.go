@@ -3230,8 +3230,11 @@ func TestOpencodeMCPDisablesCheck(t *testing.T) {
 	}
 	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), MCPConfigPath: mcp}
 	got := checkOpencodeMCPDisables(cfg)
+	// `mcp.clankerbar`, not the bare word: TMPDIR contains the project's name
+	// (clankerbar-tmp), so a bare "clankerbar" assertion fails on a machine whose
+	// temp dir lives under it.
 	if len(got) != 1 || got[0].status != warn || !strings.Contains(got[0].detail, "mcp.context7") ||
-		!strings.Contains(got[0].detail, "mcp.servers.chrome") || strings.Contains(got[0].detail, "clankerbar") {
+		!strings.Contains(got[0].detail, "mcp.servers.chrome") || strings.Contains(got[0].detail, "mcp.clankerbar") {
 		t.Fatalf("got %+v", got)
 	}
 	if !strings.Contains(got[0].remedy, `"type"`) {

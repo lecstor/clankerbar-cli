@@ -20,7 +20,7 @@ var builtinPhasePrompts = map[string]string{
 		implementResumedBranchRule +
 		implementCommitEarlyRule +
 		" Unless you parked above or served a close-out above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
-		"record_progress(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
+		"record_progress(taskId, runId, branch)." + driverRenewsLease + " Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
 
@@ -28,7 +28,8 @@ var builtinPhasePrompts = map[string]string{
 		"branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin " +
 		"remote with its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that " +
 		"run, not starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
-		PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the " +
+		PhaseRunPlaceholder + "\") to resume the run." + driverRenewsLease + resumeHeartbeatStays +
+		" Then get_task with includeDecisions: true to re-read the " +
 		"bar and the standing decisions. An empty branch field on the task is a FAILED hand-off to report, not " +
 		"work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
 		" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is " +

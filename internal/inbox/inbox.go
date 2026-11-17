@@ -2,10 +2,10 @@
 //
 // The plane never holds a socket into a session. A message is stored for the run and the
 // CLI polls `GET /api/runs/<runId>/inbox?after=<seq>` every 2 s with the run's own `clk_`
-// credential; each unacknowledged message is written to the session's stdin, then the
-// highest written seq is acknowledged so it is not offered again. The poll is a separate
-// goroutine by construction: a slow or failed poll can only delay a message, never the
-// session.
+// credential; each unacknowledged message is handed to the harness's own delivery channel
+// (claude's stdin, opencode's session API), then the highest delivered seq is acknowledged
+// so it is not offered again. The poll is a separate goroutine by construction: a slow or
+// failed poll can only delay a message, never the session.
 package inbox
 
 import (
@@ -206,8 +206,8 @@ func NewPoller(cfg Config) *Poller {
 }
 
 // Run polls until ctx is cancelled, the run ends, or deliver refuses a message. `deliver`
-// must write the message to the session's stdin and may block; a nil error means it was
-// written and may be acknowledged.
+// must put the message into the live session on the harness's own channel and may block; a
+// nil error means it landed and may be acknowledged.
 //
 // Delivery is at-least-once at the transport (a message written but not acked is offered
 // again after a restart) and exactly-once within this run loop: the cursor advances only
@@ -257,19 +257,19 @@ func (p *Poller) Run(ctx context.Context, deliver func(Message) error) {
 
 		for _, m := range page.Messages {
 			if m.Seq <= delivered {
-				continue // already written in this session
+				continue // already delivered in this session
 			}
 			if err := deliver(m); err != nil {
-				p.log("inbox: message #%d was not written (%v); it stays queued for the next process", m.Seq, err)
+				p.log("inbox: message #%d was not delivered (%v); it stays queued and is retried", m.Seq, err)
 				return
 			}
 			delivered = m.Seq
-			// Acknowledge the write NOW, not only on the next cycle: the session can end
+			// Acknowledge the delivery NOW, not only on the next cycle: the session can end
 			// immediately after a steer (a final result), and a watermark left for the retry
 			// would re-offer this message to the next process. That same session end cancels
-			// ctx, so the ACK of bytes already written must not inherit the cancellation; the
-			// client's requestTimeout still bounds it. A failed ACK is harmless — the
-			// top-of-loop retry (and the next process) carries it.
+			// ctx, so the ACK of a message already delivered must not inherit the
+			// cancellation; the client's requestTimeout still bounds it. A failed ACK is
+			// harmless — the top-of-loop retry (and the next process) carries it.
 			if err := p.client.Ack(context.WithoutCancel(ctx), p.cfg.RunID, delivered); err != nil {
 				p.log("inbox: could not acknowledge message #%d (will retry): %v", delivered, err)
 			} else {
@@ -278,8 +278,8 @@ func (p *Poller) Run(ctx context.Context, deliver func(Message) error) {
 		}
 
 		if page.Ended {
-			// The run is closed: acknowledge what we wrote and stop. The session's own end
-			// closes stdin independently.
+			// The run is closed: acknowledge what we delivered and stop. The session's own
+			// end is separate and ends delivery through its context.
 			if delivered > acked {
 				_ = p.client.Ack(ctx, p.cfg.RunID, delivered) // a retry: cancellable, so shutdown waits on at most one ACK
 			}

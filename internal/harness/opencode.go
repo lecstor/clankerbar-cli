@@ -90,6 +90,39 @@ func (opencode) MCPConfigUse() MCPConfigUse {
 // cap bounds the whole loop; after it, the last Result falls through to the
 // driver's existing dead-phase path unchanged.
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	// Console -> agent delivery (CLA-911). The RUN id is not known at spawn for
+	// a fresh claim — the session claims inside itself — so the adapter learns it
+	// from ResumeClaim (a resumed phase) or the OnClaim watcher, exactly as
+	// claude does. One delivery target serves the WHOLE Invoke: a resurrection or
+	// a turn continuation is the same session, and each process attaches its own
+	// private server to it.
+	var delivery *opencodeInbox
+	if in.Inbox != nil && !in.Probe {
+		runIDs := make(chan string, 8)
+		if in.ResumeClaim.RunID != "" {
+			runIDs <- in.ResumeClaim.RunID
+		}
+		lastRunID := in.ResumeClaim.RunID
+		origOnClaim := in.OnClaim
+		in.OnClaim = func(c Claim) {
+			// A settle fires this callback with the run id unchanged; only a NEW
+			// run is a delivery target. Never block: this runs on the parser
+			// goroutine.
+			if c.RunID != "" && c.RunID != lastRunID {
+				lastRunID = c.RunID
+				select {
+				case runIDs <- c.RunID:
+				default: // pathological churn; the newest claim will start the next poller
+				}
+			}
+			if origOnClaim != nil {
+				origOnClaim(c)
+			}
+		}
+		delivery = newOpencodeInbox(ctx, in.Console, *in.Inbox, runIDs)
+		defer delivery.close()
+	}
+
 	// The wall-clock cap bounds the WHOLE Invoke, not each process: the
 	// deadline is computed BEFORE the first run so the original run's time
 	// counts against the budget the continuations inherit. Computing it after
@@ -99,7 +132,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.MaxSessionWallClock > 0 {
 		deadline = time.Now().Add(in.MaxSessionWallClock)
 	}
-	res, err := o.runSession(ctx, in, opencodeArgs(in))
+	res, err := o.runSession(ctx, in, opencodeArgs(in), delivery)
 	if err != nil {
 		return res, err
 	}
@@ -115,7 +148,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// invocation: everything below judges the turn that actually ended the
 		// session, never the first one's model or route list.
 		var completed bool
-		in, completed, err = o.runTurns(ctx, in, &res, deadline)
+		in, completed, err = o.runTurns(ctx, in, &res, deadline, delivery)
 		if err != nil {
 			return res, err
 		}
@@ -139,18 +172,18 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// quiet-death loop so a stall resume that then dies quietly still gets
 	// CLA-406's probe on its own terms.
 	if o.OutputCapNoOutput(res) {
-		o.resumeOutputCapStall(ctx, in, &res, deadline)
+		o.resumeOutputCapStall(ctx, in, &res, deadline, delivery)
 	}
 	// A silent 130 gets one resume before the route switch, so a quota error
 	// the resume surfaces is switched on evidence rather than a guess.
-	o.resumeInterrupted(ctx, in, &res, deadline)
+	o.resumeInterrupted(ctx, in, &res, deadline, delivery)
 	// CLA-782: a usage limit on one model route is not the end of the session
 	// when the config named a fallback. Runs BEFORE the resurrection loop (a
 	// switch resumes the same session, and a later quiet death then resurrects on
 	// the route that was working), never on a probe, and leaves a limit on the
 	// last route untouched for the driver's existing limit branch.
 	if !in.Probe {
-		if err := o.switchRoutesOnLimit(ctx, in, in.RouteList(), &res, deadline); err != nil {
+		if err := o.switchRoutesOnLimit(ctx, in, in.RouteList(), &res, deadline, delivery); err != nil {
 			return res, err
 		}
 		// Keep later resumes on the route that actually ran: the resurrection
@@ -212,7 +245,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// actually reaches the driver.
 		probeIn.ResumeClaim = res.Claim
 		probeRes, probeErr := o.runSession(pctx, probeIn,
-			opencodeResumeArgs(in, sid, resurrectionProbePrompt))
+			opencodeResumeArgs(in, sid, resurrectionProbePrompt), nil) // a probe has no private server to steer
 		pcancel()
 		// Charge the probe's spend UNCONDITIONALLY, before any verdict: a
 		// resume re-sends the whole transcript, so this is real money even when
@@ -280,7 +313,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			contIn.MaxSessionWallClock = remaining
 		}
 		contRes, contErr := o.runSession(ctx, contIn,
-			opencodeResumeArgs(in, sid, continuePrompt))
+			opencodeResumeArgs(in, sid, continuePrompt), delivery)
 		if contErr != nil {
 			// Spend first, even on the error path.
 			res.Tokens += contRes.Tokens
@@ -308,7 +341,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	}
 	// Last, so it judges the merged result of every recovery above and resumes
 	// on the route that finished. One resume; a second refusal is the runner's.
-	o.resumeBadReport(ctx, in, &res, deadline)
+	o.resumeBadReport(ctx, in, &res, deadline, delivery)
 	if len(res.TurnMessages) > 0 {
 		// The recovery passes above resume the FINAL turn, so its message is
 		// whatever the session said last: the per-turn record may not keep the
@@ -1716,7 +1749,12 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // RunsTurnSequences is true: `run -s <session id>` continues a live session, so
 // Invocation.Turns is honoured (CLA-867).
 func (opencode) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true}
+	// DeliversMessages is true because every non-probe session with a clankerbar
+	// MCP server runs attached to a private `opencode serve` this adapter owns,
+	// and that server's session API steers a message into the live run
+	// (opencode_inbox.go). A session with no such server has no delivery target
+	// and simply receives nothing.
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true, DeliversMessages: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {

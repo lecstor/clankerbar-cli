@@ -127,7 +127,7 @@ func (o opencode) resumeSkippedReason(ctx context.Context, in Invocation, res *R
 //
 // mergeResume replaces FinalMessage with the continuation's, so a corrected
 // report is what the runner reads off this Result.
-func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Result, deadline time.Time) {
+func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) {
 	if in.CheckReport == nil {
 		return
 	}
@@ -190,7 +190,7 @@ func (o opencode) resumeBadReport(ctx context.Context, in Invocation, res *Resul
 		if !deadline.IsZero() {
 			contIn.MaxSessionWallClock = time.Until(deadline)
 		}
-		contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, reportSteerPrompt(checkErr)))
+		contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, reportSteerPrompt(checkErr)), delivery)
 		if contErr != nil {
 			chargeReportResume(res, contRes)
 			// The resume never ran a full reply, so the report is still the

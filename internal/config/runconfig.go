@@ -113,12 +113,12 @@ type RunConfigPanelMember struct {
 	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
-// RunConfigEvents mirrors the plane's `events` block (CLA-601/603). Absent
-// reads as both dials off; the CLI consumes only Activity in this release, but
-// Transcript is decoded so the document decodes whole and a reader can see what
-// the plane stored. The consumer is resolveRunConfigEvents on the plane; this
-// side must fail closed on its own, and a stored `transcript: true` without
-// activity is only ever read as off.
+// RunConfigEvents mirrors the plane's `events` block (CLA-601/603/887). Absent
+// reads as both dials off. Activity carries tool names, one identifying string
+// per call and todo snapshots; Transcript is the second opt-in and adds a
+// completed call's output and each assistant text block. The consumer is
+// resolveRunConfigEvents on the plane; this side must fail closed on its own, and
+// a stored `transcript: true` without activity is only ever read as off.
 type RunConfigEvents struct {
 	Activity   bool `json:"activity"`
 	Transcript bool `json:"transcript"`

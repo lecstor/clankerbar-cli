@@ -111,7 +111,7 @@ func outputCapStallReasoning(res Result) int {
 // carrying the marker (mergeResume recomputes terminal_reason from the
 // continuation), and NO further resume is attempted — the second consecutive
 // stall is terminal, as designed.
-func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *Result, deadline time.Time) {
+func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) {
 	if ctx.Err() != nil {
 		// The run is ending under us; there is no turn left to save and a
 		// resume would be killed on arrival. The stall stands unremarked, as
@@ -141,7 +141,7 @@ func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *
 	if !deadline.IsZero() {
 		contIn.MaxSessionWallClock = time.Until(deadline)
 	}
-	contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, opencodeStallSteerPrompt))
+	contRes, contErr := o.runSession(ctx, contIn, opencodeResumeArgs(in, sid, opencodeStallSteerPrompt), delivery)
 	if contErr != nil {
 		// Spend first, even on the error path — a resume re-sends the whole
 		// transcript, so it is real money even when the continuation fails.

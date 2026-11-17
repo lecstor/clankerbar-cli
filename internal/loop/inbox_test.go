@@ -19,8 +19,8 @@ func inboxTestDriver(wired bool) *Driver {
 	return d
 }
 
-// Delivery is capability-gated and probe-free: claude only in v1, never a probe, and never
-// when the plane wiring is absent.
+// Delivery is capability-gated and probe-free: claude and opencode, never a probe, and
+// never when the plane wiring is absent.
 func TestInvocationCarriesInboxOnlyForACapableWiredHarness(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -32,7 +32,8 @@ func TestInvocationCarriesInboxOnlyForACapableWiredHarness(t *testing.T) {
 		{"claude is wired", inboxTestDriver(true), "claude", false, true},
 		{"no wiring", inboxTestDriver(false), "claude", false, false},
 		{"probe", inboxTestDriver(true), "claude", true, false},
-		{"opencode has no delivery in v1", inboxTestDriver(true), "opencode", false, false},
+		{"opencode is wired", inboxTestDriver(true), "opencode", false, true},
+		{"opencode probe", inboxTestDriver(true), "opencode", true, false},
 		{"codex has no delivery in v1", inboxTestDriver(true), "codex", false, false},
 		{"copilot has no delivery in v1", inboxTestDriver(true), "copilot", false, false},
 	}
