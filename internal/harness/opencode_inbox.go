@@ -46,9 +46,9 @@ import (
 // because it was never ACKed.
 const opencodePromptTimeout = 10 * time.Second
 
-// opencodeInboxRetryInterval is the pause before re-polling a run whose last
-// delivery failed. A var so tests can shrink it.
-var opencodeInboxRetryInterval = 2 * time.Second
+// opencodeInboxRetryInterval is the default pause before re-polling a run whose
+// last delivery failed. Tests shrink it through opencodeInbox.retry.
+const opencodeInboxRetryInterval = 2 * time.Second
 
 // opencodeInbox is one Invocation's console -> agent delivery: the run-id
 // channel Invoke feeds from ResumeClaim/OnClaim, the plane half of the poll,

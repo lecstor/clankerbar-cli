@@ -220,7 +220,11 @@ func TestOpencodeDeliversMessagesInOrder(t *testing.T) {
 	runIDs <- "run.cred"
 	startTestDelivery(t, planeTS.URL, runIDs, srv, "ses_abc")
 
-	waitUntil(t, "three delivered prompts", func() bool { return len(oc.delivered()) >= 3 })
+	// Wait on the ACK watermark too: the fake server records a post BEFORE it
+	// answers 2xx, so a post-count gate alone can observe two ACKs.
+	waitUntil(t, "three delivered and ACKed prompts", func() bool {
+		return len(oc.delivered()) >= 3 && plane.watermark("run.cred") == 3
+	})
 
 	posts := oc.delivered()
 	if len(posts) != 3 {
@@ -448,4 +452,134 @@ printf '%s\n' '{"type":"text","sessionID":"ses_x","part":{"id":"prt_2","type":"t
 	if polls := plane.pollCount("run.cred"); polls != 0 {
 		t.Errorf("polled the inbox %d times, want 0", polls)
 	}
+}
+
+// pinnedServer is the private server a stubbed runSession announces: it reports
+// the clankerbar MCP server connected, records every prompt POST, and answers
+// /prompt-received once one has landed.
+type pinnedServer struct {
+	mu    sync.Mutex
+	posts []promptPost
+}
+
+func (s *pinnedServer) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/mcp":
+			w.Header().Set("Content-Type", "application/json")
+			dir := r.URL.Query().Get("location[directory]")
+			fmt.Fprintf(w, `{"location":{"directory":%q},"data":[{"name":"clankerbar","status":{"status":"connected"}}]}`, dir)
+		case strings.HasPrefix(r.URL.Path, "/api/session/") && strings.HasSuffix(r.URL.Path, "/prompt"):
+			sid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/session/"), "/prompt")
+			var body struct {
+				Text     string `json:"text"`
+				Delivery string `json:"delivery"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			user, pass, _ := r.BasicAuth()
+			s.mu.Lock()
+			s.posts = append(s.posts, promptPost{Session: sid, Text: body.Text, Delivery: body.Delivery, User: user, Pass: pass})
+			s.mu.Unlock()
+			fmt.Fprint(w, `{"ok":true}`)
+		case r.URL.Path == "/prompt-received":
+			if len(s.delivered()) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+}
+
+func (s *pinnedServer) delivered() []promptPost {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]promptPost(nil), s.posts...)
+}
+
+// Through the real adapter path: an invocation whose config declares a
+// clankerbar MCP server runs against its own private server, and that server is
+// the delivery target. Without the attach in runSession every other test stays
+// green while no console message is ever steered in production.
+func TestOpencodeRunSessionAttachesDeliveryToItsPrivateServer(t *testing.T) {
+	shortMCPTimeouts(t, 5*time.Second, 5*time.Millisecond)
+
+	private := &pinnedServer{}
+	privateTS := httptest.NewServer(private.handler())
+	defer privateTS.Close()
+
+	// run holds its process open until the delivery has landed, so the
+	// assertion cannot race the process exiting (and detaching) first.
+	opencodeStub(t, `#!/bin/sh
+case "$1" in
+serve)
+  echo "server listening on $FAKE_OPENCODE_URL"
+  echo "server password test-password"
+  sleep 60
+  ;;
+run)
+  printf '%s\n' '{"type":"step_start","sessionID":"ses_wired","part":{"id":"prt_1","type":"step-start"}}'
+  i=0
+  while [ "$i" -lt 100 ]; do
+    curl -fsS "$FAKE_OPENCODE_URL/prompt-received" >/dev/null 2>&1 && break
+    sleep 0.05
+    i=$((i+1))
+  done
+  printf '%s\n' '{"type":"text","sessionID":"ses_wired","part":{"id":"prt_2","type":"text","text":"OK"}}'
+  printf '%s\n' '{"type":"step_finish","sessionID":"ses_wired","part":{"id":"prt_3","type":"step-finish","reason":"stop","tokens":{"total":10,"input":8,"output":2},"cost":0.001}}'
+  ;;
+*)
+  exit 0
+  ;;
+esac
+`)
+
+	plane := newFakePlane()
+	plane.add("run.wired", "steer me")
+	planeTS := httptest.NewServer(plane.handler())
+	defer planeTS.Close()
+
+	runIDs := make(chan string, 1)
+	runIDs <- "run.wired"
+	d := newOpencodeInbox(context.Background(), nil, InboxConfig{
+		Origin: planeTS.URL, APIKey: "k", PollInterval: 5 * time.Millisecond,
+	}, runIDs)
+	// Not a production cadence: the retry path must be observable in a test.
+	d.retry = 5 * time.Millisecond
+	defer d.close()
+
+	in := Invocation{
+		Prompt:        "Work.",
+		WorkDir:       t.TempDir(),
+		MCPConfigPath: writeMCPConfig(t),
+		Env:           []string{"FAKE_OPENCODE_URL=" + privateTS.URL},
+	}
+	if _, err := (opencode{}).runSession(context.Background(), in, opencodeArgs(in), d); err != nil {
+		t.Fatalf("runSession: %v", err)
+	}
+
+	d.mu.Lock()
+	started := d.started
+	d.mu.Unlock()
+	if !started {
+		t.Fatal("runSession ran a session with a private server but never started delivery")
+	}
+	posts := private.delivered()
+	if len(posts) != 1 {
+		t.Fatalf("prompt posts = %d (%+v), want the console message steered once", len(posts), posts)
+	}
+	got := posts[0]
+	if got.Text != "steer me" || got.Delivery != "steer" || got.Session != "ses_wired" {
+		t.Errorf("post = %+v, want the message steered into ses_wired", got)
+	}
+	if got.User != "opencode" || got.Pass != "test-password" {
+		t.Errorf("post auth = %q:%q, want the announced private server's basic auth", got.User, got.Pass)
+	}
+	// The run exits as soon as the prompt lands, so its ACK can still be in
+	// flight when runSession returns: wait for the watermark, never sample it.
+	waitUntil(t, "the steered message ACKed", func() bool {
+		return plane.watermark("run.wired") == 1
+	})
 }

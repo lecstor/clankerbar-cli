@@ -260,7 +260,7 @@ func (p *Poller) Run(ctx context.Context, deliver func(Message) error) {
 				continue // already delivered in this session
 			}
 			if err := deliver(m); err != nil {
-				p.log("inbox: message #%d was not delivered (%v); it stays queued for the next process", m.Seq, err)
+				p.log("inbox: message #%d was not delivered (%v); it stays queued and is retried", m.Seq, err)
 				return
 			}
 			delivered = m.Seq

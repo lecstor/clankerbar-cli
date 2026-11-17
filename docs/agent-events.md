@@ -188,11 +188,13 @@ message as an `inbound_message` feed event, so the transcript shows the steering
   run, resurrection or turn continuation starts its own private server, the target is attached
   to it for that process's lifetime, and a message arriving while no process is live waits
   rather than being posted to a stopped server.
-- **The session's turn accounting keeps the old lifecycle.** Each user message written (the
+- **Claude's turn accounting keeps the old lifecycle.** Each user message written (the
   prompt included) is one outstanding turn; each `result` on the stream retires one. When the
   last one is retired and no message is outstanding, the adapter closes stdin and the CLI
   exits — exactly when the old `-p <prompt>` form did. A message delivered mid-turn is
-  therefore processed as the next turn before the session ends.
+  therefore processed as the next turn before the session ends. An opencode steer creates no
+  outstanding turn: it is handled inside the turn already running, and the run ends when the
+  model stops, as it always did.
 - **Exactly-once within the session.** The cursor advances only after a successful delivery —
   a stdin write, or a 2xx from opencode's prompt endpoint — and a repeated `seq` is skipped.
   Across a restart the plane may re-offer a message delivered but not ACKed (at-least-once at
