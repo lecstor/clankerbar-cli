@@ -824,8 +824,7 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		output := st.Output
 		if st.Status == "error" {
 			output = st.Error
-		}
-		if rehydratedOK {
+		} else if rehydratedOK {
 			output = rehydrated
 		}
 		noteOpencodeToolResult(p.observed.events, part.Tool, part.ID, st.Input, st.Status != "error", output)
