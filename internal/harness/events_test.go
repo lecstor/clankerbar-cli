@@ -97,7 +97,7 @@ func TestClaudePerItemTodoToolsAreDropped(t *testing.T) {
 	// primary (CLA-601). Mapping one as a tool_call would be a different fact.
 	for _, tool := range []string{"TaskCreate", "TaskUpdate"} {
 		s := &recSink{}
-		noteClaudeToolEvent(s, tool, "c1", raw(`{"subject":"x","description":"y"}`))
+		NoteClaudeToolEvent(s, tool, "c1", raw(`{"subject":"x","description":"y"}`))
 		if len(s.calls) != 0 {
 			t.Fatalf("%s emitted %v, want nothing", tool, s.calls)
 		}
