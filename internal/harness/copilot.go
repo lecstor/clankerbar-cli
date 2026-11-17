@@ -186,6 +186,10 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	}
 
 	res := newSessionResult(in)
+	// Close the sink this Result may have built. copilot does not emit events in
+	// v1 (EmitsEvents false), but the guard must not depend on that stay true: an
+	// unclosed emitter leaks its sender goroutine.
+	defer res.closeEvents()
 	var p copilotParse
 	captured := newCapture(func(line []byte) { p.line(line, &res, console) })
 	captured.attach(cmd, tee)

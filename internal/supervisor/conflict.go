@@ -137,6 +137,17 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		label = task.ID
 	}
 
+	// CLA-906: a conflict-only session is a NEW paid session, so a scheduled
+	// pause window gates it exactly as it gates a phase spawn. The task stays
+	// approved and the next close-out pass after the window retries it; the
+	// supervisor takes no claim it would then have to hold.
+	if active, until := cfg.PauseWindows.ActiveAt(time.Now()); active {
+		d.conflictSay("paused:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but a scheduled pause window is active until %s - "+
+			"no session is started; the task waits for the next close-out pass after the window ends",
+			label, pr, until.Format("Mon 15:04 MST"))
+		return
+	}
+
 	// One at a time ON THIS SUPERVISOR. A second conflicting task is not dropped:
 	// it stays approved, and the pass reaches it again on the next poll once this
 	// session ends. The bound ACROSS supervisors is the shared slot below.
@@ -586,8 +597,8 @@ func (d *Supervisor) conflictSay(key, format string, args ...any) {
 // the fleet's phases use, and the same per-session ceilings, so a conflict session
 // is bounded and equipped exactly like any other session on that harness.
 //
-// Deliberately does not consult pause_windows: the schedule gates the loop's
-// claims, and a conflict run is close-out of work already delivered.
+// The scheduled-pause gate is startConflictSession's, before the claim: this
+// launcher only composes and runs the session it is handed.
 func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error) {
 	adapter, err := harness.Get(req.Harness)
 	if err != nil {

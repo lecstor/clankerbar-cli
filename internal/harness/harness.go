@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/events"
 )
 
 // Adapter is one harness. Implementations register themselves via Register in an
@@ -262,6 +264,22 @@ type Capabilities struct {
 	// instead of letting a run reach a phase that cannot start. opencode is the
 	// adapter with session continuation today.
 	RunsTurnSequences bool
+
+	// EmitsEvents reports whether this adapter normalizes its structured tool
+	// events into the agent event channel's activity tier (CLA-603). False means
+	// the loop must not build a sink: there is no mapping, and an unclosed sink
+	// would leak its batch goroutine. codex is out of v1 by scope; copilot's tool
+	// events exist but its activity mapping is out of v1 too.
+	EmitsEvents bool
+
+	// DeliversMessages reports whether this adapter can receive console -> agent
+	// messages (CLA-606). True only for claude in v1: its `-p --input-format
+	// stream-json` reads user messages from stdin for the session's lifetime, so
+	// a message can be injected mid-turn. The other harnesses have no delivery in
+	// v1 — opencode/codex run one-shot prompts and copilot has no equivalent — and
+	// an interactive session waits for its hook. The loop sets Invocation.Inbox
+	// only when this is true.
+	DeliversMessages bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -447,6 +465,39 @@ type Invocation struct {
 	// one. opencode is the adapter with that capability today (claude and codex
 	// refuse it with ErrTurnsUnsupported).
 	Turns []Turn
+
+	// NewEventSink, when non-nil, builds this session's agent-event sink. The
+	// loop sets it only when the project's events.activity dial is on, the
+	// machine has not opted out, and the adapter emits events. It is a FACTORY
+	// because one Invocation may run several processes (an opencode resurrection
+	// or a multi-turn sequence), each with its own batch goroutine over a shared
+	// per-run sequence counter.
+	//
+	// The adapter MUST close what it builds (Result.closeEvents /
+	// opencodeParse.closeEvents) when the session ends. Nil means the channel is
+	// off.
+	NewEventSink func() *events.Emitter
+
+	// Inbox wires the console -> agent message channel for this session (CLA-606).
+	// The loop sets it only for an adapter whose Capabilities.DeliversMessages is
+	// true and only when the plane origin and key are configured. The adapter polls
+	// the run's inbox and writes each message to the session's stdin; the run id
+	// arrives from ResumeClaim or OnClaim, because the session claims inside itself.
+	//
+	// Nil means no delivery: every other harness in v1, and every probe.
+	Inbox *InboxConfig
+}
+
+// InboxConfig is the plane half of the console -> agent message channel: where the run
+// inbox lives and the account key that authorises the poll. The RUN id is not here because
+// the driver does not know it at spawn time for a fresh claim; the adapter observes it.
+type InboxConfig struct {
+	// Origin is the trusted plane origin, e.g. https://clankerbar.com (no path).
+	Origin string
+	// APIKey is the same account key every other plane write carries.
+	APIKey string
+	// PollInterval overrides the v1 2 s cadence; tests set a short one.
+	PollInterval time.Duration
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -828,10 +879,24 @@ type Result struct {
 	// which builds that field-by-field: stream-side state stays stream-side.
 	onClaim func(Claim)
 
+	// onTurnEnd is called by the adapter's parser when a terminal `result` event
+	// arrives: the turn the CLI was working is over. The claude adapter uses it
+	// to close the stream-json stdin when no console message is outstanding, so
+	// the CLI exits exactly when the old prompt-argument form did. Nil on every
+	// other adapter and every test that builds a Result directly.
+	onTurnEnd func()
+
 	// Reports are the delivery claims this session got the plane to ACCEPT — a
 	// branch recorded as the hand-off, a commit declared landed — for the driver
 	// to check against local git (CLA-253). Order is the order they were made.
 	Reports []Report
+
+	// events is this session's agent-event sink (CLA-603), nil when the channel
+	// is off. It is stream-side state like onClaim: the adapter closes it when
+	// the session ends (closeEvents, which nils it on the copy it was called on).
+	// A value copy of the Result may still carry the closed pointer — harmless,
+	// since the field is unexported and nothing writes through it after Close.
+	events *events.Emitter
 
 	// pending maps a tool_use id to what its result will mean. Parser state, not
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,

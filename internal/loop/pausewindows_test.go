@@ -1,8 +1,10 @@
 package loop
 
 // Scheduled pause windows (config.PauseWindows): during a configured local-time
-// window the loop starts no new sessions — checked between iterations exactly
-// like the console pause, so an in-flight session or sequence always finishes.
+// window the loop starts no new sessions — checked between iterations like the
+// console pause, and at every phase boundary (CLA-906), so a running session
+// always finishes while the next one waits. The poll-gate tests are here; the
+// boundary hold is in pause_boundary_test.go.
 
 import (
 	"context"
@@ -82,6 +84,16 @@ func TestPickTarget_ScheduledPauseHoldsSpawnsInsideAWindow(t *testing.T) {
 	sent, _ := ff.reports()
 	if len(sent) != 1 || sent[0].State.Kind != fleet.StateDraining {
 		t.Errorf("the poll must still beacon, and report draining while the window holds spawns; got %+v", sent)
+	}
+	if len(sent) == 1 {
+		// The reason and the resume instant ride the same beacon (CLA-908), so
+		// the console can name the schedule instead of showing bare draining.
+		if sent[0].State.PauseReason != fleet.PauseReasonSchedule {
+			t.Errorf("poll beacon pause reason = %q, want %q", sent[0].State.PauseReason, fleet.PauseReasonSchedule)
+		}
+		if want := brisbaneAt(t, 9, 14, 0); !sent[0].State.PauseUntil.Equal(want) {
+			t.Errorf("poll beacon pause until = %v, want the window's end %v", sent[0].State.PauseUntil, want)
+		}
 	}
 	if !d.schedPaused {
 		t.Error("schedPaused should be set while a window is active")
@@ -207,18 +219,92 @@ func TestPickTarget_ScheduledPauseDefersTheDrainVerdict(t *testing.T) {
 	}
 }
 
-func TestFleetState_ReportsDrainingDuringAScheduledPause(t *testing.T) {
+// The schedule's presence payload (CLA-908): a window-paused target says WHY and
+// UNTIL WHEN, so the console's banner can name the resume time instead of showing
+// the same bare `draining` a console or fleet pause shows. A pause the operator
+// has to act on takes precedence, and nothing paused is unchanged.
+func TestFleetState_ScheduledPauseCarriesReasonAndUntil(t *testing.T) {
 	at := brisbaneAt(t, 9, 12, 0)
 	d, _, _, _ := pauseDriver(t, peakSchedule(t), &at)
+	until := brisbaneAt(t, 9, 14, 0)
 
 	d.schedPaused = true
-	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
-		t.Errorf("scheduled-pause state = %v, want draining", got)
-	}
-	// An in-flight session outranks the window: the pause holds the NEXT spawn.
-	d.iter = []iterState{{on: true, n: 3, ref: "CB-7", phase: "implement"}}
 	got := d.fleetState(0)
+	if got.Kind != fleet.StateDraining {
+		t.Fatalf("scheduled-pause state = %q, want draining", got.Kind)
+	}
+	if got.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("pause reason = %q, want %q so the console can name the schedule", got.PauseReason, fleet.PauseReasonSchedule)
+	}
+	if !got.PauseUntil.Equal(until) {
+		t.Errorf("pause until = %v, want the window's end %v", got.PauseUntil, until)
+	}
+	if got.PauseZone != "Australia/Brisbane" {
+		t.Errorf("pause zone = %q, want the schedule's own zone Australia/Brisbane", got.PauseZone)
+	}
+
+	// A console pause is the cause the operator has to act on: it wins, and it
+	// names itself so the console renders "paused by console" rather than the
+	// schedule's window.
+	d.paused[0] = true
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonConsole || !got.PauseUntil.IsZero() {
+		t.Errorf("console pause + schedule = %+v, want draining with reason %q and no end", got, fleet.PauseReasonConsole)
+	}
+	d.paused[0] = false
+
+	// So does a fleet pause (a raised dead-phase question awaits an answer).
+	d.fleetPaused[0] = true
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonFleet {
+		t.Errorf("fleet pause + schedule = %+v, want draining with reason %q", got, fleet.PauseReasonFleet)
+	}
+	d.fleetPaused[0] = false
+
+	// A window that has ended leaves plain draining: schedPaused is bookkeeping
+	// updated at the next gate, and a reason with no end would keep a banner up.
+	at = brisbaneAt(t, 9, 14, 30)
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining || got.PauseReason != "" {
+		t.Errorf("stale schedule flag = %+v, want plain draining once the window has ended", got)
+	}
+
+	// Nothing paused: unchanged.
+	d.schedPaused = false
+	if got := d.fleetState(0); got.Kind != fleet.StateIdle {
+		t.Errorf("no pause state = %v, want idle", got)
+	}
+
+	// An in-flight session still outranks the window: the pause holds the NEXT
+	// spawn, so the Fleet page keeps showing the iteration while work is running.
+	at = brisbaneAt(t, 9, 12, 0)
+	d.schedPaused = true
+	d.iter = []iterState{{on: true, n: 3, ref: "CB-7", phase: "implement"}}
+	got = d.fleetState(0)
 	if got.Kind != fleet.StateIteration || got.N != 3 || got.TaskRef != "CB-7" || got.Phase != "implement" {
 		t.Errorf("mid-drain during a window = %+v, want iteration{n:3 taskRef:CB-7 phase:implement}", got)
+	}
+}
+
+// A target held at a phase boundary (CLA-906) reports the pause, not the open
+// iteration: the walk's iteration names the phase that just ENDED, while the
+// console needs the task and the phase waiting behind the window.
+func TestFleetState_HeldPhaseOutranksTheIterationMarker(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d, _, _, _ := pauseDriver(t, peakSchedule(t), &at)
+	d.schedPaused = true
+	d.iter = []iterState{{on: true, n: 3, ref: "CB-7", phase: "implement"}}
+	d.holdPause(0, "CB-7", "review")
+
+	got := d.fleetState(0)
+	if got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonSchedule {
+		t.Fatalf("held state = %+v, want draining with the schedule reason", got)
+	}
+	if got.TaskRef != "CB-7" || got.Phase != "review" {
+		t.Errorf("held state names %q at %q, want CB-7 at the HELD phase review", got.TaskRef, got.Phase)
+	}
+
+	// The clear is what the hold's defer does: the next beacon is the iteration
+	// again, not a pause stuck on the row.
+	d.clearHoldPause(0)
+	if got := d.fleetState(0); got.Kind != fleet.StateIteration || got.Phase != "implement" {
+		t.Errorf("after the hold = %+v, want the iteration back", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/events"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -348,7 +349,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 	if err != nil {
 		return harness.Invocation{}, err
 	}
-	return harness.Invocation{
+	inv := harness.Invocation{
 		Prompt:        d.cfg.Prompt,
 		Model:         hc.Model.First(),
 		WorkDir:       workdir,
@@ -359,7 +360,24 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		EnvAllowlist:  d.cfg.SessionEnvAllowlist(harnessName, t.Name),
 		Nice:          d.cfg.SessionNice,
 		Probe:         probe,
-	}, nil
+	}
+	// The agent event channel (CLA-603). The loop's top-level probe is a one-word
+	// liveness check, not a session doing work, so it never emits. A recovery
+	// probe inside an already-started session is different: it inherits this
+	// factory (opencode's resurrection sets Probe on a copy) and its tool calls
+	// are part of that session's activity, so they do emit. The destination is
+	// the project's run config dial, and the machine can only have opted out.
+	if !probe && d.eventSenderOn(tc, harnessName) {
+		name := harnessName
+		inv.NewEventSink = func() *events.Emitter { return d.newEventEmitter(name) }
+	}
+	// Console -> agent messages (CLA-606): independent of the event dials. The project
+	// activity dial governs what is RECORDED in the feed, not whether an operator's input
+	// can reach the agent, and the machine has no opt-out for input to its own session.
+	if d.inboxOn(harnessName, probe) {
+		inv.Inbox = &harness.InboxConfig{Origin: d.inboxOrigin, APIKey: d.inboxKey}
+	}
+	return inv, nil
 }
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task

@@ -18,6 +18,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/events"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
@@ -190,10 +191,11 @@ type Driver struct {
 	state   *statedir.Dir
 	blind   bool // no cheap backlog read available — drain then idle-poll
 
-	// now is the clock the scheduled-pause check reads, and ONLY that: the
-	// back-off ladder in progress.go still reads the wall clock. Nil falls back
-	// to time.Now, so a hand-built test Driver works. schedPaused is whether a
-	// window is active — kept so the enter and exit are logged once, not per poll.
+	// now is the clock the scheduled-pause check reads (at the poll gate and at a
+	// phase boundary), and ONLY that: the back-off ladder in progress.go still
+	// reads the wall clock. Nil falls back to time.Now, so a hand-built test
+	// Driver works. schedPaused is whether a window is active — kept so the enter
+	// and exit are logged once, not per poll.
 	now         func() time.Time
 	schedPaused bool
 
@@ -465,6 +467,22 @@ type Driver struct {
 	// may hold it.
 	stateMu sync.Mutex
 
+	// The agent event channel's wiring (CLA-603): the trusted plane origin, the
+	// account key and the process-wide per-run sequence counter. Set by
+	// SetEventChannel; a zero value is inert (no sessions emit). eventMu guards
+	// the lazy counter because a review panel builds its members from more than
+	// one goroutine.
+	eventMu     sync.Mutex
+	eventOrigin string
+	eventKey    string
+	eventSeq    *events.SeqCounter
+
+	// The console -> agent message channel's wiring (CLA-606): the trusted plane
+	// origin and the same account key. Set by SetInboxChannel; empty = no
+	// delivery, which is every driver built without it.
+	inboxOrigin string
+	inboxKey    string
+
 	// startRefusals counts consecutive worktree refusals per task id, so a tree
 	// that refuses every claim deterministically reaches the operator instead of
 	// the queue. Lazily built for a Driver built without the constructor.
@@ -539,6 +557,13 @@ type Driver struct {
 	iter   []iterState
 	iterMu sync.Mutex
 
+	// hold is each target's phase-boundary hold (CLA-908): the task and phase a
+	// scheduled pause is holding, so presence can say what waits behind the
+	// window. It is separate from iter because the walk's iteration stays open
+	// across the hold and names the phase that just ENDED, while the console
+	// needs the phase that is about to run. Guarded by iterMu, like iter.
+	hold []holdState
+
 	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
 	hostname string
 	hostOnce sync.Once
@@ -571,6 +596,14 @@ type Driver struct {
 	// Run stamps it at the first drain, and budget checks a parallel panel's
 	// members run on their own goroutines read it while they do.
 	tgtStart []time.Time
+
+	// pausedRun and pausedTargets are wall-clock time spent held at a scheduled
+	// pause boundary (CLA-906): idle time, not draining time, so every budget
+	// clock credits it back. pausedRun corrects the run-wide clock the local-file
+	// budget reads; pausedTargets corrects the per-target clock a stored overlay's
+	// max_wall_clock reads. Guarded by stateMu, like the clocks they correct.
+	pausedRun     time.Duration
+	pausedTargets []time.Duration
 
 	// overlayBudget marks a target whose stored run-config document SET a
 	// budget: only that target's own spend is judged by it. A document that
@@ -647,12 +680,14 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		startupRaised:       make([]bool, n),
 		startupOpenQ:        make([]int, n),
 		iter:                make([]iterState, n),
+		hold:                make([]holdState, n),
 		rcVersions:          make([]int, n),
 		rcAttempt:           make([]time.Time, n),
 		rcAttemptVer:        make([]int, n),
 		rcFails:             make([]int, n),
 		tgtSpend:            make([]targetSpend, n),
 		tgtStart:            make([]time.Time, n),
+		pausedTargets:       make([]time.Duration, n),
 		overlayBudget:       make([]bool, n),
 		exhausted:           make([]bool, n),
 		budgetStopped:       make([]bool, n),

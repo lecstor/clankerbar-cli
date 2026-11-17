@@ -841,3 +841,115 @@ func TestMarshalReport_ResetAtOnlyOnTheLimitedState(t *testing.T) {
 		t.Errorf("an iteration state carried resetAt: %s", b)
 	}
 }
+
+// A schedule-paused draining beacon carries the reason and the window's end in
+// the shape the plane's parseFleetReport reads (CLA-907/CLA-908), as an explicit
+// UTC instant — never a zoneless local time the plane would parse in its own.
+func TestMarshalReport_DrainingStateCarriesTheSchedulePause(t *testing.T) {
+	until := time.Date(2026, 11, 9, 14, 0, 0, 0, time.FixedZone("AEST", 10*60*60))
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateDraining,
+			PauseReason: PauseReasonSchedule, PauseUntil: until,
+			TaskRef: "CLA-9", Phase: "review"},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+
+	var got struct {
+		State struct {
+			Kind        string `json:"kind"`
+			TaskRef     string `json:"taskRef"`
+			Phase       string `json:"phase"`
+			PauseReason string `json:"pauseReason"`
+			PauseUntil  string `json:"pauseUntil"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if got.State.PauseReason != PauseReasonSchedule {
+		t.Errorf("state.pauseReason = %q, want %q", got.State.PauseReason, PauseReasonSchedule)
+	}
+	parsed, err := time.Parse(time.RFC3339, got.State.PauseUntil)
+	if err != nil {
+		t.Fatalf("state.pauseUntil %q is not RFC 3339: %v\n%s", got.State.PauseUntil, err, b)
+	}
+	if !parsed.Equal(until) {
+		t.Errorf("state.pauseUntil = %s, want the window's end %s", parsed.UTC(), until.UTC())
+	}
+	if !strings.HasSuffix(got.State.PauseUntil, "Z") {
+		t.Errorf("pauseUntil %q carries no explicit UTC designator; the plane refuses a zoneless instant", got.State.PauseUntil)
+	}
+	// The held task rides the same state: the plane's hold reads taskRef/phase
+	// on a draining row, so the console can say what waits at the boundary.
+	if got.State.TaskRef != "CLA-9" || got.State.Phase != "review" {
+		t.Errorf("draining state names %q at %q, want the held task and phase", got.State.TaskRef, got.State.Phase)
+	}
+}
+
+// Every other pause cause names itself with no resume instant, and neither field
+// rides any other state kind: the plane reads them only on `draining`, and an old
+// plane must keep seeing the bytes it always did.
+func TestMarshalReport_PauseOnlyOnTheDrainingState(t *testing.T) {
+	nothing := time.Time{}
+	for _, reason := range []string{PauseReasonConsole, PauseReasonFleet, PauseReasonStartup, PauseReasonBudget} {
+		b, err := marshalReport(Report{
+			Identity: Identity{Instance: "x"},
+			State:    State{Kind: StateDraining, PauseReason: reason, PauseUntil: nothing},
+		})
+		if err != nil {
+			t.Fatalf("marshalReport: %v", err)
+		}
+		var got struct {
+			State map[string]any `json:"state"`
+		}
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, b)
+		}
+		if got.State["pauseReason"] != reason {
+			t.Errorf("%s reason = %v, want the cause named so the console can render it", reason, got.State["pauseReason"])
+		}
+		if _, ok := got.State["pauseUntil"]; ok {
+			t.Errorf("%s carried a pauseUntil; only the schedule states an end", reason)
+		}
+	}
+
+	// The reason guard, not just the zero-value one: a non-schedule cause must
+	// not carry an end even when the state sets one, so the wire keeps saying
+	// "the schedule is the only cause with a moment" (CLA-908).
+	nonSched, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateDraining, PauseReason: PauseReasonConsole,
+			PauseUntil: time.Date(2026, 11, 9, 14, 0, 0, 0, time.UTC)},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var nonSchedState struct {
+		State map[string]any `json:"state"`
+	}
+	if err := json.Unmarshal(nonSched, &nonSchedState); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, nonSched)
+	}
+	if nonSchedState.State["pauseReason"] != PauseReasonConsole {
+		t.Errorf("console reason = %v, want the cause named", nonSchedState.State["pauseReason"])
+	}
+	if v, ok := nonSchedState.State["pauseUntil"]; ok {
+		t.Errorf("a console pause carried pauseUntil %v; only the schedule states an end", v)
+	}
+
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateIteration,
+			PauseReason: PauseReasonSchedule,
+			PauseUntil:  time.Date(2026, 11, 9, 14, 0, 0, 0, time.UTC)},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), "pauseReason") || strings.Contains(string(b), "pauseUntil") {
+		t.Errorf("an iteration state carried a pause payload: %s", b)
+	}
+}

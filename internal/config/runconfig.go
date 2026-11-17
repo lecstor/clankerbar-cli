@@ -113,6 +113,17 @@ type RunConfigPanelMember struct {
 	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
+// RunConfigEvents mirrors the plane's `events` block (CLA-601/603). Absent
+// reads as both dials off; the CLI consumes only Activity in this release, but
+// Transcript is decoded so the document decodes whole and a reader can see what
+// the plane stored. The consumer is resolveRunConfigEvents on the plane; this
+// side must fail closed on its own, and a stored `transcript: true` without
+// activity is only ever read as off.
+type RunConfigEvents struct {
+	Activity   bool `json:"activity"`
+	Transcript bool `json:"transcript"`
+}
+
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
 // keys this build consumes. JSON decoding ignores everything else, so a newer
 // plane's added keys degrade to "unconsumed" rather than unmarshal errors;
@@ -148,6 +159,10 @@ type RunConfigDoc struct {
 	MaxSessionWallClock    Duration                         `json:"max_session_wall_clock"`
 	Budget                 *RunConfigBudget                 `json:"budget"`
 	Escalation             *RunConfigEscalation             `json:"escalation"`
+	// Events is the agent event channel's per-project opt-in. A nil pointer is an
+	// ABSENT key (both dials off, the local rules); a present block — even one
+	// with both false — is the project stating where the dials sit.
+	Events *RunConfigEvents `json:"events"`
 }
 
 // UnmarshalJSON decodes the document and records whether the `prompt` KEY was
@@ -212,7 +227,7 @@ func (d *RunConfigDoc) Empty() bool {
 	return d.Harness == "" && d.Model == "" && d.Models == nil && d.Harnesses == nil &&
 		!d.pipelineSet() &&
 		d.MaxTurns == 0 && d.MaxSessionWallClock == 0 &&
-		d.Budget == nil && d.Escalation == nil
+		d.Budget == nil && d.Escalation == nil && d.Events == nil
 }
 
 // Clone returns a copy safe to overlay a run-config document onto: every map
@@ -289,7 +304,9 @@ func cloneStrMap(m map[string]string) map[string]string {
 }
 
 // ApplyRunConfig overlays a stored document onto c IN PLACE: a field the
-// document sets wins, a field it omits keeps the local value. Maps replace
+// document sets wins, a field it omits keeps the local value — except the
+// `events` dials, which belong to the stored document alone (an absent block is
+// both off, fail closed: no local file may turn the channel on). Maps replace
 // wholesale when present — the document is the operator's ratified word for
 // that map, and merging would resurrect entries the ratification dropped.
 // Callers re-run Validate afterwards: an overlay CAN produce a combination the
@@ -319,6 +336,27 @@ func cloneStrMap(m map[string]string) map[string]string {
 func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.SchemaNewer() {
 		return nil
+	}
+	if doc == nil {
+		// No document at all is not a stored `{}`: there is nothing to overlay
+		// and nothing to fail closed on, so leave the config untouched.
+		return nil
+	}
+	// The event channel's dials (CLA-603) are reset FIRST, before the empty
+	// document returns: the stored, effective document is the authority, so an
+	// absent block means both dials off (fail closed) — including the plane's
+	// default `{}` document, so a caller reusing a live config cannot keep the
+	// channel on a project that says nothing. No local-file value can turn one
+	// on; the machine can only opt out (NoEvents), which this overlay never
+	// touches.
+	c.Events = RunConfigEvents{}
+	if doc.Events != nil {
+		c.Events = *doc.Events
+	}
+	if c.Events.Transcript && !c.Events.Activity {
+		// The plane refuses this combination at save time; a document that still
+		// carries it (a hand-edited store, a future reader) fails closed.
+		c.Events.Transcript = false
 	}
 	if doc.Empty() {
 		return nil
@@ -437,6 +475,8 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 			c.Escalation.CategoryRules = e.CategoryRules
 		}
 	}
+	// The event channel's dials were applied at the top, before the empty
+	// document returned: they are the stored document's alone.
 	return nil
 }
 

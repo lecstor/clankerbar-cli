@@ -1316,7 +1316,11 @@ allowlist, which `doctor` already warns about.
 lists the version it itself runs and, per instance, the state and the version
 of the child serving it — so version skew between children (and between a
 child and the supervisor) is observable on the machine, not only on the fleet
-page. Those lines, and its refuse/spawn/exit decisions, are also written to
+page. A live child held by the pause schedule also says so, from its own local
+beacon: `paused by schedule until 14:00 AEST (holding CLA-1 at the review
+phase)` — the same facts the console's instance row shows (see
+[pause-windows](docs/pause-windows.md#what-the-beacon-says)). Those lines, and
+its refuse/spawn/exit decisions, are also written to
 `<supervisor state dir>/supervise.log` (see [Visibility](#visibility)).
 `clankerbar supervise roll` rolls the children onto a newly installed
 binary one at a time, verifying each one's next beacon reports it before the
@@ -2179,18 +2183,28 @@ local-time windows — the DeepSeek peak-pricing hours, say:
 }
 ```
 
-It is checked between iterations, like the console pause: an in-flight session,
-and the rest of a phase sequence already under way, always finishes — nothing is
-killed mid-session — and the next claim waits for the window to end. `lead`
-stops new claims that long BEFORE a window too, so a fresh sequence is not
+It is checked between iterations, like the console pause, AND at every phase
+boundary: an in-flight session is never interrupted — nothing is killed
+mid-session — but the next SESSION is held until the window ends. A phase
+sequence that reaches a boundary inside a window keeps its claim (renewing the
+lease at the usual third-of-lease cadence), logs the hold once, and resumes the
+same run at that phase when the window closes. The same boundary rule holds a
+handoff respawn, a review panel's fan-out (the whole panel, not one member), and
+a drain's first phase when the claim was taken just before the window opened.
+`lead` stops new sessions that long BEFORE a window too, so a fresh sequence is not
 started only to run into it; it is capped at 24h, since it is how long before a
-window new work stops. `days` is the day the window STARTS in `timezone`
+window new work stops. The supervisor's conflict-only session obeys the schedule
+as well: it is a new paid session, so it does not start inside a window and the
+task waits for the next close-out pass (the deterministic close-out runs no agent
+session and is unaffected). `days` is the day the window STARTS in `timezone`
 (three-letter names, case-insensitive; a `-` range, which may not wrap, or
 `daily`), so an overnight window reads as one entry — `{"days": "fri", "from":
 "22:00", "to": "06:00"}` runs Friday night into Saturday morning. `to` before
 `from` crosses midnight, and `from` equal to `to` is a whole 24 hours. Windows
 that overlap or abut are one pause. Unset (or an empty `windows` list) means no
-schedule at all; `doctor` reports the schedule, and whether it is holding now.
+schedule at all; `doctor` reports the schedule, whether it is holding now, and
+the boundary rule. See [docs/pause-windows.md](docs/pause-windows.md) for what
+counts as a boundary and which session kinds are covered.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default
@@ -2589,6 +2603,14 @@ ceiling looser than this file's is therefore the one in force for that project
 project only**: its siblings keep draining, and the daemon stops when every
 project has reached its ceiling. Projects with no stored budget (no document, or
 one that sets none) share this file's budget as one instance-wide pool.
+
+A project's `events.activity` dial (off by default, set by operator+) turns on
+the **agent activity channel**: the daemon streams each session's tool calls,
+their one identifying argument and its todo snapshots to the plane, redacted on
+this machine before anything leaves it. It sends no tool output and no assistant
+text in this release. This machine can refuse the channel with `--no-events` on
+`clankerbar run` / `clankerbar supervise`, or with `CLANKERBAR_EVENTS=off`; no
+local signal can turn it on. See [`docs/agent-events.md`](./docs/agent-events.md).
 
 Import today's file as the starting point with:
 
@@ -3039,11 +3061,13 @@ the catch-all matches last, denying every read.
 ## Docs
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
+- [`docs/pause-windows.md`](./docs/pause-windows.md) - the `pause_windows` boundary rule: a running session is never interrupted, but the next phase or session is held (claim kept, lease renewed) until the window ends.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
 - [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 - [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
+- [`docs/agent-events.md`](./docs/agent-events.md) - the agent activity channel the CLI feeds: what the claude and opencode adapters emit, the project dial and the machine-local opt-out, batching, sequence numbering and CLI-side redaction.
 
 ## License
 

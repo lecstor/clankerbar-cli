@@ -56,6 +56,8 @@ func Supervise(ctx context.Context, args []string) error {
 		}
 	}
 	fs := newFlagSet("supervise")
+	noEvents := false
+	fs.BoolVar(&noEvents, "no-events", false, "spawn every child with CLANKERBAR_EVENTS=off: no agent activity events leave this machine (the project's events dial still decides whether the channel is on)")
 	if err := parseFlags(fs, args); err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
 			return nil // --help already printed usage
@@ -111,6 +113,9 @@ func Supervise(ctx context.Context, args []string) error {
 		// Empty keeps the built-in https://github.com/ base; a set key changes
 		// the transport of every clone the derivation makes (CLA-713).
 		CloneURLBase: strings.TrimSpace(base.CloneURLBase),
+		// The machine-local event-channel opt-out (CLA-603): propagated to every
+		// child through the environment, so it cannot be lost at a respawn.
+		NoEvents: noEvents || eventsEnvOff(),
 	}
 	if o.CloneURLBase != "" {
 		log.Printf("deriving clones from %s (set by clone_url_base) - an ssh base uses the key and spawns no gh auth token", config.RedactURLCredentials(o.CloneURLBase))

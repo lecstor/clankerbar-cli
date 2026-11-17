@@ -406,9 +406,12 @@ type Config struct {
 
 	// PauseWindows is the operator's recurring local-time schedule of hours in
 	// which the loop starts no new work — checked between iterations, like the
-	// console pause, so an in-flight session or phase sequence always finishes.
-	// Nil/empty = no schedule. `omitempty` is load-bearing for the same reason as
-	// ProjectRoot: an unset key must not change a daemon's config identity.
+	// console pause, AND at every phase boundary. A session already running is
+	// never interrupted; the pause holds the NEXT phase/session, keeps the
+	// sequence's claim alive, and resumes the same run there when the window
+	// ends. See docs/pause-windows.md. Nil/empty = no schedule. `omitempty` is
+	// load-bearing for the same reason as ProjectRoot: an unset key must not
+	// change a daemon's config identity.
 	PauseWindows *PauseWindows `json:"pause_windows,omitempty"`
 
 	// BacklogURL is the clankerbar base URL the driver reads backlog counts from
@@ -632,6 +635,19 @@ type Config struct {
 	// project (see Project.AllowLocalMCPServers) to replace the top-level list
 	// for that project only.
 	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
+	// Events is the agent event channel's dials as the project's EFFECTIVE run
+	// config stated them (CLA-603). It is never decoded from the local file
+	// (`json:"-"`): opt-in is the project dial's alone (operator decision
+	// 564a0957), and a machine may only opt OUT — see NoEvents.
+	Events RunConfigEvents `json:"-"`
+
+	// NoEvents is the machine-local opt-out: the `--no-events` flag or
+	// CLANKERBAR_EVENTS=off (`0`/`false` accepted). It can only turn the channel
+	// off; no machine-local signal can turn a tier on. `json:"-"` because it is a
+	// fact about THIS invocation, not part of the fleet-shared config — and in
+	// particular not part of Identity(), which fingerprints the shared policy.
+	NoEvents bool `json:"-"`
 
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
