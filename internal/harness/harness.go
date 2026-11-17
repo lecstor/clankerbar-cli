@@ -273,12 +273,12 @@ type Capabilities struct {
 	EmitsEvents bool
 
 	// DeliversMessages reports whether this adapter can receive console -> agent
-	// messages (CLA-606). True only for claude in v1: its `-p --input-format
-	// stream-json` reads user messages from stdin for the session's lifetime, so
-	// a message can be injected mid-turn. The other harnesses have no delivery in
-	// v1 — opencode/codex run one-shot prompts and copilot has no equivalent — and
-	// an interactive session waits for its hook. The loop sets Invocation.Inbox
-	// only when this is true.
+	// messages (CLA-606, CLA-911). True for claude, whose `-p --input-format
+	// stream-json` reads user messages from stdin for the session's lifetime, and
+	// for opencode, whose private `opencode serve` takes a steer through its
+	// session API. codex and copilot run one-shot prompts with no equivalent
+	// channel, and an interactive session waits for its hook. The loop sets
+	// Invocation.Inbox only when this is true.
 	DeliversMessages bool
 }
 
@@ -481,7 +481,9 @@ type Invocation struct {
 	// Inbox wires the console -> agent message channel for this session (CLA-606).
 	// The loop sets it only for an adapter whose Capabilities.DeliversMessages is
 	// true and only when the plane origin and key are configured. The adapter polls
-	// the run's inbox and writes each message to the session's stdin; the run id
+	// the run's inbox and delivers each message the way its harness can: claude
+	// writes it to the session's stdin as a user turn; opencode steers it into the
+	// live session through its private server's session API (CLA-911). The run id
 	// arrives from ResumeClaim or OnClaim, because the session claims inside itself.
 	//
 	// Nil means no delivery: every other harness in v1, and every probe.

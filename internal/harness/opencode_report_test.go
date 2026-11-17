@@ -352,7 +352,7 @@ echo '`+reportGoodText+`'
 echo '`+reportGoodStep+`'
 `)
 			res := tc.res
-			(opencode{}).resumeBadReport(tc.ctx, tc.in, &res, time.Time{})
+			(opencode{}).resumeBadReport(tc.ctx, tc.in, &res, time.Time{}, nil)
 			if runs := stubRuns(t, logPath); len(runs) != 0 {
 				t.Errorf("stub ran %d times, want none — this end cannot take a resume:\n%v", len(runs), runs)
 			}
@@ -385,7 +385,7 @@ echo "$*" >> "`+logPath+`"
 
 	console := &bytes.Buffer{}
 	in := Invocation{Prompt: "Work.", Console: console, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}
-	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{})
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{}, nil)
 
 	if runs := stubRuns(t, logPath); len(runs) != 0 {
 		t.Errorf("stub ran %d times, want none — a cap-killed session cannot be resumed:\n%v", len(runs), runs)
@@ -398,7 +398,7 @@ echo "$*" >> "`+logPath+`"
 	passing := &bytes.Buffer{}
 	in.Console = passing
 	in.CheckReport = func(string) error { return nil }
-	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{})
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{}, nil)
 	if out := passing.String(); out != "" {
 		t.Errorf("a passing report on a cap-killed session printed a resume line; got:\n%s", out)
 	}
@@ -414,7 +414,7 @@ printf '%s\n%s\n' '`+reportGoodText+`' '`+reportGoodStep+`'
 	rec := &failWriter{}
 	res := reportSession(reportBadStream)
 	(opencode{}).resumeBadReport(context.Background(),
-		Invocation{Prompt: "Work.", Console: rec, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}, &res, time.Time{})
+		Invocation{Prompt: "Work.", Console: rec, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}, &res, time.Time{}, nil)
 
 	if !strings.Contains(rec.notes.String(), "report resume errored") {
 		t.Fatalf("the resume did not error as the fixture requires; console got:\n%s", rec.notes.String())
@@ -714,7 +714,7 @@ echo '`+reportGoodStep+`'
 	console := &bytes.Buffer{}
 	res := reportSession(reportBadStream)
 	in := Invocation{Prompt: "Work.", Console: console, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}
-	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Now().Add(opencodeResumeWallClockFloor/2))
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Now().Add(opencodeResumeWallClockFloor/2), nil)
 
 	if runs := stubRuns(t, logPath); len(runs) != 0 {
 		t.Errorf("stub ran %d times, want none — no budget for a resume:\n%v", len(runs), runs)
@@ -765,7 +765,7 @@ exec sleep 30
 	res := reportSession(reportBadStream)
 	in := Invocation{Prompt: "Work.", Console: console, ResumeClaim: reportClaim, CheckReport: reportRefusesLong}
 	in.MaxSessionWallClock = time.Second
-	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{})
+	(opencode{}).resumeBadReport(context.Background(), in, &res, time.Time{}, nil)
 
 	if res.ReportResumeFailed == "" {
 		t.Fatal("ReportResumeFailed is empty; a resume whose end no report is read on must fail closed")

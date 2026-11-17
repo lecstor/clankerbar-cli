@@ -924,7 +924,7 @@ func TestOpencodeConformance_resume(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
 	defer cancel()
-	second, err := (opencode{}).runSession(ctx, in, opencodeResumeArgs(in, sid, "Reply with exactly: OK"))
+	second, err := (opencode{}).runSession(ctx, in, opencodeResumeArgs(in, sid, "Reply with exactly: OK"), nil)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
