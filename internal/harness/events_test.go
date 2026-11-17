@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -550,6 +552,111 @@ func TestOpencodeParserEmitsTranscriptEvents(t *testing.T) {
 	}
 	if r := results["call_3"]; r == nil || r["ok"] != false || r["output"] != "exit 1" {
 		t.Errorf("call_3 result = %v (want the error text as a failed result)", r)
+	}
+}
+
+// truncatedReadLine is one terminal opencode tool part whose output opencode
+// spilled to path: `state.output` is the pointer, and the metadata names the
+// file (the shape 2.0.32 emits above 51,200 bytes).
+func truncatedReadLine(callID, path string) string {
+	pointer := "[showing 0 lines of 1; full output saved to " + path + "]"
+	ev := map[string]any{
+		"type": "tool_use", "sessionID": "ses_1",
+		"part": map[string]any{
+			"partID": "prt_" + callID, "type": "tool", "id": callID, "tool": "read",
+			"state": map[string]any{
+				"status": "completed",
+				"input":  map[string]any{"filePath": "a.go"},
+				"output": pointer,
+				"metadata": map[string]any{
+					"metadata": map[string]any{"truncated": true, "outputPath": path},
+					"content":  []any{map[string]any{"type": "text", "text": pointer}},
+				},
+			},
+		},
+	}
+	b, _ := json.Marshal(ev)
+	return string(b)
+}
+
+// TestOpencodeTranscriptRehydratesATruncatedResult drives the real opencode
+// parser with the transcript dial on and a spilled tool result: the event must
+// carry the saved output, not the pointer the stream showed.
+func TestOpencodeTranscriptRehydratesATruncatedResult(t *testing.T) {
+	plane, srv := newEventPlane(t)
+	defer srv.Close()
+	data := t.TempDir()
+	dir := filepath.Join(data, "opencode", "tool-output")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "tool_14be859510016lUEsFzsv0H3FT")
+	full := strings.Repeat("complete output line\n", 20)
+	if err := os.WriteFile(path, []byte(full), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in := Invocation{
+		ResumeClaim:  Claim{RunID: "run-1.secret"},
+		NewEventSink: eventSinkFactoryWith(t, srv, "opencode", true),
+		Env:          []string{"XDG_DATA_HOME=" + data},
+	}
+	p := newOpencodeParse(in, io.Discard)
+	defer p.closeEvents()
+
+	p.line([]byte(truncatedReadLine("call_1", path)))
+	batches := plane.waitForEvents(t, 2) // activity tool_call + transcript tool_result
+
+	var result map[string]any
+	for _, b := range batches {
+		for _, ev := range b.events {
+			if ev["type"] == "tool_result" {
+				result = ev
+			}
+		}
+	}
+	if result == nil {
+		t.Fatal("no tool_result for the truncated read")
+	}
+	if result["output"] != full {
+		t.Fatalf("output = %q, want the rehydrated spill", result["output"])
+	}
+	if result["callId"] != "call_1" || result["ok"] != true {
+		t.Errorf("tool_result = %v", result)
+	}
+}
+
+// TestClaudeTranscriptRehydratesAndFallsBackOnASpill pins both ends of the
+// claude spill path: a readable file's contents replace the pointer, and an
+// unreadable one sends the envelope the stream carried rather than nothing.
+func TestClaudeTranscriptRehydratesAndFallsBackOnASpill(t *testing.T) {
+	s := &recSink{transcript: true}
+	dir := t.TempDir()
+
+	spill := filepath.Join(dir, "c1.json")
+	if err := os.WriteFile(spill, []byte(`"the full output"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envelope := func(path string) json.RawMessage {
+		text := "<persisted-output>\nOutput too large (66.4KB). Full output saved to: " + path + "\n"
+		raw, err := json.Marshal(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	noteClaudeToolResult(s, "c1", false, envelope(spill), false)
+
+	missing := filepath.Join(dir, "c2.json") // never written: readSpilled fails
+	noteClaudeToolResult(s, "c2", false, envelope(missing), false)
+
+	if len(s.results) != 2 {
+		t.Fatalf("results = %v, want two", s.results)
+	}
+	if !strings.Contains(s.results[0], "the full output") || strings.Contains(s.results[0], "persisted-output") {
+		t.Errorf("a readable spill was not rehydrated: %q", s.results[0])
+	}
+	if !strings.Contains(s.results[1], "Full output saved to:") {
+		t.Errorf("an unreadable spill did not fall back to the envelope: %q", s.results[1])
 	}
 }
 

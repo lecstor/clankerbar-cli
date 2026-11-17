@@ -3,6 +3,7 @@ package events
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -64,8 +65,9 @@ func TestEmitterTranscriptCapsDoNotSplitUTF8(t *testing.T) {
 	output := "a" + strings.Repeat("é", MaxTranscriptBytes/2+10)
 	e.ToolResult("call-1", true, output, false)
 	e.AssistantText(output)
-	bodies := c.waitFor(t, 1)
-	for _, raw := range decodeBatch(t, bodies[0]).Events {
+	events := c.waitForEvents(t, 2)
+	seen := map[string]bool{}
+	for _, raw := range events {
 		var ev struct {
 			Type   string  `json:"type"`
 			Output *string `json:"output"`
@@ -74,6 +76,7 @@ func TestEmitterTranscriptCapsDoNotSplitUTF8(t *testing.T) {
 		if err := json.Unmarshal(raw, &ev); err != nil {
 			t.Fatal(err)
 		}
+		seen[ev.Type] = true
 		got := ev.Text
 		if ev.Output != nil {
 			got = *ev.Output
@@ -84,6 +87,11 @@ func TestEmitterTranscriptCapsDoNotSplitUTF8(t *testing.T) {
 		if !utf8.ValidString(got) {
 			t.Errorf("%s is not valid UTF-8 at the cap boundary", ev.Type)
 		}
+	}
+	// Both halves must be checked: a split flush previously left assistant_text
+	// unexamined while the test still passed.
+	if !seen[TypeToolResult] || !seen[TypeAssistantText] {
+		t.Fatalf("event types = %v, want both transcript types", seen)
 	}
 	e.Close()
 }
@@ -109,6 +117,241 @@ func TestEmitterAssistantTextCapsAt64KB(t *testing.T) {
 		t.Error("truncated marker missing")
 	}
 	e.Close()
+}
+
+func TestEmitterTranscriptByteCountsMeasureRedactedText(t *testing.T) {
+	// outputBytes/textBytes are measured AFTER redaction and BEFORE truncation.
+	// Plain ASCII has the same length either way, so no existing cap test can
+	// tell the two rules apart: a long key past the 64 KB point makes the
+	// redacted length differ from the input length, and that is what the counts
+	// must report.
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1}`))
+	defer srv.Close()
+	e := newTranscriptEmitter(srv, nil, nil)
+	e.SetRunID("run-1")
+
+	output := strings.Repeat("o", MaxTranscriptBytes+100) + " ghp_" + strings.Repeat("a", 36)
+	text := strings.Repeat("t", MaxTranscriptBytes+100) + " sk-ant-" + strings.Repeat("b", 30)
+	e.ToolResult("call-1", true, output, false)
+	e.AssistantText(text)
+
+	events := c.waitForEvents(t, 2)
+	var result ToolResultEvent
+	var assistant AssistantTextEvent
+	for _, raw := range events {
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &kind); err != nil {
+			t.Fatal(err)
+		}
+		switch kind.Type {
+		case TypeToolResult:
+			if err := json.Unmarshal(raw, &result); err != nil {
+				t.Fatal(err)
+			}
+		case TypeAssistantText:
+			if err := json.Unmarshal(raw, &assistant); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// The redacted prefix plus " " plus the 10-byte marker.
+	wantResultBytes := MaxTranscriptBytes + 100 + 1 + len(redactedMarker)
+	if result.OutputBytes != wantResultBytes {
+		t.Errorf("outputBytes = %d, want the redacted length %d (input was %d)", result.OutputBytes, wantResultBytes, len(output))
+	}
+	if result.OutputBytes == len(output) {
+		t.Error("outputBytes measured the raw input, not the redacted text")
+	}
+	if !result.Truncated {
+		t.Error("tool_result truncated marker missing")
+	}
+	wantTextBytes := MaxTranscriptBytes + 100 + 1 + len(redactedMarker)
+	if assistant.TextBytes != wantTextBytes {
+		t.Errorf("textBytes = %d, want the redacted length %d (input was %d)", assistant.TextBytes, wantTextBytes, len(text))
+	}
+	if assistant.TextBytes == len(text) {
+		t.Error("textBytes measured the raw input, not the redacted text")
+	}
+	if !assistant.Truncated {
+		t.Error("assistant_text truncated marker missing")
+	}
+	e.Close()
+}
+
+func TestFitTranscriptMatchesTheJSONEncoder(t *testing.T) {
+	// The fit's byte arithmetic must agree with encoding/json, or an event can
+	// still encode past a batch on content the estimate under-counted. Every
+	// expanding shape is fed at the cap and the real encoder is the judge.
+	payloads := map[string]string{
+		"control":       strings.Repeat("\x01", MaxTranscriptBytes),
+		"short escapes": strings.Repeat("\n\t\r", MaxTranscriptBytes/3),
+		"html":          strings.Repeat("<>&", MaxTranscriptBytes/3),
+		"js separators": strings.Repeat("\u2028\u2029", MaxTranscriptBytes/6),
+		"quotes":        strings.Repeat(`"\`, MaxTranscriptBytes/2),
+		"multibyte":     strings.Repeat("é", MaxTranscriptBytes/2),
+		"invalid utf8":  strings.Repeat("\xff", MaxTranscriptBytes),
+		"mixed":         strings.Repeat("a\x01<é\u2028", MaxTranscriptBytes/9),
+	}
+	for name, payload := range payloads {
+		t.Run(name, func(t *testing.T) {
+			ev := event{kind: TypeToolResult, callID: "c1", output: payload, outputBytes: len(payload)}
+			ev.fitTranscript("claude")
+			raw, err := ev.marshal(math.MaxUint64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if limit := MaxBatchBytes - batchOverhead("claude"); len(raw) > limit {
+				t.Fatalf("encoded event = %d bytes, over the %d-byte batch budget", len(raw), limit)
+			}
+			if len(ev.output) > len(payload) {
+				t.Fatalf("fit grew the payload: %d > %d", len(ev.output), len(payload))
+			}
+		})
+	}
+}
+
+func TestEmitterTranscriptEventAlwaysFitsABatch(t *testing.T) {
+	// A control byte encodes to six (`\u0001`), so 64 KB of them would encode
+	// past MaxBatchBytes and buildBatch would drop the whole event as
+	// unsendable — losing what the plane never refused. The cut is sized against
+	// the encoded event, so it still arrives, shorter, with the after-redaction
+	// count intact.
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1}`))
+	defer srv.Close()
+	e := newTranscriptEmitter(srv, nil, nil)
+	e.SetRunID("run-1")
+
+	output := strings.Repeat("\x01", MaxTranscriptBytes)
+	text := strings.Repeat("<", MaxTranscriptBytes)
+	e.ToolResult("call-1", true, output, false)
+	e.AssistantText(text)
+
+	events := c.waitForEvents(t, 2)
+	bodies, _, _ := c.snapshot()
+	for _, body := range bodies {
+		if len(body) > MaxBatchBytes {
+			t.Errorf("batch is %d bytes, over MaxBatchBytes", len(body))
+		}
+	}
+	seen := map[string]bool{}
+	for _, raw := range events {
+		var ev struct {
+			Type        string  `json:"type"`
+			Output      *string `json:"output"`
+			Text        string  `json:"text"`
+			OutputBytes int     `json:"outputBytes"`
+			TextBytes   int     `json:"textBytes"`
+			Truncated   bool    `json:"truncated"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			t.Fatal(err)
+		}
+		seen[ev.Type] = true
+		got, want := ev.Text, ev.TextBytes
+		if ev.Output != nil {
+			got, want = *ev.Output, ev.OutputBytes
+		}
+		if want != MaxTranscriptBytes {
+			t.Errorf("%s count = %d, want the after-redaction %d", ev.Type, want, MaxTranscriptBytes)
+		}
+		if len(got) >= MaxTranscriptBytes {
+			t.Errorf("%s payload = %d bytes; the cut was not sized against the encoding", ev.Type, len(got))
+		}
+		if len(got) == 0 || !ev.Truncated {
+			t.Errorf("%s payload = %d bytes, truncated = %v; want a shorter marked prefix", ev.Type, len(got), ev.Truncated)
+		}
+	}
+	if !seen[TypeToolResult] || !seen[TypeAssistantText] {
+		t.Fatalf("event types = %v, want both transcript types", seen)
+	}
+	e.Close()
+}
+
+func TestStopTranscriptDropsQueuedEventsAndRefusesLaterOnes(t *testing.T) {
+	// The stop has two branches beyond the ACK itself: the queued transcript
+	// events are filtered out of the buffer, and a transcript event that loses
+	// the race with the ACK (enqueued after the stop) is refused. Activity
+	// already queued keeps flowing.
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":1,"dropped":{"transcript":1}}`))
+	defer srv.Close()
+	var logs []string
+	var logMu sync.Mutex
+	e := newTranscriptEmitter(srv, nil, func(format string, args ...any) {
+		logMu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		logMu.Unlock()
+	})
+	e.cfg.FlushEvery = time.Hour
+	e.SetRunID("run-1")
+	at := "2026-01-01T00:00:00.000Z"
+
+	// Prime the buffer directly: the first flush must carry exactly one full
+	// batch of activity filler and leave the transcript events queued.
+	// Enqueueing 50 events would wake the sender and race this test's flush.
+	e.mu.Lock()
+	for i := 0; i < MaxBatchEvents; i++ {
+		e.pending = append(e.pending, event{kind: TypeToolCall, at: at, tool: "Bash",
+			callID: fmt.Sprintf("fill-%d", i), target: "ls"})
+	}
+	e.pending = append(e.pending,
+		event{kind: TypeToolResult, at: at, callID: "queued-1", output: "one", outputBytes: 3},
+		event{kind: TypeToolResult, at: at, callID: "queued-2", output: "two", outputBytes: 3},
+		event{kind: TypeToolCall, at: at, tool: "Bash", callID: "kept", target: "ls"},
+	)
+	for _, q := range e.pending {
+		e.approxBytes += q.approxBytes()
+	}
+	e.mu.Unlock()
+
+	e.flush(1, time.Second)
+	if e.TranscriptEnabled() {
+		t.Fatal("the drop report did not stop the transcript tier")
+	}
+	e.mu.Lock()
+	pending := append([]event(nil), e.pending...)
+	e.mu.Unlock()
+	if len(pending) != 1 || pending[0].callID != "kept" {
+		t.Fatalf("pending after the stop = %+v, want only the queued activity call", pending)
+	}
+
+	// A transcript event arriving after the stop is refused before buffering.
+	e.enqueue(event{kind: TypeToolResult, at: at, callID: "late", output: "late", outputBytes: 4})
+
+	e.flush(1, time.Second)
+	events := c.waitForEvents(t, MaxBatchEvents+1)
+	if len(events) != MaxBatchEvents+1 {
+		t.Fatalf("events sent = %d, want %d (the late transcript event must not be sent)", len(events), MaxBatchEvents+1)
+	}
+	var types []string
+	for _, raw := range events {
+		var ev struct {
+			Type   string `json:"type"`
+			CallID string `json:"callId"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			t.Fatal(err)
+		}
+		types = append(types, ev.Type)
+		if ev.Type == TypeToolResult {
+			t.Fatalf("a transcript event was sent after the stop: %+v", ev)
+		}
+	}
+	if types[len(types)-1] != TypeToolCall {
+		t.Fatalf("last event type = %q, want the queued activity call", types[len(types)-1])
+	}
+	e.Close()
+
+	logMu.Lock()
+	defer logMu.Unlock()
+	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "3 transcript event(s) dropped") {
+		t.Fatalf("the stop did not count the ACK's 1 plus the 2 queued events: %v", logs)
+	}
 }
 
 func TestEmitterTranscriptRedactsBeforeTruncation(t *testing.T) {

@@ -40,11 +40,16 @@ and batcher in `internal/events`.
 - **Transcript events are a second opt-in.** With `events.transcript` off, the
   normalizers still feed the activity tier and the transcript methods do
   nothing. With it on, each `tool_result` carries `output` (head bytes at the
-  64 KB cap, `truncated` when cut), `outputBytes` (the original length measured
-  after redaction and before truncation, so `outputBytes > len(output)` means
-  exactly "bytes were cut") and `ok`. Each `assistant_text` carries `text` and
-  `textBytes` on the same rule. One event per assistant text block, in order;
-  consecutive blocks are not merged.
+  64 KB cap, `truncated` when cut), `outputBytes` (the length measured after
+  redaction and before truncation, so with an output present
+  `outputBytes > len(output)` means exactly "bytes were cut"; a withheld `.env*`
+  output has no `output` and its count is what was withheld) and `ok`. Each
+  `assistant_text` carries `text` and `textBytes` on the same rule. One event
+  per non-blank assistant text block, in order; consecutive blocks are not
+  merged, and a whitespace-only block is skipped as stream framing. A payload is
+  additionally cut shorter when JSON escaping (a control byte, `<`, `>` or `&`
+  expands to six) would push the single event past the 256 KB batch cap, so an
+  escape-heavy output still arrives rather than being dropped whole.
 - **`.env*` reads are withheld.** The output of a read of any `.env*` path is
   dropped entirely: the `tool_result` carries no `output`, only `redacted: true`
   (`outputBytes` is still present, as the wire requires). "Read" means the
@@ -188,10 +193,12 @@ try to.
 The CLI's half of the cooperation is the ACK: every ingest response carries
 `dropped: { transcript: N }`, which is non-zero when the cap stopped the tier
 (or when a stale emitter sent transcript events with the dial off). On the first
-non-zero count the emitter **stops the transcript tier for that run**: queued
+non-zero count the emitter **stops the transcript tier for that session**: queued
 transcript events are dropped, later ones are refused before they are buffered,
-and one log line says so. Activity keeps flowing — a runaway run degrades, it
-never bills unbounded.
+and one log line says so. The stop is per session/emitter, not durable: a later
+session on the same run starts sending again and re-learns the cap from its own
+first ACK. Activity keeps flowing — a runaway run degrades, it never bills
+unbounded.
 
 ## Redaction
 

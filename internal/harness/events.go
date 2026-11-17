@@ -73,10 +73,11 @@ func noteOpencodeToolEvent(sink events.Sink, tool, callID string, input json.Raw
 
 // noteAssistantText maps one assistant text block onto the transcript tier.
 // Both harnesses hand over a block's whole text in one event, so they share
-// this mapping; a whitespace-only block is NOT an event: it is the stream's
-// framing, not something the model said.
+// this mapping. The tier must be on (checked here, as the tool-result helpers
+// do), and a whitespace-only block is NOT an event: it is the stream's framing,
+// not something the model said.
 func noteAssistantText(sink events.Sink, text string) {
-	if sink == nil || strings.TrimSpace(text) == "" {
+	if sink == nil || !sink.TranscriptEnabled() || strings.TrimSpace(text) == "" {
 		return
 	}
 	sink.AssistantText(text)

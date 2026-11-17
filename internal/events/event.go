@@ -20,7 +20,9 @@ package events
 
 import (
 	"encoding/json"
+	"math"
 	"time"
+	"unicode/utf8"
 )
 
 // The channel's event types (CLA-601's schema). The first three are the activity
@@ -47,10 +49,11 @@ const (
 	MaxToolBytes        = 128
 	MaxCallIDBytes      = 256
 
-	// MaxTranscriptBytes is the transcript tier's per-event cap on `output` and
-	// `text`. It is the R2 copy's cap AND the emitter's wire cap: no layer keeps
-	// more, one event always fits a batch, and `outputBytes` / `textBytes` make
-	// the loss explicit rather than silent.
+	// MaxTranscriptBytes is the transcript tier's nominal per-event cap on
+	// `output` and `text`. It is the R2 copy's cap: no layer keeps more. The
+	// emitted prefix can be shorter when JSON escaping would push the event past
+	// MaxBatchBytes (fitTranscript) — one event must always fit a batch — and
+	// `outputBytes` / `textBytes` make both cuts explicit rather than silent.
 	MaxTranscriptBytes = 64 << 10
 
 	// MaxBatchEvents / MaxBatchBytes are the flush caps: whichever is reached
@@ -157,10 +160,11 @@ type event struct {
 	truncated bool
 	redacted  bool
 
-	// Transcript tier. outputBytes/textBytes are the ORIGINAL lengths measured
-	// before truncation (after redaction, so the difference from len(output) /
-	// len(text) means exactly "bytes were cut"). dropOutput is the `.env*` read
-	// rule: the output is withheld entirely and the event carries no output.
+	// Transcript tier. outputBytes/textBytes are the lengths measured after
+	// redaction and before truncation, so for a present output the difference
+	// from len(output) / len(text) means exactly "bytes were cut". A withheld
+	// `.env*` output has dropOutput set: no payload is sent and the count is
+	// simply what was withheld.
 	ok          bool
 	output      string
 	outputBytes int
@@ -230,3 +234,82 @@ func (e event) approxBytes() int {
 // marshal is json.Marshal for the tests and the batcher; an event always
 // marshals (all fields are strings and slices).
 func (e event) marshal(seq uint64) ([]byte, error) { return json.Marshal(e.wire(seq)) }
+
+// batchOverhead is what the batch wrapper adds before any event's encoded
+// bytes: the same figure buildBatch measures against.
+func batchOverhead(harness string) int {
+	return len(`{"harness":"","events":[]}`) + len(harness)
+}
+
+// fitTranscript shrinks a transcript event's payload until its JSON encoding
+// fits a batch on its own. The 64 KB cap is on the raw bytes, but JSON expands
+// control and HTML bytes to six (`\uXXXX`), so a cap-sized output can encode
+// past MaxBatchBytes — and buildBatch drops a lone event that big whole, losing
+// what the plane would have accepted. outputBytes/textBytes keep the
+// after-redaction length, so the extra cut is already visible as `truncated`.
+func (e *event) fitTranscript(harness string) {
+	payload, text := e.output, false
+	if e.kind == TypeAssistantText {
+		payload, text = e.text, true
+	}
+	// The event with an empty payload, at the widest seq a batch can assign
+	// (the seq is the only field not known here). The fit sets `truncated` on
+	// the event it shrinks, so the probe carries it too; the free bytes left are
+	// the payload's encoded budget.
+	probe := *e
+	probe.truncated = true
+	if text {
+		probe.text = ""
+	} else {
+		probe.output = ""
+	}
+	raw, err := probe.marshal(math.MaxUint64)
+	if err != nil {
+		return // unreachable: every field is a string, a bool or a slice
+	}
+	budget := MaxBatchBytes - batchOverhead(harness) - len(raw)
+	if budget < 0 {
+		budget = 0
+	}
+	kept, used := 0, 0
+	for kept < len(payload) {
+		r, size := utf8.DecodeRuneInString(payload[kept:])
+		cost := jsonStringRuneBytes(r, size)
+		if used+cost > budget {
+			break
+		}
+		used += cost
+		kept += size
+	}
+	if kept >= len(payload) {
+		return
+	}
+	if text {
+		e.text = payload[:kept]
+	} else {
+		e.output = payload[:kept]
+	}
+	e.truncated = true
+}
+
+// jsonStringRuneBytes is one rune's encoded length inside a JSON string, as
+// encoding/json writes it: quotes and backslashes take two, so do the short
+// control escapes (\n, \t, ...); other control bytes, <, >, & and the JS line
+// separators U+2028/U+2029 take six (\uXXXX); an invalid byte becomes \ufffd.
+// Everything else is its own UTF-8 length. Under-counting here would let an
+// event encode past a batch, so the six-byte cases are the load-bearing ones.
+func jsonStringRuneBytes(r rune, size int) int {
+	switch {
+	case r == utf8.RuneError && size == 1:
+		return 6 // \ufffd
+	case r == '"' || r == '\\':
+		return 2
+	case r == '\b' || r == '\f' || r == '\n' || r == '\r' || r == '\t':
+		return 2
+	case r < 0x20 || r == '<' || r == '>' || r == '&':
+		return 6 // \u00XX
+	case r == '\u2028' || r == '\u2029':
+		return 6 // escaped unconditionally for JS safety
+	}
+	return size
+}

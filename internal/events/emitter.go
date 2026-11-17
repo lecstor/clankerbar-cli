@@ -276,8 +276,10 @@ func validTodoStatus(s string) bool {
 //
 // The order is the design note's: redact the FULL string, then truncate to the
 // 64 KB wire cap. outputBytes is measured between the two (after redaction,
-// before truncation), so `outputBytes > len(output)` means exactly "bytes were
-// cut" and nothing else is being claimed.
+// before truncation), so with an output present `outputBytes > len(output)`
+// means exactly "bytes were cut" and nothing else is being claimed. A withheld
+// `.env*` output is identified by `redacted: true` and no output at all: its
+// outputBytes is simply what was withheld.
 func (e *Emitter) ToolResult(callID string, ok bool, output string, dropOutput bool) {
 	if e == nil || !e.TranscriptEnabled() {
 		return
@@ -301,6 +303,7 @@ func (e *Emitter) ToolResult(callID string, ok bool, output string, dropOutput b
 		ev.outputBytes = len(redactedText)
 		ev.redacted = redacted
 		ev.truncated = truncated
+		ev.fitTranscript(e.cfg.Harness)
 	}
 	e.enqueue(ev)
 }
@@ -314,10 +317,12 @@ func (e *Emitter) AssistantText(text string) {
 	}
 	redactedText, redacted := Redact(text)
 	cut, truncated := truncateUTF8(redactedText, MaxTranscriptBytes)
-	e.enqueue(event{
+	ev := event{
 		kind: TypeAssistantText, at: e.timestamp(), text: cut,
 		textBytes: len(redactedText), redacted: redacted, truncated: truncated,
-	})
+	}
+	ev.fitTranscript(e.cfg.Harness)
+	e.enqueue(ev)
 }
 
 // TranscriptEnabled reports whether transcript-tier events are being sent right
@@ -599,7 +604,7 @@ func (e *Emitter) takeBatch() (body []byte, runID string, maxSeq uint64, n int) 
 // that prefix.
 func buildBatch(pending []event, runID, harness string, seq *SeqCounter) (body []byte, n int, maxSeq uint64, consumed, dropped int) {
 	// The wrapper's own bytes, including the harness name, before any event.
-	overhead := len(`{"harness":"","events":[]}`) + len(harness)
+	overhead := batchOverhead(harness)
 	remaining := MaxBatchBytes - overhead
 
 	raws := make([]json.RawMessage, 0, min(len(pending), MaxBatchEvents))
