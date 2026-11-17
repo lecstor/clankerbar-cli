@@ -171,7 +171,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)
-				noteClaudeToolEvent(res.events, b.Name, b.ID, b.Input)
+				NoteClaudeToolEvent(res.events, b.Name, b.ID, b.Input)
 				res.noteToolName(b.ID, b.Name)
 				res.idle.toolStarted(b.ID)
 			}

@@ -54,6 +54,10 @@ Usage:
     --task <ref|id>             and print its review URL. Same byte-free path:
                                 the HTML goes up as a text/html asset, then
                                 binds to the task as its review deck.
+  clankerbar hook emit         Read one Claude Code PostToolUse payload on stdin
+                               and send it to the plane's per-run activity channel.
+                               Exits 0 silently when the session is not bound to a
+                               run (CLANKERBAR_RUN_ID / CLANKERBAR_API_KEY unset).
   clankerbar review run        Review one local base..head with the driver's own
     --base <commit>            review, outside any task, claim or plane, and
                                print the findings as JSON. Runs in a temporary
@@ -84,7 +88,7 @@ Usage:
 
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
 --help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
-'clankerbar upload --help', 'clankerbar deck --help' or 'clankerbar review run
---help' for their flags.
+'clankerbar upload --help', 'clankerbar deck --help', 'clankerbar hook
+--help' or 'clankerbar review run --help' for their flags.
 `)
 }

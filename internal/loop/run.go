@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -337,6 +338,12 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 	if !d.blind {
 		candidates := make([]bool, len(d.targets))
 		anyCandidate := false
+		// The local BEACON takes no target, so this pass writes it ONCE, from
+		// the state that best speaks for the daemon (CLA-908). Writing it per
+		// target would let whichever project is polled last decide what
+		// `supervise` says about every project on the daemon.
+		localState := fleet.State{Kind: fleet.StateIdle}
+		reported := false
 		for i := range d.targets {
 			t := d.targets[i]
 			sum, err := t.Poller.Poll(runCtx)
@@ -440,10 +447,18 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 			// fleetState reads (CLA-483); every poll beacons bar the two hard-stop
 			// arms, which get their `stopping` from fleetShutdown. A session blocks
 			// the poll, so the in-session renewal tick carries the same lap (CLA-771).
-			d.beacon(i, t, d.fleetState(i))
+			// The plane gets one report per target; the local file is written once
+			// after the loop (see localState above).
+			st := d.fleetState(i)
+			d.sendBeacon(i, t, st)
+			localState = pollBeaconState(localState, st)
+			reported = true
 			if d.blind {
 				break
 			}
+		}
+		if reported {
+			d.writeLocalBeacon(localState)
 		}
 		if !d.blind {
 			if !anyCandidate {

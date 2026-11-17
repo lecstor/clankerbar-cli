@@ -55,13 +55,16 @@ func TestCheckPauseWindowsReportsTheScheduleAndTheMoment(t *testing.T) {
 	if paused.detail != wantDetail {
 		t.Errorf("detail = %q, want %q", paused.detail, wantDetail)
 	}
-	if len(paused.info) != 1 || !strings.Contains(paused.info[0], "now: paused until Fri 14:00") {
-		t.Errorf("info = %v, want a paused line ending at Fri 14:00", paused.info)
+	if len(paused.info) != 2 || !strings.Contains(paused.info[0], "now: paused until Fri 14:00") {
+		t.Errorf("info = %v, want a paused line ending at Fri 14:00, plus the boundary rule", paused.info)
+	}
+	if !strings.Contains(paused.info[1], "holds at its next phase boundary") {
+		t.Errorf("info = %v, want the CLA-906 boundary semantics stated", paused.info)
 	}
 
 	// Friday 21:00 local: running, and the next pause is Monday's lead.
 	running := checkPauseWindowsAt(cfg, time.Date(2026, 11, 13, 21, 0, 0, 0, loc))
-	if len(running.info) != 1 || !strings.Contains(running.info[0], "now: running; next pause Mon 10:30") {
-		t.Errorf("info = %v, want a running line naming Mon 10:30", running.info)
+	if len(running.info) != 2 || !strings.Contains(running.info[0], "now: running; next pause Mon 10:30") {
+		t.Errorf("info = %v, want a running line naming Mon 10:30, plus the boundary rule", running.info)
 	}
 }

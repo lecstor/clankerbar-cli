@@ -108,6 +108,16 @@ walk:
 			st.terminal = true
 		}
 		st.isHandoff = s.nextPrompt != ""
+		// CLA-906: the boundary check runs BEFORE the panel fan-out. A review
+		// panel is one phase boundary that starts N sessions at once, so the
+		// pause must hold the whole fan-out — checking per member would either
+		// run the first member inside the window or split the panel across it.
+		switch s.checkPhaseBoundary(ctx, st) {
+		case seqContinue:
+			continue
+		case seqBreak:
+			break walk
+		}
 		switch s.runPanelFanOut(ctx, st) {
 		case seqContinue:
 			continue
@@ -116,12 +126,6 @@ walk:
 		}
 		st.promptBytes = 0
 		switch s.buildHandoffPrompt(st) {
-		case seqContinue:
-			continue
-		case seqBreak:
-			break walk
-		}
-		switch s.checkPhaseBoundary(st) {
 		case seqContinue:
 			continue
 		case seqBreak:
