@@ -15,9 +15,10 @@ import (
 // pinned it; any unintended change anywhere in them fails here.
 //
 // A deliberate change to a shared fragment these briefs embed (the gate scope,
-// the record shape, the handoff guidance, or CLA-865's {{baseSha}} diff line)
-// means updating the matching goldens by hand — that friction is the point,
-// because it is the only way an edit elsewhere in the brief cannot slip through.
+// the record shape, the handoff guidance, CLA-865's {{baseSha}} diff line, or
+// CLA-917's lease-renewal clause) means updating the matching goldens by hand —
+// that friction is the point, because it is the only way an edit elsewhere in
+// the brief cannot slip through.
 // The panel member's UNVERIFIED brief is deliberately not pinned: CLA-702
 // rewrites exactly that one.
 func TestReviewBriefsUnchangedByTheUnverifiedSplit(t *testing.T) {
