@@ -47,7 +47,7 @@ and batcher in `internal/events`.
   consecutive blocks are not merged.
 - **`.env*` reads are withheld.** The output of a read of any `.env*` path is
   dropped entirely: the `tool_result` carries no `output`, only `redacted: true`
-  (and `outputBytes`, the length of what was withheld). "Read" means the
+  (`outputBytes` is still present, as the wire requires). "Read" means the
   read-shaped tool (`Read` on claude, `read` on opencode); a shell `cat .env` is
   not visible to this rule.
 - **Spilled results are rehydrated.** Claude Code and opencode sometimes replace

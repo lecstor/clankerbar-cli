@@ -171,7 +171,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				// Transcript tier (CLA-887): one event per text block, unmerged
 				// and un-trimmed. The sink is off-safe, and the mapping skips a
 				// whitespace-only block.
-				noteClaudeAssistantText(res.events, b.Text)
+				noteAssistantText(res.events, b.Text)
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)

@@ -653,7 +653,7 @@ func (p *opencodeParse) line(line []byte) {
 			p.lastText = t
 		}
 		// Transcript tier (CLA-887): one event per text part.
-		noteOpencodeAssistantText(p.observed.events, ev.Part.Text)
+		noteAssistantText(p.observed.events, ev.Part.Text)
 	case "step_finish":
 		// CLA-900: the step window is CLOSED above, before the Part check. A
 		// step_finish must never OPEN one: it is published after the step's tools

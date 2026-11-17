@@ -306,3 +306,21 @@ func TestClaudeClaimTracking_theRequestedIdNeverBecomesAClaim(t *testing.T) {
 		t.Errorf("Claim = %+v, want zero: a request is not an answer", res.Claim)
 	}
 }
+
+// TestClaudeTranscriptRehydratesASpilledResult pins the transcript tier's use of
+// the same spill guard the claim path uses: the event carries the output the
+// model saw, not the pointer the stream carried.
+func TestClaudeTranscriptRehydratesASpilledResult(t *testing.T) {
+	const id = "toolu_transcript_spill"
+	path := spillClaimPayload(t, id)
+	content, err := json.Marshal(persistedEnvelope(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &recSink{transcript: true}
+	noteClaudeToolResult(s, id, false, content, false)
+	want := "tool_result|" + id + "|true|" + claimOK + "|false"
+	if len(s.results) != 1 || s.results[0] != want {
+		t.Fatalf("results = %q, want [%q]", s.results, want)
+	}
+}

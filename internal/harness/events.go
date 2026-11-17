@@ -71,18 +71,11 @@ func noteOpencodeToolEvent(sink events.Sink, tool, callID string, input json.Raw
 	}
 }
 
-// noteClaudeAssistantText maps one claude `assistant` text block onto the
-// transcript tier. A whitespace-only block is NOT an event: it is the stream's
+// noteAssistantText maps one assistant text block onto the transcript tier.
+// Both harnesses hand over a block's whole text in one event, so they share
+// this mapping; a whitespace-only block is NOT an event: it is the stream's
 // framing, not something the model said.
-func noteClaudeAssistantText(sink events.Sink, text string) {
-	if sink == nil || strings.TrimSpace(text) == "" {
-		return
-	}
-	sink.AssistantText(text)
-}
-
-// noteOpencodeAssistantText is the opencode half: one `text` part is one block.
-func noteOpencodeAssistantText(sink events.Sink, text string) {
+func noteAssistantText(sink events.Sink, text string) {
 	if sink == nil || strings.TrimSpace(text) == "" {
 		return
 	}

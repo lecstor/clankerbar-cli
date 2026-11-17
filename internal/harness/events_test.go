@@ -332,8 +332,8 @@ func TestOpencodeParserEmitsActivityEvents(t *testing.T) {
 
 func TestClaudeTranscriptMapping(t *testing.T) {
 	s := &recSink{transcript: true}
-	noteClaudeAssistantText(s, "working on it")
-	noteClaudeAssistantText(s, "  \n") // framing, not a message
+	noteAssistantText(s, "working on it")
+	noteAssistantText(s, "  \n") // framing, not a message
 	if len(s.texts) != 1 || s.texts[0] != "working on it" {
 		t.Fatalf("texts = %q", s.texts)
 	}
@@ -353,8 +353,8 @@ func TestClaudeTranscriptMapping(t *testing.T) {
 
 func TestOpencodeTranscriptMapping(t *testing.T) {
 	s := &recSink{transcript: true}
-	noteOpencodeAssistantText(s, "step one")
-	noteOpencodeAssistantText(s, "")
+	noteAssistantText(s, "step one")
+	noteAssistantText(s, "")
 	noteOpencodeToolResult(s, "read", "c1", raw(`{"filePath":"a.go"}`), true, "package a")
 	noteOpencodeToolResult(s, "read", "c2", raw(`{"filePath":".env.local"}`), true, "SECRET=1")
 	noteOpencodeToolResult(s, "shell", "c3", raw(`{"command":"false"}`), false, "exit 1")
@@ -375,9 +375,9 @@ func TestTranscriptDialOffRecordsNothing(t *testing.T) {
 	// The dial is checked in the mapping, not only in the emitter: an off sink
 	// must not do transcript-only work or record an event to discard.
 	s := &recSink{} // transcript off
-	noteClaudeAssistantText(s, "hi")
+	noteAssistantText(s, "hi")
 	noteClaudeToolResult(s, "c1", false, raw(`"x"`), false)
-	noteOpencodeAssistantText(s, "hi")
+	noteAssistantText(s, "hi")
 	noteOpencodeToolResult(s, "read", "c1", raw(`{"filePath":"x"}`), true, "x")
 	if len(s.texts)+len(s.results) != 0 {
 		t.Fatalf("texts = %q, results = %v; want nothing with the dial off", s.texts, s.results)
