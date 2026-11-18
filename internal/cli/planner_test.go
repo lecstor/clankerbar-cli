@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/config"
 )
 
 // The role branch of `run`: a planner instance must refuse the two local
@@ -14,7 +16,7 @@ import (
 
 func TestRunPlannerRefusesWithoutAKey(t *testing.T) {
 	cfg := plannerConfig(t)
-	if err := runPlanner(context.Background(), cfg, ""); err == nil || !strings.Contains(err.Error(), "CLANKERBAR_API_KEY") {
+	if err := runPlanner(context.Background(), cfg, "", "", config.Overrides{}); err == nil || !strings.Contains(err.Error(), "CLANKERBAR_API_KEY") {
 		t.Fatalf("runPlanner = %v, want a refusal naming the missing key", err)
 	}
 }
@@ -23,7 +25,7 @@ func TestRunPlannerRefusesWithoutAProject(t *testing.T) {
 	cfg := plannerConfig(t)
 	cfg.BacklogURL = "https://clankerbar.com"
 	cfg.MCPConfigPath = ""
-	if err := runPlanner(context.Background(), cfg, "k"); err == nil || !strings.Contains(err.Error(), "no project slug") {
+	if err := runPlanner(context.Background(), cfg, "k", "", config.Overrides{}); err == nil || !strings.Contains(err.Error(), "no project slug") {
 		t.Fatalf("runPlanner = %v, want a refusal naming the missing project", err)
 	}
 }

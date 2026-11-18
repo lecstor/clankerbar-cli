@@ -192,8 +192,15 @@ func TestProposeConfig_CommandFlow(t *testing.T) {
 			} `json:"params"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		// propose-config reads the stored document first (to preserve a roles
+		// block), then sends the proposal.
 		if body.Params.Name != "propose_project_run_config" {
-			t.Errorf("tool = %q", body.Params.Name)
+			if body.Params.Name != "get_project_run_config" {
+				t.Errorf("tool = %q", body.Params.Name)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`))
+			return
 		}
 		called = true
 		gotDoc, _ = body.Params.Arguments["config"].(map[string]any)
@@ -222,6 +229,57 @@ func TestProposeConfig_CommandFlow(t *testing.T) {
 	}
 	if !strings.Contains(gotNotes, "propose-config") {
 		t.Errorf("notes = %q, want the auto derivation note naming the command", gotNotes)
+	}
+}
+
+// 1.review-1.3: `roles` lives only on the stored document, and ratifying a
+// proposal REPLACES that document. A proposal that omitted the project's roles
+// would therefore clear its planner and turn chat off, so propose-config carries
+// the stored section forward verbatim.
+func TestProposeConfig_CarriesTheStoredRolesSection(t *testing.T) {
+	var gotDoc map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Params struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		text := `{}`
+		if body.Params.Name == "get_project_run_config" {
+			text = `{"version":3,"config":{"harness":"claude","roles":{"planner":{"harness":"claude","tier":"strong","max_wall_clock":600}}}}`
+		}
+		if body.Params.Name == "propose_project_run_config" {
+			gotDoc, _ = body.Params.Arguments["config"].(map[string]any)
+		}
+		resp, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": 1,
+			"result": map[string]any{"content": []map[string]any{{"type": "text", "text": text}}},
+		})
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(resp)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"harness": "claude", "model": "opus", "workdir": "` + dir + `", "backlog_url": "` + srv.URL + `/mcp/demo"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLANKERBAR_API_KEY", "k-test")
+
+	if err := ProposeConfig(context.Background(), []string{"--config", path}); err != nil {
+		t.Fatalf("ProposeConfig: %v", err)
+	}
+	if gotDoc == nil {
+		t.Fatal("no proposal was recorded")
+	}
+	roles, _ := gotDoc["roles"].(map[string]any)
+	planner, _ := roles["planner"].(map[string]any)
+	if planner["harness"] != "claude" || planner["tier"] != "strong" {
+		t.Fatalf("proposal roles = %+v, want the stored roles.planner carried forward", gotDoc["roles"])
 	}
 }
 

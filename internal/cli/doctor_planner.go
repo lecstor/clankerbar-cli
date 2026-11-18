@@ -50,6 +50,11 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 
 	anyConfigured := false
 	anyResolved := false
+	// unverified counts projects whose role could not be READ. The aggregate
+	// refusal below may only fire when every project was resolved: a transient
+	// plane error is a WARN in checkRunConfigs, and it must not become a doctor
+	// rejection here.
+	unverified := 0
 	usable := 0
 	for _, t := range targets {
 		// The per-project line is always qualified; the bare `planner` name is
@@ -68,6 +73,7 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 		st, err := rc.RunConfig(ctx)
 		switch {
 		case errors.Is(err, plane.ErrNotWired):
+			unverified++
 			checks = append(checks, check{
 				name:   label,
 				status: warn,
@@ -84,6 +90,7 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 			anyResolved = true
 			continue
 		case err != nil:
+			unverified++
 			checks = append(checks, check{
 				name:   label,
 				status: warn,
@@ -94,6 +101,7 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 		}
 		var doc config.RunConfigDoc
 		if err := json.Unmarshal(st.Config, &doc); err != nil {
+			unverified++
 			checks = append(checks, check{
 				name:   label,
 				status: warn,
@@ -102,6 +110,7 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 			continue
 		}
 		if doc.SchemaNewer() {
+			unverified++
 			checks = append(checks, check{
 				name:   label,
 				status: warn,
@@ -115,6 +124,7 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 		// it (including a harness-swap refusal), without touching the base.
 		eff := cfg.Clone()
 		if err := eff.ApplyRunConfig(&doc); err != nil {
+			unverified++
 			checks = append(checks, check{
 				name:   label,
 				status: warn,
@@ -144,16 +154,45 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	}
 
 	if anyResolved && !anyConfigured {
+		if unverified > 0 {
+			// Some projects could not be read: one of them may carry the planner,
+			// so this stays the WARN the per-project lines are, never a refusal.
+			checks = append(checks, check{
+				name:   "planner",
+				status: warn,
+				detail: fmt.Sprintf("no RESOLVED project carries roles.planner, but %d project(s) could not be read - chat may still be served",
+					unverified),
+				remedy: "check the plane is reachable, then run doctor again to verify the remaining project(s)",
+			})
+		} else {
+			checks = append(checks, check{
+				name:   "planner",
+				status: fail,
+				detail: "no project's resolved run config carries roles.planner - a planner instance has no chat to serve",
+				remedy: "propose a run-config document with a `roles.planner` block and have the operator ratify it, or run this instance as a worker",
+			})
+		}
+	} else if !anyResolved && unverified > 0 {
 		checks = append(checks, check{
 			name:   "planner",
-			status: fail,
-			detail: "no project's resolved run config carries roles.planner - a planner instance has no chat to serve",
-			remedy: "propose a run-config document with a `roles.planner` block and have the operator ratify it, or run this instance as a worker",
+			status: warn,
+			detail: fmt.Sprintf("could not verify roles.planner for any of the %d project(s) - doctor and run stay usable while the plane is unreachable", unverified),
+			remedy: "check the plane is reachable, then run doctor again",
 		})
 	} else if anyConfigured && usable == 0 {
 		// Every configured project's role failed its machine check; the
-		// per-project FAILs already say why. This line makes the aggregate
-		// consequence unmissable.
+		// per-project FAILs already say why. An unreadable project may still
+		// carry a servable role, so that case stays the WARN the per-project
+		// lines are rather than turning a plane error into a refusal.
+		if unverified > 0 {
+			checks = append(checks, check{
+				name:   "planner",
+				status: warn,
+				detail: fmt.Sprintf("every READ project's planner role failed its machine check, but %d project(s) could not be read - the instance may still serve them", unverified),
+				remedy: "fix the per-project findings above, then check the plane is reachable and run doctor again",
+			})
+			return checks
+		}
 		checks = append(checks, check{
 			name:   "planner",
 			status: fail,

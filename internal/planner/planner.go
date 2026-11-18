@@ -34,6 +34,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
@@ -98,6 +99,11 @@ type Config struct {
 	// PollInterval and ConfigTTL default to the constants above.
 	PollInterval time.Duration
 	ConfigTTL    time.Duration
+	// PresenceRefresh is how often presence is refreshed WHILE a turn runs, so a
+	// planner answering a long turn never reads as offline. Defaults to
+	// DefaultIdleBeacon, far inside the plane's 15-minute stale window; tests
+	// shorten it.
+	PresenceRefresh time.Duration
 	// Now is the clock, for tests. Nil is time.Now.
 	Now func() time.Time
 	// NewSessionRef mints a fresh session handle. Nil is newSessionRef; tests
@@ -118,9 +124,18 @@ type Planner struct {
 	console      io.Writer
 	poll         time.Duration
 	configTTL    time.Duration
+	presence     time.Duration
 	now          func() time.Time
 	stateDirPath string
 	newRef       func() string
+
+	// state is the open state dir, where the control markers live. Nil until
+	// Run opens it (or a test installs one).
+	state *statedir.Dir
+	// restartRequested is set by a RESTART marker; cli reads it after Run.
+	restartRequested bool
+	// reloadConfig rebuilds and validates the local config for a RELOAD marker.
+	reloadConfig func() (*config.Config, error)
 
 	sessions *SessionStore
 
@@ -163,6 +178,7 @@ func New(cfg Config) (*Planner, error) {
 		console:      cfg.Console,
 		poll:         firstDuration(cfg.PollInterval, DefaultPollInterval),
 		configTTL:    firstDuration(cfg.ConfigTTL, DefaultConfigTTL),
+		presence:     firstDuration(cfg.PresenceRefresh, DefaultIdleBeacon),
 		now:          cfg.Now,
 		stateDirPath: strings.TrimSpace(cfg.StateDir),
 		newRef:       cfg.NewSessionRef,
@@ -213,6 +229,11 @@ func (p *Planner) Run(ctx context.Context) error {
 	}
 	defer closeState()
 
+	// A STOP left over from a previous run predates this process; consuming it
+	// with a note (rather than stopping) mirrors the drain loop, which learned
+	// that a ghost marker otherwise kills the replacement daemon at startup.
+	p.consumeStaleStop()
+
 	p.beaconAll(fleet.State{Kind: fleet.StateIdle})
 	defer p.closeBeacons()
 
@@ -223,10 +244,41 @@ func (p *Planner) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			// The control markers are honoured at the turn boundary, exactly as
+			// the drain honours them at its iteration boundary.
+			if p.checkControl() {
+				return nil
+			}
 			if err := p.lap(ctx); err != nil {
 				return err
 			}
 		}
+	}
+}
+
+// RestartRequested reports whether a RESTART marker ended the run. The caller
+// (cli.runPlanner) turns this into a re-exec, exactly as cli.runDriver does.
+func (p *Planner) RestartRequested() bool { return p.restartRequested }
+
+// SetReloader wires the closure a RELOAD marker uses to rebuild the config from
+// disk. It must return a VALIDATED config, because applyReload swaps it in
+// without re-validating.
+func (p *Planner) SetReloader(load func() (*config.Config, error)) {
+	p.reloadConfig = load
+}
+
+// consumeStaleStop removes a STOP marker that was already present at startup.
+func (p *Planner) consumeStaleStop() {
+	if p.state == nil {
+		return
+	}
+	if present, msg := p.readMarker("STOP"); present {
+		_ = p.state.Remove("STOP")
+		note := ""
+		if msg != "" {
+			note = ": " + msg
+		}
+		log.Printf("planner: warning: STOP marker%s is left over from a previous run - consumed WITHOUT stopping this one; drop a fresh marker to stop THIS run", note)
 	}
 }
 
@@ -311,6 +363,7 @@ func (p *Planner) openState(base *config.Config) (func(), error) {
 		return nil, err
 	}
 	p.sessions = store
+	p.state = dir
 	return func() { _ = closeStore() }, nil
 }
 
@@ -336,8 +389,10 @@ func (p *Planner) resolve(ctx context.Context, i int, t Target) *projectRole {
 			role.reason = "run-config reads are not wired"
 		case err != nil:
 			role.reason = fmt.Sprintf("the stored run config could not be read (%v)", err)
-			// Do not cache a fetch failure for long: the next turn retries.
-			role.fetched = p.now().Add(-p.configTTL)
+			// Cache the FAILURE like any other answer: a pending conversation
+			// makes every 2-second poll reach resolve, so a backdated fetch
+			// would turn a failing plane into an MCP request every tick. The
+			// TTL is the retry cadence; the transition is logged once below.
 		default:
 			role.reason = ""
 			var doc config.RunConfigDoc
@@ -373,6 +428,42 @@ func (p *Planner) resolve(ctx context.Context, i int, t Target) *projectRole {
 	}
 	p.resolved[i] = role
 	return role
+}
+
+// startPresence refreshes presence on a timer for as long as a turn runs. A
+// turn can occupy the whole wall-clock bound, which is the plane's 15-minute
+// stale window, and the console filters stale rows: without this, a planner
+// that is answering reads as offline. It refreshes EVERY target, because the
+// loop serves one turn at a time and the others would otherwise go stale behind
+// a long turn on one project. The returned func stops the timer and waits for
+// it, so the turn's final idle beacon cannot be overtaken by a late iteration.
+func (p *Planner) startPresence(i, n int) func() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(p.presence)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				for j := range p.targets {
+					st := fleet.State{Kind: fleet.StateIdle}
+					if j == i {
+						st = fleet.State{Kind: fleet.StateIteration, N: n, Phase: "planner"}
+					}
+					p.sendBeacon(j, p.targets[j], st)
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		wg.Wait()
+	}
 }
 
 // beaconIdle refreshes presence at most once per DefaultIdleBeacon.

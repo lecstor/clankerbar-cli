@@ -48,22 +48,36 @@ func TestSessionStorePersistsAcrossOpens(t *testing.T) {
 }
 
 func TestSessionStoreCorruptFileStartsEmpty(t *testing.T) {
-	path := t.TempDir()
-	dir, err := statedir.Open(path)
-	if err != nil {
-		t.Fatalf("statedir.Open: %v", err)
-	}
-	if err := dir.WriteFile(SessionStoreName, []byte("{not json")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	store, closeStore, err := OpenSessionStore(dir)
-	if err != nil {
-		t.Fatalf("OpenSessionStore: %v", err)
-	}
-	defer closeStore()
-	got := store.Decide(sessionKey("demo", "c"), "claude", &plane.ConversationResume{Harness: "claude", Ref: "r"}, 0)
-	if !got.Resume || got.Tokens != 0 {
-		t.Errorf("decision = %+v, want a resume with no accumulated spend", got)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		// `null` is VALID JSON, so it is the case a corrupt-file branch that only
+		// looks at the error misses: the map stays nil and Record panics.
+		{name: "not json", body: "{not json"},
+		{name: "null", body: "null"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir()
+			dir, err := statedir.Open(path)
+			if err != nil {
+				t.Fatalf("statedir.Open: %v", err)
+			}
+			if err := dir.WriteFile(SessionStoreName, []byte(tc.body)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			store, closeStore, err := OpenSessionStore(dir)
+			if err != nil {
+				t.Fatalf("OpenSessionStore: %v", err)
+			}
+			defer closeStore()
+			got := store.Decide(sessionKey("demo", "c"), "claude", &plane.ConversationResume{Harness: "claude", Ref: "r"}, 0)
+			if !got.Resume || got.Tokens != 0 {
+				t.Errorf("decision = %+v, want a resume with no accumulated spend", got)
+			}
+			// The store the doc promises to replace must be usable, not a panic.
+			store.Record(sessionKey("demo", "c"), "claude", "r", 1)
+		})
 	}
 }
 

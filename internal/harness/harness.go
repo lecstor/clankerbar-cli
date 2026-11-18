@@ -741,8 +741,9 @@ type Result struct {
 	// SessionRef is the harness session this Result ran as/into, when the
 	// adapter can name it (studio-chat.md §3): claude echoes the id it was
 	// given, opencode reports the id its stream carried. It is the handle the
-	// planner records and resumes on the next turn. Empty for every task-drain
-	// session and for a harness with no session ids.
+	// planner records and resumes on the next turn. It is populated for ANY run
+	// that carried a session handle, a task drain included — only a harness with
+	// no session ids (or an invocation given no ref) leaves it empty.
 	SessionRef string
 
 	// SessionMissing reports that this invocation asked to RESUME a session the

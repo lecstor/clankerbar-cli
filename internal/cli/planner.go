@@ -21,13 +21,13 @@ import (
 )
 
 // runPlanner builds the per-project planner targets and runs the loop until the
-// context ends.
+// context ends, then re-execs when a RESTART marker asked for it.
 //
-// A local RELOAD is deliberately not wired here: the role's harness/model come
-// from the plane and are re-read before every turn, while the machine wiring this
-// loop is built from is local config a restart re-reads. There is no session to
-// hand across, so a reload would buy nothing a restart does not.
-func runPlanner(ctx context.Context, cfg *config.Config, apiKey string) error {
+// The role's harness/model come from the plane and are re-read before every
+// turn; a local RELOAD re-reads the machine wiring the loop applies to its next
+// turn, and a role/target change needs a restart (which the marker family
+// provides through restartSelf, the same path the drain uses).
+func runPlanner(ctx context.Context, cfg *config.Config, apiKey, cfgPath string, overrides config.Overrides) error {
 	// The poll, the claim and the reply all use this key. Refusing before the
 	// loop starts is honest: an idle planner that can never claim looks like a
 	// plane with no work.
@@ -70,9 +70,16 @@ func runPlanner(ctx context.Context, cfg *config.Config, apiKey string) error {
 	if err != nil {
 		return err
 	}
+	p.SetReloader(newConfigReloader(cfgPath, overrides))
 	host, _ := os.Hostname()
 	instance := cfg.ResolvedInstanceName(host)
 	log.Printf("planner: instance %q serving %d project(s); polling conversations every %s, one turn at a time",
 		instance, len(targets), planner.DefaultPollInterval)
-	return p.Run(ctx)
+	if err := p.Run(ctx); err != nil {
+		return err
+	}
+	if p.RestartRequested() {
+		return restartSelf(os.Args)
+	}
+	return nil
 }

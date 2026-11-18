@@ -50,15 +50,55 @@ func (p *Planner) turn(ctx context.Context, i int, t Target, pending *backlog.Pe
 	p.turns++
 	n := p.turns
 	p.mu.Unlock()
-	p.sendBeacon(i, t, fleet.State{Kind: fleet.StateIteration, N: n, TaskRef: claim.ID, Phase: "planner"})
+	// TaskRef is deliberately empty: the console renders it as a task ref, and a
+	// conversation UUID is not one. The conversation id is in the local turn log.
+	p.sendBeacon(i, t, fleet.State{Kind: fleet.StateIteration, N: n, Phase: "planner"})
 
+	// The wall clock bounds the WHOLE turn from the claim, not just the harness
+	// invocation: resolve, the claim and the history pages spend the same budget,
+	// and the plane derived the claim's lease from the role's max_wall_clock.
+	// LeaseExpiresIn is the backstop when the operator raised the wall clock.
+	turnCtx := ctx
+	if budget := turnBudget(role.session.MaxWallClock, claim.LeaseExpiresIn); budget > 0 {
+		var cancel context.CancelFunc
+		turnCtx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
+	// A turn can run for the whole wall-clock bound, which is the plane's stale
+	// window; refresh this instance's presence (all targets) while it runs.
+	stopPresence := p.startPresence(i, n)
 	start := p.now()
-	res, mode, err := p.runSession(ctx, t, role, claim)
+	res, mode, err := p.runSession(turnCtx, t, role, claim)
+	stopPresence()
 	p.logTurn(t, role.session, claim, mode, res, err, p.now().Sub(start))
 	// The turn is over, so the row must stop saying `iteration` now rather than
 	// at the next throttled idle beacon.
 	p.beaconIdleNow(i, t)
 	return err
+}
+
+// claimReplyMargin is reserved out of the claim's lease so the session can post
+// its reply before the plane refuses it. The plane's own grace over the role's
+// wall clock is 120 s; this is a smaller reserve INSIDE the lease.
+const claimReplyMargin = 30 * time.Second
+
+// turnBudget picks the smaller of the role's wall clock and the claim's lease
+// (less the reply margin). Zero means neither states a bound.
+func turnBudget(maxWallClock time.Duration, leaseSeconds int) time.Duration {
+	budget := maxWallClock
+	if leaseSeconds > 0 {
+		lease := time.Duration(leaseSeconds) * time.Second
+		if lease > claimReplyMargin {
+			lease -= claimReplyMargin
+		} else {
+			lease /= 2
+		}
+		if budget <= 0 || lease < budget {
+			budget = lease
+		}
+	}
+	return budget
 }
 
 // runSession decides resume-vs-prime, spawns the session, and recovers from a
@@ -124,9 +164,9 @@ func (p *Planner) invoke(ctx context.Context, adapter harness.Adapter, t Target,
 	}
 	// The turn's wall clock is the CLI's to enforce, not the adapter's: claude
 	// honours no session time cap, and the plane derives the conversation-claim
-	// lease from this same figure plus a grace window. Without this, a claude
-	// turn could outlive the claim that authorises its reply, and the reply would
-	// be refused as `claim_lost`. Every adapter honours context cancellation.
+	// lease from this same figure plus a grace window. turn() already carries the
+	// claim-derived deadline, so this re-application is the smaller-bound
+	// backstop for a direct caller; every adapter honours context cancellation.
 	if sess.MaxWallClock > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, sess.MaxWallClock)

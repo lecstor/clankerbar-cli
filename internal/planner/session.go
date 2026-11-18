@@ -71,6 +71,10 @@ func OpenSessionStore(dir *statedir.Dir) (*SessionStore, func() error, error) {
 		} else if err := json.Unmarshal(b, &s.entries); err != nil {
 			log.Printf("planner: %s is not valid JSON (%v) - starting with no accumulated session spend", SessionStoreName, err)
 			s.entries = map[string]sessionEntry{}
+		} else if s.entries == nil {
+			// A file containing exactly `null` is valid JSON and unmarshals to a
+			// nil map; the next Record would panic assigning into it.
+			s.entries = map[string]sessionEntry{}
 		}
 	}
 	closeFn := func() error { return nil }

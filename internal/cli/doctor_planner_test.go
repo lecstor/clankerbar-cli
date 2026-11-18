@@ -245,4 +245,35 @@ func TestDoctorPlannerUnreadableConfigWarnsAndDoesNotFail(t *testing.T) {
 	if c0 := findCheck(checks, "planner[demo]"); c0 == nil || c0.status != warn {
 		t.Fatalf("checks = %+v, want a WARN when the plane cannot be read", checks)
 	}
+	// Nothing could be verified, so the instance-level line must not pass in
+	// silence: it says so as a WARN, never a refusal.
+	if c0 := findCheck(checks, "planner"); c0 == nil || c0.status != warn {
+		t.Fatalf("checks = %+v, want an aggregate WARN, never a FAIL, over unreadable configs", checks)
+	}
+}
+
+// One project resolved with no planner, another unreadable: the unreadable one
+// may carry the planner, so a transient plane error must not refuse the
+// instance. Only a fully-resolved, fully-unconfigured set FAILs.
+func TestDoctorPlannerMixedUnreadableDoesNotFailTheAggregate(t *testing.T) {
+	c := plannerConfig(t, "no-chat", "unreadable")
+	env := plannerEnv()
+	calls := 0
+	env.newRCfgAPI = func(string, string) plane.RunConfigAPI {
+		calls++
+		if calls == 2 {
+			return rcFake{err: errors.New("plane down")}
+		}
+		return rcFake{state: &plane.RunConfigState{Version: 1, Config: json.RawMessage(`{}`)}}
+	}
+	checks := checkPlanner(context.Background(), c, env)
+	if c0 := findCheck(checks, "planner[no-chat]"); c0 == nil || c0.status != pass {
+		t.Fatalf("checks = %+v, want the resolved no-planner project reported", checks)
+	}
+	if c0 := findCheck(checks, "planner[unreadable]"); c0 == nil || c0.status != warn {
+		t.Fatalf("checks = %+v, want the unreadable project at WARN", checks)
+	}
+	if c0 := findCheck(checks, "planner"); c0 == nil || c0.status != warn {
+		t.Fatalf("checks = %+v, want an aggregate WARN, not the no-planner FAIL", checks)
+	}
 }

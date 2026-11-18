@@ -2075,8 +2075,9 @@ harness session per conversation under the project's resolved `roles.planner`
 block. That session is resumed on later turns of the same conversation and
 re-primed from the plane's message history when it is foreign to this instance,
 reported missing by the harness, or over its `max_session_tokens`; the model
-answers through `reply_conversation`. The role is a **machine fact**: it rides
-the presence beacon and is never stored on the plane, and the stored role picks
+answers through `reply_conversation`. The role is a **machine fact**: it is
+never sourced from or ratified on the plane (the beacon reports it so the console
+can show it), and the stored role picks
 the harness, model, brief and turn bounds without ever falling back to this
 file's worker defaults. `doctor` names every project whose resolved config has
 no `roles.planner`, refuses the instance only when none does, and fails when the

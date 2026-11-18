@@ -142,8 +142,13 @@ func TestResolvePlannerBoundsFallbacks(t *testing.T) {
 	if sess.MaxTurns != DefaultMaxTurns {
 		t.Errorf("MaxTurns = %d, want DefaultMaxTurns %d", sess.MaxTurns, DefaultMaxTurns)
 	}
-	if sess.MaxWallClock != DefaultPlannerWallClock {
-		t.Errorf("MaxWallClock = %v, want %v (the plane derives its lease from it)", sess.MaxWallClock, DefaultPlannerWallClock)
+	// Literal on purpose: the plane's CONVERSATION_DEFAULT_TURN_SECONDS is 900,
+	// and it derives the claim lease from that same figure. Comparing against
+	// DefaultPlannerWallClock would let a change to this constant pass here while
+	// desynchronising the lease, so moving it must fail this test and force the
+	// plane side to move too.
+	if sess.MaxWallClock != 900*time.Second {
+		t.Errorf("MaxWallClock = %v, want the plane's default 900s (CONVERSATION_DEFAULT_TURN_SECONDS)", sess.MaxWallClock)
 	}
 	if sess.MaxSessionTokens != 0 {
 		t.Errorf("MaxSessionTokens = %d, want 0 (uncapped)", sess.MaxSessionTokens)

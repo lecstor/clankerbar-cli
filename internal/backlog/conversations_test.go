@@ -54,18 +54,37 @@ func TestPollPendingNullIsIdle(t *testing.T) {
 func TestPollPendingClassifiesPermanentFailures(t *testing.T) {
 	cases := []struct {
 		status int
+		body   string
 		want   error
 	}{
-		{http.StatusUnauthorized, ErrUnauthorized},
-		{http.StatusForbidden, ErrUnauthorized},
-		{http.StatusTooManyRequests, ErrConversationPollRateLimited},
+		{http.StatusUnauthorized, `{"error":{"code":"x"}}`, ErrUnauthorized},
+		{http.StatusForbidden, `{"error":{"code":"x"}}`, ErrUnauthorized},
+		// A project-scoped key used against the wrong project must stop the
+		// planner loudly, not retry as a blip.
+		{http.StatusBadRequest, `{"error":{"code":"project_required"}}`, ErrProjectRequired},
+		{http.StatusTooManyRequests, `{"error":{"code":"x"}}`, ErrConversationPollRateLimited},
 	}
 	for _, tc := range cases {
-		srv, _ := servePending(t, tc.status, `{"error":{"code":"x"}}`)
+		srv, _ := servePending(t, tc.status, tc.body)
 		_, err := NewConversationPoller(srv.URL+"/pending", "k").PollPending(context.Background())
 		if !errors.Is(err, tc.want) {
 			t.Errorf("HTTP %d err = %v, want %v", tc.status, err, tc.want)
 		}
+	}
+}
+
+// An undecodable 200 is an error (not an idle answer), and a decoded entry with
+// no id names nothing claimable, so it is the idle answer.
+func TestPollPendingDecodeAndEmptyID(t *testing.T) {
+	srv, _ := servePending(t, http.StatusOK, `not json`)
+	if _, err := NewConversationPoller(srv.URL+"/pending", "k").PollPending(context.Background()); err == nil {
+		t.Error("an undecodable 200 was accepted as an idle answer")
+	}
+
+	srv, _ = servePending(t, http.StatusOK, `{"pending":{"id":"","pendingCount":2}}`)
+	got, err := NewConversationPoller(srv.URL+"/pending", "k").PollPending(context.Background())
+	if err != nil || got != nil {
+		t.Errorf("pending = %+v, err = %v; an entry with no id must read as idle", got, err)
 	}
 }
 

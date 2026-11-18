@@ -338,8 +338,9 @@ func cloneStrMap(m map[string]string) map[string]string {
 
 // ApplyRunConfig overlays a stored document onto c IN PLACE: a field the
 // document sets wins, a field it omits keeps the local value — except the
-// `events` dials, which belong to the stored document alone (an absent block is
-// both off, fail closed: no local file may turn the channel on). Maps replace
+// `events` and `roles` sections, which belong to the stored document alone (an
+// absent block is both events dials off, fail closed, and no planner, fail
+// closed: no local file may turn either on). Maps replace
 // wholesale when present — the document is the operator's ratified word for
 // that map, and merging would resurrect entries the ratification dropped.
 // Callers re-run Validate afterwards: an overlay CAN produce a combination the
@@ -386,24 +387,25 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.Events != nil {
 		c.Events = *doc.Events
 	}
-	// The `roles` section is the stored document's alone too (studio-chat.md
-	// §1/§2): a nil map means the project inherited no planner and chat is OFF,
-	// which is the fail-closed answer for a project that never ratified one.
-	// Reset before the empty-document return for the same reason as Events: the
-	// effective document is the authority, and a cell reusing a live config must
-	// not keep a planner a project no longer carries.
-	c.Planner = plannerRoleFromDoc(doc)
 	if c.Events.Transcript && !c.Events.Activity {
 		// The plane refuses this combination at save time; a document that still
 		// carries it (a hand-edited store, a future reader) fails closed.
 		c.Events.Transcript = false
 	}
+	// The `roles` section is the stored document's alone too (studio-chat.md
+	// §1/§2): a nil map means the project inherited no planner and chat is OFF,
+	// which is the fail-closed answer for a project that never ratified one.
+	// The empty document cannot swap a harness, so the fail-closed reset happens
+	// before its early return; a non-empty one is assigned only AFTER the swap
+	// gate, so a refused document leaves c untouched as the contract says.
 	if doc.Empty() {
+		c.Planner = plannerRoleFromDoc(doc)
 		return nil
 	}
 	if err := c.CheckHarnessSwap(doc); err != nil {
 		return err
 	}
+	c.Planner = plannerRoleFromDoc(doc)
 	// The PIPELINE is one section (decision 6bf1fa15): a document carrying any
 	// of prompt/phases/review_panel replaces all three, and a key it omits is
 	// cleared to its zero value rather than kept from the local file. That is
