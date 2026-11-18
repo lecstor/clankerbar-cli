@@ -251,6 +251,25 @@ func checkPlannerRole(ctx context.Context, cfg, eff *config.Config, t plannerTar
 			c.status = warn
 		}
 		c.detail += "; no config_dir pinned (ambient credentials - an unattended environment may have none)"
+	} else {
+		// The same credential/config-dir check every other harness gets: an
+		// absent, empty or unreadable dir is a real planner outage, and its
+		// marker heuristic already words the "may be in the keychain" caveat.
+		cd := checkConfigDirNamed("config_dir", h, hc.ConfigDir)
+		switch cd.status {
+		case fail:
+			c.status = fail
+			c.detail += "; " + cd.detail
+			c.remedy = cd.remedy
+		case warn:
+			if c.status == pass {
+				c.status = warn
+			}
+			c.detail += "; " + cd.detail
+			if c.remedy == "" {
+				c.remedy = cd.remedy
+			}
+		}
 	}
 	return c
 }

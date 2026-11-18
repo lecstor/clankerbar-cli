@@ -122,6 +122,16 @@ func (p *Planner) invoke(ctx context.Context, adapter harness.Adapter, t Target,
 	if err != nil {
 		return harness.Result{}, err
 	}
+	// The turn's wall clock is the CLI's to enforce, not the adapter's: claude
+	// honours no session time cap, and the plane derives the conversation-claim
+	// lease from this same figure plus a grace window. Without this, a claude
+	// turn could outlive the claim that authorises its reply, and the reply would
+	// be refused as `claim_lost`. Every adapter honours context cancellation.
+	if sess.MaxWallClock > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, sess.MaxWallClock)
+		defer cancel()
+	}
 	return adapter.Invoke(ctx, inv)
 }
 
@@ -180,10 +190,12 @@ func (p *Planner) logTurn(t Target, sess config.PlannerSession, claim *plane.Con
 }
 
 // refFor is the handle to record: the adapter's if it named one, else the ref
-// the invocation asked for.
+// the invocation asked for. A run that ERRORED records nothing: the handle may
+// name a session that never started, and the plane stores no ref either (no
+// reply was written), so the next attempt primes.
 func refFor(res harness.Result, asked string, err error) string {
 	if err != nil {
-		return asked
+		return ""
 	}
 	if r := strings.TrimSpace(res.SessionRef); r != "" {
 		return r

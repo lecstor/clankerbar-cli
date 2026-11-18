@@ -2036,6 +2036,7 @@ instance the supervisor reads.
 
 ```json
 {
+  "role": "worker",
   "harness": "claude",
   "backlog_url": "https://clankerbar.com",
   "model": "opus",
@@ -2065,6 +2066,21 @@ instance the supervisor reads.
   }
 }
 ```
+
+`role` (default **"worker"**) declares which role this instance serves. `"planner"`
+turns it into the conversation loop instead of the backlog drain: it polls each
+project's pending conversations every 2 seconds over plain HTTP — no model runs
+between turns, so idle costs nothing — claims one turn at a time, and runs one
+harness session per conversation under the project's resolved `roles.planner`
+block. That session is resumed on later turns of the same conversation and
+re-primed from the plane's message history when it is foreign to this instance,
+reported missing by the harness, or over its `max_session_tokens`; the model
+answers through `reply_conversation`. The role is a **machine fact**: it rides
+the presence beacon and is never stored on the plane, and the stored role picks
+the harness, model, brief and turn bounds without ever falling back to this
+file's worker defaults. `doctor` names every project whose resolved config has
+no `roles.planner`, refuses the instance only when none does, and fails when the
+assigned harness, model tier or MCP wiring cannot be served on this machine.
 
 `echo_sessions` (default **false**) restores the old live echo of a session's
 stream to the daemon's terminal. Off, the stream goes only to its iteration log,

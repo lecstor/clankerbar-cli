@@ -123,9 +123,6 @@ type Planner struct {
 	newRef       func() string
 
 	sessions *SessionStore
-	// state is the opened state dir when Run owns it; nil when the store is
-	// memory-backed (tests) or the caller supplied the dir.
-	state *stateDirCloser
 
 	mu       sync.Mutex
 	resolved []*projectRole
@@ -327,7 +324,6 @@ func (p *Planner) openState(base *config.Config) (func(), error) {
 		return nil, err
 	}
 	p.sessions = store
-	p.state = closer
 	return func() { _ = closer.Close() }, nil
 }
 
@@ -360,6 +356,10 @@ func (p *Planner) resolve(ctx context.Context, i int, t Target) *projectRole {
 			var doc config.RunConfigDoc
 			if err := json.Unmarshal(st.Config, &doc); err != nil {
 				role.reason = fmt.Sprintf("the stored run config could not be decoded (%v)", err)
+				break
+			}
+			if doc.SchemaNewer() {
+				role.reason = fmt.Sprintf("the stored run config uses schema v%d, newer than this build understands (v%d)", doc.SchemaVersion, config.RunConfigSchemaVersion)
 				break
 			}
 			if err := eff.ApplyRunConfig(&doc); err != nil {

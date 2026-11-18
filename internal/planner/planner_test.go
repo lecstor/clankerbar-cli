@@ -81,14 +81,20 @@ func (f *fakeRCfg) RunConfig(context.Context) (*plane.RunConfigState, error) {
 // planner must not need them.
 type fakeAdapter struct {
 	harness.Adapter
-	caps    harness.Capabilities
-	results []harness.Result
-	errs    []error
-	calls   []harness.Invocation
+	caps      harness.Capabilities
+	results   []harness.Result
+	errs      []error
+	calls     []harness.Invocation
+	deadlines []time.Duration
 }
 
-func (f *fakeAdapter) Invoke(_ context.Context, in harness.Invocation) (harness.Result, error) {
+func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harness.Result, error) {
 	f.calls = append(f.calls, in)
+	if dl, ok := ctx.Deadline(); ok {
+		f.deadlines = append(f.deadlines, time.Until(dl))
+	} else {
+		f.deadlines = append(f.deadlines, 0)
+	}
 	i := len(f.calls) - 1
 	var res harness.Result
 	if i < len(f.results) {
@@ -508,6 +514,44 @@ func TestBeaconsCarryThePlannerRole(t *testing.T) {
 	}
 	if len(f.fleet.closed) != 1 || f.fleet.closed[0].State.Kind != fleet.StateStopping {
 		t.Errorf("close beacons = %+v, want one stopping", f.fleet.closed)
+	}
+}
+
+// The per-turn wall clock is the CLI's: the plane's claim lease is derived from
+// the same figure, so a turn that ran past it could not post its reply.
+func TestInvokeBoundsTheTurnByTheWallClock(t *testing.T) {
+	f := newFixture(t, map[string]any{"harness": "claude"})
+	sess := config.PlannerSession{Harness: "claude", MaxWallClock: 2 * time.Second}
+	if _, err := f.planner.invoke(context.Background(), f.adapter, f.planner.targets[0], f.base, sess, "prompt", "ref", false); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if len(f.adapter.deadlines) != 1 {
+		t.Fatalf("deadlines = %d, want one", len(f.adapter.deadlines))
+	}
+	if d := f.adapter.deadlines[0]; d <= 0 || d > 2*time.Second {
+		t.Errorf("adapter deadline = %v, want a deadline within the role's 2s", d)
+	}
+}
+
+// blockingAdapter holds its session until the context is cancelled, like a
+// harness that ignores its brief and keeps working.
+type blockingAdapter struct{ harness.Adapter }
+
+func (*blockingAdapter) Invoke(ctx context.Context, _ harness.Invocation) (harness.Result, error) {
+	<-ctx.Done()
+	return harness.Result{}, ctx.Err()
+}
+
+func TestInvokeKillsASessionThatOutlivesTheTurn(t *testing.T) {
+	f := newFixture(t, map[string]any{"harness": "claude"})
+	sess := config.PlannerSession{Harness: "claude", MaxWallClock: 20 * time.Millisecond}
+	start := time.Now()
+	_, err := f.planner.invoke(context.Background(), &blockingAdapter{}, f.planner.targets[0], f.base, sess, "prompt", "ref", false)
+	if err == nil {
+		t.Fatal("invoke returned no error for a session held past its wall clock")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("invoke took %s; the turn was not cut off", elapsed)
 	}
 }
 

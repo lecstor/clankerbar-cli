@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,13 +29,17 @@ func (f rcFake) ProposeRunConfig(context.Context, map[string]any, string) error 
 
 func plannerConfig(t *testing.T, projects ...string) *config.Config {
 	t.Helper()
+	cfgDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cfgDir, ".credentials.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	c := &config.Config{
 		Harness:    "claude",
 		Role:       config.RolePlanner,
 		Prompt:     "Work the next backlog item.",
 		BacklogURL: "https://clankerbar.com/mcp/demo",
 		WorkDir:    t.TempDir(),
-		ConfigDir:  t.TempDir(),
+		ConfigDir:  cfgDir,
 	}
 	// A Claude-shaped file resolves for claude; its existence is not read here.
 	c.MCPConfigPath = c.WorkDir + "/.mcp.json"
