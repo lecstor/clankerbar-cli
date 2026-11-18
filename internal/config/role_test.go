@@ -240,3 +240,22 @@ func TestPlannerRoleIsNotDecodedFromTheLocalFile(t *testing.T) {
 		t.Errorf("Config marshals an effective planner role into the local-file shape: %s", b)
 	}
 }
+
+func TestConversationPendingURLs(t *testing.T) {
+	c := defaults()
+	c.BacklogURL = "https://clankerbar.com/mcp/demo"
+	if got, want := c.ConversationPendingURL(), "https://clankerbar.com/api/projects/demo/conversations/pending"; got != want {
+		t.Errorf("ConversationPendingURL() = %q, want %q", got, want)
+	}
+	if got, want := c.ProjectConversationPendingURL(Project{Slug: "other"}), "https://clankerbar.com/api/projects/other/conversations/pending"; got != want {
+		t.Errorf("ProjectConversationPendingURL() = %q, want %q", got, want)
+	}
+
+	// No derivable slug: no endpoint. The planner refuses to start rather than
+	// poll a route the plane can only reject.
+	c = defaults()
+	c.MCPConfigPath = ""
+	if got := c.ConversationPendingURL(); got != "" {
+		t.Errorf("ConversationPendingURL() = %q with no slug, want empty", got)
+	}
+}

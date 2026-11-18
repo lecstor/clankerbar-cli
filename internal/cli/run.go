@@ -145,6 +145,12 @@ func Run(ctx context.Context, args []string) error {
 	// The same key also authorises the driver's one WRITE: handing back a task a
 	// session was still holding when it ended, so an interrupted iteration does not
 	// leave a lease to expire and charge the task a reclaim (CLA-242).
+	if cfg.EffectiveRole() == config.RolePlanner {
+		// One role per instance (operator decision 96ac5e8d): a planner serves
+		// conversations and never drains the backlog, so it takes the other branch
+		// entirely rather than sharing the drain loop.
+		return runPlanner(ctx, cfg, apiKey)
+	}
 	if projects := cfg.Projects; len(projects) > 0 {
 		targets := make([]loop.Target, 0, len(projects))
 		for _, p := range projects {
