@@ -299,6 +299,41 @@ func TestLapClaimsAndPrimesOneSession(t *testing.T) {
 	}
 }
 
+// Every bound the stored role names reaches the ONE invocation the turn spawns:
+// max_turns on the harness, max_wall_clock as the CLI's own deadline (the plane
+// derives the claim lease from it), and max_session_tokens as the session
+// budget. A dropped field would fall back to a more permissive default silently.
+func TestRoleBoundsReachTheInvocation(t *testing.T) {
+	f := newFixture(t, map[string]any{
+		"harness":            "claude",
+		"max_turns":          7,
+		"max_wall_clock":     30,
+		"max_session_tokens": 5000,
+	})
+	f.poller.pending = pending("conv-1")
+	f.convs.claim = claim("conv-1", 2, "hi")
+	f.adapter.results = []harness.Result{{Tokens: 10}}
+
+	f.lap(t)
+
+	if len(f.adapter.calls) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(f.adapter.calls))
+	}
+	inv := f.adapter.calls[0]
+	if inv.MaxTurns != 7 {
+		t.Errorf("MaxTurns = %d, want the role's 7", inv.MaxTurns)
+	}
+	if inv.MaxSessionWallClock != 30*time.Second {
+		t.Errorf("MaxSessionWallClock = %v, want the role's 30s", inv.MaxSessionWallClock)
+	}
+	if inv.MaxSessionTokens != 5000 {
+		t.Errorf("MaxSessionTokens = %d, want the role's 5000", inv.MaxSessionTokens)
+	}
+	if len(f.adapter.deadlines) != 1 || f.adapter.deadlines[0] <= 0 || f.adapter.deadlines[0] > 30*time.Second {
+		t.Errorf("adapter deadlines = %v, want one within the role's 30s", f.adapter.deadlines)
+	}
+}
+
 // The second turn of the same conversation resumes the SAME session: the plane's
 // pointer is followed, and the turn carries no history because the transcript
 // already has it.
