@@ -286,7 +286,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 		// salvage, handback and spend are computed from res before any error
 		// check either way, and the cancelled driver ctx stops the run one spawn
 		// later — so the noise is left standing rather than guarded against.
-		o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
+		o.settleUsage(ctx, in, &res, started, in.ResumeSession)
 		return res, nil
 	} else if runErr != nil && !timedOut && !loopKilled && !idleKilled {
 		// A launch failure (bad PATH, unreadable config): nothing was emitted,
@@ -298,7 +298,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 		// is the kill's and not a verdict. The marker above is the verdict.
 		res.ExitCode = -1
 	}
-	o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
+	o.settleUsage(ctx, in, &res, started, in.ResumeSession)
 	return res, nil
 }
 

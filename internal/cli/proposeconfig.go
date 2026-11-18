@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -88,12 +89,24 @@ func ProposeConfig(ctx context.Context, args []string) error {
 	apiKey := os.Getenv("CLANKERBAR_API_KEY")
 	rc := plane.NewRunConfigAPI(endpoint, apiKey)
 
+	// `roles` is the stored document's alone (studio-chat.md §1/§2): the local
+	// file cannot carry it, and a ratification REPLACES the project's document,
+	// so a proposal that omitted it would clear a project-level planner. Carry
+	// the stored section forward verbatim instead.
+	carriedRoles, err := carryStoredRoles(ctx, rc, doc)
+	if err != nil {
+		return err
+	}
+
 	notes := fmt.Sprintf(
 		"Imported from the local config file by `clankerbar propose-config` (%s). "+
 			"This is the file's movable half verbatim - the machine-local core "+
 			"(workdir, MCP wiring, env) stays local. Ratifying makes this document "+
 			"the project's execution config; dismissing keeps the local file in force.",
 		srcLabel(cfg))
+	if carriedRoles {
+		notes += "\n\nThe project's stored `roles` section is carried forward unchanged: it belongs to the stored document alone and the local file cannot carry it, so omitting it would clear the project's planner."
+	}
 	if f.notes != "" {
 		notes += "\n\n" + f.notes
 	}
@@ -151,6 +164,38 @@ func pickSlug(cfg *config.Config, want, flag string) (string, error) {
 		}
 		return "", fmt.Errorf("%s is required: neither a projects[] entry nor an .mcp.json naming /mcp/<slug> says which project to target", flag)
 	}
+}
+
+// carryStoredRoles copies the project's stored `roles` section into the
+// proposal, reporting whether there was one. A project that never stored a
+// document (or has no roles block) proposes exactly the local movable half. A
+// read that FAILS refuses the proposal: the command cannot know whether it would
+// clear a planner, and silently dropping it is the harm this exists to prevent.
+func carryStoredRoles(ctx context.Context, rc plane.RunConfigAPI, doc map[string]any) (bool, error) {
+	if _, ok := doc["roles"]; ok {
+		return false, nil
+	}
+	st, err := rc.RunConfig(ctx)
+	switch {
+	case errors.Is(err, plane.ErrNoConfig), errors.Is(err, plane.ErrNotWired):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("read the stored run config to preserve its `roles` section (a ratification replaces the document, so omitting roles would clear the project's planner): %w", err)
+	}
+	if st == nil || len(st.Config) == 0 {
+		return false, nil
+	}
+	var stored struct {
+		Roles map[string]json.RawMessage `json:"roles"`
+	}
+	if err := json.Unmarshal(st.Config, &stored); err != nil {
+		return false, fmt.Errorf("decode the stored run config to preserve its `roles` section: %w", err)
+	}
+	if len(stored.Roles) == 0 {
+		return false, nil
+	}
+	doc["roles"] = stored.Roles
+	return true, nil
 }
 
 func srcLabel(cfg *config.Config) string {

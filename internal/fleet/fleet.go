@@ -243,6 +243,11 @@ type Identity struct {
 	Host           string // hostname
 	Version        string // binary version
 	ConfigIdentity string // fingerprint of the effective config in force
+	// Role is the role this instance serves (studio-chat.md §2): "worker" or
+	// "planner". It is a machine fact, reported on every beacon so the console
+	// can render the marker and count planners from presence. An empty value is
+	// omitted from the wire, which an older plane reads exactly as before.
+	Role string
 }
 
 // Report is one POST body: identity + current state + any iterations that
@@ -580,6 +585,7 @@ type wireReport struct {
 	Host           string          `json:"host,omitempty"`
 	Version        string          `json:"version,omitempty"`
 	ConfigIdentity string          `json:"configIdentity,omitempty"`
+	Role           string          `json:"role,omitempty"`
 	State          *wireState      `json:"state,omitempty"`
 	Iterations     []wireIteration `json:"iterations,omitempty"`
 }
@@ -595,6 +601,7 @@ func marshalReport(rep Report) ([]byte, error) {
 		Host:           rep.Host,
 		Version:        rep.Version,
 		ConfigIdentity: rep.ConfigIdentity,
+		Role:           rep.Role,
 		State: &wireState{
 			Kind:        rep.State.Kind,
 			N:           rep.State.N,

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 )
 
@@ -106,17 +105,6 @@ func parseOpencodeExport(data []byte) (opencodeExport, error) {
 		return doc, errors.New("session export carries no info.cost/info.tokens")
 	}
 	return doc, nil
-}
-
-// isResumeArgs reports whether an `opencode run` argument list continues an
-// existing session (`-s <id>`) rather than creating one. Only flags ahead of
-// the `--` terminator count, so a prompt of "-s" cannot fake it.
-func isResumeArgs(args []string) bool {
-	head := args
-	if i := slices.Index(args, "--"); i >= 0 {
-		head = args[:i]
-	}
-	return slices.Contains(head, "-s")
 }
 
 // settleUsage replaces a finished run's streamed usage with the session

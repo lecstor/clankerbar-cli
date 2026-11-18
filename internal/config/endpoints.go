@@ -172,6 +172,41 @@ func projectFleetReportPath(origin, slug string) string {
 	return origin + "/api/projects/" + url.PathEscape(slug) + "/fleet/report"
 }
 
+// ConversationPendingURL is the planner loop's 2-second wake poll for the
+// single-project config (studio-chat.md §4): the project named by the config's
+// MCP wiring. It is process-level HTTP, not an MCP call, so the poll never
+// touches a model.
+//
+// Empty when no slug can be derived: the endpoint has no legacy slug-less form,
+// exactly like FleetReportURL, and an underivable slug means this config cannot
+// serve chat. The origin is CredentialOrigin — the same trusted origin every
+// other credentialed call uses.
+func (c *Config) ConversationPendingURL() string {
+	origin := c.CredentialOrigin()
+	if origin == "" {
+		return ""
+	}
+	slug := c.Slug()
+	if slug == "" {
+		return ""
+	}
+	return projectConversationPendingPath(origin, slug)
+}
+
+// ProjectConversationPendingURL is the same poll for one configured project of a
+// multi-project instance.
+func (c *Config) ProjectConversationPendingURL(p Project) string {
+	origin := c.CredentialOrigin()
+	if origin == "" || p.Slug == "" {
+		return ""
+	}
+	return projectConversationPendingPath(origin, p.Slug)
+}
+
+func projectConversationPendingPath(origin, slug string) string {
+	return origin + "/api/projects/" + url.PathEscape(slug) + "/conversations/pending"
+}
+
 // ResolveInstanceName composes the Fleet-page instance identity a daemon
 // beacons under (CLA-466): an explicit instance_name wins verbatim; otherwise
 // the default is the machine's hostname plus the config file's basename minus

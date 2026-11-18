@@ -251,6 +251,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkFleets(ctx, cfg, e)...)
 	checks = append(checks, checkInstanceIdentity(cfg))
 	checks = append(checks, checkRunConfigs(ctx, cfg, e)...)
+	checks = append(checks, checkPlanner(ctx, cfg, e)...)
 	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)

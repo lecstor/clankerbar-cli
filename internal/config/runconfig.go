@@ -124,6 +124,25 @@ type RunConfigEvents struct {
 	Transcript bool `json:"transcript"`
 }
 
+// RunConfigRole is one stored role block (`roles.planner`), mapped onto
+// RoleAssignment. It reuses the phase block's field names, plus
+// `max_session_tokens` — the per-session bound a conversation resumes against.
+// There is no `name`: a role is keyed by its own name, and a role's `prompt` is
+// a custom brief, never a built-in selector.
+//
+// `roles` is a WHOLE SECTION of the stored document (studio-chat.md §1): absent
+// inherits the org default, `roles: {}` is the explicit opt-out. Only `planner`
+// exists in v1, and the plane refuses any other key before it is stored.
+type RunConfigRole struct {
+	Harness          string   `json:"harness"`
+	Model            string   `json:"model"`
+	Tier             string   `json:"tier"`
+	Prompt           string   `json:"prompt"`
+	MaxTurns         int      `json:"max_turns"`
+	MaxWallClock     Duration `json:"max_wall_clock"`
+	MaxSessionTokens int      `json:"max_session_tokens"`
+}
+
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
 // keys this build consumes. JSON decoding ignores everything else, so a newer
 // plane's added keys degrade to "unconsumed" rather than unmarshal errors;
@@ -163,6 +182,13 @@ type RunConfigDoc struct {
 	// ABSENT key (both dials off, the local rules); a present block — even one
 	// with both false — is the project stating where the dials sit.
 	Events *RunConfigEvents `json:"events"`
+
+	// Roles is the sixth whole-section (studio-chat.md §1): `roles.planner` is
+	// the conversation role's harness, model, brief and bounds. A nil map is an
+	// ABSENT key (inherit, and with nothing to inherit there is no chat); a
+	// present map replaces the section whole, so `roles: {}` is the explicit
+	// opt-out. Only `planner` is consumed in v1.
+	Roles map[string]RunConfigRole `json:"roles"`
 }
 
 // UnmarshalJSON decodes the document and records whether the `prompt` KEY was
@@ -227,7 +253,7 @@ func (d *RunConfigDoc) Empty() bool {
 	return d.Harness == "" && d.Model == "" && d.Models == nil && d.Harnesses == nil &&
 		!d.pipelineSet() &&
 		d.MaxTurns == 0 && d.MaxSessionWallClock == 0 &&
-		d.Budget == nil && d.Escalation == nil && d.Events == nil
+		d.Budget == nil && d.Escalation == nil && d.Events == nil && d.Roles == nil
 }
 
 // Clone returns a copy safe to overlay a run-config document onto: every map
@@ -273,6 +299,13 @@ func (c *Config) Clone() *Config {
 	for i := range cp.ReviewPanel {
 		cp.ReviewPanel[i].MapsSession = cloneMapsSession(cp.ReviewPanel[i].MapsSession)
 	}
+	// The planner role is replaced wholesale by an overlay (a pointer), so the
+	// clone gets its own block: a later apply on the clone must never rewrite
+	// the base config the driver shares across targets.
+	if c.Planner != nil {
+		p := *c.Planner
+		cp.Planner = &p
+	}
 	return &cp
 }
 
@@ -305,8 +338,9 @@ func cloneStrMap(m map[string]string) map[string]string {
 
 // ApplyRunConfig overlays a stored document onto c IN PLACE: a field the
 // document sets wins, a field it omits keeps the local value — except the
-// `events` dials, which belong to the stored document alone (an absent block is
-// both off, fail closed: no local file may turn the channel on). Maps replace
+// `events` and `roles` sections, which belong to the stored document alone (an
+// absent block is both events dials off, fail closed, and no planner, fail
+// closed: no local file may turn either on). Maps replace
 // wholesale when present — the document is the operator's ratified word for
 // that map, and merging would resurrect entries the ratification dropped.
 // Callers re-run Validate afterwards: an overlay CAN produce a combination the
@@ -358,12 +392,20 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		// carries it (a hand-edited store, a future reader) fails closed.
 		c.Events.Transcript = false
 	}
+	// The `roles` section is the stored document's alone too (studio-chat.md
+	// §1/§2): a nil map means the project inherited no planner and chat is OFF,
+	// which is the fail-closed answer for a project that never ratified one.
+	// The empty document cannot swap a harness, so the fail-closed reset happens
+	// before its early return; a non-empty one is assigned only AFTER the swap
+	// gate, so a refused document leaves c untouched as the contract says.
 	if doc.Empty() {
+		c.Planner = plannerRoleFromDoc(doc)
 		return nil
 	}
 	if err := c.CheckHarnessSwap(doc); err != nil {
 		return err
 	}
+	c.Planner = plannerRoleFromDoc(doc)
 	// The PIPELINE is one section (decision 6bf1fa15): a document carrying any
 	// of prompt/phases/review_panel replaces all three, and a key it omits is
 	// cleared to its zero value rather than kept from the local file. That is

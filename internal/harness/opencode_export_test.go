@@ -136,12 +136,34 @@ func TestParseOpencodeExportRefusesADocumentWithoutTotals(t *testing.T) {
 	}
 }
 
-func TestIsResumeArgs(t *testing.T) {
-	if !isResumeArgs(opencodeResumeArgs(Invocation{}, "ses_1", "go")) {
-		t.Error("resume args not recognised")
+// A planner PRIME carries a session ref too (`run -s <id>` creates the session),
+// so the accounting's resume flag must come from Invocation.ResumeSession, not
+// from the argv: otherwise the new session's title-generation overhead is
+// skipped and the role's max_session_tokens accumulator under-counts.
+func TestOpencodeCreatingRunWithASessionRefChargesTheOverhead(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "opencode")
+	script := `#!/bin/sh
+if [ "$1" = session ] && [ "$2" = export ]; then
+  echo '{"info":{"id":"ses_x","cost":0.25,"tokens":{"input":900,"output":100,"reasoning":0,"cache":{"read":0,"write":0}}},"messages":[{"type":"assistant","finish":"stop","cost":0.2,"tokens":{"input":800,"output":100,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":99999999999999}}]}'
+  exit 0
+fi
+echo '{"type":"step_start","sessionID":"ses_x","part":{"type":"step-start"}}'
+echo '{"type":"text","sessionID":"ses_x","part":{"type":"text","text":"DONE"}}'
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if isResumeArgs(opencodeArgs(Invocation{Prompt: "-s"})) {
-		t.Error("a prompt of -s faked a resume")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "work", SessionRef: "ses_x", ResumeSession: false})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if res.Tokens != 1000 {
+		t.Errorf("Tokens = %d, want the session total 1000 (900 in messages + 100 title overhead)", res.Tokens)
+	}
+	if res.CostUSD < 0.2499 || res.CostUSD > 0.2501 {
+		t.Errorf("CostUSD = %v, want the export's 0.25", res.CostUSD)
 	}
 }
 

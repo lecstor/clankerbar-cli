@@ -112,6 +112,24 @@ const ReviewRoundCap = 3
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
 type Config struct {
+	// Role is the role THIS instance serves (studio-chat.md §2, decision
+	// 96ac5e8d): empty/"worker" drains the backlog, "planner" runs the
+	// conversation loop instead. It is a MACHINE fact — which roles this
+	// machine serves — so it stays in the local file and rides the presence
+	// beacon; the plane never decides it.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: the
+	// config's marshalled form is its identity, and an absent key must mean
+	// worker without changing the identity of every existing daemon.
+	Role string `json:"role,omitempty"`
+
+	// Planner is the EFFECTIVE `roles.planner` block from the stored run config
+	// (studio-chat.md §1/§3), never decoded from the local file (`json:"-"`):
+	// the harness, model, brief and turn bounds are ratified project policy, so
+	// a machine may only serve them, never author them. Nil = no chat surface
+	// for this project. See RoleAssignment and ResolvePlanner.
+	Planner *RoleAssignment `json:"-"`
+
 	// Harness selects the coding-agent CLI to drive (e.g. "claude", "codex",
 	// "opencode"). Validated against the harness registry (harness.Known), so the
 	// accepted set is exactly what is registered — see Validate.
