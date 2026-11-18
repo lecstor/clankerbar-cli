@@ -348,6 +348,13 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// pre-recovery text beside a corrected FinalMessage.
 		res.TurnMessages[len(res.TurnMessages)-1] = res.FinalMessage
 	}
+	// Studio chat (studio-chat.md §3): a stream that never named a session still
+	// ran under the handle the invocation gave it, and that is what the planner
+	// records. (`-s` creates a missing session, so there is no missing-session
+	// verdict to report here: Result.SessionMissing stays false.)
+	if res.SessionRef == "" {
+		res.SessionRef = strings.TrimSpace(in.SessionRef)
+	}
 	return res, nil
 }
 
@@ -368,6 +375,13 @@ func opencodeArgs(in Invocation) []string {
 	args := []string{"run", "--standalone", "--format", "json", "--agent", opencodeAgent}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
+	}
+	// Studio chat (studio-chat.md §3): `run -s <id>` creates the session when it
+	// does not exist and continues it when it does, so a planner passes the same
+	// handle for a fresh prime and a later turn. Absent for every task-drain
+	// session.
+	if ref := strings.TrimSpace(in.SessionRef); ref != "" {
+		args = append(args, "-s", ref)
 	}
 	return append(args, "--", prompt)
 }
@@ -1096,6 +1110,10 @@ func (p *opencodeParse) finish(res *Result) {
 			res.Raw = map[string]any{}
 		}
 		res.Raw[opencodeSessionIDKey] = p.sessionID
+		// The handle the driver records for the next turn (studio-chat.md §3):
+		// the id this run actually streamed under, which is authoritative over
+		// whatever the invocation asked for when the stream names one.
+		res.SessionRef = p.sessionID
 	}
 	if p.errorType != "" {
 		if res.Raw == nil {
@@ -1754,7 +1772,7 @@ func (opencode) Capabilities() Capabilities {
 	// and that server's session API steers a message into the live run
 	// (opencode_inbox.go). A session with no such server has no delivery target
 	// and simply receives nothing.
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true, DeliversMessages: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {

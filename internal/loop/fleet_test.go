@@ -1216,6 +1216,15 @@ func identityOf(t *testing.T, cfg *config.Config) fleet.Identity {
 	return d.fleetIdentity(0)
 }
 
+// studio-chat.md §2's worker half: a drain states its role on every beacon,
+// just as the planner loop states its own. The plane reads an ABSENT role as
+// worker, so only this assertion tells a reported worker from an old CLI.
+func TestFleetIdentityCarriesTheWorkerRole(t *testing.T) {
+	if got := identityOf(t, fastCfg()).Role; got != config.RoleWorker {
+		t.Errorf("worker beacon role = %q, want %q", got, config.RoleWorker)
+	}
+}
+
 // The bug CLA-501 fixes: four daemons on one host all beaconed the bare
 // hostname, so the plane's unique (project, instance_name) key collapsed them
 // into one Fleet row. Two daemons started from different config files in the

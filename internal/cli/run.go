@@ -145,6 +145,12 @@ func Run(ctx context.Context, args []string) error {
 	// The same key also authorises the driver's one WRITE: handing back a task a
 	// session was still holding when it ended, so an interrupted iteration does not
 	// leave a lease to expire and charge the task a reclaim (CLA-242).
+	if cfg.EffectiveRole() == config.RolePlanner {
+		// One role per instance (operator decision 96ac5e8d): a planner serves
+		// conversations and never drains the backlog, so it takes the other branch
+		// entirely rather than sharing the drain loop.
+		return runPlanner(ctx, cfg, apiKey, f.cfgPath, overrides)
+	}
 	if projects := cfg.Projects; len(projects) > 0 {
 		targets := make([]loop.Target, 0, len(projects))
 		for _, p := range projects {
@@ -225,18 +231,12 @@ func eventsEnvOff() bool {
 	return false
 }
 
-// runDriver drives the loop and turns a requested restart into an actual re-exec
-// (CLA-461). The reloader closure re-derives the config the way THIS invocation
-// did — Load + these flag overrides + Validate — so a RELOAD sees the flags it
-// was started with, not just the file; without it a reload would silently drop
-// every --flag the operator launched with. A restart re-execs with the same
-// argv through the same launch path, so the fresh daemon inherits both.
-func runDriver(ctx context.Context, drv *loop.Driver, cfgPath string, overrides config.Overrides) error {
-	// The stored run-config overlay (CLA-410) re-applies these after every
-	// fetch-and-overlay: a ratified document outranks the FILE, but the flags
-	// the operator actually launched with outrank both.
-	drv.SetOverrides(overrides)
-	drv.SetReloader(func() (*config.Config, error) {
+// newConfigReloader re-derives the config the way THIS invocation did — Load +
+// these flag overrides + Validate — so a RELOAD sees the flags it was started
+// with, not just the file; without it a reload would silently drop every
+// --flag the operator launched with. Shared by the drain and the planner.
+func newConfigReloader(cfgPath string, overrides config.Overrides) func() (*config.Config, error) {
+	return func() (*config.Config, error) {
 		fresh, err := config.Load(cfgPath)
 		if err != nil {
 			return nil, err
@@ -246,7 +246,18 @@ func runDriver(ctx context.Context, drv *loop.Driver, cfgPath string, overrides 
 			return nil, err
 		}
 		return fresh, nil
-	})
+	}
+}
+
+// runDriver drives the loop and turns a requested restart into an actual re-exec
+// (CLA-461). A restart re-execs with the same argv through the same launch path,
+// so the fresh daemon inherits the flags.
+func runDriver(ctx context.Context, drv *loop.Driver, cfgPath string, overrides config.Overrides) error {
+	// The stored run-config overlay (CLA-410) re-applies these after every
+	// fetch-and-overlay: a ratified document outranks the FILE, but the flags
+	// the operator actually launched with outrank both.
+	drv.SetOverrides(overrides)
+	drv.SetReloader(newConfigReloader(cfgPath, overrides))
 	err := drv.Run(ctx)
 	if err != nil {
 		return err
