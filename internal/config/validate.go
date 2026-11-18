@@ -55,6 +55,9 @@ func (c *Config) Validate() error {
 	if err := c.normalizePaths(); err != nil {
 		return err
 	}
+	if err := c.validateRole(); err != nil {
+		return err
+	}
 	if err := c.validateHarnessNames(); err != nil {
 		return err
 	}
@@ -182,6 +185,18 @@ func (c *Config) normalizePaths() error {
 		c.Harnesses[name] = hc
 	}
 	return nil
+}
+
+// validateRole refuses a local `role` outside the two roles an instance may
+// serve. Only the LOCAL key is checked: the plane-supplied `roles.planner` is
+// ratified policy for the projects that carry it, and one bad planner block
+// must not refuse a worker drain that may serve other projects fine.
+func (c *Config) validateRole() error {
+	role := strings.TrimSpace(c.Role)
+	if role == "" || ValidRole(role) {
+		return nil
+	}
+	return fmt.Errorf("unknown role %q (want: %s or %s; an absent key means %s)", role, RoleWorker, RolePlanner, RoleWorker)
 }
 
 // validateHarnessNames refuses an unknown top-level harness, then unknown `harnesses`, `budget.per_harness`

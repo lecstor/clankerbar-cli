@@ -84,14 +84,17 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 	}
 	d.controlMu.Unlock()
 	cfgID := ""
+	role := config.RoleWorker
 	if eff != nil {
 		cfgID = eff.Identity()
+		role = eff.EffectiveRole()
 	}
 	return fleet.Identity{
 		Instance:       inst,
 		Host:           d.hostnameOnce(),
 		Version:        version.Current,
 		ConfigIdentity: cfgID,
+		Role:           role,
 	}
 }
 

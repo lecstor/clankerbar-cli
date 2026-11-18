@@ -281,6 +281,14 @@ type Capabilities struct {
 	// channel, and an interactive session waits for its hook. The loop sets
 	// Invocation.Inbox only when this is true.
 	DeliversMessages bool
+
+	// ResumesSessions reports whether this adapter can continue an existing
+	// session by id (studio-chat.md §3): claude's `--resume <id>` and
+	// opencode's `run -s <id>`. False means a conversation cannot keep one
+	// session across turns, so `doctor` says a planner on this harness re-primes
+	// every turn. It is deliberately separate from RunsTurnSequences: that one
+	// is about follow-up turns inside ONE Invoke, this one is across Invokes.
+	ResumesSessions bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -491,6 +499,22 @@ type Invocation struct {
 	//
 	// Nil means no delivery: every other harness in v1, and every probe.
 	Inbox *InboxConfig
+
+	// SessionRef is the harness session this session runs as/into
+	// (studio-chat.md §3). Empty on every task-drain session, which starts a
+	// fresh unnamed session exactly as before.
+	//
+	// With ResumeSession false it is the id the session is CREATED under —
+	// claude's `--session-id`, opencode's `run -s` (which creates a missing
+	// session) — so the planner knows the handle before the model answers.
+	// With ResumeSession true it names the session to continue.
+	SessionRef string
+
+	// ResumeSession continues Invocation.SessionRef instead of creating it.
+	// An adapter that cannot resume must not silently start fresh: claude
+	// reports the missing session on Result.SessionMissing, and the planner
+	// re-primes within the same turn.
+	ResumeSession bool
 }
 
 // InboxConfig is the plane half of the console -> agent message channel: where the run
@@ -713,6 +737,21 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// SessionRef is the harness session this Result ran as/into, when the
+	// adapter can name it (studio-chat.md §3): claude echoes the id it was
+	// given, opencode reports the id its stream carried. It is the handle the
+	// planner records and resumes on the next turn. Empty for every task-drain
+	// session and for a harness with no session ids.
+	SessionRef string
+
+	// SessionMissing reports that this invocation asked to RESUME a session the
+	// harness no longer has (a pruned local store), so the planner must re-prime
+	// a fresh session from the plane's transcript within the same turn. It is
+	// the adapter's verdict, not a text the driver matches: only the adapter
+	// knows its CLI's wording. False whenever ResumeSession was false and for
+	// every adapter whose `resume` creates instead of refusing (opencode).
+	SessionMissing bool
 
 	// TurnMessages is the final message of EACH turn of a multi-turn invocation,
 	// in order: TurnMessages[0] is the first turn's (Invocation.Prompt) and the

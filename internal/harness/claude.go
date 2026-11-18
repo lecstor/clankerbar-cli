@@ -116,6 +116,17 @@ func claudeArgs(in Invocation) []string {
 	if in.MaxTurns > 0 {
 		args = append(args, "--max-turns", strconv.Itoa(in.MaxTurns))
 	}
+	// Studio chat (studio-chat.md §3): one session per conversation, created
+	// under an id the CLI chooses (`--session-id`) and continued on later turns
+	// (`--resume`). Both are the same handle; which flag is emitted is what
+	// decides create-vs-continue. Absent for every task-drain session.
+	if ref := strings.TrimSpace(in.SessionRef); ref != "" {
+		if in.ResumeSession {
+			args = append(args, "--resume", ref)
+		} else {
+			args = append(args, "--session-id", ref)
+		}
+	}
 	return args
 }
 
@@ -307,8 +318,25 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// the kill's, not a verdict. The marker is the verdict.
 		res.ExitCode = -1
 	}
+	// Studio chat (studio-chat.md §3): the handle this session ran under, and
+	// the one failure the planner must recover from in-turn. Claude refuses a
+	// resume of a session its local store no longer has with
+	// "No conversation found with session ID: <id>" and exit 1. The failed
+	// attempt produces no assistant output, so scanning the CLI-authored text
+	// (never raw stdout) cannot be fooled by conversation prose.
+	res.SessionRef = strings.TrimSpace(in.SessionRef)
+	if in.ResumeSession && res.SessionRef != "" && res.ExitCode != 0 &&
+		strings.Contains(claudeText(res, claudeDiagnostic), claudeSessionMissingText) {
+		res.SessionMissing = true
+	}
 	return res, nil
 }
+
+// claudeSessionMissingText is claude's own refusal to resume a session its local
+// store no longer holds (verified against claude 2.1.322: exit 1, stderr
+// "No conversation found with session ID: <id>"). It is matched only on a
+// failed RESUME, and only against text the CLI authored.
+const claudeSessionMissingText = "No conversation found with session ID"
 
 // noteToolResult applies one clankerbar call's RESULT to res: it resolves the
 // delivery claim noteToolUse armed on the request, and then whatever else that
@@ -1148,7 +1176,7 @@ func (r *Result) markCeilingHit() {
 // opencode does too as of CLA-365; codex still does not. See
 // Capabilities.TracksClaims.
 func (claude) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true, EmitsEvents: true, DeliversMessages: true}
+	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
 }
 
 // Diagnostic returns the same CLI-authored text IsTransient judged, so a caller
