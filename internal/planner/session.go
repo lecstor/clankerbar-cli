@@ -60,8 +60,9 @@ func sessionKey(project, conversationID string) string {
 
 // OpenSessionStore loads the store from dir. A nil dir yields an in-memory store
 // (the unit tests); a real one reads the file when present and starts empty when
-// it cannot be trusted.
-func OpenSessionStore(dir *statedir.Dir) (*SessionStore, *stateDirCloser, error) {
+// it cannot be trusted. The returned closer releases the state-dir handle and is
+// always safe to call.
+func OpenSessionStore(dir *statedir.Dir) (*SessionStore, func() error, error) {
 	s := &SessionStore{dir: dir, entries: map[string]sessionEntry{}}
 	if dir != nil && dir.Exists(SessionStoreName) {
 		b, err := dir.ReadFile(SessionStoreName)
@@ -72,11 +73,11 @@ func OpenSessionStore(dir *statedir.Dir) (*SessionStore, *stateDirCloser, error)
 			s.entries = map[string]sessionEntry{}
 		}
 	}
-	closer := &stateDirCloser{}
+	closeFn := func() error { return nil }
 	if dir != nil {
-		closer.close = dir.Close
+		closeFn = dir.Close
 	}
-	return s, closer, nil
+	return s, closeFn, nil
 }
 
 // NewMemorySessionStore is the test and caller-supplied form: no file, no state

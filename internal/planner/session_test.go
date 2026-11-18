@@ -21,12 +21,12 @@ func TestSessionStorePersistsAcrossOpens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("statedir.Open: %v", err)
 	}
-	store, closer, err := OpenSessionStore(dir)
+	store, closeStore, err := OpenSessionStore(dir)
 	if err != nil {
 		t.Fatalf("OpenSessionStore: %v", err)
 	}
 	store.Record(key, "claude", "ref-1", 4242)
-	if err := closer.Close(); err != nil {
+	if err := closeStore(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
@@ -35,11 +35,11 @@ func TestSessionStorePersistsAcrossOpens(t *testing.T) {
 		t.Fatalf("reopen state dir: %v", err)
 	}
 	defer dir2.Close()
-	store2, closer2, err := OpenSessionStore(dir2)
+	store2, close2, err := OpenSessionStore(dir2)
 	if err != nil {
 		t.Fatalf("OpenSessionStore: %v", err)
 	}
-	defer closer2.Close()
+	defer close2()
 
 	got := store2.Decide(key, "claude", &plane.ConversationResume{Harness: "claude", Ref: "ref-1"}, 10000)
 	if !got.Resume || got.Ref != "ref-1" || got.Tokens != 4242 {
@@ -56,11 +56,11 @@ func TestSessionStoreCorruptFileStartsEmpty(t *testing.T) {
 	if err := dir.WriteFile(SessionStoreName, []byte("{not json")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	store, closer, err := OpenSessionStore(dir)
+	store, closeStore, err := OpenSessionStore(dir)
 	if err != nil {
 		t.Fatalf("OpenSessionStore: %v", err)
 	}
-	defer closer.Close()
+	defer closeStore()
 	got := store.Decide(sessionKey("demo", "c"), "claude", &plane.ConversationResume{Harness: "claude", Ref: "r"}, 0)
 	if !got.Resume || got.Tokens != 0 {
 		t.Errorf("decision = %+v, want a resume with no accumulated spend", got)
@@ -138,12 +138,12 @@ func TestSessionStoreFileIsOwnerOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("statedir.Open: %v", err)
 	}
-	store, closer, err := OpenSessionStore(dir)
+	store, closeStore, err := OpenSessionStore(dir)
 	if err != nil {
 		t.Fatalf("OpenSessionStore: %v", err)
 	}
 	store.Record(sessionKey("demo", "c"), "claude", "r", 1)
-	if err := closer.Close(); err != nil {
+	if err := closeStore(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	fi, err := os.Stat(filepath.Join(path, SessionStoreName))

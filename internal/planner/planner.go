@@ -134,19 +134,6 @@ type Planner struct {
 	turnFailures []int
 }
 
-// stateDirCloser abstracts statedir.Dir so a test can hand in a store without
-// opening one. It carries only the one method the store needs at shutdown.
-type stateDirCloser struct {
-	close func() error
-}
-
-func (s *stateDirCloser) Close() error {
-	if s == nil || s.close == nil {
-		return nil
-	}
-	return s.close()
-}
-
 // projectRole is one target's cached effective config and resolved planner
 // session. It is refreshed just before a turn, honouring ConfigTTL.
 type projectRole struct {
@@ -319,12 +306,12 @@ func (p *Planner) openState(base *config.Config) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	store, closer, err := OpenSessionStore(dir)
+	store, closeStore, err := OpenSessionStore(dir)
 	if err != nil {
 		return nil, err
 	}
 	p.sessions = store
-	return func() { _ = closer.Close() }, nil
+	return func() { _ = closeStore() }, nil
 }
 
 // resolve refreshes the target's effective config and planner session when the
