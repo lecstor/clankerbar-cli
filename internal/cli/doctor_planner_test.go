@@ -184,6 +184,28 @@ func TestDoctorPlannerMissingBinaryFails(t *testing.T) {
 	}
 }
 
+func TestDoctorPlannerUnpinnedCredentialsWarn(t *testing.T) {
+	c := plannerConfig(t)
+	c.ConfigDir = ""
+	env := plannerEnv(plannerDoc(t, map[string]any{"harness": "claude"}))
+	checks := checkPlanner(context.Background(), c, env)
+	if c0 := findCheck(checks, "planner[demo]"); c0 == nil || c0.status != warn ||
+		!strings.Contains(c0.detail, "no config_dir pinned") {
+		t.Fatalf("checks = %+v, want a credential WARN", checks)
+	}
+}
+
+func TestDoctorPlannerMissingConfigDirFails(t *testing.T) {
+	c := plannerConfig(t)
+	c.ConfigDir = filepath.Join(t.TempDir(), "gone")
+	env := plannerEnv(plannerDoc(t, map[string]any{"harness": "claude"}))
+	checks := checkPlanner(context.Background(), c, env)
+	if c0 := findCheck(checks, "planner[demo]"); c0 == nil || c0.status != fail ||
+		!strings.Contains(c0.detail, "does not resolve") {
+		t.Fatalf("checks = %+v, want a FAIL for a config dir that does not exist", checks)
+	}
+}
+
 func TestDoctorPlannerMissingMCPConfigFails(t *testing.T) {
 	c := plannerConfig(t)
 	c.MCPConfigPath = ""
