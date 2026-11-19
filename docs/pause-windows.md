@@ -6,6 +6,11 @@ pricing hours, so it applies to **every new session**, not only to the claim tha
 starts a task. A session already running is never interrupted — the pause lands
 at the next boundary.
 
+A *per-route* pricing schedule — "pause this provider's peak, leave the free and
+flat-priced routes alone" — is a different key: see
+[route-windows.md](route-windows.md). The two may both be set; `pause_windows`
+still stops every route.
+
 ## The boundary rule
 
 There are two gates:

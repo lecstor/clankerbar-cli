@@ -49,7 +49,7 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold 
 		if !active {
 			return boundaryHoldState{}
 		}
-		return boundaryHoldState{active: true, until: until, label: "scheduled pause", detail: pw.Describe()}
+		return boundaryHoldState{active: true, until: until, label: "scheduled pause", detail: pw.Describe(), zone: pw.Timezone}
 	})
 }
 
@@ -60,6 +60,7 @@ type boundaryHoldState struct {
 	until  time.Time
 	label  string // "scheduled pause" / "route windows", for the log lines
 	detail string // the schedule's own description, in the entry line's parens
+	zone   string // IANA zone the instant is rendered in (the presence row)
 }
 
 // holdSequence holds the sequence at its next boundary while decide reports a
@@ -112,7 +113,7 @@ func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() 
 	if claim != nil && claim.Claim.Held() {
 		heldRef = claimLabel(claim.Claim)
 	}
-	d.holdPause(s.ti, heldRef, st.ph.Label(s.i))
+	d.holdPause(s.ti, heldRef, st.ph.Label(s.i), until, hs.zone)
 	defer d.clearHoldPause(s.ti)
 	// until carries the window's own zone, so the line names the operator's
 	// local resume time rather than the daemon's.
@@ -194,6 +195,10 @@ func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() 
 			return pauseHoldResumed
 		}
 		until = hs.until
+		// Re-publish the hold with the fresh instant: a RELOAD can shorten or
+		// move the window mid-hold, and the presence row must not count down to
+		// an instant the config no longer says.
+		d.holdPause(s.ti, heldRef, st.ph.Label(s.i), until, hs.zone)
 		// Wake at the next cadence, or when the window ends, whichever is first.
 		wait := interval
 		if remaining := until.Sub(now); remaining < wait {

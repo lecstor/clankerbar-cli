@@ -148,6 +148,28 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		return
 	}
 
+	// CLA-947: a conflict-only session is a new paid session ON A ROUTE, so that
+	// route's pricing window gates it exactly as the scheduled pause above does.
+	// The window filter is the loop's own (config.RouteChoiceAt): a windowed route
+	// is not offered, and when every route is blocked under "wait" the task waits
+	// for a later close-out pass rather than paying the peak price. Under "run"
+	// the first route is used, which is the operator accepting it. Resolved BEFORE
+	// the claim and the fleet slot, so a waiting task costs neither.
+	step := cfg.ConflictStep()
+	conflictModel, conflictRoutes := step.Model.First(), step.Model.List()
+	if len(conflictRoutes) > 0 {
+		routeChoice := cfg.RouteChoiceAt(time.Now(), conflictRoutes)
+		if len(routeChoice.Routes) == 0 && !routeChoice.WaitUntil.IsZero() {
+			d.conflictSay("routespaused:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but every route for the conflict step is "+
+				"inside a pricing window until %s - no session is started; the task waits for the next close-out pass after the window ends",
+				label, pr, routeChoice.WaitUntil.Local().Format("Mon 15:04 MST"))
+			return
+		}
+		if len(routeChoice.Routes) > 0 {
+			conflictModel, conflictRoutes = routeChoice.Routes[0], routeChoice.Routes
+		}
+	}
+
 	// One at a time ON THIS SUPERVISOR. A second conflicting task is not dropped:
 	// it stays approved, and the pass reaches it again on the next poll once this
 	// session ends. The bound ACROSS supervisors is the shared slot below.
@@ -167,7 +189,6 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		}
 	}()
 
-	step := cfg.ConflictStep()
 	if strings.EqualFold(step.Harness, "claude") {
 		d.conflictSay("claude", "conflict: %s PR #%d is CONFLICTING, but the conflict step resolves to harness %q - "+
 			"daemon-started sessions never run on Claude, so the task waits for the agent close-out", label, pr, step.Harness)
@@ -258,8 +279,8 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		Paths:    paths,
 		Gate:     gate,
 		Harness:  step.Harness,
-		Model:    step.Model.First(),
-		Routes:   step.Model.List(),
+		Model:    conflictModel,
+		Routes:   conflictRoutes,
 		WorkDir:  dir,
 		Worktree: worktree,
 

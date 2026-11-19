@@ -58,11 +58,13 @@ func (s *drainSeq) holdThroughRouteWindows(ctx context.Context, st *seqStep) pau
 		if len(choice.Routes) > 0 || choice.WaitUntil.IsZero() {
 			return boundaryHoldState{}
 		}
+		detail, zone := routeWindowDetail(tc, routes, now)
 		return boundaryHoldState{
 			active: true,
 			until:  choice.WaitUntil,
 			label:  "route windows",
-			detail: routeWindowDetail(tc, routes, now),
+			detail: detail,
+			zone:   zone,
 		}
 	})
 }
@@ -70,7 +72,7 @@ func (s *drainSeq) holdThroughRouteWindows(ctx context.Context, st *seqStep) pau
 // routeWindowDetail names every blocking schedule and its windows for the hold's
 // entry line, so the operator reads WHY these routes are held rather than only
 // that something is.
-func routeWindowDetail(tc *config.Config, routes []string, now time.Time) string {
+func routeWindowDetail(tc *config.Config, routes []string, now time.Time) (detail, zone string) {
 	seen := map[string]bool{}
 	var parts []string
 	for _, route := range routes {
@@ -87,6 +89,9 @@ func routeWindowDetail(tc *config.Config, routes []string, now time.Time) string
 		}
 		seen[name] = true
 		parts = append(parts, fmt.Sprintf("%s %s", name, sched.Describe()))
+		if zone == "" {
+			zone = sched.Timezone
+		}
 	}
-	return strings.Join(parts, "; ")
+	return strings.Join(parts, "; "), zone
 }

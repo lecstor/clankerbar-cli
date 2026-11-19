@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 )
 
 const (
@@ -331,5 +332,39 @@ func TestInvocationFor_RefusesWhenEveryRouteIsWindowed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), routeGo) {
 		t.Errorf("the refusal does not name the blocked routes: %v", err)
+	}
+}
+
+// Presence during a route-window hold names the end and the schedule's zone, as
+// a daemon-wide schedule pause does — the console banner has one reason word for
+// both, because both clear themselves.
+func TestFleetState_RouteWindowHoldCarriesItsEndAndZone(t *testing.T) {
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo)
+	until := brisbaneAt(t, 9, 14, 0)
+	d.schedPaused = true
+	d.holdPause(0, "CB-7", "implement", until, "Australia/Brisbane")
+
+	st := d.fleetState(0)
+	if st.Kind != fleet.StateDraining {
+		t.Fatalf("state = %q, want draining", st.Kind)
+	}
+	if st.PauseReason != fleet.PauseReasonSchedule {
+		t.Errorf("pause reason = %q, want %q", st.PauseReason, fleet.PauseReasonSchedule)
+	}
+	if !st.PauseUntil.Equal(until) {
+		t.Errorf("pauseUntil = %v, want %v", st.PauseUntil, until)
+	}
+	if st.PauseZone != "Australia/Brisbane" {
+		t.Errorf("pauseZone = %q, want the schedule's zone", st.PauseZone)
+	}
+	if st.TaskRef != "CB-7" || st.Phase != "implement" {
+		t.Errorf("held state names %q at %q, want CB-7 at implement", st.TaskRef, st.Phase)
+	}
+
+	// A stale hold with no instant falls back to plain draining, so the row never
+	// shows a reason with no resume time.
+	d.holdPause(0, "CB-7", "implement", time.Time{}, "")
+	if st := d.fleetState(0); st.PauseReason != "" {
+		t.Errorf("a hold with no instant reported reason %q, want plain draining", st.PauseReason)
 	}
 }
