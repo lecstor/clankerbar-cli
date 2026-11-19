@@ -2188,7 +2188,9 @@ deliberately.
 #### Pause windows
 
 `pause_windows` keeps the loop from STARTING new work during recurring
-local-time windows — the DeepSeek peak-pricing hours, say:
+local-time windows — quiet hours, or a machine that must not be loaded, say (for
+one provider's peak PRICES, use a [route schedule](#route-pricing-windows)
+instead: a route schedule stops only the routes it names):
 
 ```json
 "pause_windows": {
@@ -2223,6 +2225,46 @@ that overlap or abut are one pause. Unset (or an empty `windows` list) means no
 schedule at all; `doctor` reports the schedule, whether it is holding now, and
 the boundary rule. See [docs/pause-windows.md](docs/pause-windows.md) for what
 counts as a boundary and which session kinds are covered.
+
+#### Route pricing windows
+
+`route_schedules` and `route_windows` keep new work off a route whose provider
+bills peak rates, **without** stopping the routes that do not — the narrow
+question `pause_windows` cannot ask, because a daemon-wide window blocks free and
+flat-priced routes to protect one peak-priced one:
+
+```json
+"route_schedules": {
+  "deepseek-peak": {
+    "timezone": "Australia/Brisbane",
+    "windows": [
+      { "days": "mon-fri", "from": "11:00", "to": "14:00" },
+      { "days": "mon-fri", "from": "16:00", "to": "20:00" }
+    ],
+    "when_all_blocked": "wait"
+  }
+},
+"route_windows": {
+  "opencode-go/deepseek-v4.1-flash": "deepseek-peak",
+  "commandcode/deepseek/deepseek-v4.1-flash": "deepseek-peak"
+}
+```
+
+A schedule is a named `PauseWindows` set — same `timezone` / `lead` / `days` /
+`HH:MM` handling, overnight windows included — and `route_windows` attaches one
+to a route **by the route ID**, the exact model string the driver iterates
+(`provider/model`), never by provider or model alone: the same DeepSeek model via
+a flat-priced provider has no peak tier and must not pause. A route with no entry
+is always available, and a `route_windows` value naming no `route_schedules`
+entry is a `Validate` error naming the route (a route ID no configured route
+matches is a `doctor` WARN). With every route in a phase inside a window, the
+schedule's `when_all_blocked` decides: `"wait"` (the default) holds the spawn —
+the same claim-keeping, lease-renewing hold as `pause_windows`, with STOP /
+RESTART / HALT / RELOAD responsive — until the earliest window ends; `"run"`
+starts on the first route whose schedule allows it and accepts the peak price. A
+usage MARK is still honoured under `"run"`. `doctor`'s `route_windows` check lists
+each route's schedule, its windows and whether it is blocking now. See
+[docs/route-windows.md](docs/route-windows.md).
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default
@@ -3083,6 +3125,7 @@ the catch-all matches last, denying every read.
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
 - [`docs/pause-windows.md`](./docs/pause-windows.md) - the `pause_windows` boundary rule: a running session is never interrupted, but the next phase or session is held (claim kept, lease renewed) until the window ends.
+- [`docs/route-windows.md`](./docs/route-windows.md) - per-route pricing windows (`route_schedules` / `route_windows`): the routes a peak-rate provider bills for are filtered out of new-session route selection, and only when every route is blocked does `when_all_blocked` decide between waiting and paying.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
 - [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
 - [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.

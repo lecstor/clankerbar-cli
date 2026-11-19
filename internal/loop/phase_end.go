@@ -117,6 +117,19 @@ type phaseEnd struct {
 	// when the branch-less evidence forms were consulted and showed nothing).
 	emptyWhy string
 
+	// windowHeld reports that the spawn was REFUSED by a pricing window that
+	// opened between the boundary check and the spawn (CLA-947), so no session
+	// ran and nothing was spent. It is a scheduling condition, not a failed
+	// phase: the walk ends here, the claim goes back through the ordinary
+	// no-checkpoint handback, and the next drain's boundary holds the spawn
+	// until the window ends. Deliberately NOT empty, which is the evidence-gate
+	// FAILED shape (the 2026-08-24 incident): a schedule must never be counted
+	// as a harness failure.
+	windowHeld bool
+
+	// windowWhy is the refusal's own sentence when windowHeld fired.
+	windowWhy string
+
 	// branch is the branch name when this phase checkpointed — the
 	// plane-record evidence the checkpoint is gated on (CLA-457), carried here
 	// so the successor's brief can name it instead of asserting an unverified

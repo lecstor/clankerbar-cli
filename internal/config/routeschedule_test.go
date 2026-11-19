@@ -122,6 +122,20 @@ func TestConfigValidate_RouteWindows(t *testing.T) {
 		{"bad policy is named", func(c *Config) {
 			c.RouteSchedules["deepseek-peak"] = peakSchedule("sometimes")
 		}, []string{`route_schedules["deepseek-peak"]`, "when_all_blocked"}},
+		// A JSON null entry parses to a nil *RouteSchedule, which RouteScheduleFor
+		// then reads as "no schedule": every route attached to it would be always
+		// available — a configured-looking pause that never pauses (review
+		// 1.review-1.5).
+		{"null schedule entry", func(c *Config) {
+			c.RouteSchedules["deepseek-peak"] = nil
+		}, []string{`route_schedules["deepseek-peak"]`, "must be an object"}},
+		// Lookups trim, so a padded key is attachable only by a value spelling the
+		// padding too, and would never be found (review 1.review-1.14).
+		{"padded schedule key", func(c *Config) {
+			delete(c.RouteSchedules, "deepseek-peak")
+			c.RouteSchedules[" deepseek-peak "] = peakSchedule("")
+			c.RouteWindows["opencode-go/deepseek-v4.1-flash"] = " deepseek-peak "
+		}, []string{"route_schedules", "whitespace"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := valid()
@@ -136,6 +150,25 @@ func TestConfigValidate_RouteWindows(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestConfigValidate_NullRouteScheduleFromJSON is the shape an operator actually
+// writes: a schedule keyed to null in the file. It must fail Validate naming the
+// key, not read back as a route with "no schedule" and pause nothing.
+func TestConfigValidate_NullRouteScheduleFromJSON(t *testing.T) {
+	c := &Config{Harness: "opencode", Prompt: "Work the backlog.", WorkDir: t.TempDir()}
+	if err := json.Unmarshal([]byte(`{"route_schedules":{"deepseek-peak":null},"route_windows":{"zen/free":"deepseek-peak"}}`), c); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a null route schedule")
+	}
+	for _, want := range []string{`route_schedules["deepseek-peak"]`, "must be an object"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not carry %q", err, want)
+		}
 	}
 }
 

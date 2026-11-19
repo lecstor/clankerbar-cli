@@ -148,8 +148,15 @@ func (d *Driver) routeMarkExpiry(route string) (time.Time, bool) {
 // chain is still in its reset window — the route whose mark lifts FIRST is used,
 // alone: it is the soonest the free route can be tested again, and a phase must
 // still start rather than wait on a mark. A marked route is never offered as a
-// fallback to an unmarked one, and the window policy never overrides a mark:
+// fallback to an unmarked one, and when_all_blocked "run" never overrides a mark:
 // only the window filter degrades.
+//
+// A WINDOW, unlike a mark, is never overridden by one: a mark only orders the
+// candidates ("test the soonest-resetting route first"), while a window is the
+// price the operator said not to pay. So the all-marked fallback is window
+// filtered too — a marked route inside its window under "wait" is dropped, the
+// marked route whose mark lifts first among those left open is used, and when
+// every marked route is windowed the phase holds until the earliest window ends.
 //
 // When no route is marked but every one is inside a window, the schedule's
 // when_all_blocked decides, through config.RouteChoiceAt: "run" offers them
@@ -166,14 +173,16 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 		return config.RouteChoice{}
 	}
 	unmarked := make([]string, 0, len(routes))
+	marked := make([]string, 0, len(routes))
 	var earliestMarked string
 	var earliestUntil time.Time
 	for _, route := range routes {
-		until, marked := d.routeMarkExpiry(route)
-		if !marked || !now.Before(until) {
+		until, limited := d.routeMarkExpiry(route)
+		if !limited || !now.Before(until) {
 			unmarked = append(unmarked, route)
 			continue
 		}
+		marked = append(marked, route)
 		if earliestMarked == "" || until.Before(earliestUntil) {
 			earliestMarked, earliestUntil = route, until
 		}
@@ -188,10 +197,31 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 		// ever stops being true.
 		return config.RouteChoice{Routes: unmarked}
 	}
-	if earliestMarked != "" {
-		return config.RouteChoice{Routes: []string{earliestMarked}}
+	if earliestMarked == "" {
+		return config.RouteChoice{}
 	}
-	return config.RouteChoice{}
+	choice := tc.RouteChoiceAt(now, marked)
+	if len(choice.Routes) == 0 && !choice.WaitUntil.IsZero() {
+		// Every marked route is inside a "wait" window: hold rather than pay the
+		// peak price. The mark expiry needs no wait of its own — a marked route
+		// is offered the moment it is out of its window, and the hold re-decides
+		// at every wake.
+		return choice
+	}
+	// The soonest-resetting marked route among those the window filter left
+	// open. With no windows this is exactly the earliest-marked route.
+	soonest := ""
+	var soonestUntil time.Time
+	for _, route := range choice.Routes {
+		until, _ := d.routeMarkExpiry(route)
+		if soonest == "" || until.Before(soonestUntil) {
+			soonest, soonestUntil = route, until
+		}
+	}
+	if soonest == "" {
+		soonest = earliestMarked
+	}
+	return config.RouteChoice{Routes: []string{soonest}}
 }
 
 // noteRouteFallbacks records the marks an adapter reported and writes each
@@ -265,7 +295,7 @@ func (d *Driver) routeRoutesFor(tc *config.Config, ph config.Phase) config.Route
 // harness block's first route, which may be a route this run has already moved
 // off. It returns "" for a phase with one route or none, so a single-route probe
 // keeps the model it always had, and also when every route is windowed (there is
-// no preferred route to aim at; the probe falls back to the phase's model).
+// no preferred route to aim at; probeInvocation refuses that probe instead).
 func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	if len(routes) < 2 {
@@ -281,13 +311,27 @@ func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 // probeInvocation is the supervised-wait probe's Invocation: the phase harness's
 // probe invocation, aimed at probeRouteFor's route when the phase has a route
 // list.
+//
+// A phase whose every route is inside a "wait" pricing window has NO route a
+// probe may start on, so it refuses the probe rather than letting the phase's
+// model through: the probe is a paid session, and paying the peak price to learn
+// whether a limit lifted is exactly what the schedule exists to prevent. The
+// wait logs the refusal and retries on its own interval, spending nothing.
 func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (harness.Invocation, error) {
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), true)
 	if err != nil {
 		return inv, err
 	}
-	if route := d.probeRouteFor(tc, ph); route != "" {
-		inv.Model = route
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		return inv, nil
+	}
+	choice := d.routableRoutes(tc, routes)
+	switch {
+	case len(choice.Routes) > 0:
+		inv.Model = choice.Routes[0]
+	case !choice.WaitUntil.IsZero():
+		return inv, &routeWindowBlocked{phase: ph.Label(0), until: choice.WaitUntil, routes: routes}
 	}
 	return inv, nil
 }

@@ -127,3 +127,39 @@ func TestCheckRouteWindowsSaysPauseWindowsStillApplies(t *testing.T) {
 		t.Errorf("info = %v, want the both-keys note", c.info)
 	}
 }
+
+// Review 1.review-1.15: a schedule nobody attached is dead configuration, and a
+// route pointing at one that resolves to nothing is the silent no-op this check
+// exists to surface — both must be visible, the latter as a WARN.
+func TestCheckRouteWindowsSeesUnattachedAndUnresolvableSchedules(t *testing.T) {
+	// Defined, never attached: the check must not read as "none configured".
+	defined := routeWindowCfg(t, nil)
+	defined.RouteWindows = map[string]string{}
+	defined.RouteSchedules["spare-peak"] = defined.RouteSchedules["deepseek-peak"]
+	c := checkRouteWindowsAt(defined, time.Now())
+	if c.status != pass {
+		t.Fatalf("status = %v, want pass (an unattached schedule is a setting, not a fault)", c.status)
+	}
+	if strings.Contains(c.detail, "none configured") {
+		t.Errorf("detail = %q, want it to say a schedule is defined but unattached", c.detail)
+	}
+	joined := strings.Join(c.info, "\n")
+	for _, want := range []string{"defined but attached to no route", "deepseek-peak", "spare-peak"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("info = %v, want %q", c.info, want)
+		}
+	}
+
+	// A route attached to a schedule that does not resolve: a WARN, not an
+	// informational line.
+	broken := routeWindowCfg(t, nil)
+	broken.RouteWindows[doctorGoRoute] = "no-such-schedule"
+	c = checkRouteWindowsAt(broken, time.Now())
+	if c.status != warn {
+		t.Fatalf("status = %v, want warn for an unresolvable attachment", c.status)
+	}
+	joined = strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "no such schedule") || !strings.Contains(joined, "always available") {
+		t.Errorf("info = %v, want the unresolvable attachment called out", c.info)
+	}
+}

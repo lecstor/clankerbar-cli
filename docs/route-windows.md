@@ -55,14 +55,21 @@ order wins.
 | spawn | covered by |
 | --- | --- |
 | every phase (first, next, handoff respawn, retry) | `invocationFor` -> `routeRoutesFor` |
-| a sequential or parallel review-panel member | the same, since each member is a `drainPhase` pass |
-| the supervised-wait probe | `probeRouteFor` (so it aims at the route the next spawn would use) |
+| a sequential review-panel member | the same, since each member is a `drainPhase` pass |
+| a parallel review-panel fan-out | `holdThroughPanelRouteWindows`: the whole panel is held over EVERY member's route list, not only the first member's |
+| the supervised-wait probe | `probeInvocation` aims at the route the next spawn would use, and refuses the probe when every route is windowed |
 | the supervisor's conflict-only session | `startConflictSession` -> `config.RouteChoiceAt` |
 | the deterministic close-out | not applicable: it runs no agent session |
 
 A **running** session is never interrupted; the filter decides only which route a
 new spawn may start on. A mid-session adapter route switch (CLA-782) is inside the
 session unit and is not re-filtered.
+
+A usage MARK and a window are different answers to different questions, so both
+apply: a mark only ORDERs the candidates (a phase still starts, on the route whose
+mark lifts first), while a window removes them. When every route is marked the
+first-unlifting marked route is still used, but never one that is also inside its
+window under `"wait"` — the phase then holds until the window ends.
 
 ## All routes blocked
 
@@ -72,15 +79,21 @@ inside a window":
 - `"wait"` (the default) — spawn nothing. The phase boundary holds until the
   earliest blocking window ends, through the same hold as a scheduled pause: the
   claim is kept, its lease renewed, presence beaconed, and STOP / RESTART / HALT /
-  RELOAD stay responsive. The log names the resume instant and the schedule.
-- `"run"` — start on the first configured route and accept the peak price.
+  RELOAD stay responsive. The hold RE-READS the config at every wake, so a RELOAD
+  that removes or shortens a schedule ends the hold at once and one that adds a
+  window puts it back. The log names the resume instant and the schedule.
+- `"run"` — start on the first route whose own schedule allows `run` (the first
+  configured route when they all do), accepting the peak price.
 
 `"run"` degrades **only** the window filter. A route carrying a **usage mark** is
 still skipped: the mark is a provider denial, not a price.
 
 If a window opens in the instant between the boundary check and the spawn,
 `invocationFor` refuses the spawn (no session, no spend) rather than starting on a
-paused route; the next drain's boundary holds.
+paused route. That refusal is a scheduling condition, not a failed phase: it is
+recorded as `windowHeld` (never as the evidence-gate `empty` shape), a panel member
+it happens to is named INCOMPLETE but charged to neither the member's failure
+streak nor the dead rate, and the next drain's boundary holds the spawn.
 
 ## Identity
 

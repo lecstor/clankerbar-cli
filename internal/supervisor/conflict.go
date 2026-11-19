@@ -160,9 +160,12 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	if len(conflictRoutes) > 0 {
 		routeChoice := cfg.RouteChoiceAt(time.Now(), conflictRoutes)
 		if len(routeChoice.Routes) == 0 && !routeChoice.WaitUntil.IsZero() {
+			// WaitUntil carries the schedule's own location, so it is rendered
+			// there — the same wall clock the loop's hold and the pause branch
+			// above print, whatever zone this daemon runs in.
 			d.conflictSay("routespaused:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but every route for the conflict step is "+
 				"inside a pricing window until %s - no session is started; the task waits for the next close-out pass after the window ends",
-				label, pr, routeChoice.WaitUntil.Local().Format("Mon 15:04 MST"))
+				label, pr, routeChoice.WaitUntil.Format("Mon 15:04 MST"))
 			return
 		}
 		if len(routeChoice.Routes) > 0 {

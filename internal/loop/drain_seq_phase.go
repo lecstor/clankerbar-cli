@@ -149,10 +149,21 @@ func (s *drainSeq) checkPhaseBoundary(ctx context.Context, st *seqStep) seqNext 
 	// here when EVERY route this phase may start on is inside a window and its
 	// schedule says wait. Checked second because it is the more specific
 	// setting: when both apply the operator gets the daemon-wide line first.
-	for _, hold := range []func(context.Context, *seqStep) pauseHold{
-		s.holdThroughPause,
-		s.holdThroughRouteWindows,
-	} {
+	return s.takeBoundaryHolds(ctx, st, s.holdThroughPause, s.holdThroughRouteWindows)
+}
+
+// boundaryHold is one reason a phase boundary may not spawn yet: the daemon-wide
+// scheduled pause, or the pricing windows of the routes a phase may start on.
+type boundaryHold func(context.Context, *seqStep) pauseHold
+
+// takeBoundaryHolds runs the boundary holds in order and folds the two endings
+// that are not "resume" into the walk: a stop, and a lost run.
+//
+// Shared with the parallel panel's own fan-out hold (CLA-947 review
+// 1.review-1.2), so a whole-panel wait answers STOP / RESTART / HALT and a lost
+// claim exactly as the per-phase boundary does.
+func (s *drainSeq) takeBoundaryHolds(ctx context.Context, st *seqStep, holds ...boundaryHold) seqNext {
+	for _, hold := range holds {
 		switch out := hold(ctx, st); out {
 		case pauseHoldStop:
 			s.stop = true
@@ -166,7 +177,6 @@ func (s *drainSeq) checkPhaseBoundary(ctx context.Context, st *seqStep) seqNext 
 			return seqBreak
 		}
 	}
-
 	return seqFall
 }
 

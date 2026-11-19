@@ -176,7 +176,20 @@ func (c *Config) validateRouteWindows() error {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("route_schedules: a schedule name must not be blank")
 		}
-		if err := c.RouteSchedules[name].Validate(); err != nil {
+		if strings.TrimSpace(name) != name {
+			// Lookups trim, so a padded key would be attachable only by a value
+			// spelling the padding too, and RouteScheduleFor could never find it:
+			// a pause that looks configured and never pauses.
+			return fmt.Errorf("route_schedules[%q]: a schedule name must not start or end with whitespace", name)
+		}
+		sched := c.RouteSchedules[name]
+		if sched == nil {
+			// A JSON null is "a name with no entry" spelled wrong: it would read
+			// back as no schedule at all, so a route attached to it is always
+			// available — the silent no-op this validation exists to refuse.
+			return fmt.Errorf("route_schedules[%q]: must be an object, not null", name)
+		}
+		if err := sched.Validate(); err != nil {
 			return fmt.Errorf("route_schedules[%q]: %w", name, err)
 		}
 	}

@@ -6,6 +6,7 @@ package loop
 // whether the phase boundary holds the spawn or accepts the peak price.
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -141,6 +142,35 @@ func TestRoutableRoutesAt_AppliesRouteWindowsAndMarks(t *testing.T) {
 			now:  inside,
 			want: nil,
 			wait: endOfWindow,
+		},
+		// Review 1.review-1.3: a MARK only orders the candidates, a WINDOW removes
+		// them. Every route marked and every one windowed under wait must hold —
+		// starting on the marked route would pay the peak price the schedule
+		// exists to avoid.
+		{
+			name:   "every route marked and windowed under wait holds for the window",
+			policy: config.RouteWhenAllBlockedWait, windowed: []string{routeGo, routeCC},
+			dflt: config.ModelRoutes{routeGo, routeCC},
+			mark: []string{routeGo, routeCC},
+			now:  inside,
+			want: nil,
+			wait: endOfWindow,
+		},
+		{
+			name:   "every route marked: an open route wins over a windowed one",
+			policy: config.RouteWhenAllBlockedWait, windowed: []string{routeGo},
+			dflt: config.ModelRoutes{routeGo, routeSynthetic},
+			mark: []string{routeGo, routeSynthetic},
+			now:  inside,
+			want: []string{routeSynthetic},
+		},
+		{
+			name:   "every route marked and windowed under run still starts, on a marked route",
+			policy: config.RouteWhenAllBlockedRun, windowed: []string{routeGo, routeCC},
+			dflt: config.ModelRoutes{routeGo, routeCC},
+			mark: []string{routeGo, routeCC},
+			now:  inside,
+			want: []string{routeGo},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -366,5 +396,225 @@ func TestFleetState_RouteWindowHoldCarriesItsEndAndZone(t *testing.T) {
 	d.holdPause(0, "CB-7", "implement", time.Time{}, "")
 	if st := d.fleetState(0); st.PauseReason != "" {
 		t.Errorf("a hold with no instant reported reason %q, want plain draining", st.PauseReason)
+	}
+}
+
+// CLA-947 review 1.review-1.1: the route-window hold re-reads the LIVE config at
+// every wake, so a RELOAD that deletes the schedule ends the hold at once —
+// without moving the clock and without waiting out a window the config no longer
+// has. Pinning s.tc instead leaves the drain parked to the deleted window's end.
+func TestDrainPhases_ReloadRemovingRouteWindowsEndsTheHold(t *testing.T) {
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 12, 0)} // inside 11:00-14:00
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: okResult(5, 0.05)},
+	}}
+	d := routedDriver(t, h, twoPhases(), routeGo, routeCC)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo, routeCC)
+	d.now = clk.Now
+	d.leaseRenewalInterval = 2 * time.Millisecond
+	d.SetReloader(func() (*config.Config, error) {
+		fresh := d.cfg.Clone()
+		fresh.RouteSchedules = nil
+		fresh.RouteWindows = nil
+		return fresh, nil
+	})
+	logs := captureLogs(t)
+	done := startPauseDrain(t, d)
+
+	waitUntil(t, "the route-window hold at the implement boundary", func() bool {
+		return strings.Contains(logs.String(), "route windows active until Mon 14:00 AEST")
+	})
+	if h.invokeCalls != 0 {
+		t.Fatalf("a session spawned inside a pricing window: %d", h.invokeCalls)
+	}
+
+	// The operator deletes the schedule and writes RELOAD. The clock does NOT
+	// move: only the config changed, and that is enough to end the hold.
+	writeMarker(t, d.state.Path(), MarkerReload, "")
+	waitUntil(t, "the hold to end on the RELOAD alone", func() bool {
+		return strings.Contains(logs.String(), "route windows ended — resuming the sequence at the implement phase")
+	})
+
+	res := waitPauseDrain(t, done)
+	if res.err != nil || res.stop {
+		t.Fatalf("drain after the RELOAD: stop=%v err=%v", res.stop, res.err)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("sessions after the RELOAD = %d, want 2 (the schedule is gone, the window is not)", h.invokeCalls)
+	}
+}
+
+// A probe is a paid session too: when every route of the phase is inside a "wait"
+// window there is no route it may start on, so the probe is REFUSED rather than
+// spawned on the phase's model — the peak price the schedule forbids (review
+// 1.review-1.4).
+func TestProbeInvocation_RefusesWhenEveryRouteIsWindowed(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d := routedDriver(t, &fakeAdapter{}, twoPhases(), routeGo, routeCC)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo, routeCC)
+	d.now = func() time.Time { return at }
+
+	_, err := d.probeInvocation(d.targets[0], d.cfg, d.cfg.Phases[0])
+	var blocked *routeWindowBlocked
+	if !errors.As(err, &blocked) {
+		t.Fatalf("probeInvocation error = %v, want *routeWindowBlocked — a probe must not spawn on a windowed route", err)
+	}
+	if !blocked.until.Equal(brisbaneAt(t, 9, 14, 0)) {
+		t.Errorf("probe refused until %v, want 14:00", blocked.until)
+	}
+
+	// A phase with ONE route gets the same answer: the single-route fallback used
+	// to keep the model it always had, which here is the windowed route itself.
+	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeGo)
+	single.cfg.RouteSchedules, single.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	single.now = func() time.Time { return at }
+	if _, err := single.probeInvocation(single.targets[0], single.cfg, single.cfg.Phases[0]); !errors.As(err, &blocked) {
+		t.Errorf("single-route probe error = %v, want *routeWindowBlocked", err)
+	}
+
+	// Under "run" the peak price is accepted, so the probe runs on the route.
+	run := routedDriver(t, &fakeAdapter{}, twoPhases(), routeGo, routeCC)
+	run.cfg.RouteSchedules, run.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedRun, routeGo, routeCC)
+	run.now = func() time.Time { return at }
+	inv, err := run.probeInvocation(run.targets[0], run.cfg, run.cfg.Phases[0])
+	if err != nil {
+		t.Fatalf("probe under run: %v, want a probe on the first route", err)
+	}
+	if inv.Model != routeGo {
+		t.Errorf("probe under run aimed at %q, want %q", inv.Model, routeGo)
+	}
+}
+
+// Review 1.review-1.13: the presence row's zone is the one whose schedule
+// supplied the hold's instant, not the first active schedule's — with peaks in
+// two zones the countdown must be rendered in the clock it counts to.
+func TestRouteWindowHoldDetail_ZoneFollowsTheHoldInstant(t *testing.T) {
+	now := brisbaneAt(t, 9, 12, 0) // Monday 02:00 UTC
+	cfg := &config.Config{
+		RouteSchedules: map[string]*config.RouteSchedule{},
+		RouteWindows:   map[string]string{},
+	}
+	bris := &config.RouteSchedule{PauseWindows: config.PauseWindows{
+		Timezone: "Australia/Brisbane",
+		Windows:  []config.PauseWindow{{Days: "mon", From: "11:00", To: "14:00"}},
+	}}
+	if err := bris.Validate(); err != nil {
+		t.Fatalf("fixture schedule: %v", err)
+	}
+	utc := &config.RouteSchedule{PauseWindows: config.PauseWindows{
+		Timezone: "UTC",
+		Windows:  []config.PauseWindow{{Days: "mon", From: "01:00", To: "05:00"}},
+	}}
+	if err := utc.Validate(); err != nil {
+		t.Fatalf("fixture schedule: %v", err)
+	}
+	cfg.RouteSchedules["bris-peak"], cfg.RouteSchedules["utc-peak"] = bris, utc
+	cfg.RouteWindows[routeGo], cfg.RouteWindows[routeCC] = "bris-peak", "utc-peak"
+	lists := [][]string{{routeGo, routeCC}}
+
+	// The Brisbane window ends first (14:00 AEST = 04:00 UTC), so it supplies the
+	// hold's instant and its zone.
+	detail, zone := routeWindowHoldDetail(cfg, lists, now, brisbaneAt(t, 9, 14, 0))
+	if zone != "Australia/Brisbane" {
+		t.Errorf("zone = %q, want the schedule whose end is the hold's instant (Australia/Brisbane)", zone)
+	}
+	for _, name := range []string{"bris-peak", "utc-peak"} {
+		if !strings.Contains(detail, name) {
+			t.Errorf("detail %q does not name the blocking schedule %q", detail, name)
+		}
+	}
+
+	// The UTC window ends last (05:00 UTC = 15:00 AEST): its zone must win.
+	if _, zone := routeWindowHoldDetail(cfg, lists, now, time.Date(2026, time.November, 9, 5, 0, 0, 0, time.UTC)); zone != "UTC" {
+		t.Errorf("zone = %q, want UTC when the UTC window supplies the latest end", zone)
+	}
+}
+
+// CLA-947 review 1.review-1.2: a PARALLEL panel whose windowed member is not the
+// first holds the WHOLE panel. The per-phase boundary sees only member 1's open
+// routes; without the fan-out hold, member 2 is refused inside invocationFor and
+// booked as a reviewer that recorded nothing.
+func TestDrainPhases_RouteWindowsHoldTheParallelPanelForALaterMember(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers() // three members: the fan-out really is parallel
+	// The windowed member is the SECOND: the first member's routes are open, so
+	// only a hold that looks at every member can see it.
+	members[1].Model = config.ModelRoutes{routeGo}
+	clk := &pauseHoldClock{at: brisbaneAt(t, 9, 12, 0)} // inside 11:00-14:00
+	inner := newPanelParallelAdapter(rel, branch, tip, len(members))
+	d, _ := panelParallelDriver(t, inner, rel, members, repo, tip, 0)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = clk.Now
+	d.leaseRenewalInterval = 2 * time.Millisecond
+	logs := captureLogs(t)
+
+	done := startPauseDrain(t, d)
+	waitUntil(t, "the hold at the panel boundary", func() bool {
+		return strings.Contains(logs.String(), "holding t-1 at the review-1 boundary")
+	})
+	inner.mu.Lock()
+	memberCalls := inner.reviewCalls
+	inner.mu.Unlock()
+	if memberCalls != 0 {
+		t.Fatalf("the panel fan-out spawned %d member(s) while a later member was windowed", memberCalls)
+	}
+	if out := logs.String(); strings.Contains(out, "recording it as failed") {
+		t.Errorf("a windowed member was booked as a failed reviewer:\n%s", out)
+	}
+
+	clk.Set(brisbaneAt(t, 9, 14, 30))
+	res := waitPauseDrain(t, done)
+	if res.err != nil || res.stop {
+		t.Fatalf("drain after the window: stop=%v err=%v", res.stop, res.err)
+	}
+	inner.mu.Lock()
+	memberCalls = inner.reviewCalls
+	fixCalls := inner.fixCalls
+	inner.mu.Unlock()
+	if memberCalls != len(members) {
+		t.Errorf("panel members run = %d, want %d after the window", memberCalls, len(members))
+	}
+	if fixCalls != 1 {
+		t.Errorf("fix sessions = %d, want 1 after the panel", fixCalls)
+	}
+	if out := logs.String(); !strings.Contains(out, "route windows ended — resuming t-1 at the review-1 phase") {
+		t.Errorf("the leave line is missing:\n%s", out)
+	}
+}
+
+// CLA-947 review 1.review-1.6: the refusal a window opening between the boundary
+// check and the spawn produces is its own outcome (windowHeld), never the
+// evidence-gate `empty` shape that means a FAILED phase. A schedule must not be
+// counted as a harness failure — that misclassification is what made a windowed
+// panel member look like a broken reviewer.
+func TestDrainPhase_RouteWindowRefusalIsHeldNotEmpty(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	h := &fakeAdapter{}
+	d := routedDriver(t, h, twoPhases(), routeGo, routeCC)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo, routeCC)
+	d.now = func() time.Time { return at }
+	phases := d.cfg.EffectivePhases()
+
+	_, _, _, end, err := d.drainPhase(context.Background(), 1, 0, 0, "", phases[0], true, nil, d.targets[0],
+		spend{start: time.Now()}, phases, panelState{}, phaseRunOpts{})
+	if err != nil {
+		t.Fatalf("drainPhase: %v", err)
+	}
+	if h.invokeCalls != 0 {
+		t.Fatalf("a session spawned on a windowed route: %d", h.invokeCalls)
+	}
+	if !end.windowHeld {
+		t.Fatal("the refusal is not marked windowHeld")
+	}
+	if end.empty {
+		t.Error("the refusal was booked as the evidence-gate empty shape (a FAILED phase)")
+	}
+	if end.dead || end.producedNothing {
+		t.Errorf("the refusal was booked as a dead phase: dead=%v producedNothing=%v", end.dead, end.producedNothing)
+	}
+	if !strings.Contains(end.windowWhy, routeGo) {
+		t.Errorf("windowWhy = %q, want it to name the blocked routes", end.windowWhy)
 	}
 }

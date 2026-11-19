@@ -374,16 +374,30 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		reason := panelMemberFailureReason(m)
 		out.incomplete = append(out.incomplete, panelIncompleteRole(m.role, m.optional)+": "+reason)
 		out.failed[m.role] = panelMemberFailure{reason: reason, optional: m.optional}
-		log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed",
-			labelOf(t), drainNum, m.label, reason)
-		if !m.end.deadBooked && !m.end.runLost {
+		verdict := "recording it as failed"
+		if m.end.windowHeld {
+			// CLA-947 review 1.review-1.6: the fan-out's own hold runs over every
+			// member's list, so this is the race where a window opened between
+			// that check and the spawn. The seat is named INCOMPLETE (the fix
+			// brief must know it is empty) but charged to nobody: a schedule is
+			// not a harness fault.
+			verdict = "a pricing window opened before it could spawn; not counted against the member"
+		}
+		log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — %s",
+			labelOf(t), drainNum, m.label, reason, verdict)
+		if !m.end.windowHeld && !m.end.deadBooked && !m.end.runLost {
 			d.tallyEmpty(m.label, d.targetCfg(t).HarnessFor(phases[start+k]))
 		}
-		if n := d.panelMemberFailed(m.label); n >= panelMemberFailBound {
-			ph := phases[start+k]
-			model, _ := d.targetCfg(t).ModelForPhase(ph)
-			log.Printf("%siteration %d: WARNING — the %s review-panel member has recorded nothing on %d consecutive tasks (harness %s, model %s); the panel runs on and the fix applies what the other members found, but this member's harness, model or brief is not producing reviews — check its iteration logs",
-				labelOf(t), drainNum, m.label, n, d.targetCfg(t).HarnessFor(ph), attributionOr(model, "harness default"))
+		// The streak is charged only for a member that actually failed: a
+		// window-held seat never ran, so counting it would let a schedule put a
+		// healthy reviewer's harness on the "not producing reviews" warning.
+		if !m.end.windowHeld {
+			if n := d.panelMemberFailed(m.label); n >= panelMemberFailBound {
+				ph := phases[start+k]
+				model, _ := d.targetCfg(t).ModelForPhase(ph)
+				log.Printf("%siteration %d: WARNING — the %s review-panel member has recorded nothing on %d consecutive tasks (harness %s, model %s); the panel runs on and the fix applies what the other members found, but this member's harness, model or brief is not producing reviews — check its iteration logs",
+					labelOf(t), drainNum, m.label, n, d.targetCfg(t).HarnessFor(ph), attributionOr(model, "harness default"))
+			}
 		}
 	}
 
@@ -432,6 +446,8 @@ func panelMemberFailureReason(m panelMemberOutcome) string {
 		return "ended on a transient failure before recording"
 	case m.perr != nil:
 		return failureDetail(m.perr.Error())
+	case m.end.windowHeld:
+		return m.end.windowWhy
 	case m.end.empty:
 		return m.end.emptyWhy
 	default:

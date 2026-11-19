@@ -191,15 +191,15 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 	}
 }
 
-// Mark application, directly: unmarked routes keep configured order, a marked
-// route is dropped, and when EVERY route is marked the one that lifts first is
-// used (a phase must still start rather than wait on a mark).
 // routesOf is routableRoutes without the choice: the mark tests pin the mark
 // filter, and their config carries no route schedules.
 func routesOf(d *Driver, tc *config.Config, routes []string) []string {
 	return d.routableRoutes(tc, routes).Routes
 }
 
+// Mark application, directly: unmarked routes keep configured order, a marked
+// route is dropped, and when EVERY route is marked the one that lifts first is
+// used (a phase must still start rather than wait on a mark).
 func TestRoutableRoutes_AppliesMarks(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
 	now := time.Now()
