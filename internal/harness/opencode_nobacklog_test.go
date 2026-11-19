@@ -126,10 +126,8 @@ func TestOpencodeNoBacklogMCPDisablesEveryAmbientClankerbarServer(t *testing.T) 
 // same-named direct entry it replaces, and keeps a 1.x server literally NAMED
 // "servers" (which shares the container's key) out of the way.
 func TestDisableBacklogMCPServersShapes(t *testing.T) {
-	decl := func(container bool) map[string]opencodeMCPDeclaration {
-		return map[string]opencodeMCPDeclaration{
-			"clankerbar": {entry: map[string]any{"type": "remote", "url": "https://cb.example/mcp", "headers": map[string]any{"Authorization": "Bearer x"}}, container: container},
-		}
+	decls := map[string]opencodeMCPDeclaration{
+		"clankerbar": {entry: map[string]any{"type": "remote", "url": "https://cb.example/mcp", "headers": map[string]any{"Authorization": "Bearer x"}}},
 	}
 	cases := []struct {
 		name        string
@@ -140,15 +138,15 @@ func TestDisableBacklogMCPServersShapes(t *testing.T) {
 		{
 			name:  "a 1.x direct declaration",
 			doc:   map[string]any{"mcp": map[string]any{"clankerbar": map[string]any{"type": "remote", "url": "https://cb.example/mcp"}}},
-			decls: decl(false),
+			decls: decls,
 			wantServers: map[string]map[string]any{
 				"clankerbar": {"type": "remote", "url": "https://cb.example/mcp", "disabled": true},
 			},
 		},
 		{
-			name:  "a 2.x container declaration",
+			name:  "an empty document",
 			doc:   map[string]any{},
-			decls: decl(true),
+			decls: decls,
 			wantServers: map[string]map[string]any{
 				"clankerbar": {"type": "remote", "url": "https://cb.example/mcp", "disabled": true},
 			},
@@ -157,7 +155,10 @@ func TestDisableBacklogMCPServersShapes(t *testing.T) {
 			name: "a 1.x server literally named servers is kept",
 			doc:  map[string]any{"mcp": map[string]any{"servers": map[string]any{"type": "local", "command": []any{"keep"}}}},
 			decls: func() map[string]opencodeMCPDeclaration {
-				d := decl(false)
+				d := map[string]opencodeMCPDeclaration{}
+				for name, dcl := range decls {
+					d[name] = dcl
+				}
 				d["servers"] = opencodeMCPDeclaration{entry: map[string]any{"type": "remote", "url": "https://old.example/mcp"}}
 				return d
 			}(),
@@ -170,6 +171,14 @@ func TestDisableBacklogMCPServersShapes(t *testing.T) {
 			name:        "a transport-less declaration is left alone",
 			doc:         map[string]any{},
 			decls:       map[string]opencodeMCPDeclaration{"clankerbar": {entry: map[string]any{"enabled": false}}},
+			wantServers: nil,
+		},
+		{
+			// Left for opencodeMCPOutOfCodeMode to refuse, so the spawn fails
+			// closed rather than running with the switch unwritten.
+			name:        "a non-object mcp block is not repaired",
+			doc:         map[string]any{"mcp": "nope"},
+			decls:       decls,
 			wantServers: nil,
 		},
 	}

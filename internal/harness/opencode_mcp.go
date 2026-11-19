@@ -466,11 +466,11 @@ func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool)
 }
 
 // opencodeMCPDeclaration is one clankerbar server opencode would load: the union
-// of the entry fields every layer declared for that name, plus whether the LAST
-// declaring layer used the 2.x `mcp.servers` container.
+// of the entry fields every layer declared for that name, so the switch can write
+// one FULL entry even when the layer that carried the transport was earlier than
+// the one that merely tweaked the entry.
 type opencodeMCPDeclaration struct {
-	entry     map[string]any
-	container bool
+	entry map[string]any
 }
 
 // readOpencodeMCPDocument adds the clankerbar servers of one config file. A file
@@ -539,11 +539,11 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]opencodeMCPDec
 	if raw, ok := mcp["servers"]; ok {
 		if entries, ok := raw.(map[string]any); ok {
 			if opencodeMCPEntryShaped(entries) {
-				addOpencodeMCPServer("servers", entries, false, out)
+				addOpencodeMCPServer("servers", entries, out)
 			} else {
 				for name, rawEntry := range entries {
 					if entry, ok := rawEntry.(map[string]any); ok {
-						addOpencodeMCPServer(name, entry, true, out)
+						addOpencodeMCPServer(name, entry, out)
 					}
 				}
 			}
@@ -557,7 +557,7 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]opencodeMCPDec
 			continue
 		}
 		if entry, ok := raw.(map[string]any); ok {
-			addOpencodeMCPServer(name, entry, false, out)
+			addOpencodeMCPServer(name, entry, out)
 		}
 	}
 }
@@ -572,7 +572,7 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]opencodeMCPDec
 // tools — while a runtime `disabled` status fails the preflight immediately.
 // Adding it lets the status wait observe `disabled` and fail fast with
 // ErrMCPNotConnected (CLA-703 review, finding 4.3).
-func addOpencodeMCPServer(name string, entry map[string]any, container bool, out map[string]opencodeMCPDeclaration) {
+func addOpencodeMCPServer(name string, entry map[string]any, out map[string]opencodeMCPDeclaration) {
 	if name != "clankerbar" && !opencodeMCPEntryUsesCredential(entry) {
 		return
 	}
@@ -583,7 +583,6 @@ func addOpencodeMCPServer(name string, entry map[string]any, container bool, out
 	for key, value := range entry {
 		decl.entry[key] = value
 	}
-	decl.container = container
 	out[name] = decl
 }
 
@@ -631,9 +630,13 @@ func disableBacklogMCPServers(doc map[string]any, decls map[string]opencodeMCPDe
 		return
 	}
 	mcp, _ := doc["mcp"].(map[string]any)
-	if mcp == nil {
+	if raw, present := doc["mcp"]; !present || raw == nil {
 		mcp = map[string]any{}
 		doc["mcp"] = mcp
+	} else if mcp == nil {
+		// Not an object: opencodeMCPOutOfCodeMode refuses the document, so the
+		// session fails closed instead of running with the switch unwritten.
+		return
 	}
 	servers := map[string]any{}
 	// A `servers` value shaped like an ENTRY is the 1.x server of that literal
