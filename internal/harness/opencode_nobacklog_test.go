@@ -232,6 +232,27 @@ func TestOpencodeNoBacklogMCPDoesNotStartOrWaitForAServer(t *testing.T) {
 	}
 }
 
+// The switch resolves the layers against the environment opencode will see, not
+// only the adapter's own: a caller-declared OPENCODE_CONFIG_DIR (which exec lets
+// win) must not name a config dir the switch never read.
+func TestOpencodeNoBacklogMCPResolvesCallerDeclaredLayers(t *testing.T) {
+	dir := t.TempDir()
+	writeAt(t, filepath.Join(dir, "opencode.json"),
+		`{"mcp":{"clankerbar":{"type":"remote","url":"https://cb.example/mcp"}}}`)
+	env, err := opencode{}.env(Invocation{
+		WorkDir:      t.TempDir(),
+		NoBacklogMCP: true,
+		Env:          []string{"OPENCODE_CONFIG_DIR=" + dir},
+	})
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	if !strings.Contains(lastValue(env, "OPENCODE_CONFIG_CONTENT"), `"disabled":true`) {
+		t.Errorf("the caller-declared config dir's clankerbar server was not switched off: %s",
+			lastValue(env, "OPENCODE_CONFIG_CONTENT"))
+	}
+}
+
 // A declared OPENCODE_CONFIG_CONTENT replaces the adapter's content layer, and
 // with it the off switch. That must fail closed rather than silently hand the
 // review the backlog tools.

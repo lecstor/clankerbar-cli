@@ -760,6 +760,7 @@ func (opencode) env(in Invocation) ([]string, error) {
 	// file did not; and environment plus argv is capped around 1 MB on macOS, so
 	// an enormous config would fail the spawn with E2BIG rather than merely being
 	// ignored.
+	//
 	// A declared OPENCODE_CONFIG_CONTENT replaces the adapter's own content layer
 	// wholesale (exec takes the last of a duplicate key), and with it the
 	// no-backlog disable. Fail closed rather than hand a standalone review the
@@ -771,7 +772,14 @@ func (opencode) env(in Invocation) ([]string, error) {
 			}
 		}
 	}
-	content, err := opencodeSessionConfigWithEnv(in, env)
+	// The switch resolves the config layers against the environment opencode will
+	// SEE, so a caller-declared OPENCODE_CONFIG_DIR or OPENCODE_CONFIG (which
+	// exec lets win) cannot name a layer the resolver never read.
+	contentEnv := env
+	if in.NoBacklogMCP {
+		contentEnv = append(append([]string{}, env...), in.Env...)
+	}
+	content, err := opencodeSessionConfigWithEnv(in, contentEnv)
 	if err != nil {
 		// FAIL CLOSED. The alternative - spawn without the content layer - is a
 		// session with no permission policy at all on 2.x, claiming from whichever
