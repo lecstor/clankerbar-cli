@@ -139,6 +139,9 @@ func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() 
 	// beat renews the lease once. pauseHoldNone keeps the hold going; a stop or
 	// a lost run ends it with that disposition.
 	beat := func() pauseHold {
+		if !canBeat {
+			return pauseHoldNone
+		}
 		bctx, cancel := context.WithTimeout(ctx, heartbeatBeatTimeout)
 		err := hb.Heartbeat(bctx, runID)
 		cancel()
@@ -187,9 +190,20 @@ func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() 
 			return out
 		}
 	}
+	return s.holdWakeLoop(ctx, st, decide, interval, heldRef, beat, leave, until)
+}
+
+// holdWakeLoop is the hold's wait proper: sleep to the next renewal cadence or
+// the window's end, re-decide, beacon, renew, and report how the hold ended. It
+// re-decides rather than trusting the entry state because a RELOAD can remove,
+// shorten or move the cause while the sequence is parked here.
+func (s *drainSeq) holdWakeLoop(ctx context.Context, st *seqStep, decide func() boundaryHoldState,
+	interval time.Duration, heldRef string, beat func() pauseHold, leave func(), until time.Time) pauseHold {
+	d := s.d
+	t := s.t
 	for {
 		now := d.clock()
-		hs = decide()
+		hs := decide()
 		if !hs.active {
 			leave()
 			return pauseHoldResumed
@@ -218,10 +232,8 @@ func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() 
 		// Presence goes out on the cadence whatever the lease does: after
 		// ErrNotWired or heartbeatGiveUp the hold is still alive and holding.
 		d.beaconSessionTargets(s.ti, t)
-		if canBeat {
-			if out := beat(); out != pauseHoldNone {
-				return out
-			}
+		if out := beat(); out != pauseHoldNone {
+			return out
 		}
 	}
 }

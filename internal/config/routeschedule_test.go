@@ -45,6 +45,7 @@ func TestRouteScheduleValidate(t *testing.T) {
 		{"valid default policy", peakSchedule(""), ""},
 		{"valid wait", peakSchedule(RouteWhenAllBlockedWait), ""},
 		{"valid run", peakSchedule(RouteWhenAllBlockedRun), ""},
+		{"run with mixed case normalises", peakSchedule("Run"), ""},
 		{"no windows is valid", &RouteSchedule{}, ""},
 		{"missing timezone", &RouteSchedule{PauseWindows: PauseWindows{Windows: []PauseWindow{{Days: "mon", From: "11:00", To: "14:00"}}}}, "timezone"},
 		{"bad day", &RouteSchedule{PauseWindows: PauseWindows{Timezone: "Australia/Brisbane", Windows: []PauseWindow{{Days: "funday", From: "11:00", To: "14:00"}}}}, "windows[0].days"},
@@ -378,5 +379,17 @@ func TestRouteWindows_RoundTrip(t *testing.T) {
 	}
 	if got, want := s.Describe(), "mon-fri 11:00-14:00 (Australia/Brisbane)"; got != want {
 		t.Errorf("Describe = %q, want %q", got, want)
+	}
+}
+
+// A hand-edited policy is normalised, so Identity() hashes the canonical value
+// and the loop's comparison need not repeat the leniency.
+func TestRouteScheduleNormalisesThePolicy(t *testing.T) {
+	s := peakSchedule("  RUN ")
+	if err := s.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if s.WhenAllBlocked != RouteWhenAllBlockedRun {
+		t.Errorf("policy = %q, want %q", s.WhenAllBlocked, RouteWhenAllBlockedRun)
 	}
 }

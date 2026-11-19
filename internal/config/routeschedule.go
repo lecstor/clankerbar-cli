@@ -56,8 +56,15 @@ func (s *RouteSchedule) Validate() error {
 	if err := (&s.PauseWindows).Validate(); err != nil {
 		return err
 	}
-	switch s.WhenAllBlocked {
-	case "", RouteWhenAllBlockedWait, RouteWhenAllBlockedRun:
+	// Case-insensitive and trimmed, like the days spec: a hand-edited config
+	// writing "Run" means what "run" means, and normalising it here keeps the
+	// value Identity() hashes the canonical one.
+	policy := RouteWhenAllBlocked(strings.ToLower(strings.TrimSpace(string(s.WhenAllBlocked))))
+	switch policy {
+	case "":
+		return nil
+	case RouteWhenAllBlockedWait, RouteWhenAllBlockedRun:
+		s.WhenAllBlocked = policy
 		return nil
 	default:
 		return fmt.Errorf("when_all_blocked %q: want %q (spawn nothing until the window ends) or %q (start on the first route anyway)",
