@@ -105,6 +105,12 @@ type holdState struct {
 	on    bool
 	ref   string
 	phase string
+	// until/zone are the held window's own end and IANA zone (CLA-947). The
+	// daemon-wide PauseWindows is re-read from the config in scheduleState; a
+	// ROUTE window has no daemon-wide schedule to re-read, so the hold carries
+	// its instant instead of the presence row falling back to plain draining.
+	until time.Time
+	zone  string
 }
 
 // fleetState derives the presence State for target ti from what the loop already
@@ -177,13 +183,22 @@ func (d *Driver) operatorPauseReason(ti int) string {
 func (d *Driver) scheduleState(h holdState) fleet.State {
 	st := fleet.State{Kind: fleet.StateDraining}
 	active, until, pw := d.pauseState()
-	if !active {
+	switch {
+	case active:
+		st.PauseReason = fleet.PauseReasonSchedule
+		st.PauseUntil = until
+		if pw != nil {
+			st.PauseZone = pw.Timezone
+		}
+	case h.on && !h.until.IsZero():
+		// CLA-947: a per-route pricing window is holding the spawn. It is the
+		// same reason word — a schedule that clears itself — and the hold's own
+		// instant is the truth because there is no daemon-wide window to re-read.
+		st.PauseReason = fleet.PauseReasonSchedule
+		st.PauseUntil = h.until
+		st.PauseZone = h.zone
+	default:
 		return st
-	}
-	st.PauseReason = fleet.PauseReasonSchedule
-	st.PauseUntil = until
-	if pw != nil {
-		st.PauseZone = pw.Timezone
 	}
 	if h.on {
 		st.TaskRef, st.Phase = h.ref, h.phase
@@ -214,13 +229,13 @@ func (d *Driver) holdAt(ti int) holdState {
 // schedule and drop the mark when it ends (CLA-908). The caller owns the pair:
 // holdThroughPause defers the clear, so every way the hold can end — resume,
 // STOP, a lost run — leaves no stale hold on the presence row.
-func (d *Driver) holdPause(ti int, ref, phase string) {
+func (d *Driver) holdPause(ti int, ref, phase string, until time.Time, zone string) {
 	d.iterMu.Lock()
 	defer d.iterMu.Unlock()
 	if ti < 0 || ti >= len(d.hold) {
 		return
 	}
-	d.hold[ti] = holdState{on: true, ref: ref, phase: phase}
+	d.hold[ti] = holdState{on: true, ref: ref, phase: phase, until: until, zone: zone}
 }
 
 func (d *Driver) clearHoldPause(ti int) {

@@ -211,6 +211,62 @@ func TestConflictSessionWaitsOutAScheduledPause(t *testing.T) {
 	}
 }
 
+// CLA-947: a conflict-only session is a new paid session on a ROUTE, so a route
+// inside its pricing window is not offered. Every route blocked under "wait"
+// means the task waits for a later close-out pass — no claim, no session.
+func TestConflictSessionWaitsOutARouteWindow(t *testing.T) {
+	f := conflictingFixture(t)
+	d := f.supervisor(0)
+	cfg := d.instances[0].cfg
+	// A daily 24h window (from == to) is always active, so the test needs no
+	// clock seam. The conflict step inherits the implement step's route.
+	cfg.RouteSchedules = map[string]*config.RouteSchedule{"peak": {
+		PauseWindows: config.PauseWindows{
+			Timezone: "UTC",
+			Windows:  []config.PauseWindow{{Days: "daily", From: "00:00", To: "00:00"}},
+		},
+	}}
+	cfg.RouteWindows = map[string]string{"implement-model": "peak"}
+
+	lines := f.run(d)
+
+	if got := len(f.conflictCalls()); got != 0 {
+		t.Errorf("conflict sessions = %d inside a pricing window, want none", got)
+	}
+	if got := f.callsFor("claim_task"); len(got) != 0 {
+		t.Errorf("a route-windowed conflict still claimed the task: %v", got)
+	}
+	if !strings.Contains(lines, "every route for the conflict step is inside a pricing window until") {
+		t.Errorf("the stand-down does not name the window:\n%s", lines)
+	}
+}
+
+// when_all_blocked "run" accepts the peak price: the conflict session starts on
+// the first configured route.
+func TestConflictSessionUnderRunStartsOnTheWindowedRoute(t *testing.T) {
+	f := conflictingFixture(t)
+	d := f.supervisor(0)
+	cfg := d.instances[0].cfg
+	cfg.RouteSchedules = map[string]*config.RouteSchedule{"peak": {
+		PauseWindows: config.PauseWindows{
+			Timezone: "UTC",
+			Windows:  []config.PauseWindow{{Days: "daily", From: "00:00", To: "00:00"}},
+		},
+		WhenAllBlocked: config.RouteWhenAllBlockedRun,
+	}}
+	cfg.RouteWindows = map[string]string{"implement-model": "peak"}
+
+	f.run(d)
+
+	calls := f.conflictCalls()
+	if len(calls) != 1 {
+		t.Fatalf("conflict sessions = %d, want one under \"run\"", len(calls))
+	}
+	if calls[0].req.Model != "implement-model" {
+		t.Errorf("the session started on %q, want the first configured route", calls[0].req.Model)
+	}
+}
+
 func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	f := conflictingFixture(t)
 	// Two approved tasks in the queue, both conflicting. The second must wait for

@@ -192,10 +192,15 @@ type Driver struct {
 	blind   bool // no cheap backlog read available — drain then idle-poll
 
 	// now is the clock the scheduled-pause check reads (at the poll gate and at a
-	// phase boundary), and ONLY that: the back-off ladder in progress.go still
-	// reads the wall clock. Nil falls back to time.Now, so a hand-built test
-	// Driver works. schedPaused is whether a window is active — kept so the enter
-	// and exit are logged once, not per poll.
+	// phase boundary), the route-window filter (routableRoutes) and route-mark
+	// expiry, so a pricing window and a mark can both be driven from a fixed
+	// clock in tests. Nil falls back to time.Now, so a hand-built test Driver
+	// works. Three readers deliberately stay on the WALL clock: the back-off
+	// ladder in progress.go, loadRouteMarks (a persisted mark is an absolute
+	// instant written by a previous process, so it is loaded against real time)
+	// and routeRetryLabel (it renders an operator's clock). schedPaused is
+	// whether a window is active — kept so the enter and exit are logged once,
+	// not per poll.
 	now         func() time.Time
 	schedPaused bool
 

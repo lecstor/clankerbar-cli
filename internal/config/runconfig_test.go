@@ -938,3 +938,37 @@ func TestApplyRunConfig_LeavesPauseWindowsAlone(t *testing.T) {
 		t.Errorf("pause windows = %q, want the local schedule %q", got, want)
 	}
 }
+
+// CLA-947: route pricing schedules are machine-local too — a provider's billing
+// is the operator's account fact, not the plane's stored policy. A document
+// arriving mid-run must neither apply nor CLEAR them.
+func TestApplyRunConfig_LeavesRouteWindowsAlone(t *testing.T) {
+	sched := &RouteSchedule{
+		PauseWindows: PauseWindows{
+			Timezone: "Australia/Brisbane",
+			Windows:  []PauseWindow{{Days: "mon-fri", From: "11:00", To: "14:00"}},
+		},
+		WhenAllBlocked: RouteWhenAllBlockedRun,
+	}
+	if err := sched.Validate(); err != nil {
+		t.Fatalf("fixture schedule: %v", err)
+	}
+	base := overlayBase()
+	base.RouteSchedules = map[string]*RouteSchedule{"deepseek-peak": sched}
+	base.RouteWindows = map[string]string{"opencode-go/deepseek-v4.1-flash": "deepseek-peak"}
+
+	doc := &RunConfigDoc{
+		SchemaVersion: 1,
+		Phases:        []RunConfigPhase{{Name: "implement"}, {Name: "review"}, {Name: "fix"}},
+		MaxTurns:      42,
+	}
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if got := base.RouteScheduleFor("opencode-go/deepseek-v4.1-flash"); got != sched {
+		t.Fatalf("the overlay replaced or cleared the local route schedule: %+v", got)
+	}
+	if got := base.RouteWindows["opencode-go/deepseek-v4.1-flash"]; got != "deepseek-peak" {
+		t.Errorf("route_windows = %q, want the local attachment", got)
+	}
+}

@@ -101,6 +101,17 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 					return seqBreak
 				}
 			}
+			// CLA-947 review 1.review-1.2: the boundary check above saw only the
+			// FIRST member's phase. A later member whose own route list is inside
+			// a "wait" pricing window would reach invocationFor and be refused
+			// there — booked as a reviewer that recorded nothing, charging its
+			// failure streak and the dead rate for a scheduled peak. Hold the WHOLE
+			// panel until every member can start, over every member's list.
+			if out := s.takeBoundaryHolds(ctx, st, func(ctx context.Context, st *seqStep) pauseHold {
+				return s.holdThroughPanelRouteWindows(ctx, st, runEnd)
+			}); out == seqBreak {
+				return seqBreak
+			}
 			if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, s.i, runEnd, conc, s.carried, spend{
 				start: prior.start,
 				ti:    s.ti,
@@ -304,6 +315,12 @@ func (s *drainSeq) handlePanelMember(ctx context.Context, st *seqStep) seqNext {
 				// The `no_mcp` token is stable so the fixer's INCOMPLETE list
 				// and the analytics can exclude it without parsing prose.
 				reason = "no_mcp: no successful clankerbar MCP call and no review record"
+			case st.end.windowHeld:
+				// CLA-947 review 1.review-1.6: a pricing window opened before
+				// this member could spawn, so it never ran. Named INCOMPLETE so
+				// the fix brief knows the seat is empty, but it is a scheduling
+				// condition, not a reviewer failure (see the tally below).
+				reason = st.end.windowWhy
 			case st.end.toolLoop != "":
 				reason = st.end.toolLoop
 			case st.end.dead:
@@ -321,7 +338,11 @@ func (s *drainSeq) handlePanelMember(ctx context.Context, st *seqStep) seqNext {
 			}
 			s.panelIncomplete = append(s.panelIncomplete, panelIncompleteRole(role, st.end.panelOptional)+": "+reason)
 			s.panelFailed[role] = panelMemberFailure{reason: reason, optional: st.end.panelOptional}
-			log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed", labelOf(t), drainNum, member, reason)
+			verdict := "recording it as failed"
+			if st.end.windowHeld {
+				verdict = "a pricing window opened before it could spawn; not counted against the member"
+			}
+			log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — %s", labelOf(t), drainNum, member, reason, verdict)
 			// CLA-639 M4: the member is a failure the operator has to be able
 			// to see, so it is counted in the run's per-harness dead-phase
 			// tally (CLA-402) — the rate that exists for exactly this shape —
@@ -337,11 +358,18 @@ func (s *drainSeq) handlePanelMember(ctx context.Context, st *seqStep) seqNext {
 			// dead phase (no work was attempted), and it is not the member's
 			// fault — charging its streak would make an MCP outage look like a
 			// broken reviewer. It gets its own tally cell and its own log line.
-			if st.end.noMCP {
+			//
+			// CLA-947: a member held out by a pricing window belongs to neither
+			// counter either — it never ran, so there is no harness, model or
+			// brief to blame.
+			switch {
+			case st.end.noMCP:
 				d.tallyNoMCP(member, tc.HarnessFor(st.ph))
 				log.Printf("%siteration %d: the %s panel member's failure is no_mcp (infrastructure), not a review failure — not counted against the member's streak or the dead rate",
 					labelOf(t), drainNum, member)
-			} else {
+			case st.end.windowHeld:
+				// Not counted: the seat is empty because of a schedule, not a fault.
+			default:
 				if !st.end.deadBooked {
 					d.tallyEmpty(member, tc.HarnessFor(st.ph))
 				}
