@@ -143,17 +143,28 @@ func (s *drainSeq) checkPhaseBoundary(ctx context.Context, st *seqStep) seqNext 
 	// claim is kept and its lease renewed while it waits. Nothing is spent
 	// during the hold, so the breaker's pre-hold verdict stands: the wait is
 	// NOT charged to max_wall_clock (see docs/pause-windows.md).
-	switch s.holdThroughPause(ctx, st) {
-	case pauseHoldStop:
-		s.stop = true
-		return seqBreak
-	case pauseHoldRunLost:
-		// A lost run ends THIS drain, not the daemon — the same ending the
-		// mid-drain runLost arm takes (drain_phases.go). The hold dropped the
-		// claim, so the deferred handback has nothing to release; the run
-		// continues to its next poll.
-		log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
-		return seqBreak
+	//
+	// CLA-947: the same hold, one question narrower. `pause_windows` stops every
+	// route; a route schedule stops the routes it names, and only becomes a hold
+	// here when EVERY route this phase may start on is inside a window and its
+	// schedule says wait. Checked second because it is the more specific
+	// setting: when both apply the operator gets the daemon-wide line first.
+	for _, hold := range []func(context.Context, *seqStep) pauseHold{
+		s.holdThroughPause,
+		s.holdThroughRouteWindows,
+	} {
+		switch out := hold(ctx, st); out {
+		case pauseHoldStop:
+			s.stop = true
+			return seqBreak
+		case pauseHoldRunLost:
+			// A lost run ends THIS drain, not the daemon — the same ending the
+			// mid-drain runLost arm takes (drain_phases.go). The hold dropped the
+			// claim, so the deferred handback has nothing to release; the run
+			// continues to its next poll.
+			log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
+			return seqBreak
+		}
 	}
 
 	return seqFall

@@ -20,7 +20,7 @@ func TestRouteMarks_SurviveRestart(t *testing.T) {
 	second.state = first.state
 	second.loadRouteMarks()
 
-	got := second.routableRoutes([]string{routeFreeAlias, routePaidAlias})
+	got := routesOf(second, second.cfg, []string{routeFreeAlias, routePaidAlias})
 	if len(got) != 1 || got[0] != routePaidAlias {
 		t.Errorf("after restart routes = %v, want only the paid route", got)
 	}

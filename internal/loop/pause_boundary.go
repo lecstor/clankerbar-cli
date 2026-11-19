@@ -44,12 +44,37 @@ const (
 // spawned yet) still waits: there is no lease to renew, but a window must not
 // start a session either.
 func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold {
+	return s.holdSequence(ctx, st, func() boundaryHoldState {
+		active, until, pw := s.d.pauseState()
+		if !active {
+			return boundaryHoldState{}
+		}
+		return boundaryHoldState{active: true, until: until, label: "scheduled pause", detail: pw.Describe()}
+	})
+}
+
+// boundaryHoldState is why a boundary hold is waiting, re-read at every wake so a RELOAD
+// that removes or shortens the cause ends the hold early.
+type boundaryHoldState struct {
+	active bool
+	until  time.Time
+	label  string // "scheduled pause" / "route windows", for the log lines
+	detail string // the schedule's own description, in the entry line's parens
+}
+
+// holdSequence holds the sequence at its next boundary while decide reports a
+// cause. Shared by the global pause_windows schedule and the per-route pricing
+// windows (CLA-947): both are "start no new session yet", both keep the claim
+// and renew its lease, and both end at a wall-clock instant.
+func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() boundaryHoldState) pauseHold {
 	d := s.d
 	t := s.t
-	active, until, pw := d.pauseState()
-	if !active {
+	hs := decide()
+	if !hs.active {
 		return pauseHoldNone
 	}
+	label := hs.label
+	until := hs.until
 
 	interval := d.leaseRenewalInterval
 	if interval <= 0 {
@@ -91,8 +116,8 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold 
 	defer d.clearHoldPause(s.ti)
 	// until carries the window's own zone, so the line names the operator's
 	// local resume time rather than the daemon's.
-	log.Printf("%sscheduled pause active until %s (%s) — holding %s at the %s boundary; %s",
-		labelOf(t), until.Format("Mon 15:04 MST"), pw.Describe(), subject, st.ph.Label(s.i), tail)
+	log.Printf("%s%s active until %s (%s) — holding %s at the %s boundary; %s",
+		labelOf(t), label, until.Format("Mon 15:04 MST"), hs.detail, subject, st.ph.Label(s.i), tail)
 	// The poll that normally carries presence does not run mid-drain, and the
 	// phase's own renewer stopped when its session ended: without this a window
 	// hours long would make a healthy instance — and every sibling project this
@@ -103,7 +128,7 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold 
 
 	leave := func() {
 		d.schedPaused = false
-		log.Printf("%sscheduled pause ended — resuming %s at the %s phase", labelOf(t), subject, st.ph.Label(s.i))
+		log.Printf("%s%s ended — resuming %s at the %s phase", labelOf(t), label, subject, st.ph.Label(s.i))
 	}
 	runID := ""
 	if canBeat {
@@ -163,11 +188,12 @@ func (s *drainSeq) holdThroughPause(ctx context.Context, st *seqStep) pauseHold 
 	}
 	for {
 		now := d.clock()
-		active, until, _ = d.pauseState()
-		if !active {
+		hs = decide()
+		if !hs.active {
 			leave()
 			return pauseHoldResumed
 		}
+		until = hs.until
 		// Wake at the next cadence, or when the window ends, whichever is first.
 		wait := interval
 		if remaining := until.Sub(now); remaining < wait {
