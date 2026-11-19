@@ -636,8 +636,17 @@ func disableBacklogMCPServers(doc map[string]any, decls map[string]opencodeMCPDe
 		doc["mcp"] = mcp
 	}
 	servers := map[string]any{}
-	if raw, ok := mcp["servers"].(map[string]any); ok && !opencodeMCPEntryShaped(raw) {
-		servers = raw
+	// A `servers` value shaped like an ENTRY is the 1.x server of that literal
+	// name, not the container. It is moved into the container below rather than
+	// dropped: this doc may be a named config whose other servers are not the
+	// backlog's.
+	var legacyServersEntry map[string]any
+	if raw, ok := mcp["servers"].(map[string]any); ok {
+		if opencodeMCPEntryShaped(raw) {
+			legacyServersEntry = raw
+		} else {
+			servers = raw
+		}
 	}
 	for name, decl := range decls {
 		entry := backlogMCPTransportEntry(decl.entry)
@@ -653,6 +662,11 @@ func disableBacklogMCPServers(doc map[string]any, decls map[string]opencodeMCPDe
 			delete(mcp, name)
 		}
 		servers[name] = entry
+	}
+	if legacyServersEntry != nil {
+		if _, switchedOff := servers["servers"]; !switchedOff {
+			servers["servers"] = legacyServersEntry
+		}
 	}
 	if len(servers) > 0 {
 		mcp["servers"] = servers

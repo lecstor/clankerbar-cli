@@ -198,9 +198,10 @@ Usage:
 
 "review run" reviews one local base..head in a temporary detached worktree and
 prints the findings as JSON. It claims no task, writes no plane record and
-connects no MCP config: the change itself is the whole subject, and the JSON is
-the whole deliverable. The reviewed repository is only read from; nothing is
-edited, committed or pushed.
+connects no MCP config: a clankerbar MCP server the reviewed checkout declares
+is switched off, so the session cannot reach your backlog. The change itself is
+the whole subject, and the JSON is the whole deliverable. The reviewed
+repository is only read from; nothing is edited, committed or pushed.
 
   --repo <path>             local git checkout (default: .)
   --base <commit>           commit the review diffs from (required)

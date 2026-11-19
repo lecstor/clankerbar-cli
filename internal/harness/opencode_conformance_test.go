@@ -846,6 +846,74 @@ func TestOpencodeConformance_largeClaim(t *testing.T) {
 	}
 }
 
+// CLA-927: a standalone review of a checkout that CHECKS IN a clankerbar MCP
+// server must reach the model with no connection attempt and no backlog tools.
+// The reviewed repo declares the fake server, the invocation is review run's own
+// shape (NoBacklogMCP, no named MCP config), and the assertions are the two
+// halves of the incident: the server is never started (so no needs_auth), and no
+// request the model saw offers a clankerbar tool (so the operator's backlog is
+// not reachable with a key in the environment either).
+func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	cfg := writeJSON(t, fakeConfigDoc(srv.URL))
+
+	// run starts a session over a checkout that itself declares the fake
+	// clankerbar server, and reports the server's start marker and the tool names
+	// the model was offered.
+	run := func(t *testing.T, noBacklog bool) (started bool, tools []string) {
+		t.Helper()
+		mcpDir := t.TempDir()
+		work := t.TempDir()
+		project, err := json.Marshal(map[string]any{
+			"mcp": map[string]any{"servers": map[string]any{"clankerbar": fakeMCPEntry(t, mcpDir)}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, "opencode.json"), project, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		in := iso.invocation(conformancePrompt, work, cfg)
+		in.NoBacklogMCP = noBacklog
+		before := len(fake.requests())
+		res := invokeConformance(t, in)
+		requireHit(t, fake)
+		for _, req := range fake.requests()[before:] {
+			tools = append(tools, req.Tools...)
+		}
+		_, err = os.Stat(filepath.Join(mcpDir, "starts"))
+		if res.ExitCode != 0 || strings.TrimSpace(res.FinalMessage) != "OK" {
+			t.Errorf("the session ended %s with final %q, want a clean OK", res.ExitString(), res.FinalMessage)
+		}
+		return err == nil, tools
+	}
+
+	// The control: without the switch this checkout does hand the session the
+	// backlog server and its tools. If this stops being true the assertions below
+	// are testing a config nothing was contending.
+	started, tools := run(t, false)
+	if !started {
+		t.Fatal("the control session did not start the checkout's clankerbar server - the no-backlog case below would pass for the wrong reason")
+	}
+	if indexOfTool(tools, "clankerbar_claim_task") < 0 {
+		t.Fatalf("the control session was offered no clankerbar tool (tools: %v)", tools)
+	}
+
+	started, tools = run(t, true)
+	if started {
+		t.Error("the checkout's clankerbar MCP server was started for a no-backlog session")
+	}
+	for _, name := range tools {
+		if strings.HasPrefix(name, "clankerbar") {
+			t.Errorf("the no-backlog session was offered the backlog tool %q (tools: %v)", name, tools)
+		}
+	}
+}
+
 // Switching off a server the global config declares takes a FULL entry in the
 // mcp config: verified on 2.0.32, a partial `{"enabled": false}` (1.x) or
 // `servers.X: {"disabled": true}` (2.x) leaves it running, and doctor's

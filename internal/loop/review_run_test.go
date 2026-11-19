@@ -157,6 +157,9 @@ func TestRunReviewSinglePassReport(t *testing.T) {
 	if !got.AllowUnclaimed {
 		t.Error("AllowUnclaimed = false: a standalone review holds no claim and the adapter would refuse its turns")
 	}
+	if !got.NoBacklogMCP {
+		t.Error("NoBacklogMCP = false: a checkout's checked-in clankerbar MCP server would give the review the operator's backlog tools (CLA-927)")
+	}
 	if got.MaxTurns != config.DefaultMaxTurns {
 		t.Errorf("MaxTurns = %d, want the built-in default %d: a standalone review has no phase cap", got.MaxTurns, config.DefaultMaxTurns)
 	}
