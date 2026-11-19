@@ -703,9 +703,15 @@ func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
 // over even when config resolved none (CLA-318). An explicit in.Env value still
 // applies, since it is appended later.
 func withoutAmbientOpencodeConfig(env []string) []string {
+	return withoutEnvKey(env, "OPENCODE_CONFIG")
+}
+
+// withoutEnvKey drops every assignment of one variable.
+func withoutEnvKey(env []string, key string) []string {
+	prefix := key + "="
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "OPENCODE_CONFIG=") {
+		if strings.HasPrefix(kv, prefix) {
 			continue
 		}
 		out = append(out, kv)
@@ -777,7 +783,11 @@ func (opencode) env(in Invocation) ([]string, error) {
 	// exec lets win) cannot name a layer the resolver never read.
 	contentEnv := env
 	if in.NoBacklogMCP {
-		contentEnv = append(append([]string{}, env...), in.Env...)
+		// The content layer is the one this call is about to WRITE: an inherited
+		// OPENCODE_CONFIG_CONTENT (the daemon's own, say) is replaced by ours at
+		// exec, so it is not a layer of the session's effective config and must
+		// not decide which server the switch names.
+		contentEnv = append(withoutEnvKey(env, "OPENCODE_CONFIG_CONTENT"), in.Env...)
 	}
 	content, err := opencodeSessionConfigWithEnv(in, contentEnv)
 	if err != nil {

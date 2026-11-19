@@ -262,6 +262,29 @@ func TestOpencodeNoBacklogMCPResolvesCallerDeclaredLayers(t *testing.T) {
 	}
 }
 
+// An INHERITED content layer is replaced by the adapter's own at exec, so it is
+// not part of the session's effective config and must not decide the switch's
+// entry over the checkout's own declaration.
+func TestOpencodeNoBacklogMCPIgnoresAnInheritedContentLayer(t *testing.T) {
+	t.Setenv("OPENCODE_CONFIG_CONTENT",
+		`{"mcp":{"clankerbar":{"type":"remote","url":"https://elsewhere.example/mcp"}}}`)
+	env, err := opencode{}.env(Invocation{
+		WorkDir:      ambientClankerbarProject(t), // .../mcp/makespdf
+		ConfigDir:    t.TempDir(),
+		NoBacklogMCP: true,
+	})
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	content := lastValue(env, "OPENCODE_CONFIG_CONTENT")
+	if !strings.Contains(content, "https://clankerbar.com/mcp/makespdf") {
+		t.Errorf("the switch did not use the checkout's server entry: %s", content)
+	}
+	if strings.Contains(content, "elsewhere.example") {
+		t.Errorf("the inherited content layer decided the switch's entry: %s", content)
+	}
+}
+
 // A declared OPENCODE_CONFIG_CONTENT replaces the adapter's content layer, and
 // with it the off switch. That must fail closed rather than silently hand the
 // review the backlog tools.
