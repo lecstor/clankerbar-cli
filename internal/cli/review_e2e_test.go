@@ -163,7 +163,21 @@ esac
 func TestReviewRunEndToEnd_CheckedInClankerbarServer(t *testing.T) {
 	for _, key := range []string{"", "sk-live"} {
 		t.Run("CLANKERBAR_API_KEY="+key, func(t *testing.T) {
-			t.Setenv("CLANKERBAR_API_KEY", key)
+			if key == "" {
+				// "Without" must mean unset: this suite can run inside a session
+				// that exports the operator's key.
+				old, had := os.LookupEnv("CLANKERBAR_API_KEY")
+				if err := os.Unsetenv("CLANKERBAR_API_KEY"); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if had {
+						os.Setenv("CLANKERBAR_API_KEY", old)
+					}
+				})
+			} else {
+				t.Setenv("CLANKERBAR_API_KEY", key)
+			}
 			// Hermetic config: no operator config, and no real global opencode dir.
 			// (This suite runs inside an opencode session whose environment names
 			// its own config dir and content layer; the content one is replaced by

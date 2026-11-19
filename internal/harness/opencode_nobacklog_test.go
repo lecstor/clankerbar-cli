@@ -15,12 +15,33 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// setOrUnsetEnv sets key to value, or REMOVES it when value is empty: "without
+// CLANKERBAR_API_KEY" must mean unset, not set to the empty string (this suite
+// can run inside a session that exports the real key).
+func setOrUnsetEnv(t *testing.T, key, value string) {
+	t.Helper()
+	if value != "" {
+		t.Setenv(key, value)
+		return
+	}
+	old, had := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if had {
+			os.Setenv(key, old)
+		}
+	})
+}
 
 // noBacklogStatusServer answers /api/mcp with a fixed status and lets the fake
 // `run` start unconditionally, so the test can see whether the adapter polled at
@@ -74,7 +95,7 @@ func ambientClankerbarProject(t *testing.T) string {
 func TestOpencodeNoBacklogMCPDisablesEveryAmbientClankerbarServer(t *testing.T) {
 	for _, key := range []string{"", "sk-live"} {
 		t.Run("CLANKERBAR_API_KEY="+key, func(t *testing.T) {
-			t.Setenv("CLANKERBAR_API_KEY", key)
+			setOrUnsetEnv(t, "CLANKERBAR_API_KEY", key)
 
 			globalDir := t.TempDir()
 			writeAt(t, filepath.Join(globalDir, "opencode.json"),
