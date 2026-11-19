@@ -376,20 +376,49 @@ var (
 // for (the run still gets no backlog tools, which the driver's own no_mcp
 // backstop classifies).
 func opencodeEffectiveMCPServers(in Invocation, env []string) ([]string, error) {
-	names := map[string]bool{}
+	decls, err := opencodeBacklogMCPDeclarations(in, env, in.MCPConfigPath == "")
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(decls))
+	for name := range decls {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// opencodeBacklogMCPDeclarations resolves every clankerbar server opencode would
+// load for this invocation, with the entry fields each layer declared.
+//
+// allLayers decides the question the caller is asking. The preflight asks what
+// the NAMED file declares when there is one, because that file is pinned into the
+// content layer and displaces the ambient servers of the same name; the
+// no-backlog switch asks what opencode will END UP loading, so it must read every
+// layer, the named file included.
+//
+// A name declared by several layers keeps the union of their fields, later
+// layers winning key by key. That is deliberately more generous than opencode's
+// own merge for a PARTIAL entry (a `{"enabled": false}` does not switch a global
+// server off — see the conformance suite's mcpDisable test): the union is what
+// lets the switch write one full entry that does switch it off.
+func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool) (map[string]opencodeMCPDeclaration, error) {
+	decls := map[string]opencodeMCPDeclaration{}
 	if in.MCPConfigPath != "" {
 		// Strict JSON, the same rule config applies to every file the driver
 		// names; env() has already failed the spawn if this file is unreadable,
 		// so an error here is defensive, not a silent skip.
-		if err := readOpencodeMCPDocument(in.MCPConfigPath, true, names); err != nil {
+		if err := readOpencodeMCPDocument(in.MCPConfigPath, true, decls); err != nil {
 			return nil, fmt.Errorf("%w: cannot establish opencode's effective config: mcp config %s: %v",
 				ErrMCPNotConnected, in.MCPConfigPath, err)
 		}
-		return sortedMCPNames(names), nil
+		if !allLayers {
+			return decls, nil
+		}
 	}
 
 	read := func(path, source string) error {
-		if err := readOpencodeMCPDocument(path, false, names); err != nil {
+		if err := readOpencodeMCPDocument(path, false, decls); err != nil {
 			return fmt.Errorf("%w: cannot establish opencode's effective config: %s: %v", ErrMCPNotConnected, source, err)
 		}
 		return nil
@@ -429,17 +458,25 @@ func opencodeEffectiveMCPServers(in Invocation, env []string) ([]string, error) 
 	// 4. The content layer, merged last. With no named file the adapter's own
 	// copy carries no `mcp`, but an explicit caller value in in.Env can.
 	if content := envValue(env, "OPENCODE_CONFIG_CONTENT"); content != "" {
-		if err := collectOpencodeMCPNames([]byte(content), names); err != nil {
+		if err := collectOpencodeMCPNames([]byte(content), decls); err != nil {
 			return nil, fmt.Errorf("%w: cannot establish opencode's effective config: OPENCODE_CONFIG_CONTENT: %v", ErrMCPNotConnected, err)
 		}
 	}
-	return sortedMCPNames(names), nil
+	return decls, nil
+}
+
+// opencodeMCPDeclaration is one clankerbar server opencode would load: the union
+// of the entry fields every layer declared for that name, plus whether the LAST
+// declaring layer used the 2.x `mcp.servers` container.
+type opencodeMCPDeclaration struct {
+	entry     map[string]any
+	container bool
 }
 
 // readOpencodeMCPDocument adds the clankerbar servers of one config file. A file
 // that does not exist contributes nothing; any other read or parse failure is an
 // error, because the caller fails closed on it.
-func readOpencodeMCPDocument(path string, strict bool, out map[string]bool) error {
+func readOpencodeMCPDocument(path string, strict bool, out map[string]opencodeMCPDeclaration) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -456,7 +493,7 @@ func readOpencodeMCPDocument(path string, strict bool, out map[string]bool) erro
 // collectOpencodeMCPNames decodes one JSON document and collects its clankerbar
 // servers. Nothing about `mcp` yields nothing; a document that is not JSON is an
 // error.
-func collectOpencodeMCPNames(data []byte, out map[string]bool) error {
+func collectOpencodeMCPNames(data []byte, out map[string]opencodeMCPDeclaration) error {
 	var doc map[string]any
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return err
@@ -473,11 +510,16 @@ func opencodeMCPServers(path string) []string {
 	if path == "" {
 		return nil
 	}
-	names := map[string]bool{}
-	if err := readOpencodeMCPDocument(path, true, names); err != nil {
+	decls := map[string]opencodeMCPDeclaration{}
+	if err := readOpencodeMCPDocument(path, true, decls); err != nil {
 		return nil
 	}
-	return sortedMCPNames(names)
+	names := make([]string, 0, len(decls))
+	for name := range decls {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // collectOpencodeMCPServers adds every server in one document's `mcp` block that
@@ -489,7 +531,7 @@ func opencodeMCPServers(path string) []string {
 // mcpFile.UnmarshalJSON applies: the container's value carries none of the entry
 // fields, while a 1.x entry carries at least one. Excluding the key outright
 // skipped that supported legacy shape entirely (CLA-703 review, finding 1.2).
-func collectOpencodeMCPServers(doc map[string]any, out map[string]bool) {
+func collectOpencodeMCPServers(doc map[string]any, out map[string]opencodeMCPDeclaration) {
 	mcp, ok := doc["mcp"].(map[string]any)
 	if !ok {
 		return
@@ -497,11 +539,11 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]bool) {
 	if raw, ok := mcp["servers"]; ok {
 		if entries, ok := raw.(map[string]any); ok {
 			if opencodeMCPEntryShaped(entries) {
-				addOpencodeMCPServer("servers", entries, out)
+				addOpencodeMCPServer("servers", entries, false, out)
 			} else {
 				for name, rawEntry := range entries {
 					if entry, ok := rawEntry.(map[string]any); ok {
-						addOpencodeMCPServer(name, entry, out)
+						addOpencodeMCPServer(name, entry, true, out)
 					}
 				}
 			}
@@ -515,13 +557,14 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]bool) {
 			continue
 		}
 		if entry, ok := raw.(map[string]any); ok {
-			addOpencodeMCPServer(name, entry, out)
+			addOpencodeMCPServer(name, entry, false, out)
 		}
 	}
 }
 
 // addOpencodeMCPServer adds a server that IS the backlog's: the documented name,
-// or any entry handed CLANKERBAR_API_KEY.
+// or any entry handed CLANKERBAR_API_KEY, merging its fields into whatever
+// earlier layers declared for that name.
 //
 // A DISABLED entry is deliberately added too. Excluding it at config-read time
 // would let a config-disabled clankerbar server through the preflight and only
@@ -529,10 +572,19 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]bool) {
 // tools — while a runtime `disabled` status fails the preflight immediately.
 // Adding it lets the status wait observe `disabled` and fail fast with
 // ErrMCPNotConnected (CLA-703 review, finding 4.3).
-func addOpencodeMCPServer(name string, entry map[string]any, out map[string]bool) {
-	if name == "clankerbar" || opencodeMCPEntryUsesCredential(entry) {
-		out[name] = true
+func addOpencodeMCPServer(name string, entry map[string]any, container bool, out map[string]opencodeMCPDeclaration) {
+	if name != "clankerbar" && !opencodeMCPEntryUsesCredential(entry) {
+		return
 	}
+	decl := out[name]
+	if decl.entry == nil {
+		decl.entry = map[string]any{}
+	}
+	for key, value := range entry {
+		decl.entry[key] = value
+	}
+	decl.container = container
+	out[name] = decl
 }
 
 // opencodeMCPEntryShaped reports whether a value carries any field an MCP entry
@@ -558,13 +610,73 @@ func opencodeMCPEntryShaped(entry map[string]any) bool {
 	return false
 }
 
-func sortedMCPNames(names map[string]bool) []string {
-	out := make([]string, 0, len(names))
-	for name := range names {
-		out = append(out, name)
+// disableBacklogMCPServers writes an OFF switch into doc's `mcp` block for every
+// server the resolver found. This is the NoBacklogMCP half: content is the layer
+// opencode merges last, so the entry it carries is the one that applies.
+//
+// The switch is a FULL entry, not the partial `{"disabled": true}` shape: verified
+// on 2.0.32, a partial entry in a later layer leaves the earlier server running
+// (see the conformance suite's mcpDisable and doctor's opencode_mcp_disables).
+// Only the transport keys are copied — type and url/command/args — so a
+// credential in `headers` or `environment` is not moved out of the operator's
+// config file and into the child's environment, where a process listing reaches
+// it. A disabled server never dials, so it needs none of them.
+//
+// The entry is written in the 2.x container shape and any same-named direct entry
+// in doc is dropped: opencode applies the later layer's container entry over an
+// earlier layer's 1.x entry of the same name (proven by the same conformance
+// test), and the adapter's own out-of-Code-Mode rewrite then sees one shape.
+func disableBacklogMCPServers(doc map[string]any, decls map[string]opencodeMCPDeclaration) {
+	if len(decls) == 0 {
+		return
 	}
-	sort.Strings(out)
-	return out
+	mcp, _ := doc["mcp"].(map[string]any)
+	if mcp == nil {
+		mcp = map[string]any{}
+		doc["mcp"] = mcp
+	}
+	servers := map[string]any{}
+	if raw, ok := mcp["servers"].(map[string]any); ok && !opencodeMCPEntryShaped(raw) {
+		servers = raw
+	}
+	for name, decl := range decls {
+		entry := backlogMCPTransportEntry(decl.entry)
+		if entry == nil {
+			// A typeless or transport-less declaration cannot start a server, so
+			// there is nothing to switch off (a partial entry alone is that
+			// case; the resolver's field union gives it a transport when any
+			// layer declared one).
+			continue
+		}
+		entry["disabled"] = true
+		if name != "servers" {
+			delete(mcp, name)
+		}
+		servers[name] = entry
+	}
+	if len(servers) > 0 {
+		mcp["servers"] = servers
+	}
+}
+
+// backlogMCPTransportEntry is the minimal full entry for one declaration: the
+// fields opencode needs to know what the server WOULD be, with none that carry a
+// credential. nil when the declaration has no transport at all.
+func backlogMCPTransportEntry(fields map[string]any) map[string]any {
+	kind, _ := fields["type"].(string)
+	if kind == "" {
+		return nil
+	}
+	entry := map[string]any{"type": kind}
+	for _, key := range []string{"url", "command", "args"} {
+		if value, ok := fields[key]; ok && value != nil {
+			entry[key] = value
+		}
+	}
+	if entry["url"] == nil && entry["command"] == nil {
+		return nil
+	}
+	return entry
 }
 
 // opencodeGlobalConfigDir resolves the ONE global config directory opencode
