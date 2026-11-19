@@ -767,29 +767,7 @@ func (opencode) env(in Invocation) ([]string, error) {
 	// an enormous config would fail the spawn with E2BIG rather than merely being
 	// ignored.
 	//
-	// A declared OPENCODE_CONFIG_CONTENT replaces the adapter's own content layer
-	// wholesale (exec takes the last of a duplicate key), and with it the
-	// no-backlog disable. Fail closed rather than hand a standalone review the
-	// backlog tools it exists to avoid.
-	if in.NoBacklogMCP {
-		for _, kv := range in.Env {
-			if strings.HasPrefix(kv, "OPENCODE_CONFIG_CONTENT=") {
-				return nil, errors.New("a no-backlog session cannot run with a declared OPENCODE_CONFIG_CONTENT: it replaces the adapter's content layer, and with it the switch that keeps the backlog MCP server off")
-			}
-		}
-	}
-	// The switch resolves the config layers against the environment opencode will
-	// SEE, so a caller-declared OPENCODE_CONFIG_DIR or OPENCODE_CONFIG (which
-	// exec lets win) cannot name a layer the resolver never read.
-	contentEnv := env
-	if in.NoBacklogMCP {
-		// The content layer is the one this call is about to WRITE: an inherited
-		// OPENCODE_CONFIG_CONTENT (the daemon's own, say) is replaced by ours at
-		// exec, so it is not a layer of the session's effective config and must
-		// not decide which server the switch names.
-		contentEnv = append(withoutEnvKey(env, "OPENCODE_CONFIG_CONTENT"), in.Env...)
-	}
-	content, err := opencodeSessionConfigWithEnv(in, contentEnv)
+	content, err := opencodeSessionConfigWithEnv(in, env)
 	if err != nil {
 		// FAIL CLOSED. The alternative - spawn without the content layer - is a
 		// session with no permission policy at all on 2.x, claiming from whichever
@@ -832,6 +810,23 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 // catch-all. doctor WARNs on a named file carrying one (and config refuses one
 // in a DISCOVERED file, checkDiscoveredMCPConfig).
 func opencodeSessionConfigWithEnv(in Invocation, env []string) ([]byte, error) {
+	if in.NoBacklogMCP {
+		// A declared OPENCODE_CONFIG_CONTENT replaces this document wholesale
+		// (exec takes the last of a duplicate key), and with it the backlog
+		// switch. Fail closed rather than hand a standalone review the tools it
+		// exists to avoid.
+		for _, kv := range in.Env {
+			if strings.HasPrefix(kv, "OPENCODE_CONFIG_CONTENT=") {
+				return nil, errors.New("a no-backlog session cannot run with a declared OPENCODE_CONFIG_CONTENT: it replaces the adapter's content layer, and with it the switch that keeps the backlog MCP server off")
+			}
+		}
+		// The switch resolves the layers against the environment opencode will
+		// SEE, so a caller-declared OPENCODE_CONFIG_DIR or OPENCODE_CONFIG (which
+		// exec lets win) cannot name a layer the resolver never read. An
+		// INHERITED content layer is dropped: this call is about to write the
+		// one that replaces it.
+		env = append(withoutEnvKey(env, "OPENCODE_CONFIG_CONTENT"), in.Env...)
+	}
 	doc := map[string]any{}
 	if in.MCPConfigPath != "" {
 		data, err := os.ReadFile(in.MCPConfigPath)
