@@ -116,7 +116,7 @@ func hunkFence(text string) string {
 }
 
 // escapeDoneMarker prefixes a backslash to the content of every hunk line whose
-// text is exactly the done marker. The diff prefix stays, so the hunk still
+// text the done-report parser reads as the marker. The diff prefix stays, so the hunk still
 // reads correctly; a model that strips the prefix copies the escaped form,
 // which the done-report parser does not accept as a marker.
 func escapeDoneMarker(text string) string {
@@ -129,7 +129,7 @@ func escapeDoneMarker(text string) string {
 		if len(body) > 0 && (body[0] == '+' || body[0] == '-' || body[0] == ' ') {
 			prefix, body = body[:1], body[1:]
 		}
-		if strings.TrimRight(body, " \t\r") == DoneMarker {
+		if isDoneMarkerLine(body) {
 			lines[i] = prefix + `\` + body
 		}
 	}
