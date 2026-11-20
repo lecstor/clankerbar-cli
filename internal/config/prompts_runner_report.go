@@ -26,10 +26,10 @@ const runnerNoWrites = " NEVER write to the task: no record_progress (phaseDone 
 func runnerDoneReport(fields string) string {
 	return " END WITH A DONE REPORT and record nothing yourself: the LAST thing in your final message is a line " +
 		"that is exactly " + DoneMarker + " - those characters alone, no backticks, unindented and outside any " +
-		"code fence - followed by ONE JSON object and nothing after it. Fields: " + fields + ". The runner writes every record from this report and " +
-		"attributes it to this session's harness and model. A session that ends without a valid report has " +
-		"recorded nothing, and the runner treats the phase as failed. A declared handoff (below) replaces the " +
-		"report: end with one or the other, never both."
+		"code fence - followed by ONE JSON object and nothing after it. Fields: " + fields + ". The runner " +
+		"writes every record from this report and attributes it to this session's harness and model. A session " +
+		"that ends without a valid report has recorded nothing, and the runner treats the phase as failed. A " +
+		"declared handoff (below) replaces the report: end with one or the other, never both."
 }
 
 // runnerReportReminder repeats the report contract as the brief's LAST line.

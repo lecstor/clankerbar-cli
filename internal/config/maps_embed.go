@@ -115,10 +115,10 @@ func hunkFence(text string) string {
 	return strings.Repeat("`", max(3, longest+1))
 }
 
-// escapeDoneMarker prefixes a backslash to the content of every hunk line whose
-// text the done-report parser reads as the marker. The diff prefix stays, so the hunk still
-// reads correctly; a model that strips the prefix copies the escaped form,
-// which the done-report parser does not accept as a marker.
+// escapeDoneMarker prefixes a backslash to the content of every hunk line
+// isDoneMarkerLine accepts. The diff prefix stays, so the hunk still reads
+// correctly; a model that strips the prefix copies the escaped form, which the
+// done-report parser does not accept as a marker.
 func escapeDoneMarker(text string) string {
 	if !strings.Contains(text, DoneMarker) {
 		return text
