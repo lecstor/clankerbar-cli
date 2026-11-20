@@ -132,6 +132,43 @@ func TestParseDoneFindsTheMarker(t *testing.T) {
 			errHas:      "",
 		},
 		{
+			// CLA-948: DeepSeek on Command Code copied the inline-code span a
+			// brief showed the marker in.
+			name:        "a backticked marker line matches",
+			final:       "Done.\n`" + DoneMarker + "`\n" + `{"summary":"ticked"}`,
+			wantFound:   true,
+			wantSummary: "ticked",
+			errHas:      "",
+		},
+		{
+			name:        "a backticked marker line inside a fence does not match",
+			final:       "The shape is:\n```\n`" + DoneMarker + "`\n" + `{"summary":"x"}` + "\n```\nI did not emit one.",
+			wantFound:   false,
+			wantSummary: "",
+			errHas:      "",
+		},
+		{
+			name:        "the last marker wins across bare and backticked forms",
+			final:       DoneMarker + "\n" + `{"summary":"stale"}` + "\n`" + DoneMarker + "`\n" + `{"summary":"real"}`,
+			wantFound:   true,
+			wantSummary: "real",
+			errHas:      "",
+		},
+		{
+			name:        "an indented backticked marker line does not match",
+			final:       "  `" + DoneMarker + "`\n" + `{"summary":"x"}`,
+			wantFound:   false,
+			wantSummary: "",
+			errHas:      "",
+		},
+		{
+			name:        "a half-backticked marker line does not match",
+			final:       "`" + DoneMarker + "\n" + `{"summary":"x"}`,
+			wantFound:   false,
+			wantSummary: "",
+			errHas:      "",
+		},
+		{
 			name:        "unknown fields are ignored",
 			final:       DoneMarker + "\n" + `{"summary":"known","somethingNew":{"a":1}}`,
 			wantFound:   true,

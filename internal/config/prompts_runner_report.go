@@ -25,11 +25,11 @@ const runnerNoWrites = " NEVER write to the task: no record_progress (phaseDone 
 // no business giving.
 func runnerDoneReport(fields string) string {
 	return " END WITH A DONE REPORT and record nothing yourself: the LAST thing in your final message is a line " +
-		"that is exactly `" + DoneMarker + "` - unindented and outside any code fence - followed by ONE JSON " +
-		"object and nothing after it. Fields: " + fields + ". The runner writes every record from this report and " +
-		"attributes it to this session's harness and model. A session that ends without a valid report has " +
-		"recorded nothing, and the runner treats the phase as failed. A declared handoff (below) replaces the " +
-		"report: end with one or the other, never both."
+		"that is exactly " + DoneMarker + " - those characters alone, no backticks, unindented and outside any " +
+		"code fence - followed by ONE JSON object and nothing after it. Fields: " + fields + ". The runner " +
+		"writes every record from this report and attributes it to this session's harness and model. A session " +
+		"that ends without a valid report has recorded nothing, and the runner treats the phase as failed. A " +
+		"declared handoff (below) replaces the report: end with one or the other, never both."
 }
 
 // runnerReportReminder repeats the report contract as the brief's LAST line.
@@ -38,8 +38,8 @@ func runnerDoneReport(fields string) string {
 // instruction it cannot complete the phase without gets the last word. It
 // defers to a declared handoff, which replaces the report.
 const runnerReportReminder = " ONE LAST TIME: unless you are declaring a handoff, the LAST thing in your final " +
-	"message is the `" + DoneMarker + "` line and its ONE JSON object, with nothing after them. A session that " +
-	"ends without them has recorded nothing."
+	"message is the " + DoneMarker + " line (no backticks) and its ONE JSON object, with nothing after them. " +
+	"A session that ends without them has recorded nothing."
 
 // runnerDoneFindingShape is the finding object the review and verify reports
 // carry, in the same shape the plane's durable record takes. The limits are the
