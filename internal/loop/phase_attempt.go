@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -91,6 +92,20 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	// of the log itself.
 	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
 	if at.ierr != nil {
+		// CLA-947: every route is inside a pricing window. The phase boundary is
+		// where that normally holds the spawn (checkPhaseBoundary); reaching it
+		// here means the window opened between the boundary check and this spawn,
+		// so end the phase without spending. windowHeld marks it as a scheduling
+		// condition rather than a failed phase (review 1.review-1.6): the claim
+		// goes back through the ordinary no-checkpoint path and the next drain's
+		// boundary holds the spawn until the window ends.
+		var blocked *routeWindowBlocked
+		if errors.As(at.ierr, &blocked) {
+			log.Printf("%siteration %d: %v — the boundary will hold the next spawn until it ends", labelOf(t), drainNum, blocked)
+			r.end.windowHeld = true
+			r.end.windowWhy = blocked.Error()
+			return attemptVerdict{next: attemptReturn, zeroSpend: true}
+		}
 		// The session env refused to resolve (a failing or empty-output
 		// fromCommand, an unreadable @path file — the error names the
 		// variable). REFUSING THE SPAWN is the fail-closed contract: no

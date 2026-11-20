@@ -143,19 +143,40 @@ func (s *drainSeq) checkPhaseBoundary(ctx context.Context, st *seqStep) seqNext 
 	// claim is kept and its lease renewed while it waits. Nothing is spent
 	// during the hold, so the breaker's pre-hold verdict stands: the wait is
 	// NOT charged to max_wall_clock (see docs/pause-windows.md).
-	switch s.holdThroughPause(ctx, st) {
-	case pauseHoldStop:
-		s.stop = true
-		return seqBreak
-	case pauseHoldRunLost:
-		// A lost run ends THIS drain, not the daemon — the same ending the
-		// mid-drain runLost arm takes (drain_phases.go). The hold dropped the
-		// claim, so the deferred handback has nothing to release; the run
-		// continues to its next poll.
-		log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
-		return seqBreak
-	}
+	//
+	// CLA-947: the same hold, one question narrower. `pause_windows` stops every
+	// route; a route schedule stops the routes it names, and only becomes a hold
+	// here when EVERY route this phase may start on is inside a window and its
+	// schedule says wait. Checked second because it is the more specific
+	// setting: when both apply the operator gets the daemon-wide line first.
+	return s.takeBoundaryHolds(ctx, st, s.holdThroughPause, s.holdThroughRouteWindows)
+}
 
+// boundaryHold is one reason a phase boundary may not spawn yet: the daemon-wide
+// scheduled pause, or the pricing windows of the routes a phase may start on.
+type boundaryHold func(context.Context, *seqStep) pauseHold
+
+// takeBoundaryHolds runs the boundary holds in order and folds the two endings
+// that are not "resume" into the walk: a stop, and a lost run.
+//
+// Shared with the parallel panel's own fan-out hold (CLA-947 review
+// 1.review-1.2), so a whole-panel wait answers STOP / RESTART / HALT and a lost
+// claim exactly as the per-phase boundary does.
+func (s *drainSeq) takeBoundaryHolds(ctx context.Context, st *seqStep, holds ...boundaryHold) seqNext {
+	for _, hold := range holds {
+		switch out := hold(ctx, st); out {
+		case pauseHoldStop:
+			s.stop = true
+			return seqBreak
+		case pauseHoldRunLost:
+			// A lost run ends THIS drain, not the daemon — the same ending the
+			// mid-drain runLost arm takes (drain_phases.go). The hold dropped the
+			// claim, so the deferred handback has nothing to release; the run
+			// continues to its next poll.
+			log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(s.t), s.drainNum)
+			return seqBreak
+		}
+	}
 	return seqFall
 }
 

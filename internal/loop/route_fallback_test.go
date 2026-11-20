@@ -191,6 +191,12 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 	}
 }
 
+// routesOf is routableRoutes without the choice: the mark tests pin the mark
+// filter, and their config carries no route schedules.
+func routesOf(d *Driver, tc *config.Config, routes []string) []string {
+	return d.routableRoutes(tc, routes).Routes
+}
+
 // Mark application, directly: unmarked routes keep configured order, a marked
 // route is dropped, and when EVERY route is marked the one that lifts first is
 // used (a phase must still start rather than wait on a mark).
@@ -198,18 +204,18 @@ func TestRoutableRoutes_AppliesMarks(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
 	now := time.Now()
 
-	if got := d.routableRoutes([]string{routeFreeAlias, routePaidAlias}); len(got) != 2 || got[0] != routeFreeAlias || got[1] != routePaidAlias {
+	if got := routesOf(d, d.cfg, []string{routeFreeAlias, routePaidAlias}); len(got) != 2 || got[0] != routeFreeAlias || got[1] != routePaidAlias {
 		t.Fatalf("unmarked routes = %v, want both in order", got)
 	}
 
 	d.markRouteLimited(routeFreeAlias, now.Add(time.Hour))
-	if got := d.routableRoutes([]string{routeFreeAlias, routePaidAlias}); len(got) != 1 || got[0] != routePaidAlias {
+	if got := routesOf(d, d.cfg, []string{routeFreeAlias, routePaidAlias}); len(got) != 1 || got[0] != routePaidAlias {
 		t.Errorf("with the free route marked, routes = %v, want only the paid one", got)
 	}
 
 	// Every route marked: the earliest expiry wins, alone.
 	d.markRouteLimited(routePaidAlias, now.Add(10*time.Minute))
-	if got := d.routableRoutes([]string{routeFreeAlias, routePaidAlias}); len(got) != 1 || got[0] != routePaidAlias {
+	if got := routesOf(d, d.cfg, []string{routeFreeAlias, routePaidAlias}); len(got) != 1 || got[0] != routePaidAlias {
 		t.Errorf("all routes marked = %v, want the earliest-expiring route alone", got)
 	}
 
@@ -224,7 +230,7 @@ func TestRoutableRoutes_AppliesMarks(t *testing.T) {
 	// rule above deliberately keeps the 1h mark on the same field.
 	fresh := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
 	fresh.markRouteLimited(routeFreeAlias, now.Add(-time.Minute))
-	if got := fresh.routableRoutes([]string{routeFreeAlias, routePaidAlias}); len(got) != 2 || got[0] != routeFreeAlias {
+	if got := routesOf(fresh, fresh.cfg, []string{routeFreeAlias, routePaidAlias}); len(got) != 2 || got[0] != routeFreeAlias {
 		t.Errorf("an expired mark still excluded its route: %v", got)
 	}
 }

@@ -136,6 +136,39 @@ func TestOpencodeInvokeSwitchesRouteOnAUsageLimit(t *testing.T) {
 	}
 }
 
+// synthetic429Event is Synthetic's spent-subscription refusal verbatim, as
+// opencode emits it: typed like a burst limit, no window, no reset.
+const synthetic429Event = `{"type":"error","sessionID":"ses_live","error":{"type":"provider.rate-limit","message":"You've exceeded your subscription rate limits. Upgrade, or try again later. You can view your usage at https://synthetic.new/billing","status":429,"response":{"body":"{\"error\":\"You've exceeded your subscription rate limits. Upgrade, or try again later. You can view your usage at https://synthetic.new/billing\"}"}}}`
+
+// A spent subscription that opencode types provider.rate-limit still switches:
+// retrying it on the same route only repeats the refusal, and with no next route
+// tried the session ended empty and the route was never marked.
+func TestOpencodeInvokeSwitchesRouteOnASubscriptionRateLimit(t *testing.T) {
+	// The stub echoes the line single-quoted, so the message's apostrophe is escaped.
+	script, logPath := routeStubScript(t, strings.ReplaceAll(synthetic429Event, "'", `'\''`))
+	opencodeStub(t, script)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree, routePaid},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 2 || !strings.Contains(calls[1], "-s ses_live") || !strings.Contains(calls[1], "--model "+routePaid) {
+		t.Fatalf("want the session resumed on the next route; the stub ran:\n%s", strings.Join(calls, "\n"))
+	}
+	_, finished, fallbacks := RouteFallbacks(res)
+	if finished != routePaid || len(fallbacks) != 1 || fallbacks[0].Route != routeFree || fallbacks[0].Reason != "usage_limit" {
+		t.Fatalf("route report finished=%q fallbacks=%+v, want the denied route reported as usage_limit", finished, fallbacks)
+	}
+	if !fallbacks[0].ResetAt.IsZero() {
+		t.Errorf("ResetAt = %v, want zero: the provider stated none, so the mark takes the default interval", fallbacks[0].ResetAt)
+	}
+}
+
 // A transient 429 is NOT a switch: it rides the existing retry ladder, on the
 // route that already holds the context.
 func TestOpencodeInvokeTransientRateLimitDoesNotSwitch(t *testing.T) {

@@ -57,7 +57,8 @@ var reviewRunGateScope = strings.NewReplacer(
 // consumes it: not the runner writing plane records, but the command writing
 // JSON.
 var reviewRunDoneReport = " END WITH A DONE REPORT: the LAST thing in your final message is a line that is " +
-	"exactly `" + DoneMarker + "` - unindented and outside any code fence - followed by ONE JSON object and " +
+	"exactly " + DoneMarker + " - those characters alone, no backticks, unindented and outside any code " +
+	"fence - followed by ONE JSON object and " +
 	"nothing after it. Fields: " + runnerReviewReportFields + ". `reviewedTip` must be the head commit the " +
 	"context above names. The command parses this report and writes it as JSON; a session that ends without a " +
 	"valid report has produced nothing, and the command exits non-zero."

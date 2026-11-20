@@ -133,6 +133,9 @@ func (c *Config) Validate() error {
 	if err := c.validatePauseWindows(); err != nil {
 		return err
 	}
+	if err := c.validateRouteWindows(); err != nil {
+		return err
+	}
 	return nil
 }
 

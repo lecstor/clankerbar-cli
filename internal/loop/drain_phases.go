@@ -194,6 +194,18 @@ walk:
 		case seqBreak:
 			break walk
 		}
+		// CLA-947 review 1.review-1.6: a pricing window opened between the
+		// boundary check and the spawn, so the spawn was refused and nothing was
+		// spent. That is a SCHEDULING condition, not the evidence-gate empty
+		// shape above: no retry (there is nothing to retry — the window is
+		// still open), no tally, no park. The walk ends here; the ordinary
+		// no-checkpoint handback releases the claim and the next drain's
+		// boundary holds the spawn until the window ends.
+		if st.end.windowHeld {
+			log.Printf("%siteration %d: the %s phase did not spawn — %s; the next drain's boundary holds until it ends",
+				labelOf(t), drainNum, st.ph.Label(s.i), st.end.windowWhy)
+			break
+		}
 		// A held-but-empty exit is a FAILED phase (2026-08-24), not a checkpoint
 		// and not an ordinary "ended without holding the task" end: the claim was
 		// held to the end, it just carried no durable, origin-reachable branch

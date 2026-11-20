@@ -432,6 +432,32 @@ type Config struct {
 	// change a daemon's config identity.
 	PauseWindows *PauseWindows `json:"pause_windows,omitempty"`
 
+	// RouteSchedules are NAMED pricing schedules a route can be attached to
+	// (CLA-947), keyed by schedule name. One definition attached to N routes
+	// means DeepSeek's peak hours — which move as a set — are one edit, not one
+	// per route.
+	//
+	// They are deliberately named rather than inline per route: per-route
+	// literals drift, and a route's window is a fact about its provider's
+	// billing, which several routes share.
+	//
+	// `omitempty` is load-bearing for the same reason as PauseWindows: a config
+	// that sets no route schedule must keep its existing identity.
+	RouteSchedules map[string]*RouteSchedule `json:"route_schedules,omitempty"`
+
+	// RouteWindows attaches a route ID (the exact model string the driver
+	// iterates) to a RouteSchedules entry. A route inside its schedule's window
+	// is unavailable for a NEW session, exactly like a route carrying a usage
+	// mark — but it is a filter on route SELECTION, never a gate on the driver:
+	// a route with no entry is always available, so a newly added model cannot
+	// inherit a schedule by accident.
+	//
+	// Keyed by route ID rather than provider or model because the same model
+	// reached through a flat-priced provider has no peak tier.
+	//
+	// `omitempty` is load-bearing for identity, as above.
+	RouteWindows map[string]string `json:"route_windows,omitempty"`
+
 	// BacklogURL is the clankerbar base URL the driver reads backlog counts from
 	// (cheap, no tokens). The project-scoped API key comes from CLANKERBAR_API_KEY
 	// in the environment, never the config file.

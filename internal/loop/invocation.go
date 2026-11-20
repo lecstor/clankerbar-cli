@@ -184,13 +184,24 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// line and the brief placeholder) keeps naming the FIRST routable route, so a
 	// single-route config is unchanged; the full list is what the adapter switches
 	// between when a provider denies the free route mid-session.
-	routes := d.routeRoutesFor(tc, ph)
-	if len(routes) > 0 {
-		inv.Model = routes[0]
-	} else {
+	//
+	// CLA-947: the same selection also drops a route inside one of its pricing
+	// windows. When that leaves NOTHING and the schedule says wait, the spawn is
+	// refused: the phase boundary holds until the window ends, and starting on
+	// the blocked route here would spend exactly what the schedule exists to
+	// avoid.
+	choice := d.routeRoutesFor(tc, ph)
+	switch {
+	case len(choice.Routes) > 0:
+		inv.Model = choice.Routes[0]
+		inv.Routes = choice.Routes
+	case !choice.WaitUntil.IsZero():
+		configured, _ := tc.ModelRoutesForPhase(ph)
+		return inv, &routeWindowBlocked{phase: ph.Label(phaseIdx), until: choice.WaitUntil, routes: configured}
+	default:
 		inv.Model = model
+		inv.Routes = nil
 	}
-	inv.Routes = routes
 	if prev != nil && prev.Claim.Held() {
 		// The {{branch}} placeholder is filled from the recorded, VERIFIED hand-off
 		// (CLA-457): the checkpoint the driver ran against this claim already
