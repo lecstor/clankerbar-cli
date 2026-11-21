@@ -32,6 +32,14 @@ func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip stri
 	if strings.TrimSpace(req.Checkout) == "" || strings.TrimSpace(req.Branch) == "" || len(id) < 8 || !isHex(id[:8]) {
 		return "", originBranchFacts{}, nil
 	}
+	if err := validateGitBranchRef(req.Branch); err != nil {
+		return fmt.Sprintf("task %s has invalid branch %q: %v", id[:8], req.Branch, err), originBranchFacts{}, nil
+	}
+	if req.PRBase != "" {
+		if err := validateGitBranchRef(req.PRBase); err != nil {
+			return fmt.Sprintf("task %s has invalid PR base %q: %v", id[:8], req.PRBase, err), originBranchFacts{}, nil
+		}
+	}
 	registered, err := taskWorktreeWorktrees(ctx, req.Checkout)
 	if err != nil {
 		return "", originBranchFacts{}, err
@@ -98,7 +106,7 @@ func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip stri
 		}
 	}
 	if req.Resume || req.CloseOut {
-		out, err := taskWorktreeGit(ctx, wt.path, "rev-list", "--left-right", "--count", "HEAD..."+remote)
+		out, err := taskWorktreeGit(ctx, wt.path, "rev-list", "--left-right", "--count", "--end-of-options", "HEAD..."+remote, "--")
 		if err != nil {
 			return "", facts, err
 		}
@@ -171,7 +179,7 @@ func claimWorktreeLocalBranchRefusal(ctx context.Context, checkout, branch, agai
 	if !taskWorktreeCommitishExists(ctx, checkout, "refs/heads/"+branch) {
 		return "", nil
 	}
-	if _, err := taskWorktreeGit(ctx, checkout, "merge-base", "--is-ancestor", "refs/heads/"+branch, against); err != nil {
+	if _, err := taskWorktreeGit(ctx, checkout, "merge-base", "--is-ancestor", "--", "refs/heads/"+branch, against); err != nil {
 		if !negativeFact(err) {
 			return "", err
 		}

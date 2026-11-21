@@ -33,6 +33,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // worktreeRequest is one task's worktree to prepare. CloseOut marks an approved
@@ -290,11 +291,14 @@ func validateGitBranchRef(ref string) error {
 	if ref == "" {
 		return errors.New("empty ref")
 	}
+	if !utf8.ValidString(ref) {
+		return errors.New("ref contains invalid UTF-8")
+	}
 	if strings.HasPrefix(ref, "-") {
 		return errors.New("ref must not start with '-'")
 	}
-	if ref == "@" {
-		return errors.New("ref must not be '@'")
+	if ref == "@" || ref == "HEAD" {
+		return fmt.Errorf("ref must not be %q", ref)
 	}
 	if strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") || strings.Contains(ref, "//") {
 		return errors.New("ref has empty path component")
@@ -306,7 +310,7 @@ func validateGitBranchRef(ref string) error {
 		return errors.New("ref contains forbidden revision sequence")
 	}
 	for _, r := range ref {
-		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
 			return errors.New("ref contains whitespace or control character")
 		}
 		switch r {
