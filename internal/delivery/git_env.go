@@ -1,21 +1,6 @@
 package delivery
 
-import (
-	"regexp"
-	"strings"
-)
-
-// urlUserinfoRe matches URL userinfo (`scheme://user:pass@`) inside free-form
-// git error output without crossing path/query/fragment delimiters or touching
-// scp-style SSH addresses like `git@github.com:owner/repo.git`.
-var urlUserinfoRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/?#'"<>]+)@`)
-
-// redactURLCredentials scrubs embedded credentials from any URL appearing in s
-// so failing scoped git commands never leak x-access-token URLs into logs or
-// Check.Detail.
-func redactURLCredentials(s string) string {
-	return urlUserinfoRe.ReplaceAllString(s, "${1}redacted@")
-}
+import "strings"
 
 // isOwnedGitEnv reports whether name is one of the non-interactive settings
 // gitRunOut always enforces itself.

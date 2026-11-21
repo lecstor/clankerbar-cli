@@ -107,6 +107,35 @@ func TestConflictPathsOnACleanPairNamesNothing(t *testing.T) {
 	}
 }
 
+// The failure error quotes merge-tree's output for diagnosis, so that output
+// must go through the same redactor as git stderr: a scoped invocation's stdout
+// can quote the rewritten remote too.
+func TestConflictPathsRedactsCredentialsInQuotedOutput(t *testing.T) {
+	const secret = "gho_super_secret_token_966"
+	dir := t.TempDir()
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	writeFile(t, fakeGit, `#!/bin/sh
+echo "fatal: fetching https://x-access-token:`+secret+`@github.com/lecstor/private.git/"
+exit 128
+`)
+	if err := os.Chmod(fakeGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	v := New(dir, "")
+	v.gitBin = fakeGit
+	_, err := v.ConflictPaths(context.Background(), dir, "main", "clanker/feature")
+	if err == nil {
+		t.Fatal("expected merge-tree to fail")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "x-access-token:") {
+		t.Fatalf("ConflictPaths leaked the credential from git output: %q", err)
+	}
+	if !strings.Contains(err.Error(), "https://redacted@github.com/lecstor/private.git/") {
+		t.Fatalf("ConflictPaths should keep the redacted URL for diagnosis, got %q", err)
+	}
+}
+
 func TestMergedOnRemoteAnswersAncestry(t *testing.T) {
 	e := newEnv(t)
 	e.commit("main", "base.txt", "base")

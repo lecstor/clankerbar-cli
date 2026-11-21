@@ -51,6 +51,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // Status is the outcome of one check. The three-way split is the whole point: see
@@ -810,7 +812,7 @@ func (v *Verifier) gitRunOut(ctx context.Context, dir string, extraEnv []string,
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, redactURLCredentials(firstLine(msg)))
+			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, secureurl.RedactUserinfo(firstLine(msg)))
 		}
 		return stdout.String(), fmt.Errorf("git %s: %w", args[0], err)
 	}
