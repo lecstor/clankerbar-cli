@@ -2,28 +2,27 @@ package harness
 
 import "time"
 
-// RouteFallback is one model route the adapter abandoned mid-session because it hit a usage limit,
-// and the route it moved to.
 type RouteFallback struct {
-	// Route is the route that was denied, exactly as it was configured.
-	Route string
-	// Next is the route the session was resumed on.
+	Route  string
 	Next   string
 	Reason string
-	// ResetAt is the reset the provider STATED, or the zero time when it stated none.
+	// ResetAt is the reset the provider STATED, or the zero time when it stated none. The driver owns
+	// the fallback mark duration (the same probe interval the supervised wait uses) because the
+	// adapter has no config.
 	ResetAt time.Time
 }
 
 const (
 	// RouteStartedKey and RouteFinishedKey are the Result.Raw keys naming the route the session
-	// started on and the route that finished it.
+	// started on and the route that finished it. Both are set only when the adapter actually switched:
+	// a single-route result carries neither, so its Raw stays exactly the shape it had before this
+	// existed.
 	RouteStartedKey  = "route_started"
 	RouteFinishedKey = "route_finished"
 
 	RouteFallbacksKey = "route_fallbacks"
 )
 
-// RouteFallbacks reads the adapter's report off a Result.
 func RouteFallbacks(res Result) (started, finished string, fallbacks []RouteFallback) {
 	if res.Raw == nil {
 		return "", "", nil

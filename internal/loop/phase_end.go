@@ -6,10 +6,12 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
+// panelState is what a phase following a review panel needs to know about it: the round the panel's
+// members' records landed in, and — for the members that recorded NOTHING — why, keyed by
+// reviewer role. Zero when the phase does not follow a panel, or when the panel never got a record
+// into a round — which is exactly when there is no merged list to build.
 type panelState struct {
-	round int
-	// failed maps a member's role to the reason it recorded nothing, so the fix brief names the
-	// incomplete members AND what happened to them, not only that the list is short.
+	round  int
 	failed map[string]panelMemberFailure
 	// recorded reports that a REQUIRED member has already recorded in this panel.
 	recorded bool
@@ -20,8 +22,6 @@ type panelMemberFailure struct {
 	optional bool
 }
 
-// phaseEnd is how a phase reports what it left behind, so drainPhases can decide whether to run the
-// next one and what is still owed a handback. The three fields are deliberately independent.
 type phaseEnd struct {
 	claim *harness.Result
 
@@ -38,15 +38,18 @@ type phaseEnd struct {
 	deadBooked bool
 
 	// session is the harness session this pass spawned, for the fleet record's sessions list: the
-	// phase label, the resolved harness and the resolved model the spawn line named.
+	// phase label, the resolved harness and the resolved model the spawn line named. Only the fleet
+	// record reads it.
 	session *fleet.Session
 
+	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape: the phase ended
+	// cleanly still holding the task with NO durable, origin-reachable branch evidence on the plane
+	// record. Deliberately distinct from dead, which keys on the "unknown" finish reason — the
+	// incident's sessions finished with reason "stop", so the dead signature alone did not catch them.
 	empty bool
 
 	emptyWhy string
 
-	// windowHeld reports that the spawn was REFUSED by a pricing window that opened between the
-	// boundary check and the spawn, so no session ran and nothing was spent.
 	windowHeld bool
 
 	windowWhy string
@@ -57,8 +60,6 @@ type phaseEnd struct {
 
 	handoff string
 
-	// panelMember reports that this pass was one reviewer of a review panel, and panelLast that it was
-	// the panel's last member.
 	panelMember bool
 	panelLast   bool
 	// panelOptional reports that this member is an OPTIONAL (trial) seat of the review panel.
@@ -71,17 +72,14 @@ type phaseEnd struct {
 
 	reportResumeFailed string
 
-	// reviewCloseFailed reports that this pass's review seam gate passed far enough to find a SEALED
-	// round, but the driver's own close of that round failed.
 	reviewCloseFailed bool
 
-	// reviewRound is the review round the seam gate MATCHED this pass, zero when the phase is not
-	// review-shaped or no record matched.
 	reviewRound int
 
 	verifyChecked bool
 	// verifyFailure is the reason a verification seam could not be evaluated (no record this run
-	// wrote, an unreadable task, a round that would not close).
+	// wrote, an unreadable task, a round that would not close). Non-empty means the driver must park
+	// rather than hand over or loop: an unverifiable round cannot be the gate.
 	verifyFailure string
 	verifyRound   int
 	// verifyOpenMusts is every open MUST on a RELEASED record, by plane finding id, as of AFTER this
@@ -97,7 +95,8 @@ type phaseEnd struct {
 	verifyStatus      string
 
 	// reportProblem is why a runner-claimed session's done report became no records: missing,
-	// unreadable, invalid, or a write the plane refused.
+	// unreadable, invalid, or a write the plane refused. The seam gates append it to their own "no
+	// record matched" reason, because a phase that wrote nothing looks identical either way.
 	reportProblem string
 	doneReport    *config.DoneReport
 
@@ -124,6 +123,8 @@ func deadPhase(res harness.Result) bool {
 }
 
 // isReviewPhase reports whether a phase is a review-phase (the gate where escalation applies).
+// Named phases whose name is "review" are review phases; custom prompts with no name are never
+// treated as review for escalation.
 func isReviewPhase(ph config.Phase) bool {
 	return ph.Name == config.ReviewPhaseName
 }

@@ -15,7 +15,9 @@ func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx in
 		nextIdx < 0 || nextIdx >= len(s.phases) {
 		return false
 	}
-	// Verified checkpoints only.
+	// Verified checkpoints only. The CLA-576 unverified form writes no `phasesDone` marker
+	// (markPhaseDone skips it), and a HANDOFF checkpoint writes none either — markPhaseDone cannot
+	// know yet whether the handoff will be accepted, so it skips them all.
 	if s.carried.CheckpointUnverified || st.end.handoff != "" {
 		return false
 	}

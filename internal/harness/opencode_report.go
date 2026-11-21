@@ -14,7 +14,9 @@ const (
 	// cap-killed on arrival. The report stays refused and the marker makes the phase fail closed.
 	opencodeReportWallClockMsg = "!! wall-clock budget exhausted before the report resume — leaving the report refused\n"
 
-	// opencodeReportResumeAttempts bounds the resume processes ONE refused report earns.
+	// opencodeReportResumeAttempts bounds the resume processes ONE refused report earns. A silent
+	// provider hang is usually transient, so a stalled resume is worth ONE fresh attempt; a second
+	// stall is the runner's to fail closed on, exactly as a single refusal was before CLA-877.
 	opencodeReportResumeAttempts = 2
 )
 

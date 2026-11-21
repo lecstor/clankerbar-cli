@@ -219,7 +219,9 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 		}
 
 	default:
-		// A schema added to harness but not taught to doctor.
+		// A schema added to harness but not taught to doctor. Go will not make this a compile error, so
+		// it is made LOUD instead of silent - the whole point of CLA-263 is that this arm must never pass
+		// a workdir on a premise it has not checked.
 		c.status = warn
 		c.detail = workdirLabel(dir) + ": doctor cannot judge mcp_config_path for harness " + harnessName
 		c.remedy = "teach sessionCheck this harness's MCPConfigUse schema before trusting a green workdir here"

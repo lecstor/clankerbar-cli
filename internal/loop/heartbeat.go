@@ -37,7 +37,12 @@ func heartbeatInterval(lease time.Duration) time.Duration {
 }
 
 // leaseRenewer renews the lease of whatever backlog task the spawned session is holding, for
-// exactly as long as the session's Invoke runs.
+// exactly as long as the session's Invoke runs. The run id to renew is learned one of two ways:
+// seeded from the invocation's ResumeClaim (a resumed phase continues a live run it never claimed),
+// or observed live as the session's own claim_task lands - both adapters that track claims fire
+// Invocation.OnClaim the moment the stream carries the ids, so an opencode session that claims
+// twenty minutes in is renewed from that moment, which is the exact gap that used to kill its
+// lease.
 type leaseRenewer struct {
 	hb       plane.Heartbeat
 	interval time.Duration
@@ -95,8 +100,6 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		claimFile: func(c harness.Claim) { d.noteCurrentClaim(c, t.Name) },
 	}
 	if t.Fleet != nil {
-		// CLA-510: the fleet card's task ref rides the same observation seam as lease renewal - one
-		// watcher, two consumers.
 		r.reflect = d.reflectClaim(ti, t, r.done)
 		// CLA-771: presence on the renewal cadence. The state is read fresh at each tick so it carries
 		// the CURRENT claim ref and phase; every target gets its lap, because the poll that covers the
@@ -181,7 +184,10 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 	defer stopTicker()
 	beats := 0
 	failures := 0
-	// stoodDown disables the BEAT only.
+	// stoodDown disables the BEAT only. The tick keeps firing, so the presence beacon keeps flowing
+	// every interval for the rest of the session: a plane that will not renew this lease may still
+	// accept the fleet report, which is a different transport, and a healthy long session must not
+	// read as a dead instance just because the heartbeat endpoint is refusing.
 	stoodDown := false
 	for {
 		select {
@@ -205,8 +211,6 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 					break drain
 				}
 			}
-			// CLA-771: the presence beacon rides THIS tick - the one cadence that still fires while a
-			// session runs.
 			select {
 			case <-r.done:
 				return
@@ -233,8 +237,6 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 			case ctx.Err() != nil:
 				return
 			case errors.Is(err, plane.ErrRunLost):
-				// The plane says this run no longer holds the task: taken over, reclaimed, released or
-				// withheld.
 				log.Printf("%sthe plane refused the lease renewal: %v - this run no longer holds the task, ending the session", r.prefix, err)
 				stoodDown = true
 				if r.onLost != nil {

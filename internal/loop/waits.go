@@ -40,7 +40,9 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 	return resetAt, time.Until(resetAt) > remaining
 }
 
-// probeWait returns how long the paused loop sleeps before its next probe.
+// probeWait returns how long the paused loop sleeps before its next probe. An unknown or
+// already-past reset falls back to the blind grid: codex states no reset at all, and after CLA-258
+// claude parses one only from typed sources, so an unknown reset is normal rather than exceptional.
 func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Duration {
 	if resetAt.IsZero() || !now.Before(resetAt) {
 		return interval
@@ -141,7 +143,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				return tokens, cost, true
 			}
 		}
-		// Probe time.
+		// Probe time. A stated reset is the provider's claim, not a guarantee, so crossing it mid-wait
+		// does NOT resume the run the way a blind-grid wake used to: it falls back to interval polling,
+		// and the very next probe is what confirms or refutes the claim.
 		if !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) && waitingForReset {
 			log.Print("stated reset passed - falling back to interval polling (a stated reset is a claim, not a guarantee)")
 			waitingForReset = false
@@ -254,7 +258,8 @@ func retryLabel(n, max int) string {
 }
 
 // waitOrStop waits up to dur, but stays responsive to a STOP marker (consuming it) and to context
-// cancellation. Reports whether the loop should stop.
+// cancellation. CLA-461: the restart/reload markers get the same responsiveness, so a control
+// request is never stuck behind a multi-hour idle poll or a supervised limit wait.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 	return d.waitResponsive(ctx, dur, false)
 }
@@ -386,6 +391,8 @@ func formatReset(t time.Time) string {
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness leaves it blank.
+// The window rides along when the adapter named one: a multi-day weekly wait should say which cap
+// it is waiting out, not just "usage limit".
 func limitReason(lim harness.Limit) string {
 	reason := lim.Reason
 	if reason == "" {

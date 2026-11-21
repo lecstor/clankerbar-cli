@@ -2,7 +2,9 @@ package config
 
 // worktreeReclaimStep is the reclaim every FINAL phase step carries: the session that takes the
 // work off the machine removes the tree it worked in, because the close-out that merges may not
-// touch a tree it did not create.
+// touch a tree it did not create. Order is the property: it follows the PR's confirmation, because
+// until then the tree may hold the only copy of the work, and it precedes the phase's final call,
+// which stays the emphatic ending.
 const worktreeReclaimStep = " AFTER the PR is confirmed open - and before this session's final call - " +
 	"reclaim the tree this run worked in, in ONE shell invocation started from the repo's main checkout (the " +
 	"first path `git worktree list` prints, so the shell is never left in a deleted directory): " +
@@ -18,7 +20,7 @@ const worktreeReclaimStep = " AFTER the PR is confirmed open - and before this s
 	"tree, never another task's worktree."
 
 // reviewTerminalStep is the review phase's LAST instruction, kept as a constant so its position can
-// be pinned by a test and not only its wording.
+// be pinned by a test and not only its wording. Position is the property that failed.
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
 	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
 	"hand-off below." + worktreeReclaimStep +
@@ -32,7 +34,8 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
-// reviewOnlyTerminalStep ends the review-only phase.
+// reviewOnlyTerminalStep ends the review-only phase. A file in the worktree was rejected: it is
+// invisible to the plane, dies with the worktree, and cannot be read from another machine.
 const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE TASK " +
 	"in BOTH forms the shape above prescribes, in that order - FIRST the legacy outcome block with " +
 	"record_progress(taskId, runId, outcome: ...), THEN the sealed durable record with " +
@@ -43,7 +46,8 @@ const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the pha
 	"this same run from it. Ending this session after recording the review is this phase " +
 	"FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
 
-// panelMemberTerminalStep ends a PANEL MEMBER's phase.
+// panelMemberTerminalStep ends a PANEL MEMBER's phase. A session told to write both would have its
+// outcome write refused by the plane and could easily read that refusal as the phase failing.
 const panelMemberTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
 	"TASK in the ONE form the shape above prescribes - the sealed durable record with " +
 	"record_review(taskId, runId, {...}) - and write NOTHING ELSE on the task: do NOT call record_progress with an outcome, do not write " +
@@ -53,8 +57,6 @@ const panelMemberTerminalStep = " FINALLY, and this is the step that ENDS the ph
 	"panel member, or the fix phase) resumes this same run from it. Ending this session after recording the " +
 	"review is this phase FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
 
-// reviewRecordOutcomeShape is the LEGACY half of the review record: the `## Review` block appended
-// to the task's outcome.
 const reviewRecordOutcomeShape = " THE REVIEW RECORD IS THE DELIVERABLE. First get_task and read the outcome as it " +
 	"stands: a statusless record_progress outcome replaces the WHOLE field, so preserve it. Record the LEGACY block " +
 	"with record_progress(taskId, runId, outcome: ...) by copying the existing outcome's text unchanged, then " +
@@ -69,7 +71,9 @@ const reviewRecordOutcomeShape = " THE REVIEW RECORD IS THE DELIVERABLE. First g
 	"fix applied here is a fix the next phase cannot attribute and may undo."
 
 // reviewRecordTipVerified tells the reviewer which commit the driver verified and requires that
-// exact tip in both halves of the record.
+// exact tip in both halves of the record. Handing the SHA over is not a shortcut around the check:
+// the session must fetch and confirm HEAD is that commit before reviewing, and the seam matches the
+// recorded tip against the origin tip the driver read.
 const reviewRecordTipVerified = " The driver verified the origin remote's tip for branch " + PhaseBranchPlaceholder +
 	" as `" + ReviewedTipPlaceholder + "`. Fetch and confirm the worktree is at that commit (`git rev-parse HEAD`) " +
 	"before you review, and record that SHA as `reviewedTip` in the durable record and on the block's " +
@@ -87,6 +91,9 @@ const reviewRecordTipUnverified = " The driver could NOT verify the origin remot
 
 // reviewRecordTipNone is the branchless counterpart: there is no branch and no commit to review,
 // and — per the operator's decision on question 03a12578, option 1 — no durable record either.
+// The plane accepts review writes only from the task's LIVE holder: a settled task (phase 1's own
+// session settled it) refuses the append outright, and on a still-held no-code task it would seal a
+// round this variant's driver never closes, blocking the run's own outcome writes.
 const reviewRecordTipNone = " There is NO branch and NO tip to review: this record is about the PLANE'S RECORD of " +
 	"what phase 1 did. Write `- reviewed tip: none (no branch - the plane record was reviewed)` on the block's " +
 	"`- reviewed tip:` line. Do NOT append a durable review record: a settled task has no live holder to accept " +
@@ -94,7 +101,8 @@ const reviewRecordTipNone = " There is NO branch and NO tip to review: this reco
 	"this variant's review record, and the driver gates the seam on it."
 
 // reviewRecordDurableShape is the durable half: one sealed per-reviewer record per run, written
-// through record_review.
+// through record_review. While a run has a sealed record in an open round the plane refuses that
+// run's outcome, body and decision writes, so the legacy outcome block must be written FIRST.
 const reviewRecordDurableShape = " THEN, and only after that outcome write has SUCCEEDED, append THIS run's durable " +
 	"review record with record_review(taskId, runId, {...}). This order is load-bearing: the plane seals the " +
 	"record's round, and a sealed record makes this run's outcome, body and decision writes illegal - so the legacy " +
@@ -119,26 +127,25 @@ const reviewRecordDurableShape = " THEN, and only after that outcome write has S
 	"send no findings (or an empty array), write `- none` under Findings, and verdict: pass."
 
 // reviewOnlyRecordShape is the verified review-only phase's full record contract: the legacy
-// outcome block, then the durable record.
+// outcome block, then the durable record. The driver injected the phases' RESOLVED harness/model
+// and the verified round, role and tip, because a session cannot reliably name its own model,
+// cannot see its predecessor's, and cannot see whether the branch tip it read is the one the driver
+// verified.
 const reviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipVerified +
 	reviewRecordDurableShape + reviewMUSTBar
 
-// unverifiedReviewOnlyRecordShape is reviewOnlyRecordShape for a checkpoint the driver could not
-// verify on the origin remote: the reviewer establishes the tip itself, and the seam demands a
-// non-empty one.
 const unverifiedReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipUnverified +
 	reviewRecordDurableShape + reviewMUSTBar
 
-// noCodeReviewOnlyRecordShape is the branchless review-only phase's record contract: the LEGACY
-// outcome block alone, with no durable-record half — the plane accepts review writes only from
-// the task's LIVE holder and a settled task has none (operator decision on question 03a12578,
-// option 1), so the seam gates this variant on the block (changed since the spawn, heading on its
-// own line, and a last block the baseline did not carry).
 const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNone + reviewMUSTBar
 
 // panelMemberRecordIntro and panelMemberRecordBody are the two halves of a PANEL MEMBER's record
 // contract: the tip paragraph sits between them, so the verified and unverified variants share
-// everything else.
+// everything else. The legacy outcome block reviewOnlyRecordShape prescribes is not merely deferred
+// here, it is forbidden: member 1's block would be readable by member 2 through its own get_task
+// — the exact cross-member leak the seal exists to prevent — and the plane refuses a run's
+// outcome writes while its record sits sealed in the open round the panel writes into, so the write
+// would be refused anyway.
 const panelMemberRecordIntro = " You are ONE MEMBER of a review PANEL: several reviewers, possibly on " +
 	"different models, review the SAME revision independently, and the driver merges every member's findings " +
 	"into the fix phase's work list afterwards. Do not look for, wait for or defer to another member's " +
@@ -167,15 +174,11 @@ const panelMemberRecordBody = " THE RECORD IS YOUR DELIVERABLE, and it is the ON
 	"signal, and retrying it changes nothing. If there are no findings, send no findings (or an empty array), " +
 	"and verdict: pass."
 
-// panelMemberRecordTipVerified is the panel member's counterpart of reviewRecordTipVerified: the
-// same driver-verified tip, recorded in the durable record alone.
 const panelMemberRecordTipVerified = " The driver verified the origin remote's tip for branch " +
 	PhaseBranchPlaceholder + " as `" + ReviewedTipPlaceholder + "`. Fetch and confirm the worktree is at that " +
 	"commit (`git rev-parse HEAD`) before you review, and record that SHA as `reviewedTip` in your durable " +
 	"record."
 
-// panelMemberRecordTipUnverified is the panel member's counterpart of reviewRecordTipUnverified:
-// the member establishes the tip itself.
 const panelMemberRecordTipUnverified = " The driver could NOT verify the origin remote's tip, so there is no " +
 	"driver-verified tip to record: establish it yourself. Read the branch from the origin remote " +
 	"(`git ls-remote origin " + PhaseBranchPlaceholder + "`, or fetch it), check out the commit it names, review " +
@@ -183,19 +186,16 @@ const panelMemberRecordTipUnverified = " The driver could NOT verify the origin 
 	"remote cannot be read, record that failed hand-off IN YOUR DURABLE RECORD and end holding the task — do not " +
 	"write an outcome or touch the task's status, do not invent a tip, and do not review a phantom diff."
 
-// panelMemberRecordShape is the verified panel member's record contract: the panel context, the
-// verified tip, and the durable record alone.
 var panelMemberRecordShape = panelMemberRecordIntro + panelMemberRecordTipVerified +
 	panelMemberRecordBody + panelMemberMUSTBar
 
-// panelMemberUnverifiedRecordShape is panelMemberRecordShape for a checkpoint the driver could not
-// verify on the origin remote.
 var panelMemberUnverifiedRecordShape = panelMemberRecordIntro + panelMemberRecordTipUnverified +
 	panelMemberRecordBody + panelMemberMUSTBar
 
 // reviewMUSTBarGrades is the accepted bar for a MUST: the evidence a MUST must cite, the seventh
 // kind the operator added after the second review, and the things that are never a MUST however
-// confident the reviewer is.
+// confident the reviewer is. Only PRESENCE is checked structurally - here as the reviewer's own
+// obligation, and by the driver when it parses the block back (loop.reviewFindingsDigest).
 const reviewMUSTBarGrades = " GRADE EVERY FINDING. A severity in brackets is `[must]`, `[should]` or `[nit]`; " +
 	"MUST is the only gating grade and the only one that must carry evidence. A MUST must be followed by " +
 	"`(<kind>): <evidence>`, where <kind> is one of: doneWhen - quote the clause of the task's doneWhen the change " +
@@ -212,18 +212,12 @@ const reviewMUSTBarGrades = " GRADE EVERY FINDING. A severity in brackets is `[m
 	"documentation wording - and where a repo hard rule concerns style, prose or documentation wording, this " +
 	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. "
 
-// reviewMUSTBarAttribution closes the bar for the SINGLE reviewer, whose record has two halves: the
-// legacy outcome block and the durable record.
 const reviewMUSTBarAttribution = "Every finding in the block is " +
 	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +
 	"finding so the review is attributable per finding, not only per block."
 
-// reviewMUSTBar is the bar as the single reviewer's record shape carries it: the grading rules,
-// then the attribution sentence.
 const reviewMUSTBar = reviewMUSTBarGrades + reviewMUSTBarAttribution
 
-// panelMemberMUSTBarAttribution is reviewMUSTBarAttribution for a panel member: there is no block,
-// so the record's own `raisedByModel` is the whole attribution.
 const panelMemberMUSTBarAttribution = "Every finding is attributed in your durable " +
 	"record by its `raisedByModel` field, so the review is attributable per finding."
 
@@ -231,7 +225,10 @@ const panelMemberMUSTBarAttribution = "Every finding is attributed in your durab
 // attribution.
 const panelMemberMUSTBar = reviewMUSTBarGrades + panelMemberMUSTBarAttribution
 
-// fixOutcomeRecord is the fix phase's outcome requirement, shared by both fix variants.
+// fixOutcomeRecord is the fix phase's outcome requirement, shared by both fix variants. And it must
+// keep everything ABOVE the block: that is phase 1's delivery record (or an earlier round's), and
+// the statusless outcome replaces the field wholesale, so a final outcome built only from the
+// review block and ### Fixes would erase it.
 const fixOutcomeRecord = "the outcome MUST keep everything the existing outcome carries ABOVE the LAST `" +
 	ReviewRecordHeading + "` block " +
 	"(phase 1's delivery record plus any earlier rounds, their `" + ReviewRecordHeading + "` blocks included) " +
@@ -259,29 +256,31 @@ const fixFindingUpdates = " While you still hold the task, update every finding'
 // fixTerminalRecord is the BRANCH fix phase's record requirement when this fix OWNS the sequence's
 // terminal step, stated BEFORE the shared reviewTerminalStep so the emphatic final block still ends
 // the brief: the durable finding updates go out before the call that ends the run and clears the
-// holder, then the hand-over carries the outcome requirement (fixOutcomeRecord) forward.
+// holder, then the hand-over carries the outcome requirement (fixOutcomeRecord) forward. The
+// ordering sentence is here rather than in fixFindingUpdates because it is advice about THIS
+// phase's own hand-over call: the plane refuses the batch after that call, even when the same call
+// carries the outcome.
 const fixTerminalRecord = fixFindingUpdates + " It must go out BEFORE the hand-over call - before the call that " +
 	"moves the task to in_review, even when that same call carries your outcome. THEN hand the task over: " +
 	fixOutcomeRecord
 
 // fixVerifyRecord is the BRANCH fix phase's record requirement when a VERIFICATION round FOLLOWS
-// it.
+// it. fixVerifyBrief and its handoff continuation end with fixOnlyTerminalStep — "do NOT move the
+// task to in_review", because the verifier owns that move — so they must not carry
+// fixTerminalRecord's "THEN hand the task over" as well: that is one brief telling the fixer both
+// to hand the task over and not to, and a fixer that obeys the first half ships fixes no
+// verification round has seen.
 const fixVerifyRecord = fixFindingUpdates + " When you end the phase, " + fixOutcomeRecord
 
-// noCodeFixTerminalRecord is the BRANCHLESS fix phase's counterpart (question 03a12578, option 1):
-// the branchless review writes no durable record — a settled task has no live holder to accept
-// one — so there is no findingUpdates call to make and no plane-assigned id to send.
 const noCodeFixTerminalRecord = " When you hand the task over, " + fixOutcomeRecord
 
-// noCodeFixVerifyRecord is fixVerifyRecord for a BRANCHLESS fix: the outcome requirement alone,
-// with no findingUpdates half — the branchless round writes no durable record, so there is no
-// plane-assigned id to send, the same exemption noCodeFixTerminalRecord carries — and no
-// hand-over, which the verification round owns.
 const noCodeFixVerifyRecord = " When you end the phase, " + fixOutcomeRecord
 
 // fixGradingRule is the fix briefs' shared obligation for acting on the graded review record: every
 // MUST fixed or refuted with evidence, never downgraded by the fixer, and SHOULD/NIT handled by the
-// filing rule.
+// filing rule. B5's structural check runs driver-side, so a MUST that reaches this brief has
+// already been judged to carry evidence; the fixer may not second-guess the grade - it refutes the
+// finding with evidence of its own, or fixes it.
 const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
 	"recorded in your outcome - a refutation must actually refute the finding, and a MUST you neither fix nor " +
 	"refute is this phase failing. You may not downgrade a MUST: the driver has already applied its structural " +
@@ -290,9 +289,6 @@ const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
 	"NITs and the SHOULDs you do not fix in your outcome as not done, with the reason, and file a follow-up task " +
 	"only for a SHOULD worth doing."
 
-// noCodeReviewTerminalStep is the no-code review brief's LAST instruction, the counterpart of
-// reviewTerminalStep for a phase-1 exit that was evidenced by the plane's record rather than a
-// branch.
 const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: if the task still sits in " +
 	"in_progress with its no-code delivery declared, hand it over with submit_for_review(taskId, runId, " +
 	"outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a **Tests** section saying what you actually " +

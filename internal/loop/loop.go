@@ -27,71 +27,77 @@ var errZeroSpendLoop = errors.New("zero-spend attempt loop")
 
 // errUnclassifiedRetryLoop marks the other give-up no ceiling would have reached: a ladder of
 // retries taken on a failure the adapter could not NAME, only judge by heuristic
-// (harness.Adapter.IsUnclassifiedTransient).
+// (harness.Adapter.IsUnclassifiedTransient). Also distinct because the operator's next move is
+// distinct: this one means the adapter has no pattern for what went wrong, so the fix is to read
+// the diagnostic in the error and — if it is a real blip — teach the adapter's transient
+// patterns about it.
 var errUnclassifiedRetryLoop = errors.New("unclassified retry loop")
 
 // unclassifiedRetryBound is how many retries one phase's ladder may take on heuristically-judged
 // failures before it gives up. Deliberately a constant and not a config dial.
 const unclassifiedRetryBound = 2
 
-// perTaskDeadBound is how many consecutive dead phases on the SAME task park it.
+// perTaskDeadBound is how many consecutive dead phases on the SAME task park it. Four consecutive
+// deaths is a ~2% roll — a signal rather than noise — while a task that dies once per drain and
+// succeeds between (the retry re-claims the same task within the drain) never accumulates past one
+// here, because the counter resets when a phase of the task advances (see the reset below).
 const perTaskDeadBound = 4
 
 // fleetDeadBound is how many consecutive dead phases ACROSS tasks pause the loop for that target
-// and raise one project-level question.
+// and raise one project-level question. One more than the per-task bound, on purpose: a single
+// cursed task parks at 4 (its own counter fires first, and the drain breaks before any fifth
+// death), so the fleet counter can only reach 5 across DIFFERENT tasks — the shape only a
+// fleet-wide fault produces.
 const fleetDeadBound = 5
 
+// startupFailBound is how many consecutive harness-startup failures on one target pause it and
+// raise one project-level question.
 const startupFailBound = 5
 
-// Target is one backlog a Driver drives: a project's cheap poller plus where that project's drain
-// sessions run.
 type Target struct {
-	// Name is the project slug, used to prefix log lines when there is more than one target.
 	Name string
 
-	// Poller is this project's cheap backlog read.
 	Poller backlog.Poller
 
-	// WorkDir is where this project's sessions run. Empty = the config's workdir.
 	WorkDir string
 
-	// MCPConfigPath points this project's sessions at its .mcp.json (the file whose /mcp/<slug> URL
-	// selects the project). Empty = the config's path.
 	MCPConfigPath string
 
 	// MCPConfigPaths is this project's MCP config PER HARNESS, for a sequence whose phases are not all
-	// on one harness.
+	// on one harness. Empty on every single-harness run, and config.Validate refuses the combination
+	// that would need an entry here and lacks one.
 	MCPConfigPaths map[string]string
 
 	// Repos is this project's repo -> local-checkout map, and PrimaryRepo the fallback for a task that
-	// carries no repo.
+	// carries no repo. Between them they decide where each session STARTS: the task's own repo
+	// resolved to a checkout, never blindly the workdir — so the session reads its repo's rule files
+	// instead of a sibling's, and a grant scoped per-cwd cannot wall off the tree the task needs.
 	Repos map[string]string
 
-	// PrimaryRepo backs a session whose task names no repo (a fresh phase before the plane returns
-	// repos for everything). See Repos above.
 	PrimaryRepo string
 
-	// ProjectRoot says this target's workdir is a FLEET PROJECT ROOT: a directory holding this
-	// project's clones and its worktrees directory, with each session's checkout inside it.
 	ProjectRoot bool
 
-	// Releaser hands back a claim a session left holding.
+	// Releaser hands back a claim a session left holding. Nil disables the handback for this target,
+	// which costs only the reclaim an expiring lease would have cost anyway — so a target without
+	// one degrades, it does not break.
 	Releaser plane.Releaser
 
 	// Fleet reports this project's activity to the plane: a presence beacon on every backlog poll,
-	// state-change beacons at phase boundaries, and exactly one iteration record per drain.
+	// state-change beacons at phase boundaries, and exactly one iteration record per drain. Nil (not
+	// wired) disables reporting, which costs only console visibility — reporting is telemetry and is
+	// never load-bearing.
 	Fleet fleet.Reporter
 
-	// RCfg fetches this project's stored execution config.
 	RCfg plane.RunConfigReader
 
 	// Cfg is this target's EFFECTIVE config — the driver's base config with the project's stored
 	// run-config document overlaid — or nil when no document is in force, in which case every read
-	// falls through to d.cfg unchanged.
+	// falls through to d.cfg unchanged. Rebuilt between iterations when the poll's runConfigVersion
+	// moves — never mid-session.
 	Cfg *config.Config
 }
 
-// Driver runs the loop for one harness against one or more backlogs.
 type Driver struct {
 	cfg     *config.Config
 	h       harness.Adapter
@@ -103,24 +109,27 @@ type Driver struct {
 
 	// now is the clock the scheduled-pause check reads (at the poll gate and at a phase boundary), the
 	// route-window filter (routableRoutes) and route-mark expiry, so a pricing window and a mark can
-	// both be driven from a fixed clock in tests.
+	// both be driven from a fixed clock in tests. Three readers deliberately stay on the WALL clock:
+	// the back-off ladder in progress.go, loadRouteMarks (a persisted mark is an absolute instant
+	// written by a previous process, so it is loaded against real time) and routeRetryLabel (it
+	// renders an operator's clock).
 	now         func() time.Time
 	schedPaused bool
 
-	// echoOut is where an ENABLED session echo writes (cfg.EchoSessions true).
 	echoOut io.Writer
 
 	panelLaunch func(role string)
 
 	// panelRelease, when non-nil, is called with the member's index each time a PARALLEL panel member
-	// releases its successor, before that successor is unblocked.
+	// releases its successor, before that successor is unblocked. panelLaunch pins the launch ORDER;
+	// this pins the release POINT, which is the guarantee itself: a member must release from its
+	// launch boundary (phaseRunOpts.onSessionLaunch), not from its worktree being ready.
 	panelRelease func(k int)
 
-	// undeclared counts the sessions this run that ended still holding a task whose work they had
-	// already pushed — the phase did its job and then did not hand the task over.
 	undeclared int
 
-	// Per-target no-progress state.
+	// Per-target no-progress state. The gate cannot tell, so it spawns, the session correctly
+	// declines, and the operator pays for the same report every cycle.
 	quietTokens []int       // tokens spent on this target's drains that settled nothing
 	spent       []int       // the last drain's tokens, awaiting its progress verdict
 	baseline    []int       // settled count when this target's last drain began
@@ -128,7 +137,6 @@ type Driver struct {
 	pending     []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil   []time.Time // a backed-off target is ineligible until this time
 
-	// Per-target harness-failure state.
 	harnessFails []int
 	harnessErrs  []error
 
@@ -136,14 +144,17 @@ type Driver struct {
 	resumedTransients map[resumedTransientKey]int
 
 	// routeMarks is this instance's sticky memory of model routes that hit a usage limit: route alias
-	// -> the instant the mark expires.
+	// -> the instant the mark expires. A run moved off its free route stays on the paid one for later
+	// PHASES until the mark lifts, so the fleet does not flip between routes at every phase boundary;
+	// it goes back to free only when the free route's reset has passed.
 	routeMarks   map[string]time.Time
 	routeMarksMu sync.Mutex
 
-	// resumedTransientWait computes that wait from the streak: backoff(n) in production.
 	resumedTransientWait func(n int) time.Duration
 
-	// The fleet dead-phase counter.
+	// The fleet dead-phase counter. Per-target because a multi-target driver runs several projects,
+	// and "the fleet" is one project's sessions: a run of dead phases on project A must not pause
+	// project B.
 	fleetDead []int // consecutive dead phases across all tasks on this target
 
 	// fleetPaused marks a target whose fleet counter has tripped: the loop stops spawning sessions for
@@ -155,7 +166,10 @@ type Driver struct {
 
 	fleetOpenQ []int
 
-	// Per-target harness-startup-failure state.
+	// Per-target harness-startup-failure state. The two counters are deliberately distinct and one
+	// failure never ticks both: a dead phase returns err == nil (handled inside drainPhases, never
+	// reaching the sideline path), and a startup failure returns err != nil with tokens == 0 (never
+	// satisfying end.dead, which requires a held claim).
 	startupFails []int
 
 	startupPaused []bool
@@ -166,26 +180,23 @@ type Driver struct {
 
 	waitGrace time.Duration
 
-	// limitBeaconInterval is how often a paused wait re-beacons `limited`.
 	limitBeaconInterval time.Duration
 
 	leaseRenewalInterval time.Duration
 
-	// newVerifier builds the delivery checker for a workdir.
 	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
 
-	// newSalvager builds the stranded-work rescuer for a workdir.
 	newSalvager func(workdir string) workSalvager
 
 	// probePRBase reads the origin remote of the checkout in dir to resolve a repo's PR base when no
 	// pr_base override names one: whether refs/heads/<integration> exists on origin, and origin's
-	// default branch (its symbolic HEAD target).
+	// default branch (its symbolic HEAD target). Errors are NOT failures — the caller falls back to
+	// the configured integration_branch, exactly the text the briefs carried before this feature —
+	// so a probe that cannot run degrades to today's behaviour, never blocks a spawn.
 	probePRBase func(ctx context.Context, dir, integration string) (integrationOnOrigin bool, defaultBranch string, err error)
 
-	// originBranch reads what origin says about the task's branch, for the start-phase choice.
 	originBranch func(ctx context.Context, checkout, branch, doneTip string) originBranchFacts
 
-	// prepareWorktree prepares the task worktree every phase of a runner-claimed drain runs in.
 	prepareWorktree func(ctx context.Context, req worktreeRequest) (worktreePrep, error)
 
 	// worktreeCheck is the READ-ONLY pre-claim verdict on the task's existing worktree, made before
@@ -194,11 +205,8 @@ type Driver struct {
 
 	newAdapter func(name string) (harness.Adapter, error)
 
-	// stateMu serialises the run-scoped ledgers and maps below.
 	stateMu sync.Mutex
 
-	// The agent event channel's wiring: the trusted plane origin, the account key and the process-wide
-	// per-run sequence counter.
 	eventMu     sync.Mutex
 	eventOrigin string
 	eventKey    string
@@ -211,30 +219,27 @@ type Driver struct {
 	// claim deterministically reaches the operator instead of the queue.
 	startRefusals map[string]int
 
-	// claimFileMu serialises CURRENT_CLAIM writes.
 	claimFileMu sync.Mutex
 
-	// controlMu serialises control-marker CONSUMPTION and the RELOAD action.
 	controlMu sync.Mutex
 
 	deadTally map[tallyKey]*phaseTally
 
 	// panelFailStreak is how many consecutive TASKS each review-panel member has recorded nothing on,
-	// keyed by the member's log label (the positional `review-N` when unnamed).
+	// keyed by the member's log label (the positional `review-N` when unnamed). Like deadTally it is
+	// the run's account: one flaky member is a blip, but the same member failing task after task is a
+	// fault in that member's harness, model or brief, and the warning it earns must not depend on the
+	// drain boundary.
 	panelFailStreak map[string]int
 
-	// restartRequested flips when a RESTART / RESTART_NOW marker has been consumed and the run is
-	// unwinding toward a re-exec.
 	restartRequested atomic.Bool
 
 	expireUnsupportedOnce sync.Once
 
 	beaconWriteFailed atomic.Bool
 
-	// reloadConfig rebuilds the config for a RELOAD marker.
 	reloadConfig func() (*config.Config, error)
 
-	// restartPoll is how often the RESTART_NOW watcher polls the state dir.
 	restartPoll time.Duration
 
 	iter   []iterState
@@ -242,11 +247,13 @@ type Driver struct {
 
 	hold []holdState
 
-	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
 	hostname string
 	hostOnce sync.Once
 
-	// Per-target run-config state.
+	// Per-target run-config state. rcVersions holds the version each target's effective config was
+	// built from, -1 until the first fetch; the poll's runConfigVersion differing from it is the
+	// re-read signal, honoured exactly where STOP/RELOAD are: the ITERATION boundary (the poll only
+	// happens there), never mid-session.
 	rcVersions   []int
 	rcAttempt    []time.Time
 	rcAttemptVer []int
@@ -260,7 +267,8 @@ type Driver struct {
 	pausedTargets []time.Duration
 
 	// overlayBudget marks a target whose stored run-config document SET a budget: only that target's
-	// own spend is judged by it.
+	// own spend is judged by it. A document that sets no budget leaves the target in the local pool,
+	// because the README's exception is the document's budget, not its mere existence (see budget.go).
 	overlayBudget []bool
 
 	// exhausted marks a target that has reached the budget in force for it: no more sessions for it
@@ -271,32 +279,23 @@ type Driver struct {
 	overrides config.Overrides
 }
 
-// resumedTransientKey names the target a resumed phase's transient failure is charged to: the
-// project (its index in targets) and the harness the failed phase runs on.
 type resumedTransientKey struct {
 	target  int
 	harness string
 }
 
-// deliveryVerifier is the driver's view of internal/delivery, narrowed to the one call it makes.
 type deliveryVerifier interface {
 	Verify(ctx context.Context, c delivery.Claim) delivery.Report
 }
 
-// workSalvager is the driver's view of internal/salvage, narrowed the same way.
 type workSalvager interface {
-	// Salvage rescues the work a dead session left in a worktree.
 	Salvage(ctx context.Context, taskID, label string, recorded ...string) salvage.Outcome
 }
 
-// New builds a single-project Driver — the original mode, driven entirely by the top-level config
-// fields.
 func New(cfg *config.Config, h harness.Adapter, poller backlog.Poller) *Driver {
 	return NewMulti(cfg, h, []Target{{Poller: poller}})
 }
 
-// NewMulti builds a Driver over several targets: one loop instance, one account key, many project
-// queues — round-robin over whichever have claimable work.
 func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	d := &Driver{
@@ -355,7 +354,10 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	return d
 }
 
-// adapterFor resolves the harness that runs one phase.
+// adapterFor resolves the harness that runs one phase. config.Validate has already refused an
+// unregistered harness, so reaching here means the registry and the config disagree, and quietly
+// running the phase on the other harness would be the wrong half of a mixed sequence — the review
+// phase spawning on the implement harness, with nothing in the log to say so.
 func (d *Driver) adapterFor(ph config.Phase) (harness.Adapter, error) {
 	name := ph.Harness
 	if name == "" || name == d.cfg.Harness {
@@ -371,7 +373,6 @@ func (d *Driver) originBranchFn() func(ctx context.Context, checkout, branch, do
 	return readOriginBranch
 }
 
-// prepareWorktreeFn is prepareTaskWorktree, with the same nil fallback.
 func (d *Driver) prepareWorktreeFn() func(ctx context.Context, req worktreeRequest) (worktreePrep, error) {
 	if d.prepareWorktree != nil {
 		return d.prepareWorktree
@@ -379,7 +380,6 @@ func (d *Driver) prepareWorktreeFn() func(ctx context.Context, req worktreeReque
 	return prepareTaskWorktree
 }
 
-// worktreeCheckFn is claimWorktreeRefusal, with the same nil fallback.
 func (d *Driver) worktreeCheckFn() func(ctx context.Context, req worktreeRequest, doneTip string) (string, originBranchFacts, error) {
 	if d.worktreeCheck != nil {
 		return d.worktreeCheck

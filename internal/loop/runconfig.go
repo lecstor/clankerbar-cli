@@ -30,7 +30,10 @@ func (d *Driver) targetCfg(t Target) *config.Config {
 }
 
 // liveCfg is targetCfg re-read NOW: the same answer invocationFor gets, taken fresh at the moment
-// of asking rather than held from the drain's start.
+// of asking rather than held from the drain's start. A boundary hold calls it at every wake because
+// d.cfg is swapped by a RELOAD on another goroutine — it is read under controlMu the way
+// pauseState reads it — so the hold decides from the config the next spawn will use, not from a
+// schedule the operator has since removed.
 func (d *Driver) liveCfg(t Target) *config.Config {
 	if t.Cfg != nil {
 		return t.Cfg

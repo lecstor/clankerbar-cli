@@ -28,8 +28,6 @@ func checkBudget(cfg *config.Config) check {
 	if b.MaxWallClock < 0 {
 		bad = append(bad, "max_wall_clock")
 	}
-	// The same reading of a negative, one level down: a per-harness block's dials are guarded with `>
-	// 0` too (config.HarnessBudget.ExceededBy), so a negative there reads as a ceiling and is none.
 	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
 		hb := b.PerHarness[name]
 		if hb.MaxTokens < 0 {
@@ -76,8 +74,6 @@ func checkBudget(cfg *config.Config) check {
 	// reports cost that block is a ceiling in name only, and the remedy has to name the unit rather
 	// than the placement.
 	costOnlyInertHarness := ""
-	// Whether any spawned harness's block carries a token ceiling, for the enforced-between-sessions
-	// warning further down.
 	spawnedBlockTokens := false
 	for _, name := range spawned {
 		hb, _ := b.ForHarness(name)
@@ -92,8 +88,6 @@ func checkBudget(cfg *config.Config) check {
 	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
 		hb := b.PerHarness[name]
 		if !hb.CountsSpend() {
-			// A block with no dial at all - `"claude": {}`, or a mistyped key, since the config decoder
-			// ignores fields it does not know.
 			set = append(set, fmt.Sprintf("per_harness[%s]: no ceiling set (INERT)", name))
 			continue
 		}
@@ -120,7 +114,9 @@ func checkBudget(cfg *config.Config) check {
 			perHarnessLive = true
 		}
 	}
-	// Every ceiling this run has that can actually fire.
+	// Every ceiling this run has that can actually fire. The branches below ask this rather than "is
+	// anything configured", because a config whose only ceilings are inert has none at all - the
+	// CLA-288 reading, now including the two ways a per-harness block can be inert.
 	anyLive := b.MaxTokens > 0 || costLive || b.MaxWallClock > 0 || perHarnessLive
 
 	// The guards that were silently absent from the config that ran a 285.9M single session: doctor's
@@ -152,8 +148,6 @@ func checkBudget(cfg *config.Config) check {
 			"%s: set, but harness %q does not enforce a per-session wall-clock cap, so it is INERT there - drop it or run the harness that enforces it (opencode); %s",
 			dial, on, backstop))
 	}
-	// The complement, and the sharper case: the harness CAN enforce a session cap, takes no turn flag,
-	// has no mid-stream token ceiling — and the dial is unset.
 	if on := noSessionBackstop(cfg); on != "" {
 		guardNotes = append(guardNotes, fmt.Sprintf(
 			"max_session_wall_clock: unset, and harness %q has no turn cap and no mid-session token ceiling - so nothing bounds a single session there; a run that works past its brief is stopped only by a run-level ceiling",
@@ -170,8 +164,6 @@ func checkBudget(cfg *config.Config) check {
 			"max_iterations: 0 — no session cap: the loop stops only on a STOP/HALT marker, a signal or a budget ceiling (a dry backlog idle-polls rather than exiting); set max_iterations to bound a run window")
 		guardDials = append(guardDials, "max_iterations")
 	}
-	// copilot's adapter arms neither stream guard (docs/copilot-cli.md), so an operator who sets one
-	// for a copilot phase gets no protection.
 	if runsHarness(cfg, "copilot") {
 		if cfg.MaxRepeatedToolFailures != nil && *cfg.MaxRepeatedToolFailures > 0 {
 			guardNotes = append(guardNotes, fmt.Sprintf(
@@ -263,7 +255,11 @@ func checkBudget(cfg *config.Config) check {
 	return c
 }
 
-// harnessReportsCost asks the registry whether this harness ever populates Result.CostUSD.
+// harnessReportsCost asks the registry whether this harness ever populates Result.CostUSD. An
+// UNKNOWN harness is treated as reporting cost - i.e. the warning is withheld - because
+// config.Validate has already refused that name, so the only way to get here is a doctor run over a
+// config too broken to run at all, and warning about an inert dial on a harness that does not exist
+// would bury the real finding under a speculative one.
 func harnessReportsCost(name string) bool {
 	caps, ok := harness.CapabilitiesOf(name)
 	if !ok {
@@ -273,10 +269,8 @@ func harnessReportsCost(name string) bool {
 }
 
 // inertSessionWallClock names the wall-clock dial this config sets that will not be enforced, and
-// the harness it is inert ON - two empty strings when there is nothing to say. The run-wide
-// `max_session_wall_clock` reaches every phase, so it is only worth calling inert when NO harness
-// the run spawns honours it; if one does, the dial fires somewhere and saying otherwise would be
-// the reassuring falsehood this check exists to remove.
+// the harness it is inert ON - two empty strings when there is nothing to say. Judged PER
+// PHASE-HARNESS since CLA-366, because that is the level at which the question has an answer.
 func inertSessionWallClock(cfg *config.Config) (dial, on string) {
 	// Phase dials first, so the operator is pointed at the line they wrote - and read off cfg.Phases,
 	// NOT EffectivePhases, for exactly that reason: the effective phases have the run-wide dial
@@ -328,7 +322,9 @@ func harnessHonoursMaxTurns(name string) bool {
 
 // noSessionBackstop names a harness whose sessions in THIS run are bounded by NOTHING - it takes no
 // turn flag and kills on no token ceiling, and the phases it runs leave unset the one dial that
-// could bound it.
+// could bound it. Per phase-harness since CLA-366, and per phase within it: an unbounded opencode
+// implement phase is exactly as unbounded when a claude review phase runs after it, so asking only
+// about cfg.Harness would go silent on the very sequence this warning is for.
 func noSessionBackstop(cfg *config.Config) string {
 	for _, ph := range cfg.EffectivePhases() {
 		if ph.MaxWallClock > 0 {
@@ -344,7 +340,10 @@ func noSessionBackstop(cfg *config.Config) string {
 }
 
 // sessionTokenBounds renders the per-session runaway token ceiling for every harness this run
-// spawns that actually HAS one, or "" when none does.
+// spawns that actually HAS one, or "" when none does. Per harness for two reasons since CLA-366.
+// The ceiling itself is resolved per harness, so one number cannot describe a mixed run; and
+// whether the ceiling exists at all is a capability - codex has no mid-session ceiling, so listing
+// it with a number would claim a guard that never fires.
 func sessionTokenBounds(cfg *config.Config) string {
 	var parts, only []string
 	for _, h := range cfg.SpawnedHarnesses() {
@@ -367,7 +366,10 @@ func sessionTokenBounds(cfg *config.Config) string {
 
 // anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any session by the
 // built-in default rather than an operator-chosen cap — i.e. whether CLA-343's default is
-// load-bearing for this run.
+// load-bearing for this run. The effective phases resolve phase → top-level → default, so a
+// phase carrying DefaultMaxTurns is exactly a phase the operator never capped (an operator who set
+// the same number explicitly is indistinguishable, and the statement "the default applies" is still
+// true for them).
 func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
 	for _, ph := range cfg.EffectivePhases() {
 		if ph.MaxTurns == config.DefaultMaxTurns {

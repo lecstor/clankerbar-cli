@@ -41,7 +41,9 @@ func (d *Driver) hostnameOnce() string {
 }
 
 // fleetIdentity composes what every beacon for target ti carries: who it is, where it runs, what
-// build, which config.
+// build, which config. The fingerprint is the target's EFFECTIVE config — the CLA-410 overlay
+// when one is in force, else the base file, the same rule the drain reads through d.targetCfg —
+// because that is what the drain runs on.
 func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 	// A target INDEX, not a captured Target: the poll beacons a target before checkRunConfigVersion
 	// rebuilds its overlay, so a copy would fingerprint the document being replaced.
@@ -244,9 +246,6 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 // to correct.
 func (d *Driver) beaconLimited(resetAt time.Time) {
 	st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
-	// One daemon-wide state, one daemon-wide file: writeLocalBeacon takes no target, so writing it
-	// inside the per-target loop below would remove-then-create the identical bytes once per target on
-	// every lap.
 	d.writeLocalBeacon(st)
 	for i := range d.targets {
 		d.sendBeacon(i, d.targets[i], st)
@@ -269,7 +268,10 @@ func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
 }
 
 // pollBeaconState folds one target's presence into the daemon-wide state the poll pass writes to
-// the local BEACON.
+// the local BEACON. The file takes no target, so with several projects one of them has to speak for
+// the daemon, and target order must not decide which: a scheduled pause states the resume instant
+// the console's banner shows, so an idle or console-paused sibling polled later must not overwrite
+// it.
 func pollBeaconState(cur, next fleet.State) fleet.State {
 	switch {
 	case !isSchedulePause(cur) && isSchedulePause(next):
@@ -391,9 +393,6 @@ func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harne
 		d.iterMu.Lock()
 		select {
 		case <-done:
-			// stop() closed done while this snapshot was in flight: the session is over and the row is about
-			// to be cleared or handed to the next phase — revising it now would attribute work the session
-			// no longer owns.
 			d.iterMu.Unlock()
 			return
 		default:
@@ -439,6 +438,15 @@ func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase strin
 
 // endIteration clears the mid-drain marker and posts ONE iteration record with the outcome mapped
 // from what the loop already knows, riding the same report as the back-to-normal presence state.
+// Outcome precedence, decided once here so all four words mean one thing: - parked the dead-phase
+// budget parked the task (parkDeadPhase ran) - dead the drain ended on a death: a dead phase that
+// exhausted its retry/park paths, a fleet trip, or a returned error (zero-spend ladder,
+// unclassified ladder, repo_not_found...) - else the CLAIM's disposition at the boundary: pushed
+// work left for a successor takeover -> checkpoint; anything else (handed back to ready, or settled
+// by the session itself) -> released - nothing observed at all -> released, best-effort (the
+// iteration ran; exactly one record posts per iteration, always) Free text is NEVER an outcome:
+// marshalReport refuses the whole report on a word it does not know, so a note about the drain
+// belongs in the log.
 func (d *Driver) endIteration(ti int, t Target, rec fleet.Iteration) {
 	switch rec.Outcome {
 	case fleet.OutcomeCheckpoint, fleet.OutcomeReleased, fleet.OutcomeParked, fleet.OutcomeDead:
@@ -529,11 +537,8 @@ func (s *sessionSpend) add(a harness.Adapter, res harness.Result) {
 	}
 }
 
-// cost returns the pass's dollar figure as a pointer, or nil when it is unknown. Its zero is
-// silence, not "$0 spent", so the pass has no figure to publish — and the wire must not carry
-// one, because the plane refuses the WHOLE report with "session.costUsd requires
-// session.usageReported" and every other iteration in that batch, presence refresh included, is
-// lost with it.
+// cost returns the pass's dollar figure as a pointer, or nil when it is unknown. A figure only
+// counts as one when the pass actually REPORTED usage.
 func (s *sessionSpend) cost() *float64 {
 	if !s.costKnown || !s.usageReported {
 		return nil

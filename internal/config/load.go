@@ -54,8 +54,10 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
 	}
-	// CLA-639: whether the file named `review_panel` with a JSON ARRAY. Only an array counts as set:
-	// `null` carries no panel to honour.
+	// CLA-639: whether the file named `review_panel` with a JSON ARRAY. A present-but-empty array is
+	// the operator's own panel of none, which Validate refuses; absent (nil after unmarshal), or an
+	// explicit JSON `null` (what a marshalled config with no panel used to write), is the single
+	// reviewer, exactly as before the panel existed.
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err == nil {
 		if raw, ok := probe["review_panel"]; ok && strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {

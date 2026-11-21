@@ -28,10 +28,10 @@ func (claude) Name() string { return "claude" }
 // present one really does hand the session its clankerbar tools.
 func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfigClaudeJSON} }
 
-// newSessionResult is the Result a session starts from, before a byte of its stream is parsed.
-// Seeding leaves the stream to supply Settled/HasWIP on top: noteToolUse matches the progress and
-// terminal tools against this TaskID, which is precisely the arm that would otherwise never fire
-// for the phase that pushes the branch and opens the PR.
+// newSessionResult is the Result a session starts from, before a byte of its stream is parsed. A
+// resumed phase never calls claim_task — it was told to continue a run, not start one — so
+// without this its claim would be the zero value, and Result.Claim.Held() is what gates the
+// driver's handback, the CLA-314 salvage and the CLA-253 delivery check.
 func newSessionResult(in Invocation) Result {
 	res := Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
 	if in.NewEventSink != nil {
@@ -300,7 +300,9 @@ const (
 	escalateQuestionTool = "mcp__clankerbar__escalate_question"
 
 	// clankerbarToolPrefix is the namespace every clankerbar MCP tool carries, whichever adapter
-	// reported it.
+	// reported it. CLA-703 asks "did this session reach the backlog at all?", which is true of any
+	// successful call — get_task and heartbeat included — so the counter keys on the namespace,
+	// not on the handful of calls that carry claim state.
 	clankerbarToolPrefix = "mcp__clankerbar__"
 )
 
@@ -367,7 +369,8 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			status = args.Lane
 			res.expect(toolUseID, pendingSettle)
 		}
-		// The two claims the plane cannot check for itself.
+		// The two claims the plane cannot check for itself. Armed here, kept only if the call is
+		// accepted, and verified against local git once the session ends.
 		res.expectReport(toolUseID, Report{
 			TaskID:            res.Claim.TaskID,
 			Ref:               res.Claim.Ref,
@@ -474,7 +477,10 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 	// Any OnClaim watcher - the driver's lease renewer - learns the claim the moment the stream
 	// carries it, not when the process exits.
 	res.notifyClaim()
-	// Say it out loud.
+	// Say it out loud. Everything downstream is silent by design — a claim that is never observed
+	// produces no handback and no complaint, so without this line the feature could quietly stop
+	// working (a stream-shape change under a harness upgrade) and look exactly like a run that never
+	// claimed anything.
 	fmt.Fprintf(console, "  · holding %s (release on exit if nothing is pushed)\n", claimLabel(res.Claim))
 }
 
@@ -704,7 +710,9 @@ func (claude) parse(res *Result) {
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}
 }
 
-// claudeScope is how much of claude's output a scan is allowed to read.
+// claudeScope is how much of claude's output a scan is allowed to read. Both scans used to run over
+// the whole of Stdout+Stderr, and Stdout is the entire raw NDJSON stream: every assistant message,
+// and every `tool_result` block, which carries the verbatim MCP response to `claim_task`.
 type claudeScope int
 
 const (
@@ -810,10 +818,10 @@ func (claude) DetectLimit(res Result) Limit {
 }
 
 // claudeTransientRe anchors on the "API Error:" prefix (and bare connection errors) so a task log
-// that legitimately mentions an HTTP 500 can't be mistaken for a dead session. claudeText only
-// reads `result` when the CLI marked the session failed, which is the correct gate rather than a
-// gap: a session that keeps its partial output and exits zero is never classified at all, and one
-// that reports the turn as an error is exactly the one whose exit code brings the loop here.
+// that legitimately mentions an HTTP 500 can't be mistaken for a dead session. Claude Code's error
+// reference documents exactly three "the response above may be incomplete" variants, emitted when a
+// stream fails after Claude has completed a block of text or a tool call: API Error: Server error
+// mid-response.
 var claudeTransientRe = regexp.MustCompile(`(?i)api error: (408|429|5\d\d)` +
 	`|api error:.*(overloaded|internal server|bad gateway|service unavailable|gateway time|too many requests)` +
 	`|api error:.*(mid-response|mid-stream)` +
@@ -870,7 +878,8 @@ func (r *Result) markCeilingHit() {
 	r.Raw = map[string]any{"terminal_reason": tokenCeilingReason}
 }
 
-// Claude watches the session's clankerbar tool calls, so phases can run on it.
+// Claude watches the session's clankerbar tool calls, so phases can run on it. opencode does too as
+// of CLA-365; codex still does not.
 func (claude) Capabilities() Capabilities {
 	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
 }

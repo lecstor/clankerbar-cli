@@ -167,9 +167,6 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 	st.phaseResumed = s.carried != nil
 	opts := phaseRunOpts{taskDir: s.taskDir}
 	if s.runnerClaimed && s.carried != nil {
-		// baseSHA is the START prep's fact, and every later phase's diff needs it: the walk prepared the
-		// tree once, at the start, and this is how a review resumed at a later index still diffs from the
-		// merge-base.
 		opts.runner = &runnerBriefing{task: s.claimedTask, runID: s.carried.Claim.RunID, start: s.i == s.start, baseSHA: s.prep.BaseSHA}
 		if opts.runner.start {
 			opts.runner.prep = s.prep
@@ -195,7 +192,12 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 		s.seen = st.end.claim.Claim
 		s.finalOutcome = claimDisposition(st.end.claim)
 	}
-	// What, if anything, is still owed a handback.
+	// What, if anything, is still owed a handback. Three cases, and getting any of them wrong is a
+	// task either stranded on a dead lease or posted back to the queue over work already in review: -
+	// the phase handed the claim back itself → nothing is owed; - the phase observed claim state →
+	// that is now the authoritative view, including Settled and HasWIP, which releaseHeldClaim reads;
+	// - the phase observed nothing (it never launched) → KEEP the predecessor's, or a phase 2 that
+	// failed to start would silently drop the handback for the task phase 1 is still holding.
 	st.seamClaim = s.carried
 	switch {
 	case s.carried != nil && st.end.claim != nil && st.end.claim.Claim.TaskID != s.carried.Claim.TaskID:
@@ -236,7 +238,9 @@ func (s *drainSeq) judgeSequenceEnd(st *seqStep) seqNext {
 	d := s.d
 	tc := s.tc
 	ti := s.ti
-	// A run-level stop wins over a dead phase.
+	// A run-level stop wins over a dead phase. drainPhase returns stop=true for a budget trip and
+	// credit exhaustion (lim.Stop) — and on those paths end.dead can be set too (a credit-starved
+	// session is exactly the shape that dies on reason "unknown" with no branch).
 	if st.pstop {
 		s.stop = true
 		return seqBreak
@@ -253,9 +257,6 @@ func (s *drainSeq) judgeSequenceEnd(st *seqStep) seqNext {
 		return seqBreak
 	}
 
-	// CLA-662: a resumed phase that ended any OTHER way than the transient sequence-end above —
-	// completed, settled, died — breaks its target's streak: the next blip on that target+harness is
-	// not consecutive with the last, and starts the ladder over.
 	if st.phaseResumed {
 		d.clearResumedTransient(resumedTransientKey{target: ti, harness: tc.HarnessFor(st.ph)})
 	}

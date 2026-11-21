@@ -10,12 +10,11 @@ import (
 )
 
 // SessionPrioritySupported reports whether this platform can start a session's process tree at a
-// lowered scheduling priority.
+// lowered scheduling priority. A non-unix platform has no nice(1)/setpriority, so config validation
+// refuses a positive session_nice there rather than letting the dial be silently inert.
 const SessionPrioritySupported = false
 
-// sessionCommand builds the exec.Cmd for one session process. On this platform there is no
-// scheduling priority to apply: 0 is the unchanged shape, a positive value is an error rather than
-// a silent no-op, and a negative one is refused on every platform.
+// sessionCommand builds the exec.Cmd for one session process.
 func sessionCommand(ctx context.Context, niceValue int, name string, args ...string) (*exec.Cmd, error) {
 	if niceValue < 0 {
 		return nil, fmt.Errorf("session_nice %d is negative: a session can only be lowered below the daemon, never raised above it", niceValue)

@@ -27,7 +27,9 @@ func runnerDoneReport(fields string) string {
 		"report: end with one or the other, never both."
 }
 
-// runnerReportReminder repeats the report contract as the brief's LAST line.
+// runnerReportReminder repeats the report contract as the brief's LAST line. The full paragraph
+// sits mid-brief; a session that reads the whole brief and then writes a prose summary misses it,
+// so the one instruction it cannot complete the phase without gets the last word.
 const runnerReportReminder = " ONE LAST TIME: unless you are declaring a handoff, the LAST thing in your final " +
 	"message is the `" + DoneMarker + "` line and its ONE JSON object, with nothing after them. A session that " +
 	"ends without them has recorded nothing."

@@ -246,7 +246,10 @@ func doctorFailed(n int) error {
 
 // --- rendering ---------------------------------------------------------------
 
-// checkLabelWidth is the column the check names are padded to.
+// checkLabelWidth is the column the check names are padded to. Wide enough for the qualified labels
+// a mixed-harness run produces (`config_dir[opencode]`, `workdir[clankerbar:opencode]`), because
+// doctor output is read at a glance and one over-long name used to push every following detail out
+// of alignment.
 const checkLabelWidth = 28
 
 func printCheck(w io.Writer, c check) {

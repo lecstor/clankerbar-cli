@@ -33,11 +33,10 @@ func outputCapStallReasoning(res Result) int {
 	return n
 }
 
-// resumeOutputCapStall performs the one resume the stall earns. The guard's `Names` conjunct means
-// a claim-less stall (see above) cannot fold a claim its resume made — a conservative miss,
-// matching the probe's fold exactly, and not a guard to "fix" without changing both; - a clean
-// resume is merged with mergeResume, so the driver sees ONE session that was stalled and carried on
-// rather than two.
+// resumeOutputCapStall performs the one resume the stall earns. NO CLAIM GATE, deliberately, unlike
+// CLA-406's probe path: the probe needs a held ref to verify coherence against and declines without
+// one, while this resume asks nothing of the session and carries a steer that answers the shape
+// itself.
 func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) {
 	if ctx.Err() != nil {
 		// The run is ending under us; there is no turn left to save and a resume would be killed on

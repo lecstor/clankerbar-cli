@@ -15,7 +15,8 @@ import (
 )
 
 // findingIDRound parses the round prefix out of a plane finding id (`<round>.<reviewer role>.<n>`,
-// B13).
+// B13). The plane assigns and serves these namespaced ids; the driver reads the round back rather
+// than tracking one of its own, so the derivation survives a takeover.
 func findingIDRound(id string) (int, bool) {
 	dot := strings.Index(id, ".")
 	if dot <= 0 {
@@ -174,7 +175,9 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 			unserved = append(unserved, fmt.Sprintf("%s: %d of %d finding(s) not served", r.ReviewerRole, r.FindingsTotal-len(r.Findings), r.FindingsTotal))
 		}
 		for _, f := range r.Findings {
-			// A finding the plane already shows settled is not open work.
+			// A finding the plane already shows settled is not open work. The statuses are the plane's own:
+			// "", "open", "fixed", "refuted", "filed", and any future one is treated as NOT open — a
+			// status the driver does not know is not evidence that work remains.
 			switch f.Status {
 			case "", "open":
 			default:

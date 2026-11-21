@@ -12,7 +12,10 @@ import (
 func (r *phaseRun) judgeVerifyRound(ctx context.Context, at *phaseAttempt) {
 	d := r.d
 	t := r.t
-	// The verification seam runs even on the LAST phase.
+	// The verification seam runs even on the LAST phase. Unlike every other terminal phase its
+	// evidence is not a checkpoint (nothing follows to resume) but the durable record plus the
+	// open-MUST set: that set is what decides whether ANOTHER fix is spawned, whether the sequence is
+	// done, or whether the round cap parks the task.
 	r.end.verifyChecked = true
 	r.end.branch, at.evidenceTip, at.evidenceOK, at.evidenceUnverified, at.evidenceWhy = d.checkpointEvidence(ctx, t, at.res, at.inv.WorkDir, &r.review)
 	if !at.evidenceOK {
@@ -91,8 +94,6 @@ func (r *phaseRun) judgeReviewRecord(ctx context.Context, at *phaseAttempt) {
 	if r.review.state == "sealed" {
 		r.end.reviewRound = r.review.round
 	}
-	// CLA-637: the review phase's durable record is SEALED — the plane withholds its findings from
-	// every reader until the driver closes the round.
 	optionalOnly := panelOptional && !panel.recorded
 	if at.evidenceOK && r.review.required && r.review.round > 0 && r.review.state == "sealed" && at.handoff == "" && !nextReviewShaped && !opts.panelParallel && !optionalOnly {
 		if cerr := d.closeReviewRound(ctx, t, at.res, r.review.round); cerr != nil {
@@ -129,8 +130,6 @@ func (r *phaseRun) classifyEmpty(at *phaseAttempt) {
 	if at.noMCPNow && r.mcpRetried {
 		// The retry ended the same way: this is the final classification.
 		r.end.noMCP = true
-		// The generic dead booking (if the retry happened to look like a death) and the held-but-empty
-		// booking below both belong to dead/ empty, not to an infrastructure miss.
 		if at.bookedDead {
 			d.unbookDead(ph.Label(phaseIdx), tc.HarnessFor(ph))
 		}
@@ -161,7 +160,9 @@ func (r *phaseRun) holdCheckpoint(ctx context.Context, at *phaseAttempt) {
 			r.end.claim.Claim.Branch = ""
 		}
 		r.end.claim.CheckpointUnverified = at.evidenceUnverified
-		// CLA-637: the origin tip the verified branch check read.
+		// CLA-637: the origin tip the verified branch check read. The review brief hands it to the
+		// reviewer as the revision to check out and record, and the seam matches the record's reviewedTip
+		// against it.
 		r.end.claim.CheckpointTip = at.evidenceTip
 		// CLA-685: a HANDOFF is the one checkpoint this session's own exit did not earn — it holds only
 		// because the successor continues THIS phase, which the claim carried in as `prev` opened.

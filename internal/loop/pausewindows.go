@@ -27,8 +27,6 @@ func (d *Driver) scheduledPause() bool {
 	switch {
 	case active && !d.schedPaused:
 		d.schedPaused = true
-		// until carries the window's own zone, so the line names the operator's local resume time rather
-		// than the daemon's.
 		log.Printf("scheduled pause active until %s (%s) — not spawning new sessions; idle-polling until it ends",
 			until.Format("Mon 15:04 MST"), pw.Describe())
 	case !active && d.schedPaused:
@@ -39,7 +37,9 @@ func (d *Driver) scheduledPause() bool {
 }
 
 // pauseState is scheduledPause's read without its transition logging: whether a window is in force
-// now, the instant it ends, and its schedule for a log line.
+// now, the instant it ends, and its schedule for a log line. d.cfg is read under controlMu because
+// a RELOAD swaps it on another goroutine (a panel member parked in waitResponsive), and since
+// CLA-908 this is reachable from the lease renewer's presence lap as well as the loop.
 func (d *Driver) pauseState() (active bool, until time.Time, pw *config.PauseWindows) {
 	d.controlMu.Lock()
 	if d.cfg != nil {

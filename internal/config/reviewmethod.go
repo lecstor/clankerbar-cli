@@ -1,7 +1,5 @@
 package config
 
-// reviewmethod.go — how a review phase produces its findings.
-
 import (
 	"fmt"
 	"strings"
@@ -9,7 +7,6 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// The review methods a phase or panel member may name.
 const (
 	ReviewMethodSinglePass  = "single-pass"
 	ReviewMethodMapsSession = "maps-session"
@@ -103,7 +100,9 @@ func (o MapsSessionOptions) Resolved() MapsSessionOptions {
 // StageModels resolves the model each stage runs on for a phase whose resolved model is phaseModel:
 // a stage's own model wins, an empty one inherits the phase's, and a findings stage with neither
 // runs on the notes stage's model — a live session cannot return to the harness's own default
-// mid-conversation, so the notes model is what the findings turn actually produces.
+// mid-conversation, so the notes model is what the findings turn actually produces. The runner and
+// doctor both read this one function so the record and the preflight cannot disagree about which
+// model wrote the findings.
 func (o MapsSessionOptions) StageModels(phaseModel string) (notes, findings string) {
 	notes = o.NotesModel
 	if notes == "" {

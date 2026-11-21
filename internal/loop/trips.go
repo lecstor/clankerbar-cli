@@ -10,7 +10,9 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// deadReason renders the finish reason a dead phase was classified on, for a log line.
+// deadReason renders the finish reason a dead phase was classified on, for a log line. The
+// classification fired on FinishReasonUnknown, so a nil claim — a session that observed no task
+// — still has a reason to name.
 func deadReason(res *harness.Result) string {
 	if res != nil {
 		if r, ok := res.Raw[harness.TerminalReasonKey].(string); ok && r != "" {
@@ -35,9 +37,9 @@ func outputCapStallReasoning(res harness.Result) (int, bool) {
 	return n, true
 }
 
-// openCallKill reports that this session's kill landed while a tool call was open. In practice that
-// is the TOOL CAP: the guard pauses the idle clock while a call is open precisely so the cap, not
-// the idle clock, ends it, and an adapter reports the open call alongside whatever ended it.
+// openCallKill reports that this session's kill landed while a tool call was open. Only the adapter
+// can see that window, so the predicate reads its verdict rather than re-deriving one from the
+// cause string.
 func openCallKill(res *harness.Result) bool {
 	return res != nil && res.IdleKilled != "" && res.IdleToolCall
 }
@@ -152,7 +154,9 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 		log.Printf("%sdead-phase park: no claim observed, so there is no task to park", labelOf(t))
 		return
 	}
-	// How the sessions died.
+	// How the sessions died. A CLA-739 tool-loop kill is dead whatever it pushed, so "no branch
+	// recorded" may be false for it and the finish reason says nothing: the cause names what happened
+	// instead.
 	death := fmt.Sprintf("died producing nothing (final step reason %q, no branch recorded)", deadReason(res))
 	switch {
 	case res.ReportResumeFailed != "":

@@ -35,18 +35,16 @@ type Config struct {
 	Model string `json:"model"`
 
 	// Models is the operator's own tier map: bucket name -> harness-specific model alias, e.g.
-	// {"strong": "opus", "standard": "sonnet", "cheap": "haiku"}.
+	// {"strong": "opus", "standard": "sonnet", "cheap": "haiku"}. A phase names a BUCKET (Phase.Tier),
+	// never an alias.
 	Models map[string]string `json:"models"`
 
-	// Harnesses carries the per-harness invocation fields for a run whose phases are not all on one
-	// harness: harness name -> HarnessConfig.
 	Harnesses map[string]HarnessConfig `json:"harnesses"`
 
-	// Prompt is what each fresh session is asked to do.
+	// Prompt is what each fresh session is asked to do. One task is the default for two reasons, and
+	// only the second is unconditional.
 	Prompt string `json:"prompt"`
 
-	// Phases splits ONE task across several sessions, so its context resets at a checkpoint the model
-	// cannot reach itself. OPT-IN, and deliberately so.
 	Phases []Phase `json:"phases"`
 
 	Conflict *ConflictStep `json:"conflict,omitempty"`
@@ -64,13 +62,18 @@ type Config struct {
 	ProjectRoot bool `json:"project_root,omitempty"`
 
 	// CloneURLBase is the URL PREFIX the supervisor clones a project's missing repos from:
-	// <base><owner>/<name>.git.
+	// <base><owner>/<name>.git. Empty means the built-in DefaultCloneURLBase (`https://github.com/`),
+	// so a config that never mentions the key clones exactly as it always did.
 	CloneURLBase string `json:"clone_url_base,omitempty"`
 
 	ConfigDir string `json:"config_dir"`
 
 	MCPConfigPath string `json:"mcp_config_path"`
 
+	// InstanceName names this daemon on the console's Fleet page: presence beacons are keyed per
+	// (project, instance name), so this is how two daemons driving the same project stay
+	// distinguishable. The plane caps the name at 100 characters — Validate refuses longer here, so
+	// a too-long name fails loudly at startup instead of silently dropping every beacon.
 	InstanceName string `json:"instance_name"`
 
 	MaxIterations int `json:"max_iterations"`
@@ -83,40 +86,34 @@ type Config struct {
 
 	IdlePollInterval Duration `json:"idle_poll_interval"`
 
-	// PauseWindows is the operator's recurring local-time schedule of hours in which the loop starts
-	// no new work — checked between iterations, like the console pause, AND at every phase boundary.
 	PauseWindows *PauseWindows `json:"pause_windows,omitempty"`
 
 	// RouteSchedules are NAMED pricing schedules a route can be attached to, keyed by schedule name.
 	RouteSchedules map[string]*RouteSchedule `json:"route_schedules,omitempty"`
 
-	// RouteWindows attaches a route ID (the exact model string the driver iterates) to a
-	// RouteSchedules entry.
 	RouteWindows map[string]string `json:"route_windows,omitempty"`
 
 	// BacklogURL is the clankerbar base URL the driver reads backlog counts from (cheap, no tokens).
 	BacklogURL string `json:"backlog_url"`
 
 	// MaxRetries bounds consecutive transient-failure retries within one drain before the loop gives
-	// up.
+	// up. 0 = never give up (keep retrying at the backoff ceiling until the API recovers) — the
+	// right default for a persistent daemon.
 	MaxRetries int `json:"max_retries"`
 
 	RetryCap Duration `json:"retry_cap"`
 
-	// MaxZeroSpendAttempts bounds consecutive attempts within one drain that ended without the harness
-	// reporting any usage at all.
 	MaxZeroSpendAttempts int `json:"max_zero_spend_attempts"`
 
 	// MaxRepeatedToolFailures ends a session whose SAME tool returns the SAME error on this many
-	// consecutive tool calls.
+	// consecutive tool calls. Unset = the built-in default (DefaultMaxRepeatedToolFailures); 0 turns
+	// the check off; negative is refused.
 	MaxRepeatedToolFailures *int `json:"max_repeated_tool_failures,omitempty"`
 
 	SessionIdle map[string]IdleBounds `json:"session_idle,omitempty"`
 
 	SessionNice int `json:"session_nice,omitempty"`
 
-	// EchoSessions mirrors each session's output stream to the daemon's own stderr while it runs, as
-	// well as to its iteration log.
 	EchoSessions bool `json:"echo_sessions,omitempty"`
 
 	Budget Budget `json:"budget"`
@@ -125,17 +122,14 @@ type Config struct {
 
 	SettingsPath string `json:"settings_path"`
 
-	// Repos maps the repos a project's tasks may name to their local checkouts, so a session starts in
-	// the TASK's repo rather than in the multi-repo parent (agent-rule-scoping pieces 2 and 3).
 	Repos map[string]string `json:"repos"`
 
 	PrimaryRepo string `json:"primary_repo"`
 
-	// Escalation holds the mechanical review-tier escalation rules.
+	// Escalation holds the mechanical review-tier escalation rules. The CLI evaluates them at
+	// review-spawn time; the plane holds only the execution-config reference to them.
 	Escalation Escalation `json:"escalation"`
 
-	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup refusal: a delivery whose
-	// PR carries NO checks is logged as a WARNING instead of refused.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
 
 	HealthURL string `json:"health_url"`
@@ -153,13 +147,16 @@ type Config struct {
 	NoEvents bool `json:"-"`
 
 	// Projects declares the backlogs a single loop instance drives — one entry per clankerbar
-	// project.
+	// project. The account key in CLANKERBAR_API_KEY covers every project the operator is a member of;
+	// per-project keys are never needed.
 	Projects []Project `json:"projects"`
 
+	// Env is extra environment for the spawned harness process.
 	Env EnvMap `json:"env"`
 
 	// EnvAllowlist, when non-empty, is the COMPLETE set of inherited environment variable NAMES a
-	// spawned session receives.
+	// spawned session receives. Variables not named here are dropped from the harness process, so the
+	// session cannot read the tokens that happen to sit in the shell that started the supervisor.
 	EnvAllowlist []string `json:"env_allowlist,omitempty"`
 
 	source string // path the config was loaded from, for diagnostics
@@ -182,7 +179,9 @@ type Project struct {
 	mcpDiscovered bool
 
 	// MCPConfigPaths is this project's MCP config PER HARNESS (harness name -> path), for a run whose
-	// phases are not all on one harness.
+	// phases are not all on one harness. MCPConfigPath above selects the PROJECT (its `/mcp/<slug>`
+	// URL is what the poll and the sessions agree on), while the file's SCHEMA belongs to a harness
+	// — opencode refuses to start on Claude's `mcpServers`.
 	MCPConfigPaths map[string]string `json:"mcp_config_paths"`
 
 	// Env is this project's extra session environment, overlaid on top of the top-level env map for
@@ -198,7 +197,8 @@ type Project struct {
 	EnvAllowlistPerHarness map[string][]string `json:"env_allowlist_per_harness,omitempty"`
 
 	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the top-level field of the same
-	// name for this project only.
+	// name for this project only. See Config.AllowUncheckedPR for what it does and why the default
+	// refuses.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
 
 	// HealthURL is this project's deployment health endpoint (`/health`), overriding the top-level

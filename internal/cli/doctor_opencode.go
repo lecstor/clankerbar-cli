@@ -250,8 +250,9 @@ func checkOpencodePermissions(cfg *config.Config, label, harnessName string) che
 
 // checkOpencodeMCPDisables flags MCP entries in the opencode mcp config files that carry no `type`:
 // partial entries such as `"context7": {"enabled": false}`, meant to switch off a server the global
-// config declares. The adapter cannot repair it either: it moves only typed entries out of the 1.x
-// dialect, because a typeless one is not a server it can describe.
+// config declares. Verified on 2.0.32, a partial entry in a later layer does NOT stop that server,
+// in either dialect (`servers.X: {"disabled": true}` included); only a full entry with its `type`
+// and `command`/`url` and the off switch does.
 func checkOpencodeMCPDisables(cfg *config.Config) []check {
 	if !slices.Contains(cfg.SpawnedHarnesses(), "opencode") {
 		return nil

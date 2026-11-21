@@ -23,43 +23,43 @@ type drainSeq struct {
 	rawPhases []config.Phase
 	fixIdx    int
 
-	// i is the index of the phase being run.
-	i int
-	// start is the index the walk begins at.
+	i     int
 	start int
 	// runnerClaimed reports that the RUNNER, not a session, holds this drain's claim, so a retry must
 	// re-claim before it respawns.
 	runnerClaimed bool
-	// claimedTask is the brief behind a runner-claimed drain's claim, kept for the start-phase wiring.
-	claimedTask plane.TaskBrief
-	taskDir     string
-	// prep is what preparing taskDir did (merge result, conflicts), for the brief.
-	prep worktreePrep
-	// closeOut marks a close-out claim, which takes the close-out brief.
-	closeOut bool
+	claimedTask   plane.TaskBrief
+	taskDir       string
+	prep          worktreePrep
+	closeOut      bool
 	// preClaimOrigin is the origin read the pre-claim worktree check made, keyed to
-	// preClaimTask/preClaimCheckout.
+	// preClaimTask/preClaimCheckout. prepareStart consumes it ONCE: a retry after a long session must
+	// re-derive origin rather than resume on a stale read.
 	preClaimOrigin   originBranchFacts
 	preClaimTask     string
 	preClaimCheckout string
 
-	// What the drain returns.
 	tokens   int
 	cost     float64
 	handoffs int
 	stop     bool
 	err      error
 
-	// MUST ids a verifier has already marked resolved in THIS drain.
+	// MUST ids a verifier has already marked resolved in THIS drain. In-memory on purpose: it is a
+	// courtesy layer over the durable round-prefix check, which survives a takeover on its own because
+	// it reads the plane's round numbers.
 	verifyResolved map[string]bool
 	// Verification rounds this drain has actually closed.
 	verifyRoundsRun int
 	// CLA-639: the panel's members that wrote no record this round, and the round the panel's released
-	// records landed in.
+	// records landed in. A dead, capped or otherwise record-less member does not stop the panel: it is
+	// listed here, the round still closes, and the fix phase is told the panel was incomplete.
 	panelIncomplete []string
 	panelRound      int
 	// CLA-639 M4: whether any REQUIRED member of this panel recorded, and why each member that did NOT
-	// failed.
+	// failed. The first decides whether a failed LAST member hands the round to the fix phase (there
+	// is something to apply) or ends the drain; the second rides the fix brief, so "the panel was
+	// incomplete" names the members AND what happened to them.
 	panelRecorded        bool
 	panelFailed          map[string]panelMemberFailure
 	branchlessPanelNoted bool
@@ -70,18 +70,21 @@ type drainSeq struct {
 	panelFanOutOff        bool
 	// The claim a phase deliberately left held for its successor, and the source of the task/run ids
 	// that successor's prompt needs.
-	carried *harness.Result
-	// A session-authored successor prompt, pending from the last session's handoff block.
+	carried    *harness.Result
 	nextPrompt string
 	chain      int // consecutive handoff respawns, against handoffChainCap
 	spawned    int // sessions this drain has launched, phase or respawn
-	// Consecutive dead phases this TASK has produced.
-	deadRetries int
-	deadTask    string
-	// Consecutive held-but-empty implement exits in this drain.
+	// Consecutive dead phases this TASK has produced. deadTask names which task the counter counts
+	// for, because the retry is a fresh claiming session (the dead claim was handed back): if
+	// next_task hands it a DIFFERENT task, that task has died once, not twice, and must not be parked
+	// for a second death it did not have (review finding).
+	deadRetries  int
+	deadTask     string
 	emptyRetries int
 	// Whether the checkpoint that opened the CURRENT phase was evidenced by the plane's record rather
-	// than a verified branch.
+	// than a verified branch. Set at each seam from the claim carried INTO the phase; a handoff
+	// respawn continues the same phase and must keep the value, so it is never recomputed at the loop
+	// head (where `carried` has already become the phase's own claim).
 	branchlessCheckpoint bool
 	drainStart           time.Time
 	phasesRun            []string // distinct phase labels attempted, in order
@@ -91,9 +94,10 @@ type drainSeq struct {
 	tripFired            bool // the fleet dead counter tripped and paused this target
 	// finalOutcome is the CLAIM's disposition at the drain boundary: one of the fleet.Outcome*
 	// constants, or "" when nothing was observed (no claim state at all, or claimDisposition's nil
-	// return).
-	finalOutcome string
-	// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end signal asks the run for.
+	// return). Never append prose to it: marshalReport refuses the WHOLE report on a word it does not
+	// know, so free text here loses the iteration record AND the presence refresh riding the same
+	// report.
+	finalOutcome  string
 	limitWait     *phaseLimitWait
 	transientRung int
 	transientKey  resumedTransientKey
@@ -105,8 +109,6 @@ type drainSeq struct {
 	lastProducedNothing bool
 }
 
-// recordIteration posts the one iteration record for this drain, whatever way it ended, and logs an
-// incomplete review panel.
 func (s *drainSeq) recordIteration() {
 	d := s.d
 	t := s.t
@@ -136,7 +138,6 @@ func (s *drainSeq) recordIteration() {
 	})
 }
 
-// seqStep is one pass through the walk: the phase it ran and how that phase ended.
 type seqStep struct {
 	ph           config.Phase
 	panelMember  bool
@@ -154,7 +155,6 @@ type seqStep struct {
 	perr         error
 }
 
-// seqNext says what the walk does after a stage.
 type seqNext int
 
 const (

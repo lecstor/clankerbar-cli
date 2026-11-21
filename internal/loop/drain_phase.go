@@ -108,7 +108,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if !at.res.Claim.Held() {
 			at.canCheckpoint = false
 		}
-		// CLA-457: held-ness alone must never advance the seam.
+		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the driver's lease renewer
+		// renews a claim for a session's whole lifetime, so ANY session that claimed ends held — "still
+		// holding" is a constant, not a checkpoint signal.
 		at.evidenceOK = true
 		at.evidenceUnverified = false
 		at.evidenceWhy = ""
@@ -134,9 +136,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			r.end.producedNothing = false
 			r.end.empty = false
 		}
-		// Then check what it said it delivered. After the handback, because a dead lease is
-		// time-sensitive and a git check is not; on every exit, because a session that pushed nothing and
-		// died is exactly as likely to have recorded a branch as one that finished cleanly.
+		// Then check what it said it delivered.
 		d.verifyDeliveries(ctx, t, at.res, at.inv.WorkDir)
 
 		switch v := r.endOnInvokeError(ctx, at); v.next {

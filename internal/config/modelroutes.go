@@ -44,7 +44,9 @@ func (m *ModelRoutes) UnmarshalJSON(b []byte) error {
 }
 
 // MarshalJSON emits a plain string for zero or one route and only uses the array form when there is
-// a choice to make.
+// a choice to make. The zero case is load-bearing for Config.Identity(): these fields marshal
+// without `omitempty` (the historical tags), so an unset field used to write `"model":""` and must
+// keep writing exactly that.
 func (m ModelRoutes) MarshalJSON() ([]byte, error) {
 	switch len(m) {
 	case 0:

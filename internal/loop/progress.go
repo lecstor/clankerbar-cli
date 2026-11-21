@@ -31,7 +31,10 @@ func quietBackoff(rung int) time.Duration {
 // version.
 const quietThreshold = 3
 
-// quietTokenThreshold is the token-denominated replacement for the old session-count trigger.
+// quietTokenThreshold is the token-denominated replacement for the old session-count trigger. The
+// drift is deliberate and lenient, and it buys the property the session count could never give: ONE
+// huge fruitless drain trips the first 15-minute sit-out on its own — the 285.9M runaway would
+// have earned it at under a third of its spend instead of running three sessions past it.
 const quietTokenThreshold = 80_000_000
 
 // judgeProgress reads this poll as the verdict on the target's last drain, and backs the target off
@@ -92,9 +95,6 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	answered := openQs < wasOpen
 	d.quietTokens[i] += spent
 	d.baseline[i], d.openQs[i] = settled, openQs
-	// Bands, matching the old session-count ladder at the ~26M-per-drain calibration: 3 fruitless
-	// drains (~78M) earned 15m, 4 (~104M) earned 30m, 5 (~130M) earned 1h, 6+ (~156M) earned the 2h
-	// cap.
 	if d.quietTokens[i] < quietTokenThreshold {
 		return
 	}
@@ -105,7 +105,9 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	}
 	wait := quietBackoff(2 + d.quietTokens[i]/quietTokenThreshold)
 	d.skipUntil[i] = time.Now().Add(wait)
-	// Name the RIGHT cause.
+	// Name the RIGHT cause. The original sentence asserts there is claimable work and lists the
+	// reasons a ready task resists being finished — all of which are wrong, and misdirecting, when
+	// the only thing that opened the gate was an abandoned branch.
 	if sum.Claimable == 0 && sum.StaleClaimable > 0 {
 		log.Printf("%s%d tokens spent on sessions that settled nothing — backing off for %s. Nothing is READY; the sessions were spawned to recover %d abandoned branch(es), and are not finishing them. Check the last iteration log, and the branch itself.",
 			d.prefix(i), d.quietTokens[i], wait, sum.StaleClaimable)

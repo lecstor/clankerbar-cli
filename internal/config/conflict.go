@@ -13,7 +13,9 @@ type ConflictStep struct {
 	Harness string `json:"harness,omitempty"`
 
 	// Model pins the model alias (or an ordered route list, like a phase's own `model`) directly,
-	// skipping the tier map.
+	// skipping the tier map. Empty = the implement step's WHOLE route list, so the conflict session
+	// inherits the fallback chain that implemented the branch rather than its first entry alone: a
+	// quota on the first route is exactly the case the list exists for.
 	Model ModelRoutes `json:"model,omitempty"`
 
 	// MaxTurns caps the session's turns (harness permitting). 0 = the fleet's effective cap, exactly
@@ -144,9 +146,9 @@ func ConflictResolution(outcome string) (kind, detail string, ok bool) {
 }
 
 // ConflictResolutionSince reads the marker THIS session appended, given the outcome the claim
-// response served BEFORE the session (prior) and the outcome served after it (current). Otherwise
-// the session's own text is the suffix it appended to the stored outcome, and the LAST marker in it
-// wins.
+// response served BEFORE the session (prior) and the outcome served after it (current). An
+// unchanged outcome means the session wrote nothing, and therefore left no marker — the
+// accumulated text's older markers belong to earlier attempts and must not classify this one.
 func ConflictResolutionSince(prior, current string) (kind, detail string, ok bool) {
 	if strings.TrimSpace(current) == strings.TrimSpace(prior) {
 		return "", "", false
@@ -179,9 +181,14 @@ type ConflictBriefInput struct {
 	Gate string
 }
 
-// ConflictBrief renders the short brief a conflict-only session runs. The outcome markers are
-// load-bearing rather than decorative: the supervisor reads them after the session ends to tell a
-// mechanical hand-back from a failed one, because both leave the task in the same plane status.
+// ConflictBrief renders the short brief a conflict-only session runs. The instructions are the
+// task's own contract: - merge, NEVER rebase: the branch is already pushed, and rewriting published
+// history invalidates the fleet's tip checks; - resolve ONLY the conflicting hunks: no unrelated
+// edits, no formatter sweep, no dependency bump hiding inside a conflict resolution; - run the
+// repo-wide gate and push; - then hand back in exactly one of three states: mechanical (the task
+// stays approved for the deterministic close-out), behavioural/unsure (the code changed behaviour,
+// so it goes back to review) or failed (the claim is released and the task stays approved for the
+// agent close-out).
 func ConflictBrief(in ConflictBriefInput) string {
 	paths := strings.Join(in.Paths, ", ")
 	if paths == "" {

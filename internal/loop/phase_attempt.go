@@ -23,14 +23,21 @@ func (r *phaseRun) checkBreakers(ctx context.Context) attemptVerdict {
 	drainNum := r.drainNum
 	prior := r.prior
 	a := r.a
-	// The breaker, from inside the drain.
+	// The breaker, from inside the drain. Every path that loops back here has just waited — a
+	// supervised wait on a usage limit, an exponential backoff on a transient blip — and each of
+	// those waits used to be unbounded by anything but the wall clock, which is only one of three
+	// dials and the one an operator is least likely to have set.
 	if v := d.budgetStop(r.ti, time.Since(prior.start)); v.dim != "" {
 		log.Printf("iteration %d: budget reached mid-drain: %s — ending this drain (tokens=%d cost=$%.2f elapsed=%s)",
 			drainNum, v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 		return attemptVerdict{next: attemptReturn, stop: true}
 	}
 
-	// The breaker's blind spot, bounded.
+	// The breaker's blind spot, bounded. The check above can only stop spend it was told about; an
+	// attempt that died before its harness reported usage added nothing to either accumulator, so a
+	// ladder of those attempts leaves a token or cost ceiling permanently unreachable and only
+	// max_wall_clock - the dial an operator is least likely to have set as a spend bound - can end the
+	// run.
 	if bound := d.cfg.ZeroSpendAttemptBound(); r.noUsage >= bound {
 		return attemptVerdict{next: attemptReturn, err: fmt.Errorf(
 			"iteration %d: %w: %d consecutive attempts died before %s reported any usage, so nothing the budget breaker reads was ever fed - the sessions are failing early rather than working (see the attempt logs in the state dir; raise max_zero_spend_attempts to allow more)",
@@ -55,10 +62,11 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	prBase := r.prBase
 	fixGrading := r.fixGrading
 	verifyDigest := r.verifyDigest
-	// Each attempt streams live to the terminal and to its own logfile.
 	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
 	if at.ierr != nil {
-		// CLA-947: every route is inside a pricing window.
+		// CLA-947: every route is inside a pricing window. windowHeld marks it as a scheduling condition
+		// rather than a failed phase (review 1.review-1.6): the claim goes back through the ordinary
+		// no-checkpoint path and the next drain's boundary holds the spawn until the window ends.
 		var blocked *routeWindowBlocked
 		if errors.As(at.ierr, &blocked) {
 			log.Printf("%siteration %d: %v — the boundary will hold the next spawn until it ends", labelOf(t), drainNum, blocked)
@@ -89,7 +97,6 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	if opts.runner != nil {
 		at.inv.Prompt = r.runnerContextBlock(at) + "\n\n---\n\n" + at.inv.Prompt
 	}
-	// The maps-session method turns this one review session into a sequence.
 	plan, perr := r.mapsSessionPlanFor(at)
 	if perr != nil {
 		return attemptVerdict{next: attemptReturn, zeroSpend: true, err: fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), perr)}
@@ -134,7 +141,10 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	f, ferr := d.state.Create(logName)
 	at.logPath = filepath.Join(d.state.Path(), logName)
 	// The console is where the adapter streams the session: the file, and NOT the terminal unless the
-	// operator asked for the echo.
+	// operator asked for the echo. The stream is the whole harness transcript — prompts, tool
+	// arguments, tool output — and once it also went to the daemon's stderr it left only the last
+	// few minutes of one session in the operator's scrollback, with none of the daemon's own lines
+	// beside it.
 	var echo io.Writer
 	if d.cfg.EchoSessions {
 		echo = d.echoOut
@@ -160,7 +170,8 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 		at.inv.Console = echo
 		sink = fmt.Sprintf("log: none (could not open %s: %v - the session's stream goes to the terminal)", at.logPath, ferr)
 	default:
-		// No file and no echo: the stream has nowhere to go.
+		// No file and no echo: the stream has nowhere to go. Say so once — the daemon's own lines still
+		// land in daemon.log — rather than failing a paid session over its transcript.
 		at.inv.Console = io.Discard
 		sink = fmt.Sprintf("log: none (could not open %s: %v - the session's stream is discarded; the daemon log still records its own lines)", at.logPath, ferr)
 	}
@@ -203,8 +214,6 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	if ctx.Err() == nil {
 		at.runLost = renewalCause(sctx, joined, loss.cause())
 	}
-	// CLA-782: record the routes this session was denied and write each SWITCH to both logs before the
-	// iteration log is closed.
 	d.noteRouteFallbacks(t, drainNum, at.inv, at.res)
 	if at.logFile != nil {
 		_ = at.logFile.Close()
@@ -235,13 +244,9 @@ func (r *phaseRun) classifyEnd(at *phaseAttempt) {
 // checkpoint, and whether it is the dead signature.
 func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	last := r.last
-	// Hand back anything the session was still holding, BEFORE deciding what to do next — every
-	// branch below either waits, retries or returns, and all of them leave the lease unattended.
 	at.orderlyExit = at.toolLoop == "" && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock)
 	at.recoveredExit = !at.orderlyExit && at.toolLoop == "" && at.res.Untrusted == "" && harness.RecoveredErrors(at.res) > 0
 	at.checkpointable = at.toolLoop == "" && (at.res.ExitCode == 0 || ((at.capped || at.ceiling || at.wallclock) && at.res.Claim.HasWIP) || at.recoveredExit)
-	// CLA-386: a session whose final step finished with reason "unknown" and left no branch recorded
-	// produced NOTHING — a dead phase, not a completed one.
 	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
 		(deadPhase(at.res) || at.toolLoop != "" || at.res.ReportResumeFailed != "")
 }
@@ -258,8 +263,6 @@ func (r *phaseRun) openPhaseEnd(at *phaseAttempt) {
 	panelMember := r.shape.panelMember
 	panelOptional := r.shape.panelOptional
 	panelLast := r.shape.panelLast
-	// CLA-402: book this session into the run's dead-phase tally, per phase label and harness,
-	// whatever the seam decided about retrying it.
 	at.bookedDead = d.tallyDead(ph.Label(phaseIdx), tc.HarnessFor(ph), at.res, at.capped, at.ceiling, at.wallclock)
 	r.end = phaseEnd{}
 	r.end.deadBooked = at.bookedDead
@@ -279,8 +282,6 @@ func (r *phaseRun) openPhaseEnd(at *phaseAttempt) {
 		Model:   at.inv.Model,
 		RunID:   sessionRunID(at.res, prev),
 	}
-	// CLA-739: the tool-loop kill's cause rides the session entry on the fleet report, as CLA-703's
-	// no_mcp does - it is why this session produced nothing.
 	if at.toolLoop != "" {
 		r.end.session.Cause = at.toolLoop
 	}

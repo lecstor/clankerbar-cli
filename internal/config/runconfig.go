@@ -56,9 +56,10 @@ type RunConfigPhase struct {
 	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
-// RunConfigPanelMember is one stored review-panel member, mapped onto ReviewPanelMember. A member
-// may set both `model` and `tier` (the alias wins on expansion), exactly as in the local file —
-// the one-model rule applies to a configured PHASE, not to a member.
+// RunConfigPanelMember is one stored review-panel member, mapped onto ReviewPanelMember. Optional
+// travels with the member: a trial seat configured in the stored document must stay a trial seat
+// when the overlay applies it, or every fleet applying that pipeline would silently promote it to a
+// required reviewer.
 type RunConfigPanelMember struct {
 	Name         string              `json:"name"`
 	Harness      string              `json:"harness"`
@@ -661,7 +662,8 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 	return doc, nil
 }
 
-// planeRoutes widens the plane's plain-string model field into this package's route type.
+// planeRoutes widens the plane's plain-string model field into this package's route type. The
+// stored schema has one string per model, so a stored document can only ever name a single route.
 func planeRoutes(model string) ModelRoutes {
 	if strings.TrimSpace(model) == "" {
 		return nil

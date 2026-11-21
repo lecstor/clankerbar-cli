@@ -2,12 +2,8 @@ package config
 
 import "strings"
 
-// PRBaseProbe answers, for one integration branch, whether origin has refs/heads/<integration> and
-// what the remote's symbolic HEAD points at.
 type PRBaseProbe func(integration string) (onOrigin bool, defaultBranch string, err error)
 
-// PRBaseSource records which rule resolved a repo's PR merge target, so the phase driver and the
-// deterministic close-out can log the same decision.
 type PRBaseSource int
 
 const (
@@ -33,7 +29,10 @@ type PRBaseResolution struct {
 
 // ResolvePRBase resolves the branch one repo's PRs target: the operator's per-repo pr_base
 // override, else the project's integration branch when origin has it, else origin's default branch,
-// else the integration branch.
+// else the integration branch. A probe that cannot run degrades to the integration branch rather
+// than blocking the work that needs a merge target, and every caller gets the same answer for the
+// same repo: a brief that names one branch and a close-out that judges the PR against another is
+// the disagreement this prevents.
 func ResolvePRBase(c *Config, slug, repo string, probe PRBaseProbe) PRBaseResolution {
 	integration := strings.TrimSpace(c.IntegrationBranchFor(slug))
 	if base := strings.TrimSpace(c.PRBaseFor(slug, repo)); base != "" {

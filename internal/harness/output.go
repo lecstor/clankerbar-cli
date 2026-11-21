@@ -27,7 +27,12 @@ const (
 var newline = []byte("\n")
 
 // tail is a bounded io.Writer that keeps the LAST retainedTail bytes written to it and discards the
-// rest as it goes, so a stream of any size costs a fixed amount of memory.
+// rest as it goes, so a stream of any size costs a fixed amount of memory. When anything has been
+// dropped, the leading partial line goes with it: a half line does not parse as an event, and the
+// classifiers deliberately read a non-event stdout line as the CLI's own words (that is how a
+// usage-limit notice arrives when the stream never starts), so handing them the back half of a
+// truncated tool_result would re-open exactly the injection CLA-258 closed — the agent's
+// narration, and the backlog text it quotes, read as a harness diagnostic.
 type tail struct {
 	max int
 	buf []byte

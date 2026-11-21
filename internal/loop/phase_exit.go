@@ -125,7 +125,11 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
 			return attemptVerdict{next: attemptReturn}
 		}
-		// A RESUMED phase must not wait one out.
+		// A RESUMED phase must not wait one out. The seam's handback has already ended the claim:
+		// `release` puts a no-work claim straight back in the queue, and `expireLease` ends a pushed-work
+		// claim's lease immediately, leaving the task an immediate takeover — so a supervised wait of
+		// hours would only run against a task this sequence no longer holds, with a runId in its prompt
+		// that no longer means anything.
 		if prev != nil {
 			log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting (log: %s)",
 				drainNum, at.logPath)
@@ -135,10 +139,6 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		// Whatever this attempt held open is not held open any more: every path below either waits or
 		// retries with a FRESH session, which re-claims.
 		r.end = d.releaseCarriedEnd(ctx, t, r.end)
-		// Waiting out a reset that lands past the wall-clock ceiling buys nothing: the budget check runs
-		// between drains, so the loop would sleep through the window, run one session on the freshly
-		// reset quota and stop on the very next check — having spent the night waiting for headroom it
-		// then declines to use.
 		remaining, bounded := tc.Budget.Remaining(d.budgetElapsed(r.ti, time.Since(prior.start)))
 		if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this ceiling; not waiting, so start a fresh run after the reset (log: %s)",

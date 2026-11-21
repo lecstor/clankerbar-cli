@@ -114,7 +114,11 @@ func runPanelMembers(n, concurrency int, run func(k int, started func()), onRele
 }
 
 // releaseMember is the WHOLE of a member's release: it reports the release to the observer
-// (onRelease, test-only), and only then unblocks the scheduler that spawns the successor.
+// (onRelease, test-only), and only then unblocks the scheduler that spawns the successor. Keeping
+// both steps in one function makes that order structural rather than two adjacent statements a
+// later edit could silently swap: a swap would leave the panel fixture green, because the successor
+// needs a `git worktree add` subprocess before it can reach its own launch and would win that race
+// every time, turning the count observed at a launch into a race.
 func releaseMember(k int, onRelease func(k int), unblock func()) {
 	if onRelease != nil {
 		onRelease(k)

@@ -11,7 +11,9 @@ import (
 	"time"
 )
 
-// runSession executes ONE `opencode run` process end-to-end and parses its stream.
+// runSession executes ONE `opencode run` process end-to-end and parses its stream. A process with a
+// private server attaches it for the life of the process, so a message is only ever posted to the
+// server that is actually running.
 func (o opencode) runSession(ctx context.Context, in Invocation, args []string, delivery *opencodeInbox) (Result, error) {
 
 	// The per-session wall-clock cap, enforced on the exec context so the kill needs nothing from the
@@ -30,18 +32,16 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 	}
 	env, err := o.env(in)
 	if err != nil {
-		// Nothing has been spawned yet, so this is a clean refusal to start rather than a session to
-		// classify: an empty Result, and the error the caller reports.
 		return Result{}, err
 	}
 
-	// CLA-703: a working (non-probe) session gets a private server of the adapter's own, and does not
-	// run its first model turn until that server reports the clankerbar MCP connection established.
 	runArgs := args
 	runEnv := env
 	var srv *opencodeServer
 	if !in.Probe {
-		// Only a session with a clankerbar server gets the preflight.
+		// Only a session with a clankerbar server gets the preflight. That server is resolved across the
+		// config layers opencode actually loads: the named file when there is one, otherwise the global
+		// config dir and the project-level files discovered from the instance directory.
 		names, err := opencodeEffectiveMCPServers(in, env)
 		if err != nil {
 			return mcpPreflightFailure(sctx, ctx, err)
@@ -55,7 +55,10 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 			if err := srv.waitForMCP(sctx, names, workDir); err != nil {
 				return mcpPreflightFailure(sctx, ctx, err)
 			}
-			// The delivery target is this process's own server.
+			// The delivery target is this process's own server. Attach AFTER the MCP preflight so the target
+			// is live only for a session whose tools are actually there, and defer the detach behind
+			// srv.stop's own defer: LIFO runs detach FIRST, so the target is cleared before the server is
+			// killed.
 			if delivery != nil {
 				delivery.attach(srv)
 				defer delivery.detach(srv)
@@ -81,7 +84,9 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 		cmd.Dir = workDir
 	}
 	cmd.Env = runEnv
-	// A cap that can hang is not a cap.
+	// A cap that can hang is not a cap. The capture points Stdout/Stderr at io.MultiWriter values, so
+	// os/exec makes its own pipes and cmd.Run waits for every WRITER of them to close — and
+	// CommandContext kills the direct child only.
 	if _, hasDeadline := sctx.Deadline(); hasDeadline || ((in.MaxRepeatedToolFailures > 0 || in.MaxSessionIdle > 0) && !in.Probe) {
 		cmd.WaitDelay = 5 * time.Second
 	}
@@ -98,15 +103,10 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 	if in.Probe {
 		console = nil
 	}
-	// Through the constructor, not a struct literal: it carries the resumed-phase claim seed, and the
-	// tests build the parser the same way so that dropping it here turns them red.
 	p := newOpencodeParse(in, console)
 	defer p.closeEvents()
 	p.kill = loopKill
-	// The parser is where the session id first appears; it hands the id to the delivery target (see
-	// opencodeParse.line).
 	p.inbox = delivery
-	// The no-output watchdog, on the same cancellation the tool-loop kill uses.
 	p.armIdle(in)
 	captured := newCapture(p.line)
 	captured.attach(cmd, console)
@@ -125,7 +125,6 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 	p.idle.stop()
 	res := captured.result("opencode")
 	p.finish(&res)
-	// A clean exit beat the kill: the session finished, so it was not a hang.
 	if runErr == nil {
 		res.IdleKilled = ""
 	} else {
@@ -133,9 +132,6 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 		res.IdleToolCall = res.IdleKilled != "" && p.idle.trippedWithOpenCall()
 	}
 
-	// Our own deadline, not the caller's: ctx.Err() distinguishes a session we cut off from a run-wide
-	// Ctrl-C / SIGTERM / supervised-wait cancellation, which cancels the parent too and is NOT this
-	// phase reaching its backstop.
 	timedOut := runErr != nil && sctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 	if timedOut {
 		res.markWallClockCapped()
@@ -143,8 +139,6 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it wrote is still in the worktree, uncommitted\n", in.MaxSessionWallClock)
 		}
 	}
-	// CLA-739: the guard's verdict rides the Result whether or not the kill landed before the process
-	// ended on its own - the session WAS looping, and that is what the driver classifies.
 	res.ToolLoop = p.observed.toolLoop.tripped()
 	loopKilled := runErr != nil && res.ToolLoop != ""
 	idleKilled := res.IdleKilled != ""
@@ -153,24 +147,20 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
 	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut && !loopKilled && !idleKilled {
-		// The process exited cleanly on its own — ExitCode 0 — but a grandchild (a backgrounded
-		// build, a test run) inherited the output pipes and held them open past cmd.WaitDelay, so os/exec
-		// force-closed them and Run returned exec.ErrWaitDelay instead of an *exec.ExitError.
 		o.settleUsage(ctx, in, &res, started, in.ResumeSession)
 		return res, nil
 	} else if runErr != nil && !timedOut && !loopKilled && !idleKilled {
-		// A launch failure (bad PATH, unreadable config): nothing was emitted, so res is an honest zero,
-		// and the failure is real.
 		return res, runErr
 	} else if runErr != nil {
-		// Our own kill: the child died on the cancel, so its error is the kill's and not a verdict.
 		res.ExitCode = -1
 	}
 	o.settleUsage(ctx, in, &res, started, in.ResumeSession)
 	return res, nil
 }
 
-// opencodeEvent is one line of `opencode run --format json`.
+// opencodeEvent is one line of `opencode run --format json`. The stream is a sequence of typed
+// events, each wrapping a message part; this captures only the fields the loop needs and tolerates
+// the rest.
 type opencodeEvent struct {
 	Type  string              `json:"type"`
 	Part  *opencodePart       `json:"part"`
@@ -180,7 +170,10 @@ type opencodeEvent struct {
 	SessionID string `json:"sessionID"`
 }
 
-// opencodeErrorEvent is the typed error 2.x puts on a {"type":"error"} event.
+// opencodeErrorEvent is the typed error 2.x puts on a {"type":"error"} event. The type is a stable
+// dotted name ("provider.auth", "provider.rate-limit", "provider.no-route",
+// "provider.invalid-output"), which classification keys on before it falls back to the word
+// classes.
 type opencodeErrorEvent struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
@@ -196,14 +189,18 @@ type opencodePart struct {
 	// driver's zero-spend bound counts silence, not zeroes.
 	Cost *float64 `json:"cost"`
 
-	// Tool parts, which arrive on a "tool_use" event.
+	// Tool parts, which arrive on a "tool_use" event. On 2.x the call id is `id` (1.x called it
+	// `callID`) and the part's own id moves to `partID`.
 	Tool   string             `json:"tool"`
 	ID     string             `json:"id"`
 	PartID string             `json:"partID"`
 	State  *opencodeToolState `json:"state"`
 }
 
-// opencodeToolState is a tool call's lifecycle slot on its part.
+// opencodeToolState is a tool call's lifecycle slot on its part. There is no `is_error` flag to
+// read — the STATUS is the flag, which is why a status this adapter does not recognise must never
+// be treated as success: {"state":{"status":"error","input":{...}, "error":"No tool named
+// \"clankerbar_claim_task\" is currently available.
 type opencodeToolState struct {
 	Status   string          `json:"status"`
 	Input    json.RawMessage `json:"input"`
@@ -229,26 +226,35 @@ type opencodeTokens struct {
 }
 
 // opencodeParse accumulates FinalMessage, Tokens and CostUSD from the event stream, ONE LINE AT A
-// TIME as it arrives.
+// TIME as it arrives. Because it sums, it has to see EVERY step — which is exactly why it runs on
+// the live stream instead of over the retained tail (see Invoke).
 type opencodeParse struct {
 	lastText string
 	// lastReason is the reason of the MOST RECENT step_finish — the session's final step, once the
-	// stream ends.
+	// stream ends. opencode writes "stop" when the session produced a final answer and "unknown" when
+	// it died without one; the driver reads it off Result.Raw via FinishReasonKey.
 	lastReason string
 	// lastStepZeroUsage reports that the MOST RECENT step_finish's own usage summed to zero — no
-	// tokens block, an all-zero tokens block, or no cost are all the same quiet end.
+	// tokens block, an all-zero tokens block, or no cost are all the same quiet end. Only the final
+	// step's own usage is.
 	lastStepZeroUsage bool
 	// lastStepOut and lastStepReason are the MOST RECENT step_finish's OWN output and reasoning token
-	// counts.
+	// counts. lastStepOut is the discriminator for the output-cap stall — a final "length" step with
+	// ZERO output — and it is deliberately not the all-zero test above: the recorded MAK-123 stall
+	// carried reasoning=32000 and a nonzero total, so only the output figure sees it.
 	lastStepOut, lastStepReason           int
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
-	// sawCost reports that a step_finish actually carried a cost figure.
+	// sawCost reports that a step_finish actually carried a cost figure. Deliberately separate from
+	// sawUsage: opencode reports a step's tokens and its cost as independent siblings, so a session
+	// can account for tokens and never for money, and the durable record carries the two questions
+	// apart.
 	sawCost bool
 
 	// sessionID is the opencode session this stream belongs to, taken from the top-level sessionID
-	// field every event carries.
+	// field every event carries. Constant for a run; the CLA-406 resurrection path needs it as the
+	// handle a follow-up `opencode run --session <id>` continues into.
 	sessionID string
 
 	// observed carries ONLY the claim/report observation state, which finish copies onto the real
@@ -263,7 +269,8 @@ type opencodeParse struct {
 	settledCalls map[string]bool
 
 	// toolOutputDir is where this session's opencode saves truncated tool output: <data
-	// home>/opencode/tool-output, resolved from the session's own environment.
+	// home>/opencode/tool-output, resolved from the session's own environment. The only directory a
+	// truncated result is read back from.
 	toolOutputDir string
 
 	// errorType is the type of the last typed {"type":"error"} event ("provider.auth", ...), recorded
@@ -272,7 +279,10 @@ type opencodeParse struct {
 
 	// recoveredErrors counts the typed error (or 2.2.x retry) events the stream did NOT end on: an
 	// event that is followed by any later typed event is one the session recovered from, because 2.x
-	// retries a provider failure itself and carries on.
+	// retries a provider failure itself and carries on. lastEventWasError is whether the most recent
+	// typed event was itself an error — exactly the question buildOpencodeErrorText asks of the
+	// finished stream, tracked here as the stream arrives so the two cannot disagree about how the
+	// session ended.
 	recoveredErrors   int
 	lastEventWasError bool
 
@@ -280,7 +290,8 @@ type opencodeParse struct {
 	// observed.toolLoop by newSessionResult).
 	kill func()
 
-	// idle is the no-output watchdog, armed by runSession from the Invocation.
+	// idle is the no-output watchdog, armed by runSession from the Invocation. nil in the parser
+	// tests; a probe gets a disabled guard, where every method is a no-op.
 	idle *idleGuard
 }
 
@@ -289,7 +300,10 @@ func newOpencodeParse(in Invocation, console io.Writer) opencodeParse {
 	return opencodeParse{observed: newSessionResult(in), console: console, toolOutputDir: opencodeToolOutputDir(in)}
 }
 
-// diag is where a claim diagnostic goes.
+// diag is where a claim diagnostic goes. The zero opencodeParse has no console (a probe passes
+// none, and the parser tests build one directly), and noteClaimed writes unconditionally — by
+// design, since a claim that silently stops being tracked is indistinguishable from a session that
+// never claimed.
 func (p *opencodeParse) diag() io.Writer {
 	if p.console == nil {
 		return io.Discard
@@ -297,7 +311,9 @@ func (p *opencodeParse) diag() io.Writer {
 	return p.console
 }
 
-// armIdle starts the no-output watchdog for this session.
+// armIdle starts the no-output watchdog for this session. A probe is exempt: it is a one-word
+// liveness check, not a session doing work, and killing one for silence would report a
+// session-shaped verdict for something no phase ran.
 func (p *opencodeParse) armIdle(in Invocation) {
 	idle := in.MaxSessionIdle
 	if in.Probe {
@@ -315,11 +331,12 @@ func (p *opencodeParse) armIdle(in Invocation) {
 func (p *opencodeParse) idleCause() string { return p.idle.tripped() }
 
 // idleStepCall is the synthetic tool call an opencode STEP opens in the idle guard: the step IS the
-// call window this stream exposes.
+// call window this stream exposes. opencode forwards a tool part only once it has settled and gives
+// no request-side tool event at all (see noteTool), so a long call's silence sits somewhere between
+// the step's step_start and its step_finish.
 const idleStepCall = "step_start"
 
 func (p *opencodeParse) line(line []byte) {
-	// Output restarts the idle clock unless a step window is open.
 	p.idle.seen()
 	trimmed := strings.TrimSpace(string(line))
 	if !strings.HasPrefix(trimmed, "{") {
@@ -329,7 +346,6 @@ func (p *opencodeParse) line(line []byte) {
 	if json.Unmarshal([]byte(trimmed), &ev) != nil {
 		return // partial/non-JSON line — skip
 	}
-	// Every event names its session; the first one seen wins (they all agree within a run).
 	if p.sessionID == "" && ev.SessionID != "" {
 		p.sessionID = ev.SessionID
 		if p.inbox != nil {
@@ -339,18 +355,15 @@ func (p *opencodeParse) line(line []byte) {
 	if ev.Type == "error" && ev.Error != nil && ev.Error.Type != "" {
 		p.errorType = ev.Error.Type
 	}
-	// CLA-700: an error event the stream moves past is one the session recovered from.
 	if ev.Type != "" {
 		if p.lastEventWasError {
-			// The PREVIOUS error event was followed by this one, so it was recovered from (whether or not
-			// this event is also an error).
 			p.recoveredErrors++
 		}
-		// 2.2.x reports a recovery it retries as a `retry` event carrying the error; it counts as
-		// recovered once something follows it.
 		p.lastEventWasError = ev.Type == "error" || (ev.Type == "retry" && ev.Error != nil)
 	}
-	// CLA-900: the step is the call window this stream exposes.
+	// CLA-900: the step is the call window this stream exposes. step_start opens it - the last line
+	// before the step's tools run, because a tool's own part arrives only after it returned - and
+	// step_finish closes it.
 	switch ev.Type {
 	case "step_start":
 		p.idle.toolHandoff(idleStepCall)
@@ -362,7 +375,6 @@ func (p *opencodeParse) line(line []byte) {
 	}
 	switch ev.Type {
 	case "step_start":
-		// A new step has begun, so the previous step is no longer the final one.
 		p.lastReason = ""
 		p.lastStepOut, p.lastStepReason = 0, 0
 		p.lastStepZeroUsage = false
@@ -370,18 +382,12 @@ func (p *opencodeParse) line(line []byte) {
 		if t := strings.TrimSpace(ev.Part.Text); t != "" {
 			p.lastText = t
 		}
-		// Transcript tier (CLA-887): one event per text part.
 		noteAssistantText(p.observed.events, ev.Part.Text)
 	case "step_finish":
-		// CLA-900: the step window is CLOSED above, before the Part check.
 		if ev.Part.Reason != "" {
 			p.lastReason = ev.Part.Reason
-			// CLA-584: the stalled step's own figures move WITH the reason, so the pair always describes ONE
-			// event.
 			p.lastStepOut, p.lastStepReason = 0, 0
 		}
-		// tokens and cost are siblings on the part; count each independently so a step that reports one
-		// without the other still lands in the budget.
 		p.lastStepZeroUsage = true
 		if tk := ev.Part.Tokens; tk != nil {
 			p.total += tk.Total
@@ -412,11 +418,17 @@ func (p *opencodeParse) line(line []byte) {
 	}
 }
 
-// closeEvents flushes and stops this session's agent-event sink.
+// closeEvents flushes and stops this session's agent-event sink. The parser's observation holds the
+// sink because the real Result is only built after the process exits; it is nil when the channel is
+// off.
 func (p *opencodeParse) closeEvents() { p.observed.closeEvents() }
 
 // noteTool feeds one tool event into the shared clankerbar observation, which is what populates
-// Result.Claim and the delivery Reports.
+// Result.Claim and the delivery Reports. Only a TERMINAL state is acted on for that observation,
+// and that is FUTURE-PROOFING rather than a filter this stream needs today: `opencode run --format
+// json` forwards a tool part only once it has settled (true of 1.x source, cli/cmd/run.ts, and of
+// every 2.0.32 stream recorded for this adapter), which is why the recorded fixtures carry exactly
+// one event per tool part.
 func (p *opencodeParse) noteTool(part *opencodePart) {
 	st := part.State
 	// part.Type ("tool") is deliberately not checked: only a tool part carries a call id and a state,
@@ -424,13 +436,10 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	if st == nil || part.ID == "" {
 		return
 	}
-	// The call's identity for the replay guard.
 	key := part.PartID
 	if key == "" {
 		key = part.ID
 	}
-	// A part still in flight opens a tool call for the idle watchdog: the session is working rather
-	// than hanging, and the call's own cap bounds it.
 	if st.Status == "running" {
 		p.idle.toolStarted(key)
 		return
@@ -446,10 +455,7 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.settledCalls = map[string]bool{}
 	}
 	p.settledCalls[key] = true
-	// The channel's activity tier hears the call, once, before the clankerbar observation consumes it.
 	noteOpencodeToolEvent(p.observed.events, part.Tool, part.ID, st.Input)
-	// CLA-739: the STATUS is the failure flag (see opencodeToolState), and the error text rides where
-	// the output would have been.
 	if p.observed.toolLoop.observe(part.Tool, st.Status == "error", st.Error) && p.kill != nil {
 		fmt.Fprintf(p.diag(), "\n!! %s - killing the session here instead of letting it retry the same failing call\n", p.observed.toolLoop.tripped())
 		p.kill()
@@ -466,14 +472,10 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	if name != "" || (transcript && !dropOutput) {
 		var err error
 		if rehydrated, rehydratedOK, err = opencodeTruncatedOutput(st, p.toolOutputDir); err != nil {
-			// Fail safe: the envelope goes on as the result, which no consumer can parse, so a claim is NOT
-			// tracked - the same outcome as any unreadable claim result, with the reason said first.
 			fmt.Fprintf(p.diag(), "  · %s result was truncated by opencode and could not be read back: %v\n", part.Tool, err)
 		}
 	}
 	if transcript {
-		// Transcript tier: the status is the ok flag, and the error text stands in for the output on a
-		// failed call.
 		output := st.Output
 		if st.Status == "error" {
 			output = st.Error
@@ -487,8 +489,6 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	}
 
 	noteToolUse(name, part.ID, st.Input, &p.observed)
-	// The result text is handed over as JSON so it reaches noteClaimed by the same road claude's
-	// string-shaped tool_result content does.
 	output := st.Output
 	if rehydratedOK {
 		output = rehydrated

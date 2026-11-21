@@ -52,9 +52,11 @@ func displayRepo(dir, repo string) string {
 
 // ProbeOriginPRBase asks the origin remote of dir two questions in ONE network round-trip: whether
 // refs/heads/<integration> exists there, and what its symbolic HEAD points at — the answers
-// config.ResolvePRBase's resolution order needs. Any scoping failure degrades to running unscoped,
-// the same fail-open shape delivery keeps; the probe has no correctness cliff on top of it because
-// its own failure mode is prBaseFor's fallback.
+// config.ResolvePRBase's resolution order needs. The read is scoped to the account owning the
+// remote exactly as the delivery verifier's own ls-remote is: without it an HTTPS github origin
+// that names no account is read as whichever gh account is ACTIVE, which on the operator's machine
+// cannot see the private lecstor repos, and every probe would silently degrade to the
+// integration-branch fallback — the feature would never fire where it was filed from.
 func ProbeOriginPRBase(ctx context.Context, dir, integration string) (bool, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, prBaseProbeTimeout)
 	defer cancel()

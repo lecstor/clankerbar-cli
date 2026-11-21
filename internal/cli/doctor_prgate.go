@@ -67,8 +67,7 @@ func checkPRGate(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	}
 	c.detail = path + " present; a delivery's PR must be MERGEABLE with a passing check rollup"
 
-	// Probe a REAL `gh pr view --json`. Before this, doctor checked only that gh existed; a gh whose
-	// output is coloured passed doctor every time while the delivery gate parsed nothing.
+	// Probe a REAL `gh pr view --json`.
 	if e.probePRGate != nil {
 		probe, perr := e.probePRGate(ctx, path, prGateProbeWorkdirs(cfg))
 		switch {

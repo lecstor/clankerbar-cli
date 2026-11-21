@@ -33,7 +33,9 @@ func NoteClaudeToolEvent(sink events.Sink, name, callID string, input json.RawMe
 			sink.TodoChange(todos)
 		}
 	case name == "TaskCreate" || name == "TaskUpdate":
-		// Per-item todo tools.
+		// Per-item todo tools. The activity tier carries the whole-list snapshot (TodoWrite), and the
+		// design note drops these until a harness change makes them primary — sending one as a
+		// tool_call would put a different fact on the wire than the list.
 	case strings.HasPrefix(name, clankerbarToolPrefix):
 		sink.ClankerbarMcpCall(strings.TrimPrefix(name, clankerbarToolPrefix), callID, clankerbarTarget(input))
 	case name != "":

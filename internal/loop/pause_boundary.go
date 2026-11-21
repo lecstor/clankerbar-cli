@@ -50,7 +50,9 @@ type boundaryHoldState struct {
 	zone   string // IANA zone the instant is rendered in (the presence row)
 }
 
-// holdSequence holds the sequence at its next boundary while decide reports a cause.
+// holdSequence holds the sequence at its next boundary while decide reports a cause. Shared by the
+// global pause_windows schedule and the per-route pricing windows: both are "start no new session
+// yet", both keep the claim and renew its lease, and both end at a wall-clock instant.
 func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() boundaryHoldState) pauseHold {
 	d := s.d
 	t := s.t

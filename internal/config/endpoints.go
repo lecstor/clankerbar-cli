@@ -42,8 +42,8 @@ func (c *Config) BacklogEndpoint() string {
 func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
 
 // ProjectEndpoint returns a project's MCP endpoint: `<origin>/mcp/<slug>`, the slug path-escaped.
-// The plane membership-gates /mcp/<slug>, so an unreachable slug is refused there, never mapped
-// onto a project here.
+// The origin is CredentialOrigin — `backlog_url`, the operator's own config, or the built-in
+// default — never a host read off a checkout's .mcp.json.
 func (c *Config) ProjectEndpoint(p Project) string {
 	origin := c.CredentialOrigin()
 	if origin == "" || p.Slug == "" {
@@ -89,8 +89,8 @@ func projectSummaryPath(origin, slug string) string {
 
 // FleetReportURL returns the URL of the daemon's fleet presence beacon target: the plane's `POST
 // .../fleet/report` surface, which takes presence plus any finished iteration records in one
-// authenticated call. Same origin rule as every credentialed call: CredentialOrigin, never a path
-// read off the workdir's .mcp.json.
+// authenticated call. Unlike the summary route there is NO legacy slug-less form — the report
+// endpoint exists only as `/api/projects/<slug>/fleet/report`.
 func (c *Config) FleetReportURL() string {
 	origin := c.CredentialOrigin()
 	if origin == "" {

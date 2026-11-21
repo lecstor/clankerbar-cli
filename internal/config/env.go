@@ -118,7 +118,10 @@ type DeclaredEnv struct {
 	Name string
 	// FromCommand is the command a command-derived entry runs; empty when the entry is literal.
 	FromCommand string
-	// Path is the file an "@path" literal points at (leading ~ unexpanded); empty otherwise.
+	// Path is the file an "@path" literal points at (leading ~ unexpanded); empty otherwise. Worth
+	// stat-ing: its owner-only rule used to be enforced once at Validate, and now that resolution
+	// happens per spawn this is how a preflight still catches a chmod 644 secret before a run leans on
+	// it.
 	Path string
 }
 

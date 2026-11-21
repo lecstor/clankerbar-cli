@@ -10,9 +10,11 @@ import (
 )
 
 // consume reads the session's stream-json stdout to the end: parsing and rendering every line as it
-// arrives, and retaining a bounded tail in keep.
+// arrives, and retaining a bounded tail in keep. - A claim's settle is never observed, so the
+// driver reads a task the session handed to review as one it abandoned, and posts `ready` over it.
 func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result, ceiling int, kill context.CancelFunc) {
-	// The no-output watchdog.
+	// The no-output watchdog. Armed here because this is where the session's kill switch is in hand,
+	// and the stream below is what feeds it.
 	res.idle = newIdleGuard(res.maxIdle, res.maxToolCall, func(cause string) {
 		fmt.Fprintf(console, "\n!! %s - killing the session here instead of waiting on a silent child\n", cause)
 		kill()
@@ -35,16 +37,12 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 			kill()
 			break
 		}
-		// CLA-739: the same tool returned the same error on enough consecutive calls that the session is
-		// looping, and every further retry re-sends the whole context.
 		if cause := res.toolLoop.tripped(); cause != "" && res.ToolLoop == "" {
 			res.ToolLoop = cause
 			fmt.Fprintf(console, "\n!! %s - killing the session here instead of letting it retry the same failing call\n", cause)
 			kill()
 			break
 		}
-		// The idle watchdog fires on its own goroutine, with the same reasons for ending the read here:
-		// the child is dying and whatever is still buffered arrived after the verdict.
 		if res.idle.tripped() != "" {
 			break
 		}
@@ -63,7 +61,8 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 		"its final message and any claim it settled are all incomplete", err))
 	fmt.Fprintf(console, "\n!! stream read failed: %v — draining the rest so the session is not killed mid-write; "+
 		"this run's parsed figures are NOT trustworthy\n", err)
-	// Read the remainder so the child is not killed by EPIPE.
+	// Read the remainder so the child is not killed by EPIPE. It has nowhere to go: nothing can be
+	// parsed out of a stream whose framing we have already lost.
 	if n, cerr := io.Copy(io.Discard, r); cerr != nil {
 		fmt.Fprintf(console, "!! discarded %d further bytes, then: %v\n", n, cerr)
 	} else {
@@ -159,7 +158,8 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		}
 	case "result":
 		res.FinalMessage = ev.Result
-		// The turn this user message started is over.
+		// The turn this user message started is over. The claude adapter uses this to retire one
+		// outstanding stdin turn; every other adapter leaves it nil.
 		if res.onTurnEnd != nil {
 			res.onTurnEnd()
 		}

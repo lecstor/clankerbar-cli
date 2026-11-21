@@ -44,7 +44,10 @@ func codexArgs(in Invocation) []string {
 	return append(args, "--", in.Prompt)
 }
 
-// env builds the child environment.
+// env builds the child environment. Split out of Invoke - where it was three inline lines - so this
+// adapter's environment is testable the way claude's and opencode's already were, which is what the
+// CLA-441 PWD pin is asserted against: a fix "every adapter" has to carry needs every adapter's env
+// to be reachable from a test.
 func (c codex) env(in Invocation) []string {
 	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the daemon's inherited
 	// value - see pinPWD.
@@ -70,7 +73,9 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text scans, and tee live
 	// to the console when one is set (the JSONL event stream — a readable renderer is a TODO; raw is
-	// honest live output).
+	// honest live output). Parsing live rather than walking a saved copy afterwards is what makes the
+	// cap safe: the usage figures are read out of events as they pass, so trimming the retained text
+	// cannot cost the budget a single token.
 	var p codexParse
 	captured := newCapture(p.line)
 	console := in.Console
@@ -198,9 +203,9 @@ func deref(p *int) int {
 
 // codexErrorText collects the harness's OWN diagnostic text — all of stderr, the stdout lines
 // that are not events at all, and the events that carry an `error` or announce a failure — so a
-// limit or transient scan never reads the agent's narration. Non-JSON stdout lines are kept
-// deliberately: every word the agent says arrives inside an event, so a bare line is the CLI
-// talking — which is how codex reports a cap it has no typed event for.
+// limit or transient scan never reads the agent's narration. A backlog task whose body merely said
+// "usage limit" therefore reported a subscription cap that never happened, and the loop paused and
+// re-spawned the same paid session on a cycle no budget ceiling stopped.
 func codexErrorText(res Result) string {
 	return res.scan(scanErrorText, func() string { return buildCodexErrorText(res) })
 }

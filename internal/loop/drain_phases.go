@@ -10,16 +10,12 @@ import (
 )
 
 // drainPhases runs ONE drain as its configured sequence of phase sessions — each a separate
-// harness process, so the context resets between them.
+// harness process, so the context resets between them. 2. If the next phase will never run, the
+// handback skipped at the seam happens here instead — otherwise a budget stop leaves the task
+// leased to nobody.
 func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
-	// The target's own effective config: a stored run-config overlay changes harness/model/budget
-	// here, not on the shared base.
 	tc := d.targetCfg(t)
 	phases := tc.EffectivePhases()
-	// rawPhases is the same sequence with every EXPANSION collapsed: index- aligned 1:1 with phases,
-	// but each review-panel member maps back to the one `review` phase the operator wrote, so a member
-	// is recognised as running the resolved built-in brief its configured phase asked for rather than
-	// a prompt of its own.
 	rawPhases := make([]config.Phase, len(phases))
 	for i := range phases {
 		rawPhases[i] = phases[i]
@@ -177,9 +173,6 @@ walk:
 			break
 		}
 
-		// A non-final phase that did not reach its checkpoint leaves the next one nothing to resume: the
-		// session settled the task itself (worked past its brief and finished it), its stream could not
-		// be trusted to say either way, or the adapter does not observe claims at all.
 		if !st.last && !st.end.checkpoint {
 			log.Printf("iteration %d: the %s phase ended without holding the task — nothing for the next phase to resume, so this drain ends here",
 				drainNum, st.ph.Label(s.i))
@@ -223,7 +216,10 @@ walk:
 	return s.tokens, s.cost, s.handoffs, s.stop, s.err
 }
 
-// drainWithRetries runs a single unphased drain — the whole task in one session.
+// drainWithRetries runs a single unphased drain — the whole task in one session. ti is the
+// target's index, taken explicitly rather than from prior: a caller that passes spend{start: ...}
+// without a ti must not have its spend silently booked to target 0 and judged by target 0's stored
+// budget.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	phases := d.targetCfg(t).EffectivePhases()
 	ph := phases[0]
@@ -236,14 +232,17 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum, ti int, t Targe
 // itself closes the review round when the review stage is over.
 type phaseRunOpts struct {
 	// worktree, when non-empty, is the session's start directory instead of the one sessionDir
-	// resolved: the member's own DETACHED checkout at the reviewed tip.
+	// resolved: the member's own DETACHED checkout at the reviewed tip. The brief tells the session it
+	// is there, so a member cannot wander into the shared task worktree.
 	worktree string
 
 	// taskDir, when non-empty, is the runner-prepared task worktree: the spawn dir, with no panel
 	// note, because the brief already describes that tree.
 	taskDir string
 
-	// panelParallel says the JOIN that spawned this member owns the review round's close.
+	// panelParallel says the JOIN that spawned this member owns the review round's close. A member
+	// must not close it itself: its siblings may still be recording, and the close is what releases
+	// the findings they must not see.
 	panelParallel bool
 
 	// onSessionLaunch, when non-nil, is called immediately before the adapter is invoked — the first

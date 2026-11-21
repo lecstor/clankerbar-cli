@@ -14,6 +14,8 @@ import (
 // --- 1. config ---------------------------------------------------------------
 
 // apiKeyOriginLabel prefixes the line naming the one origin the account-scoped key may be sent to.
+// A const so the README-pins coupling test can assert the README quotes exactly this label:
+// rewording it here fails that test until the README is updated.
 const apiKeyOriginLabel = "api key origin: "
 
 func checkConfig(cfg *config.Config) check {

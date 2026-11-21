@@ -48,10 +48,12 @@ type mcpFile struct {
 	MCPServers map[string]mcpEntry `json:"mcpServers"`
 	MCP        map[string]mcpEntry `json:"mcp"`
 
-	// The opencode-schema keys that decide what a session IS rather than what it talks to. Left RAW
-	// because "present at all" is the only fact this needs: every value shape counts (object, array,
-	// bool, string), and only an absent key or a JSON null means unset — the same reading Go's own
-	// optional types give them.
+	// The opencode-schema keys that decide what a session IS rather than what it talks to. Modelled
+	// because OPENCODE_CONFIG makes the file the session's ENTIRE config (harness/opencode.go), so a
+	// workdir-discovered file carrying any of these does not merely add servers — it overrides what
+	// the driver pins: permission — replaces the fail-closed permission policy the adapter exports;
+	// the CLA-260 threat with the safety rail removed; plugin — code opencode loads and runs at
+	// startup; agent — replaces agent definitions, including their modes and per-agent permissions.
 	Permission json.RawMessage `json:"permission"`
 	Plugin     json.RawMessage `json:"plugin"`
 	Agent      json.RawMessage `json:"agent"`

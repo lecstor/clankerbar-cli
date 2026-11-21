@@ -173,7 +173,11 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"attribute." + unverifiedReviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep +
 	handoffGuidance
 
-// noCodeReviewOnlyTerminalStep ends a branchless review-only phase.
+// noCodeReviewOnlyTerminalStep ends a branchless review-only phase. The record here is the LEGACY
+// block alone (operator decision on question 03a12578, option 1): the durable table takes writes
+// only from the task's live holder — a settled task has none, and a still-held no-code task's
+// write would seal a round this variant never closes — so attempting the append would be a
+// refused call at best and a wedged run at worst, and the seam does not need it.
 const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
 	"TASK with record_progress(taskId, runId, outcome: ...), in the shape above - the LEGACY `" + ReviewRecordHeading +
 	"` block ONLY. Do NOT attempt a durable review record write here: a settled task has no live holder to accept it, " +

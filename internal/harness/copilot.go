@@ -257,7 +257,8 @@ type copilotTokens struct {
 }
 
 // copilotParse accumulates the session's final message, usage and clankerbar observation as the
-// stream arrives.
+// stream arrives. Live rather than a walk over saved output, so trimming the retained text cannot
+// cost the budget a token.
 type copilotParse struct {
 	lastText  string
 	finalText string
@@ -452,8 +453,9 @@ func copilotErrorPayload(raw json.RawMessage) bool {
 }
 
 // copilotErrorText collects the CLI's OWN diagnostic text: all of stderr, the stdout lines that are
-// not events, and the CLI's session-level error events. warnings are excluded too, deliberately -
-// the CLI's 75%-used quota notice is a warning, and it is not a limit.
+// not events, and the CLI's session-level error events. The agent's narration (assistant.message
+// content) and any tool output are EXCLUDED: a backlog task body quoting "Plan: 100% used" must not
+// stop the run on a limit that never happened.
 func copilotErrorText(res Result) string {
 	return res.scan(scanErrorText, func() string { return buildCopilotErrorText(res) })
 }

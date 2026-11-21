@@ -14,7 +14,9 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
-// SetEventChannel wires the plane origin and bearer the event sender uses.
+// SetEventChannel wires the plane origin and bearer the event sender uses. The origin is the
+// operator's trusted CredentialOrigin, never a host read off a checkout, and the key is the same
+// CLANKERBAR_API_KEY every other plane call carries.
 func (d *Driver) SetEventChannel(origin, apiKey string) {
 	d.eventOrigin = origin
 	d.eventKey = apiKey

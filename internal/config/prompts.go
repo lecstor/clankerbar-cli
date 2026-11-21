@@ -1,6 +1,9 @@
 package config
 
-// builtinPhasePrompts are the shipped briefs, selected by phase name.
+// builtinPhasePrompts are the shipped briefs, selected by phase name. The review phase's brief is
+// chosen by POSITION rather than a second name (see EffectivePhases): a review with a phase after
+// it is the read-only gate (reviewOnlyBrief), and a FINAL review keeps this historical
+// review-and-fix brief so an existing two-phase config still reaches in_review.
 var builtinPhasePrompts = map[string]string{
 	ImplementPhaseName: "Work the next backlog item. This session is PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + ", and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
 		implementCloseOutRule + " " +
@@ -100,10 +103,6 @@ func NoCodeFixVerifyBrief() string { return noCodeFixVerifyBrief }
 // NoCodeFixBrief returns the fix phase's brief for a branchless checkpoint.
 func NoCodeFixBrief() string { return noCodeFixBrief }
 
-// NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the plane's record - see
-// noCodeReviewBrief.
 func NoCodeReviewBrief() string { return noCodeReviewBrief }
 
-// UnverifiedReviewBrief returns the review brief for a checkpoint the driver could not verify
-// against the origin remote - see unverifiedReviewBrief.
 func UnverifiedReviewBrief() string { return unverifiedReviewBrief }

@@ -1,7 +1,5 @@
 package harness
 
-// turns.go — the multi-turn invocation contract.
-
 import (
 	"errors"
 	"fmt"
@@ -13,13 +11,13 @@ type Turn struct {
 	// Prompt is the message this turn sends.
 	Prompt string
 
-	// Model optionally names the model THIS turn runs on, overriding Invocation.Model for the turn
-	// alone. Blank (or whitespace) means the invocation's model.
 	Model string
 }
 
 // OnTurn returns a copy of the invocation pinned to one follow-up turn: the turn's own model when
-// it names one, otherwise the invocation's current one.
+// it names one, otherwise the invocation's current one. A turn that names a model also DROPS the
+// route list, deliberately: a fallback is a property of the stage's configured route, and walking
+// it after a per-turn model hits a limit would run the stage on a model its caller did not choose.
 func (in Invocation) OnTurn(t Turn) Invocation {
 	if m := strings.TrimSpace(t.Model); m != "" {
 		in.Model = m

@@ -29,9 +29,6 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 	if name != c.Harness {
 		return hc
 	}
-	// The run-wide twins are plain strings (they describe the top-level harness); a harness block
-	// accepts the route-list form, so the gap-fill widens a string into a one-route list rather than
-	// narrowing the block.
 	if len(hc.Model) == 0 && c.Model != "" {
 		hc.Model = ModelRoutes{c.Model}
 	}
@@ -51,8 +48,7 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 }
 
 // stringMapToRoutes widens the run-wide tier map (plain strings) into a harness block's
-// route-valued map. Nil stays nil so SessionFor's "the block named no map" test keeps
-// distinguishing an absent map from an empty one.
+// route-valued map.
 func stringMapToRoutes(m map[string]string) map[string]ModelRoutes {
 	if m == nil {
 		return nil
@@ -66,7 +62,9 @@ func stringMapToRoutes(m map[string]string) map[string]ModelRoutes {
 
 // ModelForPhase resolves one phase's model: its own pinned alias (Phase.Model, which is how a
 // review-panel member names the model it runs on), else its tier through the tier map of the
-// harness THAT phase runs on, else that harness's default model.
+// harness THAT phase runs on, else that harness's default model. `ok` is false only when a tier was
+// NAMED and resolved to nothing, exactly as before: the caller logs it and runs on the default
+// rather than stopping an unattended run over a typo.
 func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
 	routes, ok := c.ModelRoutesForPhase(ph)
 	if len(routes) == 0 {
@@ -77,7 +75,9 @@ func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
 
 // ModelRoutesForPhase is ModelForPhase with the whole ordered route list: the phase's own pinned
 // routes, else its tier's routes through the tier map of the harness that phase runs on, else that
-// harness's default routes.
+// harness's default routes. The sibling exists because two callers need the whole list: the driver
+// builds the adapter's fallback chain from it, and doctor's credential check must see every route
+// the run may ask for, not only the first.
 func (c *Config) ModelRoutesForPhase(ph Phase) (routes []string, ok bool) {
 	hc := c.SessionFor(c.HarnessFor(ph))
 	dflt := hc.Model.List()
@@ -100,7 +100,8 @@ func (c *Config) ModelRoutesForPhase(ph Phase) (routes []string, ok bool) {
 // deduplicated and sorted: each effective phase that resolves to that harness (so the review panel
 // and the unphased single phase are both included), with its model resolved through the same chain
 // the driver uses - Phase.Model, else Phase.Tier through that harness's tier map, else that
-// harness's default.
+// harness's default. Reading `model` alone would miss the tier and panel paths, which is precisely
+// where a config pins a provider the top-level field never mentions.
 func (c *Config) ModelIDsFor(harnessName string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -165,7 +166,6 @@ func (c *Config) panelMemberHarnesses() []string {
 func (c *Config) PhaseHarnesses() []string {
 	out := []string{c.Harness}
 	seen := map[string]bool{c.Harness: true}
-	// The configured phases, exactly as before the panel existed.
 	for _, ph := range c.Phases {
 		h := c.HarnessFor(ph)
 		if !seen[h] {
@@ -190,10 +190,11 @@ func (c *Config) PhaseHarnesses() []string {
 // SpawnedHarnesses lists every harness this config will actually START A SESSION on: the run-wide
 // one for an unphased run, and otherwise exactly the harnesses its phases resolve to — plus the
 // conflict-only session's own harness when the `conflict` block names a different one, because the
-// supervisor starts a real session there on a conflicted approved task.
+// supervisor starts a real session there on a conflicted approved task. PhaseHarnesses seeds
+// c.Harness unconditionally, which is right for the questions IT answers - is every declared
+// harness registered and configured, is its binary on the PATH - since a declared harness must be
+// usable whether or not today's phases reach it.
 func (c *Config) SpawnedHarnesses() []string {
-	// No phases means the synthesized single phase of EffectivePhases, which runs on the run-wide
-	// harness - so there the two are the same answer.
 	if len(c.Phases) == 0 {
 		out := []string{c.Harness}
 		if h := c.conflictHarness(); h != "" && h != c.Harness {

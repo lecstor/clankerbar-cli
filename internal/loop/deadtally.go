@@ -29,7 +29,10 @@ type phaseTally struct {
 }
 
 // tallyDead books one finished phase session into the run's dead-phase tally, and reports whether
-// this exit was booked as a DEAD phase.
+// this exit was booked as a DEAD phase. A session counts as a run when it got past its claim —
+// claimed a task, or resumed one it was seeded with — because a session that never got past its
+// claim (a refused takeover, a launch that observed nothing) is a correct refusal, not a phase run,
+// and increments neither counter.
 func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ceiling, wallclock bool) (bookedDead bool) {
 	if res.Claim.TaskID == "" {
 		return false

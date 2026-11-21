@@ -46,7 +46,9 @@ type reviewGate struct {
 	baseline string
 	role     string
 	round    int
-	// state is the matched record's plane state (sealed / open / void). Void records never match.
+	// state is the matched record's plane state (sealed / open / void). The driver closes only a
+	// SEALED round: a verifier releases its own round in the same call that hands the task over, and a
+	// second close would fail with no_open_round.
 	state string
 }
 
@@ -98,8 +100,10 @@ func matchingReviewRecord(records []plane.ReviewRecordState, role, runID, tip st
 
 // panelMemberRecordMatch asks the plane whether a panel member's durable record is already in the
 // round, using the SAME evidence the review seam uses: matchingReviewRecord keyed by this run and
-// the member's positional role, at the checkpoint's reviewed tip. Best-effort: an unreadable task
-// or an unwired reader leaves the member classified as failed, exactly as before this check.
+// the member's positional role, at the checkpoint's reviewed tip. A member that writes its record
+// and only THEN ends the sequence — a usage limit or a transient failure — returns from
+// drainPhase before the seam runs, so the panel handler must ask it here or the member is recorded
+// as a failure while its record sits in the round.
 func (d *Driver) panelMemberRecordMatch(ctx context.Context, t Target, res harness.Result, role string) (plane.ReviewRecordState, bool) {
 	if role == "" || res.Claim.TaskID == "" {
 		return plane.ReviewRecordState{}, false
@@ -111,7 +115,9 @@ func (d *Driver) panelMemberRecordMatch(ctx context.Context, t Target, res harne
 	return matchingReviewRecord(st.Reviews, role, res.Claim.RunID, res.CheckpointTip, res.CheckpointUnverified)
 }
 
-// runUUID is a run id's identity: the part before the first dot.
+// runUUID is a run id's identity: the part before the first dot. Since CLA-509 claim_task returns a
+// run as the credential `<uuid>.<secret>`, but the plane keys everything it stores (review records,
+// claimedByRun) on the bare uuid, so two ids name the same run exactly when their uuids match.
 func runUUID(id string) string {
 	if i := strings.IndexByte(id, '.'); i >= 0 {
 		return id[:i]
@@ -125,7 +131,10 @@ func isReviewHeading(line string) bool {
 	return strings.TrimRight(line, " \t\r") == config.ReviewRecordHeading
 }
 
-// reviewRecordLine reports whether outcome carries the review heading as its own line.
+// reviewRecordLine reports whether outcome carries the review heading as its own line. The
+// BRANCHLESS review-only checkpoint gates on it: a settled task cannot write the durable record —
+// the plane accepts review writes only from the live holder — so that variant keeps the legacy
+// block gate.
 func reviewRecordLine(outcome string) bool {
 	for _, line := range strings.Split(outcome, "\n") {
 		if isReviewHeading(line) {
@@ -152,7 +161,9 @@ func lastReviewBlock(outcome string) string {
 	return outcome[start:]
 }
 
-// reviewFinding is one parsed line of a review record's `### Findings` list.
+// reviewFinding is one parsed line of a review record's `### Findings` list. The driver parses the
+// block it told the review to write to build the fix phase's graded list, so the fields here are an
+// interface with the shape in config.reviewOnlyRecordShape, not a convenience.
 type reviewFinding struct {
 	ID       string // the record's own id, e.g. "R1"
 	Severity string // canonical lowercase: must | should | nit

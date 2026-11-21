@@ -30,10 +30,9 @@ func (d *Driver) endUntrustedDrain(t Target, ti, drainNum int, harnessName, logP
 }
 
 // salvageStrandedWork commits and pushes the work a dead session left in its worktree, and records
-// the branch on the task so another machine can pick it up. # Why it runs on EVERY ending, not only
-// on a usage limit The worktree is what is being rescued, and it looks identical whether the
-// session was killed by a limit, died in a crash, or simply stopped with the work unfinished —
-// while the cost of losing it is the same in all three.
+// the branch on the task so another machine can pick it up. workdir is where the session actually
+// ran — the resolved spawn directory, not rebuilt from the target — because that is where its
+// worktree lives once sessions start in per-task checkouts.
 func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result, producedNothing bool, workdir string) {
 	if d.newSalvager == nil || !res.Claim.Held() {
 		return

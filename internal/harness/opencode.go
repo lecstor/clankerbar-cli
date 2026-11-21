@@ -24,7 +24,9 @@ func (opencode) Name() string { return "opencode" }
 
 // opencode DOES receive mcp_config_path - as OPENCODE_CONFIG and, rewritten, as
 // OPENCODE_CONFIG_CONTENT (see env below) - and that is exactly why "does the adapter hand it over"
-// was the wrong question to gate a preflight on.
+// was the wrong question to gate a preflight on. A Claude-shaped file is a different schema: 1.18.2
+// refused to start on it, and 1.18.18 and 2.0.32 silently skip its `mcpServers` key, so the session
+// gets no clankerbar tools.
 func (opencode) MCPConfigUse() MCPConfigUse {
 	return MCPConfigUse{
 		Schema: MCPConfigNative,
@@ -36,7 +38,8 @@ func (opencode) MCPConfigUse() MCPConfigUse {
 // Invoke runs one opencode session for the driver, and — CLA-406 — when that session dies the
 // quiet death (stream dropped mid-generation, no terminal chunk, no usage), tries to RESURRECT it
 // in place rather than hand the driver a corpse: back off, probe the session with a coherence
-// question, and on a mechanical match continue it where it left off.
+// question, and on a mechanical match continue it where it left off. See opencode_resume.go for the
+// rules and their rationale; the loop here is only their orchestration.
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// Console -> agent delivery. The RUN id is not known at spawn for a fresh claim — the session
 	// claims inside itself — so the adapter learns it from ResumeClaim (a resumed phase) or the
@@ -83,7 +86,8 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if len(in.Turns) > 0 {
 		// A planned multi-turn session: the follow-up turns run in this same session before any recovery
 		// pass, because a turn that ends badly must stop the sequence rather than be resumed behind the
-		// caller's back.
+		// caller's back. A completed sequence hands back the FINAL turn's invocation: everything below
+		// judges the turn that actually ended the session, never the first one's model or route list.
 		var completed bool
 		in, completed, err = o.runTurns(ctx, in, &res, deadline, delivery)
 		if err != nil {
@@ -104,11 +108,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if o.OutputCapNoOutput(res) {
 		o.resumeOutputCapStall(ctx, in, &res, deadline, delivery)
 	}
-	// A silent 130 gets one resume before the route switch, so a quota error the resume surfaces is
-	// switched on evidence rather than a guess.
 	o.resumeInterrupted(ctx, in, &res, deadline, delivery)
-	// CLA-782: a usage limit on one model route is not the end of the session when the config named a
-	// fallback.
 	if !in.Probe {
 		if err := o.switchRoutesOnLimit(ctx, in, in.RouteList(), &res, deadline, delivery); err != nil {
 			return res, err
@@ -127,8 +127,6 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == "" && res.ToolLoop == ""; attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
-			// No session to resume into (died before its first event) or no claim to verify against (died
-			// before claiming — no work at stake).
 			break
 		}
 		// Budget check BEFORE the round spends anything: a round's backoff plus probe box come off the
@@ -151,20 +149,13 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		case <-time.After(opencodeResumeBackoff):
 		}
 
-		// The probe: same session, informed of the convention, asked to prove it is intact by naming its
-		// task ref.
 		pctx, pcancel := context.WithTimeout(ctx, opencodeProbeTimeout)
 		probeIn := in
 		probeIn.Probe = true // no wall-clock double-cap, no console tee
-		// Seed the probe's parser with the dead run's live claim, so a probe turn that touches the
-		// backlog is observed on the same terms as the session it belongs to - and folded back in below,
-		// so the observation actually reaches the driver.
 		probeIn.ResumeClaim = res.Claim
 		probeRes, probeErr := o.runSession(pctx, probeIn,
 			opencodeResumeArgs(in, sid, resurrectionProbePrompt), nil) // a probe has no private server to steer
 		pcancel()
-		// Charge the probe's spend UNCONDITIONALLY, before any verdict: a resume re-sends the whole
-		// transcript, so this is real money even when the answer is garbage.
 		res.Tokens += probeRes.Tokens
 		res.CostUSD += probeRes.CostUSD
 		res.Usage.Add(probeRes.Usage)
@@ -177,8 +168,6 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		if probeRes.Untrusted == "" && probeRes.Claim.Names(res.Claim.TaskID) {
 			mergeObservation(&res, probeRes)
 		}
-		// An UNTRUSTED probe capture proves nothing: its text survived an over-cap event discard
-		// (output.go), so a ref found in FinalMessage may be debris rather than recall.
 		coherent := probeErr == nil && probeRes.Untrusted == "" && probeCoherent(probeRes.FinalMessage, ref)
 		if !coherent {
 			if console != nil {
@@ -188,7 +177,11 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			break
 		}
 
-		// Coherent: continue the session for real.
+		// Coherent: continue the session for real. The continuation's parser is seeded with the DEAD
+		// RUN'S live claim (not in.ResumeClaim, which on a phase 2+ holds the staler predecessor):
+		// `opencode run -s` streams only the new turn, so without the seed every progress write the
+		// continuation makes would go unobserved — no settle, no HasWIP, no delivery report — and
+		// releaseHeldClaim would post ready over work the session pushed.
 		contIn := in
 		contIn.ResumeClaim = res.Claim
 		if !deadline.IsZero() {
@@ -230,12 +223,8 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			fmt.Fprintf(console, "!! resurrection %d succeeded — session continued in place\n", n+1)
 		}
 	}
-	// Last, so it judges the merged result of every recovery above and resumes on the route that
-	// finished.
 	o.resumeBadReport(ctx, in, &res, deadline, delivery)
 	if len(res.TurnMessages) > 0 {
-		// The recovery passes above resume the FINAL turn, so its message is whatever the session said
-		// last: the per-turn record may not keep the pre-recovery text beside a corrected FinalMessage.
 		res.TurnMessages[len(res.TurnMessages)-1] = res.FinalMessage
 	}
 	// Studio chat (studio-chat.md §3): a stream that never named a session still ran under the handle
@@ -246,7 +235,8 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	return res, nil
 }
 
-// opencodeArgs maps an Invocation to `opencode run`'s CLI dialect.
+// opencodeArgs maps an Invocation to `opencode run`'s CLI dialect. Split out so the probe's
+// read-only shape is unit-testable without executing anything.
 func opencodeArgs(in Invocation) []string {
 	prompt := opencodePrompt(in.Prompt)
 	if in.Probe {
@@ -259,18 +249,15 @@ func opencodeArgs(in Invocation) []string {
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}
-	// Studio chat (studio-chat.md §3): `run -s <id>` creates the session when it does not exist and
-	// continues it when it does, so a planner passes the same handle for a fresh prime and a later
-	// turn.
 	if ref := strings.TrimSpace(in.SessionRef); ref != "" {
 		args = append(args, "-s", ref)
 	}
 	return append(args, "--", prompt)
 }
 
-// opencodePrompt is the message a working (non-probe) run sends. The function is kept (rather than
-// inlined at its two call sites) because the prompt shape is a contract this adapter owns, and the
-// tests assert the absence of the note through it.
+// opencodePrompt is the message a working (non-probe) run sends. CLA-703 removed the race that note
+// described: the adapter now starts its own server, waits until the clankerbar server reports
+// connected, and only then attaches the run, so the first model turn already has the tools.
 func opencodePrompt(prompt string) string {
 	return prompt
 }
@@ -281,7 +268,8 @@ const opencodeMCPResourcePattern = "mcp:*"
 
 // opencodePermission is the fail-closed policy the adapter writes into the `permission` key of the
 // config it pins via OPENCODE_CONFIG_CONTENT (see opencodeSessionConfig): a path-scoped
-// PermissionConfig, not a flat tool map.
+// PermissionConfig, not a flat tool map. Everything else fails closed via the `*` catch-all, and
+// the network/exfil tools (webfetch/websearch) are denied in both shapes.
 func opencodePermission(readOnly bool, workdir string, extraDirs []string) string {
 	b, _ := json.Marshal(opencodePermissionPolicy(readOnly, workdir, extraDirs))
 	return string(b)
@@ -291,21 +279,19 @@ func opencodePermission(readOnly bool, workdir string, extraDirs []string) strin
 // embed it as an object rather than a string.
 func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string) map[string]any {
 	_, abs := opencodeWorkdirPatterns(workdir)
-	// "**" is everything under the instance directory, the root included; "../**" is every escape from
-	// it.
 	read := map[string]string{"**": "allow", "../**": "deny", opencodeMCPResourcePattern: "allow"}
 	edit := map[string]string{"**": "allow", "../**": "deny"}
 	ext := map[string]string{"*": "deny", abs: "allow"}
 	scopeExtraDirs(read, edit, ext, opencodeInstanceDir(workdir), extraDirs)
 	perm := map[string]any{
-		// The working set: read/edit scoped to the workdir subtree (root included), plus the
-		// external_directory carve-out for the same subtree.
 		"read":               read,
 		"edit":               edit,
 		"external_directory": ext,
 		// MCP tools must survive the `*` catch-all — see the function doc.
 		"*_*": "allow",
-		// The read-only search tools: grep/glob/list.
+		// The read-only search tools: grep/glob/list. Their asks carry the search pattern (a regex, a
+		// glob, or the resolved directory), never a workdir-relative path, so a path-scoped rule could
+		// not match them and the catch-all would leave the tools denied — the CLA-390 bug.
 		"grep": map[string]string{"**": "allow"},
 		"glob": map[string]string{"**": "allow"},
 		"list": map[string]string{"**": "allow"},
@@ -315,8 +301,6 @@ func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string)
 	}
 	// Code Mode, denied by name: see the function doc.
 	perm["execute"] = "deny"
-	// opencode 2.2 built-ins are named like MCP tools, so `*_*` would allow them, and worktree_create
-	// wrote outside the workdir.
 	perm["opencode_*"] = "deny"
 	perm["opencode_list_mcp_resources"] = "allow"
 	perm["opencode_read_mcp_resource"] = "allow"
@@ -326,14 +310,14 @@ func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string)
 	} else {
 		perm["shell"] = "allow"
 	}
-	// The catch-all: anything not named above — lsp/task/skill, reads or edits outside the workdir
-	// — is denied rather than asked.
 	perm["*"] = "deny"
 	return perm
 }
 
 // scopeExtraDirs widens the policy's three path-scoped rules to cover extraDirs: the absolute
-// external_directory allow, and the instance-relative read/edit form.
+// external_directory allow, and the instance-relative read/edit form. Emitting it would either
+// overwrite the "../**" deny with an allow or sort after it and beat it ("../../**"), turning the
+// policy's only stated escape boundary into an allow of the whole filesystem.
 func scopeExtraDirs(read, edit, ext map[string]string, base string, extraDirs []string) {
 	for _, dir := range extraDirs {
 		if dir == "" {
@@ -382,7 +366,10 @@ func absOrSelf(dir string) string {
 	return dir
 }
 
-// opencodeWorkdirPatterns derives two pattern forms from a directory.
+// opencodeWorkdirPatterns derives two pattern forms from a directory. rootRel is the root-relative
+// form 1.x read/edit asks used (the absolute path minus its leading separator); 2.x never asks in
+// it, and the policy no longer emits it, but the helper keeps returning it for the tests that pin
+// its derivation.
 func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
 	if workdir == "" {
 		var err error
@@ -417,22 +404,14 @@ func withoutAmbientOpencodeConfig(env []string) []string {
 }
 
 func (opencode) env(in Invocation) ([]string, error) {
-	// The session's INSTANCE directory. opencode reads $PWD, not just the real cwd, so this is what
-	// decides which project-level opencode.json it merges and which git worktree its read/edit asks
-	// are relative to - see pinPWD.
+	// The session's INSTANCE directory.
 	env := pinPWD(inheritEnv(withoutAmbientOpencodeConfig(os.Environ()), in.EnvAllowlist), in.WorkDir)
-	// Pin the config dir so a headless session loads the SAME providers, model and plugins as the
-	// interactive one (the claude/CODEX parity).
 	if in.ConfigDir != "" {
 		env = append(env, "OPENCODE_CONFIG_DIR="+in.ConfigDir)
 	}
-	// opencode has no per-run MCP flag; when a caller supplies a config file path (in opencode's own
-	// schema, carrying the mcp block) point OPENCODE_CONFIG at it.
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
 	}
-	// ...and hand the session config over again as OPENCODE_CONFIG_CONTENT, which opencode merges
-	// after every layer this driver or a checkout can write.
 	content, err := opencodeSessionConfig(in)
 	if err != nil {
 		// FAIL CLOSED. The alternative - spawn without the content layer - is a session with no
@@ -440,15 +419,15 @@ func (opencode) env(in Invocation) ([]string, error) {
 		return nil, err
 	}
 	env = append(env, "OPENCODE_CONFIG_CONTENT="+string(content))
-	// Set last so an explicit caller value in in.Env still wins (exec takes the last of a duplicate
-	// key).
 	env = append(env, in.Env...)
 	return env, nil
 }
 
 // opencodeSessionConfig builds the document pinned as OPENCODE_CONFIG_CONTENT: the mcp config
 // file's own keys, with every MCP server moved out of Code Mode and the fail-closed permission
-// policy under `permission`.
+// policy under `permission`. The file is parsed as strict JSON, the same rule config applies to
+// every file the driver names (readMCPFile): those feed fail-closed gates, and a lenient parse here
+// would let the adapter accept what config refused.
 func opencodeSessionConfig(in Invocation) ([]byte, error) {
 	doc := map[string]any{}
 	if in.MCPConfigPath != "" {
@@ -470,9 +449,7 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 	}
 	policy := opencodePermissionPolicy(in.Probe, in.WorkDir, in.ExtraDirs)
 	doc["permission"] = policy
-	// Pin the same policy on every built-in agent. Verified against 2.0.32: an agent-level permission
-	// block in ANY layer (1.x `agent.<name>.permission` or 2.x `agents.<name>.permissions`) overrides
-	// the top-level one for that agent.
+	// Pin the same policy on every built-in agent.
 	agents := map[string]any{}
 	for _, name := range opencodePinnedAgents {
 		agents[name] = map[string]any{"permission": policy}
@@ -498,11 +475,16 @@ func OpencodeSessionConfig(mcpConfigPath, workdir string, readOnly bool) ([]byte
 // reach them.
 var opencodePinnedAgents = []string{opencodeAgent, "plan", "general", "explore"}
 
-// opencodeAgent is the agent every run selects with --agent.
+// opencodeAgent is the agent every run selects with --agent. Selecting it explicitly means an
+// ambient `default_agent` cannot route the session to an agent whose permissions this adapter never
+// pinned.
 const opencodeAgent = "build"
 
 // opencodeMCPOutOfCodeMode rewrites a config's `mcp` block in place so every server it declares is
-// in the 2.x dialect (`mcp.servers.<name>`) with `codemode: false`.
+// in the 2.x dialect (`mcp.servers.<name>`) with `codemode: false`. Why both halves are needed,
+// verified against 2.0.32: - With Code Mode on (the 2.x default) a server's tools are reachable
+// only from inside the `execute` tool, which this adapter denies, and whose stream would not show
+// the claim anyway.
 func opencodeMCPOutOfCodeMode(doc map[string]any) error {
 	raw, ok := doc["mcp"]
 	if !ok || raw == nil {
@@ -618,7 +600,11 @@ func opencodeToolOutputDir(in Invocation) string {
 }
 
 // opencodeClankerbarTool maps an opencode tool name onto the namespaced name the shared observer
-// switches on, and returns "" for anything that is not a clankerbar tool.
+// switches on, and returns "" for anything that is not a clankerbar tool. The server name
+// `clankerbar` is HARD-CODED, here as in claude's constants, and that is an assumption the driver
+// does not enforce: it never writes an MCP config (the operator hand-writes opencode's, per the
+// README), and config.Validate deliberately accepts a clankerbar server under any key so long as it
+// is handed CLANKERBAR_API_KEY.
 func opencodeClankerbarTool(name string) string {
 	const prefix = "clankerbar_"
 	if !strings.HasPrefix(name, prefix) {
@@ -630,25 +616,18 @@ func opencodeClankerbarTool(name string) string {
 // finish writes what the stream added up to onto res.
 func (p *opencodeParse) finish(res *Result) {
 	res.FinalMessage = p.lastText
-	// What the session did with the backlog.
+	// What the session did with the backlog. Copied rather than accumulated in place because res does
+	// not exist until the process has exited; see the `observed` field.
 	res.Claim = p.observed.Claim
 	res.Reports = p.observed.Reports
-	// CLA-703: how many clankerbar calls got a successful result, copied for the same reason as the
-	// claim — the parser's observation is stream-side state until the process ends.
 	res.ClankerbarCalls = p.observed.ClankerbarCalls
-	// Recorded whatever the figures come to: the driver bounds attempts that reported NOTHING, and a
-	// step_finish carrying zeros still reported.
 	res.UsageReported = p.sawUsage
 	// The cost figure is its own question: a stream whose steps carried tokens but no cost reported no
 	// money, and the durable record must say so rather than reporting 0.
 	res.CostReported = p.sawCost
 	if p.sawUsage {
-		// opencode's `total` already folds in input+output+reasoning+cache, so it is the honest spend
-		// figure for the budget.
 		res.Tokens = p.total
 		res.CostUSD = p.cost
-		// The normalised breakdown: opencode's step tokens are already disjoint across exactly these five
-		// buckets, so this is the report itself, summed over the session's steps.
 		res.Usage = TokenUsage{
 			Input:      p.in,
 			Output:     p.out,
@@ -687,9 +666,6 @@ func (p *opencodeParse) finish(res *Result) {
 			res.Raw = map[string]any{}
 		}
 		res.Raw[opencodeSessionIDKey] = p.sessionID
-		// The handle the driver records for the next turn (studio-chat.md §3): the id this run actually
-		// streamed under, which is authoritative over whatever the invocation asked for when the stream
-		// names one.
 		res.SessionRef = p.sessionID
 	}
 	if p.errorType != "" {
@@ -727,7 +703,10 @@ var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
 	`|insufficient (?:[\w-]+ )?quota`)
 
 // opencodeRollingQuotaRe recognizes the OTHER kind of provider limit: a rolling subscription window
-// that a wait can outlast.
+// that a wait can outlast. The Command Code plan's 5-hour quota arrives as an HTTP 429 typed
+// `provider.quota` and states the reset instant in its message; the loop supervises that wait and
+// re-runs the session once the window lifts, so this must be reported as Limited with Stop UNSET
+// rather than falling through to the transient ladder.
 var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
 	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
 	`|\b(?:limit|quota)\b[^.\n"]{0,40}\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b` +
@@ -848,7 +827,9 @@ func opencodeWindowLimit(f opencodeErrorFacts, text string) (window string, plan
 	return "5-hour", true
 }
 
-// opencodeNamedWindow labels a window the text NAMES, when it names one.
+// opencodeNamedWindow labels a window the text NAMES, when it names one. The window word only
+// counts inside the limit STATEMENT — the same clause as a limit/quota word (either side of it,
+// since the provider swaps the order).
 var opencodeNamedWindowRe = regexp.MustCompile(`(?i)\b(weekly|daily|5[- ]hour)\b[^.\n"]{0,40}\b(?:usage\s+)?(?:limit|quota)\b` +
 	`|\b(?:usage\s+)?(?:limit|quota)\b[^.\n"]{0,40}\b(weekly|daily|5[- ]hour)\b`)
 
@@ -883,6 +864,8 @@ type opencodeErrorFacts struct {
 }
 
 // opencodeErrorFactsOf reads the structured facts out of a finished Result's terminal error event.
+// Neither is re-parsed by opencode, so `code` and `rateLimit` are only reachable by decoding that
+// string here.
 func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
 	line := opencodeTerminalErrorLine(res)
 	if line == "" {
@@ -975,7 +958,9 @@ func opencodeErrorText(res Result) string {
 }
 
 // buildOpencodeErrorText appends the stream's error event ONLY when it is how the session ENDED —
-// the last typed event on stdout.
+// the last typed event on stdout. stderr is scanned unconditionally: it is the harness's own
+// diagnostic channel, written as the process winds down, and the fallback for the untyped failures
+// the typed-event scan cannot see.
 func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
@@ -1019,7 +1004,10 @@ func opencodeTerminalErrorLine(res Result) string {
 }
 
 // opencodeFatalRe: failures that are NEVER a blip, scanned before the transient patterns and before
-// the heuristic below so neither can overrule them.
+// the heuristic below so neither can overrule them. A revoked key or a dead MCP server must end the
+// run loudly at the first attempt: those are the failures an operator has to act on, and a daemon
+// that retries them at the backoff ceiling instead reports "transient failure (exit 1) — retry
+// 47" all night and never says what is actually wrong.
 const opencodeFatalWords = `(authentication( \w+)? (failed|error|rejected)` +
 	`|unauthorized|forbidden|permission denied` +
 	`|invalid api key|api key (is )?(invalid|missing|not found|expired))`
@@ -1032,7 +1020,12 @@ var opencodeFatalRe = regexp.MustCompile(`(?i)"type": ?"provider\.(auth|no-route
 	`|"message": ?"[^"]*` + opencodeFatalWords +
 	`|error: ?[^\n]*` + opencodeFatalWords)
 
-// opencodeTransientRe: retryable server/network blips and API-level rate limits.
+// opencodeTransientRe: retryable server/network blips and API-level rate limits. The Console Go
+// tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`,
+// anomalyco/opencode#43374 and #43378) is classified HERE, deliberately, rather than as a dedicated
+// class with its own retry ladder: the gateway's enforcement is INCONSISTENT — #43374 records the
+// same catalog accepted and refused seconds apart — so the identical retry often succeeds, which
+// is exactly what the transient path does.
 var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit"` +
 	`|"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
@@ -1048,7 +1041,9 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit
 func (opencode) TurnCapped(Result) bool { return false }
 
 // wallClockReason is the terminal_reason the ADAPTER writes into a Result when it ended the session
-// for outliving Invocation.MaxSessionWallClock.
+// for outliving Invocation.MaxSessionWallClock. Like tokenCeilingReason it is deliberately not
+// something the CLI emits: the marker exists so the driver can tell an orderly cap from a genuine
+// failure, and opencode's stream carries no reason field a task could write into anyway.
 const wallClockReason = "wall_clock_capped"
 
 func (opencode) WallClockCapped(res Result) bool {
@@ -1073,6 +1068,9 @@ func (r *Result) markWallClockCapped() {
 // ZeroUsageUnknown reports whether this session ended with the CLA-398 quiet-death signature: a
 // FINAL step_finish carrying reason "unknown" whose OWN usage was all-zero — whatever the earlier
 // steps cost (the 2026-08-20 dead sessions had done real paid work before the silent final step).
+// The marker is the adapter's own (a terminal_reason it writes, never text the CLI or an agent
+// could emit), and it exists so the driver can NAME the end instead of logging "iteration done
+// (tokens=0 cost=$0.00)" over a session that produced nothing.
 func (opencode) ZeroUsageUnknown(res Result) bool {
 	if res.Raw == nil {
 		return false
@@ -1099,7 +1097,8 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // TracksClaims is true as of CLA-365, and on 2.x only because the adapter takes every MCP server
 // out of Code Mode (opencodeMCPOutOfCodeMode): opencode's `--format json` stream then carries each
 // tool call's arguments AND its result on one terminal `tool_use` event, so the adapter reads the
-// claim off the session the same way claude does and populates Result.Claim.
+// claim off the session the same way claude does and populates Result.Claim. HonoursMaxTurns stays
+// false — Invocation.MaxTurns still never reaches the CLI.
 func (opencode) Capabilities() Capabilities {
 	// DeliversMessages is true because every non-probe session with a clankerbar MCP server runs
 	// attached to a private `opencode serve` this adapter owns, and that server's session API steers a
@@ -1108,10 +1107,6 @@ func (opencode) Capabilities() Capabilities {
 }
 
 func (o opencode) IsTransient(res Result) bool {
-	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw Stdout+Stderr:
-	// the latter includes {"type":"text"} assistant narration, so a session that merely *discusses* a
-	// rate limit / connection error before exiting non-zero would be retried as transient instead of
-	// surfacing the real failure — the same reason DetectLimit scopes its scan this way.
 	text := opencodeErrorText(res)
 	// A named stop wins over every retry path below, including the heuristic.
 	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
@@ -1135,7 +1130,11 @@ func (o opencode) IsTransient(res Result) bool {
 
 // IsUnclassifiedTransient is the CLA-381 heuristic, and it is separate from the pattern scan
 // because a caller has to be able to bound it — see harness.Adapter.IsUnclassifiedTransient for
-// why that is a spending requirement and not a tidiness one.
+// why that is a spending requirement and not a tidiness one. A usage event means the session
+// authenticated and started doing paid work, so the failure came after the startup checks and is
+// more likely a version-shaped stream drop this adapter has no pattern for than a config/auth
+// refusal — that kind fails BEFORE any usage arrives, which is why the no-usage case stays a
+// stop.
 func (opencode) IsUnclassifiedTransient(res Result) bool {
 	if res.ExitCode != 1 || !res.UsageReported {
 		return false
@@ -1159,7 +1158,8 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 	return !opencodeTransientRe.MatchString(text)
 }
 
-// Diagnostic returns the scoped text IsTransient's PATTERN scans judged.
+// Diagnostic returns the scoped text IsTransient's PATTERN scans judged. See the claude adapter's
+// Diagnostic for why the scope must match exactly.
 func (opencode) Diagnostic(res Result) string { return opencodeErrorText(res) }
 
 func (o opencode) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {

@@ -28,9 +28,6 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 	// The first recorded branch whose check returned Unknown, kept apart from the Fail diagnostic: it
 	// is the branch an unverified checkpoint carries and the detail its log names.
 	unknownB, unknownWhy, unknownSeen := "", "", false
-	// The branch form (a) accepted, and the origin tip the accepting check read: the tip rides the
-	// checkpoint as the revision the review phase verifies and records, and the seam matches the
-	// record's reviewedTip against it.
 	foundBranch, foundTip, foundOK := "", "", false
 	if len(branches) > 0 {
 		if d.newVerifier == nil || workdir == "" {
@@ -194,7 +191,10 @@ func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Resu
 }
 
 // readTaskOutcome reads the claimed task's outcome from the plane, best-effort: a failure returns
-// read=false and the caller decides what to do without it.
+// read=false and the caller decides what to do without it. purpose and consequence compose the log
+// line, because two callers read the same field for different reasons — the review seam's
+// freshness baseline, and the fix phase's structural grading — and a shared message would misname
+// one of them.
 func (d *Driver) readTaskOutcome(ctx context.Context, t Target, prev *harness.Result, purpose, consequence string) (string, bool) {
 	if prev == nil || prev.Claim.TaskID == "" {
 		return "", false
@@ -259,9 +259,9 @@ func (d *Driver) planeTaskState(ctx context.Context, t Target, taskID string, at
 }
 
 // readReviewBaseline reads the task's outcome as it stands BEFORE the review phase spawns, so the
-// seam can require the record to have changed. A failure still returns read=false, and the caller
-// refuses to spawn the review rather than letting it run a session whose checkpoint the seam would
-// reject.
+// seam can require the record to have changed. Best-effort like every other plane read, with one
+// difference CLA-663 added: the read is RETRIED up to planeSeamReadAttempts times, because a blip
+// here does not degrade to "judge on other evidence" — it fails the whole sequence closed.
 func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
 	if prev == nil {
 		return "", false

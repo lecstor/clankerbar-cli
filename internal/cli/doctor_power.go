@@ -64,6 +64,10 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 }
 
 // holdsNoIdleSleep reports whether `pmset -g assertions` shows a live PreventUserIdleSystemSleep.
+// Falling through cannot invent a problem — it only defers to the more direct question —
+// whereas the previous test ("the last token is not an integer means a detail line") answered YES,
+// held for every unrecognised shape, including Apple appending a token to the summary row or a
+// locale shifting its number format.
 var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\(.+\):(?:\s|$)`)
 
 func holdsNoIdleSleep(out string) bool {

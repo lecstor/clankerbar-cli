@@ -160,7 +160,9 @@ func (d *Driver) noteTargetStart(i int) {
 }
 
 // budgetElapsed is the clock the budget in force for target i runs on: the target's own when a
-// stored overlay sets its ceiling, else the run's.
+// stored overlay sets its ceiling, else the run's. Scheduled pause holds are subtracted: the
+// operator configured that wait, so it must not count against a ceiling as if the project had been
+// draining.
 func (d *Driver) budgetElapsed(i int, runElapsed time.Duration) time.Duration {
 	runPaused, targetPaused := d.pauseCredit(i)
 	if d.overlayBudgetAt(i) {
@@ -227,7 +229,9 @@ func (d *Driver) targetBudgetTrip(i int, runElapsed time.Duration) budgetVerdict
 	}
 }
 
-// exhaustedAt reports whether target i has reached its ceiling for this run.
+// exhaustedAt reports whether target i has reached its ceiling for this run. The lock is not
+// decorative: a parallel panel's members run the mid-drain breaker on their own goroutines, and the
+// lease renewer beacons fleetState — which reads this — while they do.
 func (d *Driver) exhaustedAt(i int) bool {
 	if i < 0 || i >= len(d.exhausted) {
 		return false
