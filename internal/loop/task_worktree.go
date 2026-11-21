@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // worktreeRequest is one task's worktree to prepare. CloseOut marks an approved
@@ -202,7 +203,7 @@ func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt regi
 	}
 	remote := "origin/" + req.Branch
 	if taskWorktreeCommitishExists(ctx, wt.path, remote) {
-		if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", remote); err != nil {
+		if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "--", "HEAD", remote); err != nil {
 			if !negativeFact(err) {
 				return "", err
 			}
@@ -215,7 +216,7 @@ func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt regi
 	if !req.Resume && req.PRBase != "" {
 		base := "origin/" + req.PRBase
 		if taskWorktreeCommitishExists(ctx, wt.path, base) {
-			if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", base); err == nil {
+			if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "--", "HEAD", base); err == nil {
 				return "", nil
 			} else if !negativeFact(err) {
 				return "", err
@@ -265,10 +266,58 @@ func validateWorktreeRequest(req worktreeRequest) error {
 	if strings.TrimSpace(req.Branch) == "" {
 		return fmt.Errorf("task %s has no branch to prepare", id[:8])
 	}
+	if err := validateGitBranchRef(req.Branch); err != nil {
+		return fmt.Errorf("task %s has invalid branch %q: %w", id[:8], req.Branch, err)
+	}
 	// A close-out checks out an existing branch and never branches from or
-	// merges the base, so it is the one shape that needs no PR base.
+	// merges the base, so it is the one shape that needs no PR base. If one IS
+	// supplied, still validate it because finishTaskWorktreePrep resolves it.
 	if !req.CloseOut && strings.TrimSpace(req.PRBase) == "" {
 		return fmt.Errorf("task %s has no PR base to branch from", id[:8])
+	}
+	if req.PRBase != "" {
+		if err := validateGitBranchRef(req.PRBase); err != nil {
+			return fmt.Errorf("task %s has invalid PR base %q: %w", id[:8], req.PRBase, err)
+		}
+	}
+	return nil
+}
+
+// validateGitBranchRef enforces git-check-ref-format(1) branch-name rules in
+// pure Go so untrusted plane/config ref names can never be parsed as git flags
+// or revision-range expressions.
+func validateGitBranchRef(ref string) error {
+	if ref == "" {
+		return errors.New("empty ref")
+	}
+	if strings.HasPrefix(ref, "-") {
+		return errors.New("ref must not start with '-'")
+	}
+	if ref == "@" {
+		return errors.New("ref must not be '@'")
+	}
+	if strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") || strings.Contains(ref, "//") {
+		return errors.New("ref has empty path component")
+	}
+	if strings.HasSuffix(ref, ".") {
+		return errors.New("ref must not end with '.'")
+	}
+	if strings.Contains(ref, "..") || strings.Contains(ref, "@{") {
+		return errors.New("ref contains forbidden revision sequence")
+	}
+	for _, r := range ref {
+		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
+			return errors.New("ref contains whitespace or control character")
+		}
+		switch r {
+		case '~', '^', ':', '?', '*', '[', '\\':
+			return fmt.Errorf("ref contains forbidden character %q", r)
+		}
+	}
+	for _, part := range strings.Split(ref, "/") {
+		if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return errors.New("ref path component starts with '.' or ends with '.lock'")
+		}
 	}
 	return nil
 }
@@ -381,11 +430,11 @@ func taskWorktreeAddExisting(ctx context.Context, req worktreeRequest, dir strin
 		return fmt.Errorf("the branch %s is not on origin", req.Branch)
 	}
 	if taskWorktreeCommitishExists(ctx, req.Checkout, "refs/heads/"+req.Branch) {
-		if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "refs/heads/"+req.Branch, remote); err != nil {
+		if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "--", "refs/heads/"+req.Branch, remote); err != nil {
 			return fmt.Errorf("the local branch %s has commits origin/%s does not have — refusing to reset it", req.Branch, req.Branch)
 		}
 	}
-	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-B", req.Branch, dir, remote)
+	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-B", req.Branch, "--", dir, remote)
 	return err
 }
 
@@ -399,13 +448,13 @@ func taskWorktreeAddNew(ctx context.Context, req worktreeRequest, dir string) er
 		return fmt.Errorf("the PR base %s is not on origin", req.PRBase)
 	}
 	if !taskWorktreeCommitishExists(ctx, req.Checkout, "refs/heads/"+req.Branch) {
-		_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-b", req.Branch, dir, base)
+		_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-b", req.Branch, "--", dir, base)
 		return err
 	}
-	if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "refs/heads/"+req.Branch, base); err != nil {
+	if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "--", "refs/heads/"+req.Branch, base); err != nil {
 		return fmt.Errorf("the local branch %s already exists with commits %s does not have — refusing to reuse it", req.Branch, base)
 	}
-	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", dir, req.Branch)
+	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "--", dir, req.Branch)
 	return err
 }
 
@@ -419,7 +468,7 @@ func taskWorktreeSyncBranch(ctx context.Context, dir, branch string) error {
 	if !taskWorktreeCommitishExists(ctx, dir, remote) {
 		return fmt.Errorf("the branch %s is not on origin", branch)
 	}
-	out, err := taskWorktreeGit(ctx, dir, "rev-list", "--left-right", "--count", "HEAD..."+remote)
+	out, err := taskWorktreeGit(ctx, dir, "rev-list", "--left-right", "--count", "--end-of-options", "HEAD..."+remote, "--")
 	if err != nil {
 		return err
 	}
@@ -434,7 +483,7 @@ func taskWorktreeSyncBranch(ctx context.Context, dir, branch string) error {
 		return fmt.Errorf("worktree %s has diverged from %s (%d local and %d remote commit(s)) — refusing to reset it",
 			dir, remote, ahead, behind)
 	}
-	if _, err := taskWorktreeGit(ctx, dir, "merge", "--ff-only", remote); err != nil {
+	if _, err := taskWorktreeGit(ctx, dir, "merge", "--ff-only", "--", remote); err != nil {
 		return fmt.Errorf("fast-forwarding %s to %s: %w", dir, remote, err)
 	}
 	return nil
@@ -462,7 +511,7 @@ func taskWorktreeMerge(ctx context.Context, dir, base string) (merged, upToDate 
 	if err != nil {
 		return false, false, nil, err
 	}
-	if _, merr := taskWorktreeGit(ctx, dir, "merge", "--no-edit", base); merr != nil {
+	if _, merr := taskWorktreeGit(ctx, dir, "merge", "--no-edit", "--", base); merr != nil {
 		out, derr := taskWorktreeGit(ctx, dir, "diff", "--name-only", "--diff-filter=U")
 		if derr == nil {
 			if paths := taskWorktreeLines(out); len(paths) > 0 {
@@ -502,7 +551,7 @@ func finishTaskWorktreePrep(ctx context.Context, req worktreeRequest, prep workt
 	if req.PRBase != "" {
 		base := "origin/" + req.PRBase
 		if taskWorktreeCommitishExists(ctx, prep.Dir, base) {
-			if out, merr := taskWorktreeGit(ctx, prep.Dir, "merge-base", base, tip); merr == nil {
+			if out, merr := taskWorktreeGit(ctx, prep.Dir, "merge-base", "--", base, tip); merr == nil {
 				prep.BaseSHA = out
 			}
 		}
@@ -511,10 +560,10 @@ func finishTaskWorktreePrep(ctx context.Context, req worktreeRequest, prep workt
 	if !taskWorktreeCommitishExists(ctx, prep.Dir, remote) {
 		return prep, nil
 	}
-	if prep.OriginTip, err = taskWorktreeGit(ctx, prep.Dir, "rev-parse", remote); err != nil {
+	if prep.OriginTip, err = taskWorktreeGit(ctx, prep.Dir, "rev-parse", "--verify", "--end-of-options", remote); err != nil {
 		return prep, err
 	}
-	out, err := taskWorktreeGit(ctx, prep.Dir, "rev-list", "--count", remote+"..HEAD")
+	out, err := taskWorktreeGit(ctx, prep.Dir, "rev-list", "--count", "--end-of-options", remote+"..HEAD", "--")
 	if err != nil {
 		return prep, err
 	}
@@ -606,7 +655,7 @@ func taskWorktreeUnder(path, root string) bool {
 }
 
 func taskWorktreeCommitishExists(ctx context.Context, dir, commitish string) bool {
-	_, err := taskWorktreeGit(ctx, dir, "rev-parse", "--verify", "--quiet", commitish+"^{commit}")
+	_, err := taskWorktreeGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", commitish+"^{commit}")
 	return err == nil
 }
 
