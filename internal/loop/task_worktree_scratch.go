@@ -72,7 +72,7 @@ func taskWorktreeClearedRef(ctx context.Context, req worktreeRequest, dir string
 		if !taskWorktreeCommitishExists(ctx, dir, ref) {
 			continue
 		}
-		if _, err := taskWorktreeGit(ctx, dir, "merge-base", "--is-ancestor", "HEAD", ref); err == nil {
+		if _, err := taskWorktreeGit(ctx, dir, "merge-base", "--is-ancestor", "--", "HEAD", ref); err == nil {
 			return ref, nil
 		} else if !negativeFact(err) {
 			return "", err
