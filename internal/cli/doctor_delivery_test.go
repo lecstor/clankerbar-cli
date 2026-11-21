@@ -154,7 +154,7 @@ func TestDeliveryOnlyNonOriginRemotesWarns(t *testing.T) {
 	if c.status != warn {
 		t.Fatalf("status = %v (%s), want WARN", c.status, c.detail)
 	}
-	if len(c.info) != 1 || !strings.Contains(c.info[0], "no origin") {
+	if len(c.info) != 1 || !strings.Contains(c.info[0], "none is origin") {
 		t.Errorf("info should say there is no origin, got %v", c.info)
 	}
 }
@@ -182,7 +182,7 @@ func TestDeliveryMixedRepositoriesWarn(t *testing.T) {
 		t.Errorf("detail should count the unreadable one against the total, got %q", c.detail)
 	}
 	joined := strings.Join(c.info, "\n")
-	if !strings.Contains(joined, good+" -> origin") || !strings.Contains(joined, bad+" -> no remote") {
+	if !strings.Contains(joined, good+" -> origin") || !strings.Contains(joined, bad+" -> cannot be judged: no remote configured") {
 		t.Errorf("info should classify both repos, got %v", c.info)
 	}
 	if c.remedy == "" {

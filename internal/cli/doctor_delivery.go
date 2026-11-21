@@ -84,7 +84,7 @@ func deliveryCheck(ctx context.Context, name, workdir string, repos map[string]s
 	for _, repo := range found {
 		remote, err := deliveryRemote(ctx, e.gitRun, repo)
 		if err != nil {
-			c.info = append(c.info, repo+" -> no remote the check can read ("+err.Error()+")")
+			c.info = append(c.info, fmt.Sprintf("%s -> cannot be judged: %v", repo, err))
 			continue
 		}
 		reachable++
@@ -103,8 +103,9 @@ func deliveryCheck(ctx context.Context, name, workdir string, repos map[string]s
 		c.remedy = "add an origin remote to each checkout named above (git remote add origin <url>); the check reads origin, or a repository's only remote"
 	default:
 		c.status = warn
-		c.detail = fmt.Sprintf("%d of %d %s under %s has no remote the delivery check can read — a claim resolved in one reports could-not-verify",
-			len(found)-reachable, len(found), plural(len(found), "repository", "repositories"), where)
+		c.detail = fmt.Sprintf("%d of %d %s under %s %s no remote the delivery check can read — a claim resolved in one reports could-not-verify",
+			len(found)-reachable, len(found), plural(len(found), "repository", "repositories"), where,
+			plural(len(found)-reachable, "has", "have"))
 		c.remedy = "add an origin remote to the checkout(s) named above (git remote add origin <url>), or accept that claims in them are never verified"
 	}
 	return c
@@ -156,10 +157,10 @@ func deliveryRemote(ctx context.Context, run gitRunner, repo string) (string, er
 	}
 	switch len(names) {
 	case 0:
-		return "", errors.New("the repository has no remote")
+		return "", errors.New("no remote configured")
 	case 1:
 		return names[0], nil
 	default:
-		return "", fmt.Errorf("%d remotes and no origin; the check reads origin", len(names))
+		return "", fmt.Errorf("%d remotes and none is origin", len(names))
 	}
 }
