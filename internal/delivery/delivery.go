@@ -805,7 +805,7 @@ func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, ar
 func (v *Verifier) gitRunOut(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
-	cmd.Env = gitEnv(os.Environ(), extraEnv)
+	cmd.Env = GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

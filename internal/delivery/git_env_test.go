@@ -41,6 +41,7 @@ func TestGitRunOutStripsInheritedGitConfigAndOwnedVars(t *testing.T) {
 	t.Setenv("GIT_CONFIG_VALUE_0", "stale-user")
 	t.Setenv("GIT_CONFIG_KEY_1", "user.email")
 	t.Setenv("GIT_CONFIG_VALUE_1", "stale@example.com")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'url.https://github.com/.insteadOf'='https://evil.example.com/'")
 	t.Setenv("GIT_TERMINAL_PROMPT", "1")
 	t.Setenv("GIT_ASKPASS", "/bin/evil")
 	t.Setenv("SSH_ASKPASS", "/bin/evil")
@@ -83,7 +84,7 @@ func TestGitRunOutStripsInheritedGitConfigAndOwnedVars(t *testing.T) {
 			t.Errorf("%s = %v, want single [%q]", k, got, want)
 		}
 	}
-	for _, absent := range []string{"GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"} {
+	for _, absent := range []string{"GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1", "GIT_CONFIG_PARAMETERS"} {
 		if got := counts[absent]; len(got) != 0 {
 			t.Errorf("inherited %s should be stripped, got %v", absent, got)
 		}
@@ -97,6 +98,40 @@ func TestGitRunOutStripsInheritedGitConfigAndOwnedVars(t *testing.T) {
 	for _, line := range strings.Split(unscoped, "\n") {
 		if isGitConfigEnv(envName(line)) {
 			t.Errorf("unscoped gitRunOut leaked inherited git config env: %q", line)
+		}
+	}
+}
+
+// GitEnv owns the non-interactive vars: an extraEnv entry naming one is dropped
+// rather than appended next to ours, so no caller can reintroduce an
+// interactive or conflicting value. ExtraEnv's GIT_CONFIG_* entries are its
+// own, though - that is how ScopeEnv carries the scoped credential.
+func TestGitEnvDropsOwnedVarsFromExtraEnv(t *testing.T) {
+	env := GitEnv(
+		[]string{"PATH=/bin", "GIT_TERMINAL_PROMPT=1"},
+		[]string{
+			"GIT_ASKPASS=/bin/evil",
+			"GIT_TERMINAL_PROMPT=1",
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf",
+			"GIT_CONFIG_VALUE_0=https://x-access-token:tok@github.com/",
+			"EXTRA=kept",
+		},
+	)
+	counts := map[string][]string{}
+	for _, line := range env {
+		k := envName(line)
+		counts[k] = append(counts[k], line)
+	}
+	for k, want := range map[string]string{
+		"GIT_ASKPASS":         "GIT_ASKPASS=echo",
+		"GIT_TERMINAL_PROMPT": "GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_COUNT":    "GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_VALUE_0":  "GIT_CONFIG_VALUE_0=https://x-access-token:tok@github.com/",
+		"EXTRA":               "EXTRA=kept",
+	} {
+		if got := counts[k]; len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %v, want single [%q]", k, got, want)
 		}
 	}
 }

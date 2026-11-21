@@ -3,11 +3,13 @@ package secureurl
 import "regexp"
 
 // urlUserinfoRe matches URL userinfo (`scheme://user:pass@`) inside free-form
-// text. The userinfo class stops at path/query/fragment delimiters and quotes,
-// so an `@` in a later path or query is never mistaken for a credential, and an
-// scp-style address like `git@github.com:owner/repo.git` (no `://`) is left
-// alone.
-var urlUserinfoRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/?#'"<>]+)@`)
+// text. The userinfo class stops only at bytes RFC 3986 does not allow in
+// userinfo (`\s`, `/`, `?`, `#`), so every credential a real URL can carry -
+// including an unencoded `'`, which is a legal sub-delim - is caught. Stopping
+// at the path/query/fragment delimiters keeps an `@` in a later path or query
+// from being mistaken for a credential, and an scp-style address like
+// `git@github.com:owner/repo.git` (no `://`) is left alone.
+var urlUserinfoRe = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/?#]+)@`)
 
 // RedactUserinfo removes every URL's userinfo from s, keeping the scheme, host
 // and path so a log line or failure still names what it was doing. A string

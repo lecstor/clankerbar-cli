@@ -37,6 +37,16 @@ func TestRedactUserinfo(t *testing.T) {
 			want: "HTTPS://redacted@git.example.com/r ssh://redacted@host/r",
 		},
 		{
+			name: "password containing an unencoded apostrophe",
+			in:   "https://user:pa'ss@git.example.com/mirror/",
+			want: "https://redacted@git.example.com/mirror/",
+		},
+		{
+			name: "password containing an unencoded apostrophe in quoted git stderr",
+			in:   "fatal: repository 'https://user:pa'ss@git.example.com/mirror/' not found",
+			want: "fatal: repository 'https://redacted@git.example.com/mirror/' not found",
+		},
+		{
 			name: "no userinfo is unchanged",
 			in:   "https://git.example.com/mirror/ file:///srv/mirrors/ plain text",
 			want: "https://git.example.com/mirror/ file:///srv/mirrors/ plain text",

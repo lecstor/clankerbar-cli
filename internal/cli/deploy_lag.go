@@ -46,6 +46,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 const (
@@ -161,21 +162,18 @@ func deployGitRun(ctx context.Context, dir string, args ...string) (string, erro
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	)
-	cmd.Env = append(cmd.Env, extraEnv...)
+	// GitEnv strips inherited GIT_CONFIG_*/owned vars first, so the scoped
+	// insteadOf in extraEnv cannot be shadowed by a duplicate inherited key.
+	cmd.Env = delivery.GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
+			// The scoped env above puts the token in the URL git may echo when
+			// the network call fails; this error becomes Check.Detail.
+			return "", fmt.Errorf("git %s: %w: %s", args[0], err, secureurl.RedactUserinfo(firstLine(msg)))
 		}
 		return "", fmt.Errorf("git %s: %w", args[0], err)
 	}

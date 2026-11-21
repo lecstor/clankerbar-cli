@@ -108,8 +108,9 @@ func TestConflictPathsOnACleanPairNamesNothing(t *testing.T) {
 }
 
 // The failure error quotes merge-tree's output for diagnosis, so that output
-// must go through the same redactor as git stderr: a scoped invocation's stdout
-// can quote the rewritten remote too.
+// must go through the same redactor as git stderr. merge-tree never contacts a
+// remote, so this is defence in depth for the quoted output - not a scoped
+// invocation's URL.
 func TestConflictPathsRedactsCredentialsInQuotedOutput(t *testing.T) {
 	const secret = "gho_super_secret_token_966"
 	dir := t.TempDir()
