@@ -71,6 +71,7 @@ func TestRedactURLCredentials(t *testing.T) {
 	}{
 		{"no userinfo is unchanged", "https://git.example.com/mirror/", "https://git.example.com/mirror/"},
 		{"user and password are redacted", "https://user:token@git.example.com/mirror/", "https://redacted@git.example.com/mirror/"},
+		{"a password with an unencoded apostrophe is redacted", "https://user:pa'ss@git.example.com/mirror/", "https://redacted@git.example.com/mirror/"},
 		{"a bare token user is redacted", "http://ghp_secret@mirror.internal/git/", "http://redacted@mirror.internal/git/"},
 		{"an ssh scp-style prefix keeps its login user", "git@github-personal:", "git@github-personal:"},
 		{"a local file URL is unchanged", "file:///srv/mirrors/", "file:///srv/mirrors/"},

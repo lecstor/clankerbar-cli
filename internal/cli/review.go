@@ -198,9 +198,12 @@ Usage:
 
 "review run" reviews one local base..head in a temporary detached worktree and
 prints the findings as JSON. It claims no task, writes no plane record and
-connects no MCP config: the change itself is the whole subject, and the JSON is
-the whole deliverable. The reviewed repository is only read from; nothing is
-edited, committed or pushed.
+connects no MCP config. On the opencode adapter a clankerbar MCP server the
+reviewed checkout (or the global opencode config) declares is switched off, so
+the session cannot reach your backlog; a harness whose adapter does not
+implement that switch is refused. The change itself is
+the whole subject, and the JSON is the whole deliverable. The reviewed
+repository is only read from; nothing is edited, committed or pushed.
 
   --repo <path>             local git checkout (default: .)
   --base <commit>           commit the review diffs from (required)

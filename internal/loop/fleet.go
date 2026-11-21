@@ -5,6 +5,7 @@
 package loop
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -410,19 +411,40 @@ func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harne
 	}
 }
 
-// fleetShutdown delivers each target's final `stopping` beacon synchronously.
+// fleetShutdown delivers each target's final `stopping` beacon concurrently, under ONE deadline for
+// the whole set. It runs deferred from Run, so EVERY exit path says goodbye — STOP/HALT, a restart
+// marker, max-iterations, budget, signal, even a hard error return — which is what makes the
+// console's silence-after-this-point meaningful: after a stopping beacon, quiet means the daemon is
+// gone, not that it stopped talking.
+//
+// The shared deadline is load-bearing, not tidiness: against a hanging plane a serial Close per target
+// would hold Ctrl-C, the ctl re-exec and the supervisor's restart for one per-target worst case each.
 func (d *Driver) fleetShutdown() {
+	// One daemon-wide state, one daemon-wide file: writeLocalBeacon takes no
+	// target, so writing it per target would remove-then-create identical bytes.
+	d.writeLocalBeacon(fleet.State{Kind: fleet.StateStopping})
+
+	budget := d.shutdownBudget
+	if budget <= 0 {
+		budget = fleet.CloseBudget
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	beacons := make([]fleet.ShutdownBeacon, 0, len(d.targets))
 	for i := range d.targets {
-		t := d.targets[i]
-		d.writeLocalBeacon(fleet.State{Kind: fleet.StateStopping})
-		if t.Fleet == nil {
+		if d.targets[i].Fleet == nil {
 			continue
 		}
-		t.Fleet.Close(fleet.Report{
-			Identity: d.fleetIdentity(i),
-			State:    fleet.State{Kind: fleet.StateStopping},
+		beacons = append(beacons, fleet.ShutdownBeacon{
+			Reporter: d.targets[i].Fleet,
+			Report: fleet.Report{
+				Identity: d.fleetIdentity(i),
+				State:    fleet.State{Kind: fleet.StateStopping},
+			},
 		})
 	}
+	fleet.Shutdown(ctx, beacons)
 }
 
 // beginIteration marks target ti mid-drain and beacons the phase change NOW, so the console does

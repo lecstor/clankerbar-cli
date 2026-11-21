@@ -242,6 +242,13 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		{"RATE_LIMITED body with no window and no plan wording", Result{Stdout: `{"type":"error","error":{"message":"Rate limit exceeded","status":429,"response":{"body":"{\"error\":{\"code\":\"RATE_LIMITED\"}}"}}}`}, false, false, "", ""},
 		// The hard stop keeps winning over a structured window (settled 3).
 		{"structured window never outranks a hard budget stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You have reached your monthly usage limit","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, true, "", ""},
+		// Synthetic's spent subscription, verbatim: typed provider.rate-limit like a
+		// burst, no window, no reset. Its wording names the subscription, so it is a
+		// usage limit (route marked, session moved on), not a retry of the refusal.
+		{"subscription rate limit typed provider.rate-limit (verbatim Synthetic)", Result{Stdout: synthetic429Event}, true, false, "", ""},
+		{"subscription usage limit with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.rate-limit","message":"You've exceeded your subscription usage limit. Your limit resets at 2026-11-20T03:00:00Z.","status":429}}`}, true, false, "2026-11-20T03:00:00Z", ""},
+		{"subscription wording without a 429 or RATE_LIMITED is not a limit", Result{Stdout: `{"type":"error","error":{"message":"You've exceeded your subscription rate limits.","status":500}}`}, false, false, "", ""},
+		{"burst rate limit naming no subscription stays transient", Result{Stdout: `{"type":"error","error":{"type":"provider.rate-limit","message":"Rate limit reached for requests","status":429}}`}, false, false, "", ""},
 		// A plain 429 rate limit names no window: still transient, not a limit.
 		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false, false, "", ""},
 		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false, false, "", ""},

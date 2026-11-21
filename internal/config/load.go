@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 func defaults() *Config {
@@ -236,20 +238,7 @@ func underWorkDir(p, workdir string) string {
 // `scheme://user:password@host/...` - from raw, so a clone URL base carrying embedded mirror
 // credentials can be logged or quoted in an error without writing the credential down.
 func RedactURLCredentials(raw string) string {
-	i := strings.Index(raw, "://")
-	if i < 0 {
-		return raw
-	}
-	rest := raw[i+3:]
-	authority := rest
-	if end := strings.IndexByte(rest, '/'); end >= 0 {
-		authority = rest[:end]
-	}
-	at := strings.LastIndexByte(authority, '@')
-	if at < 0 {
-		return raw
-	}
-	return raw[:i+3] + "redacted@" + rest[at+1:]
+	return secureurl.RedactUserinfo(raw)
 }
 
 // ValidateCloneURLBase checks that base can be concatenated with an `owner/name.git` identity to

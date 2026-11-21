@@ -293,19 +293,49 @@ var (
 // for a differently-named ambient entry would stall the session on a server the backlog does not
 // depend on.
 func opencodeEffectiveMCPServers(in Invocation, env []string) ([]string, error) {
-	names := map[string]bool{}
-	if in.MCPConfigPath != "" {
-		// Strict JSON, the same rule config applies to every file the driver names; env() has already
-		// failed the spawn if this file is unreadable, so an error here is defensive, not a silent skip.
-		if err := readOpencodeMCPDocument(in.MCPConfigPath, true, names); err != nil {
+	decls, err := opencodeBacklogMCPDeclarations(in, env, in.MCPConfigPath == "")
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(decls))
+	for name := range decls {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// opencodeBacklogMCPDeclarations resolves every clankerbar server opencode would
+// load for this invocation, with the entry fields each layer declared.
+//
+// allLayers decides the question the caller is asking. The preflight asks what
+// the NAMED file declares when there is one, because that file is pinned into the
+// content layer and displaces the ambient servers of the same name; the
+// no-backlog switch asks what opencode will END UP loading, so it must read every
+// layer, the named file included.
+//
+// A name declared by several layers keeps the non-transport fields of all of
+// them, and the transport of the LAST layer that declares a complete one (type
+// plus url, or type plus command). That is deliberately more generous than
+// opencode's own merge for a PARTIAL entry (a `{"enabled": false}` does not
+// switch a global server off — see the conformance suite's mcpDisable test): the
+// carried-over transport is what lets the switch write one full entry that does
+// switch it off.
+func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool) (map[string]opencodeMCPDeclaration, error) {
+	decls := map[string]opencodeMCPDeclaration{}
+	if in.MCPConfigPath != "" && !allLayers {
+		// The preflight asks what the NAMED file declares: it is pinned into the
+		// content layer and displaces ambient servers of the same name. Strict
+		// JSON, the same rule config applies to every file the driver names.
+		if err := readOpencodeMCPDocument(in.MCPConfigPath, true, decls); err != nil {
 			return nil, fmt.Errorf("%w: cannot establish opencode's effective config: mcp config %s: %v",
 				ErrMCPNotConnected, in.MCPConfigPath, err)
 		}
-		return sortedMCPNames(names), nil
+		return decls, nil
 	}
 
-	read := func(path, source string) error {
-		if err := readOpencodeMCPDocument(path, false, names); err != nil {
+	read := func(path, source string, strict bool) error {
+		if err := readOpencodeMCPDocument(path, strict, decls); err != nil {
 			return fmt.Errorf("%w: cannot establish opencode's effective config: %s: %v", ErrMCPNotConnected, source, err)
 		}
 		return nil
@@ -318,13 +348,21 @@ func opencodeEffectiveMCPServers(in Invocation, env []string) ([]string, error) 
 	}
 	for _, name := range opencodeGlobalConfigNames {
 		path := filepath.Join(globalDir, name)
-		if err := read(path, "global config "+path); err != nil {
+		if err := read(path, "global config "+path, false); err != nil {
 			return nil, err
 		}
 	}
-	// 2. OPENCODE_CONFIG.
+	// 2. OPENCODE_CONFIG, the layer opencode reads after the global dir. The
+	// adapter pins the named MCP config there (opencode.go), so it is read at
+	// this position rather than first; a caller-declared value in in.Env wins
+	// at exec, so it is read after it.
+	if in.MCPConfigPath != "" {
+		if err := read(in.MCPConfigPath, "mcp config "+in.MCPConfigPath, true); err != nil {
+			return nil, err
+		}
+	}
 	if path := envValue(env, "OPENCODE_CONFIG"); path != "" {
-		if err := read(path, "OPENCODE_CONFIG "+path); err != nil {
+		if err := read(path, "OPENCODE_CONFIG "+path, false); err != nil {
 			return nil, err
 		}
 	}
@@ -336,23 +374,31 @@ func opencodeEffectiveMCPServers(in Invocation, env []string) ([]string, error) 
 	}
 	for _, name := range opencodeProjectConfigNames {
 		path := filepath.Join(base, name)
-		if err := read(path, "project config "+path); err != nil {
+		if err := read(path, "project config "+path, false); err != nil {
 			return nil, err
 		}
 	}
 	// 4. The content layer, merged last.
 	if content := envValue(env, "OPENCODE_CONFIG_CONTENT"); content != "" {
-		if err := collectOpencodeMCPNames([]byte(content), names); err != nil {
+		if err := collectOpencodeMCPNames([]byte(content), decls); err != nil {
 			return nil, fmt.Errorf("%w: cannot establish opencode's effective config: OPENCODE_CONFIG_CONTENT: %v", ErrMCPNotConnected, err)
 		}
 	}
-	return sortedMCPNames(names), nil
+	return decls, nil
 }
 
-// readOpencodeMCPDocument adds the clankerbar servers of one config file. A file that does not
-// exist contributes nothing; any other read or parse failure is an error, because the caller fails
-// closed on it.
-func readOpencodeMCPDocument(path string, strict bool, out map[string]bool) error {
+// opencodeMCPDeclaration is one clankerbar server opencode would load: the union
+// of the entry fields every layer declared for that name, so the switch can write
+// one FULL entry even when the layer that carried the transport was earlier than
+// the one that merely tweaked the entry.
+type opencodeMCPDeclaration struct {
+	entry map[string]any
+}
+
+// readOpencodeMCPDocument adds the clankerbar servers of one config file. A file that does not exist
+// contributes nothing; any other read or parse failure is an error, because the caller fails closed
+// on it.
+func readOpencodeMCPDocument(path string, strict bool, out map[string]opencodeMCPDeclaration) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -368,7 +414,7 @@ func readOpencodeMCPDocument(path string, strict bool, out map[string]bool) erro
 
 // collectOpencodeMCPNames decodes one JSON document and collects its clankerbar servers. Nothing
 // about `mcp` yields nothing; a document that is not JSON is an error.
-func collectOpencodeMCPNames(data []byte, out map[string]bool) error {
+func collectOpencodeMCPNames(data []byte, out map[string]opencodeMCPDeclaration) error {
 	var doc map[string]any
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return err
@@ -382,17 +428,28 @@ func opencodeMCPServers(path string) []string {
 	if path == "" {
 		return nil
 	}
-	names := map[string]bool{}
-	if err := readOpencodeMCPDocument(path, true, names); err != nil {
+	decls := map[string]opencodeMCPDeclaration{}
+	if err := readOpencodeMCPDocument(path, true, decls); err != nil {
 		return nil
 	}
-	return sortedMCPNames(names)
+	names := make([]string, 0, len(decls))
+	for name := range decls {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // collectOpencodeMCPServers adds every server in one document's `mcp` block that IS the clankerbar
 // server: the documented name, or any entry handed CLANKERBAR_API_KEY (the config's own rule for
 // which entry is the backlog's).
-func collectOpencodeMCPServers(doc map[string]any, out map[string]bool) {
+//
+// The 2.x container (`mcp.servers`, an object of entries) and a 1.x server
+// literally NAMED "servers" are told apart by the VALUE, the same rule config's
+// mcpFile.UnmarshalJSON applies: the container's value carries none of the entry
+// fields, while a 1.x entry carries at least one. Excluding the key outright
+// skipped that supported legacy shape entirely (CLA-703 review, finding 1.2).
+func collectOpencodeMCPServers(doc map[string]any, out map[string]opencodeMCPDeclaration) {
 	mcp, ok := doc["mcp"].(map[string]any)
 	if !ok {
 		return
@@ -421,12 +478,71 @@ func collectOpencodeMCPServers(doc map[string]any, out map[string]bool) {
 	}
 }
 
-// addOpencodeMCPServer adds a server that IS the backlog's: the documented name, or any entry
-// handed CLANKERBAR_API_KEY. A DISABLED entry is deliberately added too.
-func addOpencodeMCPServer(name string, entry map[string]any, out map[string]bool) {
-	if name == "clankerbar" || opencodeMCPEntryUsesCredential(entry) {
-		out[name] = true
+// addOpencodeMCPServer adds a server that IS the backlog's: the documented name, or any entry handed
+// CLANKERBAR_API_KEY, merging its fields into whatever earlier layers declared for that name.
+//
+// A DISABLED entry is deliberately added too. Excluding it at config-read time would let a
+// config-disabled clankerbar server through the preflight and only fail at the driver's backstop —
+// after a full paid session with no backlog tools — while a runtime `disabled` status fails the
+// preflight immediately. Adding it lets the status wait observe `disabled` and fail fast with
+// ErrMCPNotConnected (CLA-703 review, finding 4.3).
+func addOpencodeMCPServer(name string, entry map[string]any, out map[string]opencodeMCPDeclaration) {
+	if name != "clankerbar" && !opencodeMCPEntryUsesCredential(entry) {
+		return
 	}
+	decl := out[name]
+	if decl.entry == nil {
+		decl.entry = map[string]any{}
+	}
+	// A layer with a COMPLETE transport replaces the transport keys as a unit:
+	// merging them key by key can pair a later `type` with an earlier `url` or
+	// `command`, and opencode's tolerance of such a hybrid entry is unverified.
+	// A partial entry (no complete transport) contributes only its other fields,
+	// so `{"disabled": true}` keeps the transport an EARLIER layer declared —
+	// which is exactly what lets the switch write a full disabled entry for a
+	// server the operator's global config defines and a checkout only tweaks.
+	if transport, ok := opencodeMCPCompleteTransport(entry); ok {
+		delete(decl.entry, "type")
+		delete(decl.entry, "url")
+		delete(decl.entry, "command")
+		delete(decl.entry, "args")
+		for key, value := range transport {
+			decl.entry[key] = value
+		}
+	}
+	for key, value := range entry {
+		switch key {
+		case "type", "url", "command", "args":
+			// Transport keys arrive only through a complete transport above; a
+			// partial one must never combine with an earlier layer's dialect.
+		default:
+			decl.entry[key] = value
+		}
+	}
+	out[name] = decl
+}
+
+// opencodeMCPCompleteTransport extracts the transport a layer declares, if it
+// declares a whole one: a type plus a url, or a type plus a command. Partial
+// transports (a type alone, a url alone) are not returned: they cannot start a
+// server, and letting their keys join another layer's is how a hybrid entry is
+// made.
+func opencodeMCPCompleteTransport(entry map[string]any) (map[string]any, bool) {
+	kind, _ := entry["type"].(string)
+	if kind == "" {
+		return nil, false
+	}
+	if url, ok := entry["url"].(string); ok && url != "" {
+		return map[string]any{"type": kind, "url": url}, true
+	}
+	if command, ok := entry["command"]; ok && command != nil {
+		transport := map[string]any{"type": kind, "command": command}
+		if args, ok := entry["args"]; ok && args != nil {
+			transport["args"] = args
+		}
+		return transport, true
+	}
+	return nil, false
 }
 
 // opencodeMCPEntryShaped reports whether a value carries any field an MCP entry has, with a VALUE,
@@ -451,13 +567,100 @@ func opencodeMCPEntryShaped(entry map[string]any) bool {
 	return false
 }
 
-func sortedMCPNames(names map[string]bool) []string {
-	out := make([]string, 0, len(names))
-	for name := range names {
-		out = append(out, name)
+// disableBacklogMCPServers writes an OFF switch into doc's `mcp` block for every
+// server the resolver found. This is the NoBacklogMCP half: content is the layer
+// opencode merges last, so the entry it carries is the one that applies.
+//
+// The switch is a FULL entry, not the partial `{"disabled": true}` shape: verified
+// on 2.0.32, a partial entry in a later layer leaves the earlier server running
+// (see the conformance suite's mcpDisable and doctor's opencode_mcp_disables).
+// Only the transport key the type needs is copied — `url` for a remote server,
+// `command` (without `args`, which a disabled local server never runs) for a
+// local one — so a credential in `headers` or `environment` is not moved out of
+// the operator's config file and into the child's environment, where a process
+// listing reaches it. A URL that embeds a token in its query string IS copied:
+// it is already in the operator's config file, and the switch cannot strip it
+// without changing which server the entry names. A disabled server never dials,
+// so it needs none of the credentials.
+//
+// The entry is written in the 2.x container shape and any same-named direct entry
+// in doc is dropped: opencode applies the later layer's container entry over an
+// earlier layer's 1.x entry of the same name (proven by the same conformance
+// test), and the adapter's own out-of-Code-Mode rewrite then sees one shape.
+func disableBacklogMCPServers(doc map[string]any, decls map[string]opencodeMCPDeclaration) {
+	if len(decls) == 0 {
+		return
 	}
-	sort.Strings(out)
-	return out
+	mcp, _ := doc["mcp"].(map[string]any)
+	if raw, present := doc["mcp"]; !present || raw == nil {
+		mcp = map[string]any{}
+		doc["mcp"] = mcp
+	} else if mcp == nil {
+		// Not an object: opencodeMCPOutOfCodeMode refuses the document, so the
+		// session fails closed instead of running with the switch unwritten.
+		return
+	}
+	servers := map[string]any{}
+	// A `servers` value shaped like an ENTRY is the 1.x server of that literal
+	// name, not the container. It is moved into the container below rather than
+	// dropped: this doc may be a named config whose other servers are not the
+	// backlog's.
+	var legacyServersEntry map[string]any
+	if raw, ok := mcp["servers"].(map[string]any); ok {
+		if opencodeMCPEntryShaped(raw) {
+			legacyServersEntry = raw
+		} else {
+			servers = raw
+		}
+	}
+	for name, decl := range decls {
+		entry := backlogMCPTransportEntry(decl.entry)
+		if entry == nil {
+			// A typeless or transport-less declaration cannot start a server, so
+			// there is nothing to switch off (a partial entry alone is that
+			// case; the resolver's field union gives it a transport when any
+			// layer declared one).
+			continue
+		}
+		entry["disabled"] = true
+		if name != "servers" {
+			delete(mcp, name)
+		}
+		servers[name] = entry
+	}
+	if legacyServersEntry != nil {
+		if _, switchedOff := servers["servers"]; !switchedOff {
+			servers["servers"] = legacyServersEntry
+		}
+	}
+	if len(servers) > 0 {
+		mcp["servers"] = servers
+	}
+}
+
+// backlogMCPTransportEntry is the minimal full entry for one declaration: the
+// one transport key opencode needs to know what the server WOULD be, with none
+// that carry a credential and never both dialects. nil when the declaration has
+// no transport at all.
+func backlogMCPTransportEntry(fields map[string]any) map[string]any {
+	kind, _ := fields["type"].(string)
+	if kind == "" {
+		return nil
+	}
+	switch kind {
+	case "remote", "http", "https", "sse":
+		url, _ := fields["url"].(string)
+		if url == "" {
+			return nil
+		}
+		return map[string]any{"type": kind, "url": url}
+	default:
+		command, ok := fields["command"]
+		if !ok || command == nil {
+			return nil
+		}
+		return map[string]any{"type": kind, "command": command}
+	}
 }
 
 // opencodeGlobalConfigDir resolves the ONE global config directory opencode reads:

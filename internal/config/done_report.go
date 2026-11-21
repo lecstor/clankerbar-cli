@@ -133,7 +133,7 @@ func doneBody(final string) (string, bool) {
 			inFence = !inFence
 			continue
 		}
-		if !inFence && strings.TrimRight(line, " \t\r") == DoneMarker {
+		if !inFence && isDoneMarkerLine(line) {
 			at = i
 		}
 	}

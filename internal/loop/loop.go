@@ -186,6 +186,11 @@ type Driver struct {
 
 	leaseRenewalInterval time.Duration
 
+	// shutdownBudget bounds fleetShutdown's WHOLE goodbye — every target together, not each — because a
+	// hanging plane must not cost the run one report timeout per project while the operator waits on
+	// Ctrl-C. Zero means fleet.CloseBudget.
+	shutdownBudget time.Duration
+
 	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
 
 	newSalvager func(workdir string) workSalvager

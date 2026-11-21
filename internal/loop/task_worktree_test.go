@@ -829,24 +829,112 @@ func TestTaskWorktree_ExistingLocalBranchAtBaseIsReused(t *testing.T) {
 
 func TestTaskWorktree_RejectsBadRequests(t *testing.T) {
 	checkout := t.TempDir()
-	cases := []struct {
+	validCases := []struct {
 		name string
 		req  worktreeRequest
 	}{
-		{"no checkout", worktreeRequest{TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "staging"}},
-		{"short task id", worktreeRequest{Checkout: checkout, TaskID: "1a2b3c4", Branch: taskWorktreeBranch, PRBase: "staging"}},
-		{"non-hex task id", worktreeRequest{Checkout: checkout, TaskID: "zzzzzzzz-0000", Branch: taskWorktreeBranch, PRBase: "staging"}},
-		{"empty task id", worktreeRequest{Checkout: checkout, Branch: taskWorktreeBranch, PRBase: "staging"}},
-		{"no branch", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, PRBase: "staging"}},
-		{"no PR base", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch}},
+		{"normal branch and PR base", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "staging"}},
+		{"nested branch with dots", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "release/v1.2.3", PRBase: "integration"}},
+		{"close-out without PR base", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, CloseOut: true}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := prepareTaskWorktree(context.Background(), tc.req); err == nil {
-				t.Fatalf("prepareTaskWorktree(%+v) returned no error", tc.req)
+	for _, tc := range validCases {
+		t.Run("valid/"+tc.name, func(t *testing.T) {
+			if err := validateWorktreeRequest(tc.req); err != nil {
+				t.Fatalf("validateWorktreeRequest(%+v) = %v, want nil", tc.req, err)
 			}
 		})
 	}
+
+	cases := []struct {
+		name    string
+		req     worktreeRequest
+		wantSub string
+	}{
+		{"no checkout", worktreeRequest{TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "staging"}, "no checkout"},
+		{"short task id", worktreeRequest{Checkout: checkout, TaskID: "1a2b3c4", Branch: taskWorktreeBranch, PRBase: "staging"}, "not a UUID"},
+		{"non-hex task id", worktreeRequest{Checkout: checkout, TaskID: "zzzzzzzz-0000", Branch: taskWorktreeBranch, PRBase: "staging"}, "not a UUID"},
+		{"empty task id", worktreeRequest{Checkout: checkout, Branch: taskWorktreeBranch, PRBase: "staging"}, "not a UUID"},
+		{"no branch", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, PRBase: "staging"}, "no branch"},
+		{"no PR base", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch}, "no PR base"},
+		{"branch leading double dash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "--detach", PRBase: "staging"}, "invalid branch"},
+		{"branch leading single dash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "-b", PRBase: "staging"}, "invalid branch"},
+		{"branch double dot", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "main..evil", PRBase: "staging"}, "invalid branch"},
+		{"branch reflog syntax", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "main@{0}", PRBase: "staging"}, "invalid branch"},
+		{"branch whitespace", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/a b", PRBase: "staging"}, "invalid branch"},
+		{"branch control char", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/a\nb", PRBase: "staging"}, "invalid branch"},
+		{"branch NUL byte", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/a\x00b", PRBase: "staging"}, "invalid branch"},
+		{"branch DEL byte", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/a\x7fb", PRBase: "staging"}, "invalid branch"},
+		{"branch C1 control", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/a\u009bb", PRBase: "staging"}, "invalid branch"},
+		{"branch invalid UTF-8", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/\xff", PRBase: "staging"}, "invalid branch"},
+		{"branch backslash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: `feat\evil`, PRBase: "staging"}, "invalid branch"},
+		{"branch tilde", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "main~1", PRBase: "staging"}, "invalid branch"},
+		{"branch caret", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "main^2", PRBase: "staging"}, "invalid branch"},
+		{"branch colon", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "a:b", PRBase: "staging"}, "invalid branch"},
+		{"branch question mark", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "a?b", PRBase: "staging"}, "invalid branch"},
+		{"branch asterisk", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "a*b", PRBase: "staging"}, "invalid branch"},
+		{"branch open bracket", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "a[0]", PRBase: "staging"}, "invalid branch"},
+		{"branch dotlock suffix", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/a.lock", PRBase: "staging"}, "invalid branch"},
+		{"branch trailing dot", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "main.", PRBase: "staging"}, "invalid branch"},
+		{"branch bare dot", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: ".", PRBase: "staging"}, "invalid branch"},
+		{"branch hidden segment", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "feat/.hidden", PRBase: "staging"}, "invalid branch"},
+		{"branch bare at", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "@", PRBase: "staging"}, "invalid branch"},
+		{"branch HEAD", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "HEAD", PRBase: "staging"}, "invalid branch"},
+		{"branch leading slash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "/main", PRBase: "staging"}, "invalid branch"},
+		{"branch trailing slash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "main/", PRBase: "staging"}, "invalid branch"},
+		{"branch empty segment", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: "a//b", PRBase: "staging"}, "invalid branch"},
+		{"PR base leading double dash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "--exec=evil"}, "invalid PR base"},
+		{"PR base leading single dash", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "-f"}, "invalid PR base"},
+		{"PR base double dot", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "staging..evil"}, "invalid PR base"},
+		{"PR base whitespace", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "staging "}, "invalid PR base"},
+		{"PR base HEAD", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "HEAD"}, "invalid PR base"},
+		{"close-out with invalid PR base", worktreeRequest{Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "--detach", CloseOut: true}, "invalid PR base"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateWorktreeRequest(tc.req); err == nil {
+				t.Fatalf("validateWorktreeRequest(%+v) = nil, want error containing %q", tc.req, tc.wantSub)
+			} else if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("validateWorktreeRequest err = %q, want substring %q", err, tc.wantSub)
+			}
+			_, err := prepareTaskWorktree(context.Background(), tc.req)
+			if err == nil {
+				t.Fatalf("prepareTaskWorktree(%+v) returned no error", tc.req)
+			}
+			if errors.Is(err, errWorktreeFetch) {
+				t.Fatalf("prepareTaskWorktree(%+v) reached git fetch instead of failing validation: %v", tc.req, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("prepareTaskWorktree err = %q, want substring %q", err, tc.wantSub)
+			}
+		})
+	}
+
+	t.Run("claimWorktreeRefusal rejects flag-like branch and PRBase before touching git", func(t *testing.T) {
+		reason, _, err := claimWorktreeRefusal(context.Background(), worktreeRequest{
+			Checkout: checkout, TaskID: taskWorktreeID, Branch: "--detach", PRBase: "staging",
+		}, "")
+		if err != nil || !strings.Contains(reason, "invalid branch") {
+			t.Fatalf("claimWorktreeRefusal(bad branch) = (%q, %v), want deterministic invalid-branch refusal", reason, err)
+		}
+		reason, _, err = claimWorktreeRefusal(context.Background(), worktreeRequest{
+			Checkout: checkout, TaskID: taskWorktreeID, Branch: taskWorktreeBranch, PRBase: "--exec=evil",
+		}, "")
+		if err != nil || !strings.Contains(reason, "invalid PR base") {
+			t.Fatalf("claimWorktreeRefusal(bad PRBase) = (%q, %v), want deterministic invalid-PR-base refusal", reason, err)
+		}
+	})
+
+	t.Run("readOriginBranchFetched refuses invalid branch and flag-like doneTip", func(t *testing.T) {
+		f := newTaskWorktreeRepo(t)
+		f.commitOn(t, taskWorktreeBranch, "origin/staging", "b.txt", "work", "commit")
+		gitRun(t, f.checkout, "fetch", "origin")
+		if facts := readOriginBranchFetched(context.Background(), f.checkout, "--detach", ""); facts.Known {
+			t.Fatalf("invalid branch yielded Known=true: %+v", facts)
+		}
+		if facts := readOriginBranchFetched(context.Background(), f.checkout, taskWorktreeBranch, "--all"); facts.Known {
+			t.Fatalf("flag-like doneTip yielded Known=true: %+v", facts)
+		}
+	})
 }
 
 // Only the variables that ADDRESS a repository may be stripped: the operator's

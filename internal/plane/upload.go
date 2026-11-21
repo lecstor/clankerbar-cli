@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // The byte-free upload surface (CLA-581): the CLI declares a file with three
@@ -150,6 +153,68 @@ func (r *mcpReleaser) CreateUpload(ctx context.Context, req CreateUploadRequest)
 	}, nil
 }
 
+// validateUploadURL enforces the same transport floor and origin pinning as the
+// plane's MCP calls before any file bytes or upload capability token leave this
+// process: HTTPS everywhere (or loopback HTTP for local dev) and, when the
+// client has a configured endpoint, the exact same origin as that endpoint.
+func validateUploadURL(endpoint, uploadURL string) error {
+	// Validate the origin-only spelling, never the raw URL. secureurl.Origin
+	// embeds the string it was given in its error, and this error is printed to
+	// stderr and copied into logs while the raw URL's path carries the
+	// single-use upload token. Origin reads only scheme and host, so the
+	// refusal is the one the raw URL would get.
+	uploadOrigin, err := secureurl.Origin(originOnly(uploadURL))
+	if err != nil {
+		return fmt.Errorf("unsafe upload URL: %w", err)
+	}
+	if endpoint == "" {
+		return nil
+	}
+	endpointOrigin, err := secureurl.Origin(endpoint)
+	if err != nil {
+		return fmt.Errorf("unsafe plane endpoint: %w", err)
+	}
+	if !secureurl.SameOrigin(endpointOrigin, uploadURL) {
+		return fmt.Errorf("upload URL origin %q does not match plane endpoint origin %q", uploadOrigin, endpointOrigin)
+	}
+	return nil
+}
+
+// originOnly drops the path, query and fragment so a refusal can name where the
+// request was headed without copying the single-use upload token into stderr and
+// the logs.
+func originOnly(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable URL>"
+	}
+	if u.Scheme == "" || u.Host == "" {
+		if u.Scheme == "" {
+			return "<no scheme>"
+		}
+		return u.Scheme + "://"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// sameOriginRedirect extends noDowngradeRedirect for upload PUTs: every redirect
+// hop must still satisfy secureurl.Origin and stay on the plane's origin so a
+// compromised response cannot redirect file bytes and capability tokens off-site.
+func sameOriginRedirect(endpoint string) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if err := noDowngradeRedirect(req, via); err != nil {
+			return err
+		}
+		if endpoint == "" {
+			return nil
+		}
+		if err := validateUploadURL(endpoint, req.URL.String()); err != nil {
+			return fmt.Errorf("refusing redirect: %w", err)
+		}
+		return nil
+	}
+}
+
 // PutUpload sends the bytes to the ticket's URL. The body is the caller's
 // stream — a file handle, never bytes this process assembled into memory — and
 // the declared length rides Content-Length so the route can refuse a wrong size
@@ -162,6 +227,9 @@ func (r *mcpReleaser) PutUpload(ctx context.Context, uploadURL string, body io.R
 	if uploadURL == "" {
 		return errors.New("upload PUT: no upload URL")
 	}
+	if err := validateUploadURL(r.endpoint, uploadURL); err != nil {
+		return fmt.Errorf("upload PUT: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, body)
 	if err != nil {
 		return fmt.Errorf("upload PUT: %w", err)
@@ -171,7 +239,7 @@ func (r *mcpReleaser) PutUpload(ctx context.Context, uploadURL string, body io.R
 
 	client := r.upload
 	if client == nil {
-		client = &http.Client{Timeout: uploadTimeout, CheckRedirect: noDowngradeRedirect}
+		client = &http.Client{Timeout: uploadTimeout, CheckRedirect: sameOriginRedirect(r.endpoint)}
 	}
 	resp, err := client.Do(req)
 	if err != nil {

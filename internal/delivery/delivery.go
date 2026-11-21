@@ -44,6 +44,7 @@ package delivery
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -51,6 +52,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // Status is the outcome of one check. The three-way split is the whole point: see
@@ -178,6 +181,37 @@ func Repos(ctx context.Context, workdir string) []string {
 // judge it against. The workdir plays no part in this one, hence the empty one.
 func Remote(ctx context.Context, repo, preferred string) string {
 	return New("", preferred).resolveRemote(ctx, repo)
+}
+
+// ProbeRemote reports the remote the delivery checks will judge a claim against
+// in repo, or why none can be read: no remote at all, or several and none of them
+// preferred. It is the rule Verifier.resolveRemote applies, with the unreadable
+// cases made explicit so a caller can report the reason instead of silently
+// defaulting to a remote that is not there.
+//
+// run is the caller's own git exec: doctor bounds every command it runs, and the
+// verifier's is the one its checks use. Shared for the same reason as Repos - a
+// preflight that named a different remote than the check would tell the operator
+// the wrong thing about the check it exists to vouch for.
+func ProbeRemote(ctx context.Context, run func(ctx context.Context, dir string, args ...string) (string, error), repo, preferred string) (string, error) {
+	out, err := run(ctx, repo, "remote")
+	if err != nil {
+		return "", err
+	}
+	names := strings.Fields(out)
+	for _, n := range names {
+		if n == preferred {
+			return n, nil
+		}
+	}
+	switch len(names) {
+	case 0:
+		return "", errors.New("no remote configured")
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("%d remotes and none is %s", len(names), preferred)
+	}
 }
 
 // maxDepth is how far below the workdir a repository is looked for. Two levels
@@ -613,11 +647,6 @@ func realPath(p string) string {
 
 func sameDir(a, b string) bool { return realPath(a) == realPath(b) }
 
-// resolveRemote picks the remote to judge against: the configured one when the
-// repository has it, otherwise its only remote. A repo with several remotes and no
-// `origin` keeps the configured name and fails the read loudly, rather than
-// silently checking against whichever remote happened to sort first.
-
 // resolveRepoByURL filters repos to those whose remote URL matches the claim's repo slug.
 func (v *Verifier) resolveRepoByURL(ctx context.Context, repos []string, repoSlug string) []string {
 	if repoSlug == "" {
@@ -690,21 +719,16 @@ func MatchesRepoSlug(url, slug string) bool {
 	return false
 }
 
+// resolveRemote picks the remote to judge against: ProbeRemote's choice, keeping
+// the configured name when none can be read. A repo with several remotes and no
+// `origin` then fails its remote read loudly, rather than silently checking
+// against whichever remote happened to sort first.
 func (v *Verifier) resolveRemote(ctx context.Context, repo string) string {
-	out, err := v.run(ctx, repo, "remote")
-	if err != nil || out == "" {
+	remote, err := ProbeRemote(ctx, v.run, repo, v.remote)
+	if err != nil {
 		return v.remote
 	}
-	names := strings.Fields(out)
-	for _, n := range names {
-		if n == v.remote {
-			return v.remote
-		}
-	}
-	if len(names) == 1 {
-		return names[0]
-	}
-	return v.remote
+	return remote
 }
 
 // remoteURL reads the URL of the repository's resolved remote, for callers
@@ -803,21 +827,14 @@ func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, ar
 func (v *Verifier) gitRunOut(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	)
-	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Env = GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
+			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, secureurl.RedactUserinfo(firstLine(msg)))
 		}
 		return stdout.String(), fmt.Errorf("git %s: %w", args[0], err)
 	}

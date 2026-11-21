@@ -37,7 +37,10 @@ func readOriginBranchFetched(ctx context.Context, checkout, branch, doneTip stri
 		// No recorded branch: nothing about origin can be asked.
 		return f
 	}
-	out, err := taskWorktreeGit(ctx, checkout, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch)
+	if err := validateGitBranchRef(branch); err != nil {
+		return originBranchFacts{}
+	}
+	out, err := taskWorktreeGit(ctx, checkout, "rev-parse", "--verify", "--quiet", "--end-of-options", "refs/remotes/origin/"+branch)
 	if err != nil {
 		if !negativeFact(err) {
 			return originBranchFacts{}
@@ -54,7 +57,10 @@ func readOriginBranchFetched(ctx context.Context, checkout, branch, doneTip stri
 	case doneTip == f.Tip:
 		f.DoneIsAncestor = true
 	default:
-		if _, err := taskWorktreeGit(ctx, checkout, "merge-base", "--is-ancestor", doneTip, f.Tip); err != nil {
+		if err := validateGitBranchRef(doneTip); err != nil {
+			return originBranchFacts{}
+		}
+		if _, err := taskWorktreeGit(ctx, checkout, "merge-base", "--is-ancestor", "--", doneTip, f.Tip); err != nil {
 			if !negativeFact(err) {
 				return originBranchFacts{}
 			}

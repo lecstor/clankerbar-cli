@@ -234,6 +234,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkSessions(cfg)...)
 	checks = append(checks, checkSessionPriority(cfg, e))
 	checks = append(checks, checkStranded(ctx, cfg, e))
+	checks = append(checks, checkDelivery(ctx, cfg, e)...)
 	checks = append(checks, checkMCPServers(cfg), checkOpencodeAmbientConfigs(cfg))
 	checks = append(checks, checkOpencodeAuth(ctx, cfg, e)...)
 	checks = append(checks, checkOpencodeMCPDisables(cfg)...)
