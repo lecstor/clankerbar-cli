@@ -259,8 +259,8 @@ type Report struct {
 }
 
 // Reporter sends activity reports. Both methods are fail-soft by contract:
-// neither blocks meaningfully, neither returns an error, and neither may be
-// load-bearing for the caller.
+// Send returns at once, Close returns by its context's deadline at the latest,
+// and neither returns an error or may be load-bearing for the caller.
 type Reporter interface {
 	// Send enqueues one report and returns at once. Under an unresponsive
 	// endpoint the queue fills and the report is dropped (counted, mentioned in
@@ -275,11 +275,12 @@ type Reporter interface {
 	//
 	// ctx bounds the whole goodbye: Close returns at the deadline rather than
 	// waiting out a pump POST that started before it, and every POST it does
-	// make takes its timeout from what the deadline leaves. A daemon with
-	// several targets passes ONE deadline shared by all of them (Shutdown), so
-	// shutdown costs one budget rather than one per target. After the deadline
-	// nothing more is posted — that is what keeps an old daemon's late
-	// `stopping` beacon from overwriting its replacement's presence row.
+	// make takes its timeout from what the deadline leaves. A longer deadline
+	// is capped at CloseBudget. A daemon with several targets passes ONE
+	// deadline shared by all of them (Shutdown), so shutdown costs one budget
+	// rather than one per target. After the deadline nothing more is posted —
+	// that is what keeps an old daemon's late `stopping` beacon from
+	// overwriting its replacement's presence row.
 	//
 	// Idempotent: only the first call speaks. Used for the `stopping` beacon on
 	// shutdown paths.
@@ -458,7 +459,7 @@ func (r *httpReporter) Close(ctx context.Context, rep Report) {
 	defer cancel()
 
 	if !r.postMu.LockContext(ctx) {
-		log.Printf("fleet: shutdown: the pump was still delivering at the %s deadline - no stopping beacon sent", CloseBudget)
+		log.Printf("fleet: shutdown: the pump was still delivering at the shutdown deadline - no stopping beacon sent")
 		return
 	}
 	defer r.postMu.Unlock()

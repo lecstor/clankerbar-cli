@@ -1915,3 +1915,95 @@ func TestFleetIdentityToleratesNilConfig(t *testing.T) {
 		t.Errorf("want a host-derived instance name, got %+v", id)
 	}
 }
+
+// --- CLA-484: one shutdown budget for the whole fleet -------------------------
+
+// blockingFleet is a Reporter whose Close never returns until released, and
+// ignores its context: the shape a reporter must not be able to use to hold
+// process exit.
+type blockingFleet struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingFleet() *blockingFleet {
+	return &blockingFleet{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (b *blockingFleet) Send(fleet.Report) {}
+
+func (b *blockingFleet) Close(context.Context, fleet.Report) {
+	b.entered <- struct{}{}
+	<-b.release
+}
+
+// A hanging plane must cost the whole fleet ONE shutdown budget, not one per
+// target. Each serial Close used to be able to spend its own timeouts on the
+// pump wait, the flush and the stopping POST — so the operator's Ctrl-C and the
+// ctl restart re-exec waited N times that.
+func TestFleetShutdownIsBoundedByOneBudgetAcrossTargets(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{
+		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
+		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
+		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
+	})
+	openTestStateDir(t, d)
+	d.shutdownBudget = 100 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		d.fleetShutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("fleetShutdown had not returned 2s into a hanging plane with 3 targets (budget %s) — total shutdown must be one budget, not one per target", d.shutdownBudget)
+	}
+}
+
+// The budget is the guarantee, not the wait: a Reporter that ignores its
+// context must not keep fleetShutdown from returning at the deadline.
+func TestFleetShutdownAbandonsAReporterThatIgnoresTheDeadline(t *testing.T) {
+	a, b := newBlockingFleet(), newBlockingFleet()
+	t.Cleanup(func() { close(a.release) })
+	t.Cleanup(func() { close(b.release) })
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{
+		{Poller: busyPoller(), Fleet: a},
+		{Poller: busyPoller(), Fleet: b},
+	})
+	openTestStateDir(t, d)
+	d.shutdownBudget = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		d.fleetShutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("fleetShutdown never returned against a Reporter that ignores its context (budget %s)", d.shutdownBudget)
+	}
+	select {
+	case <-a.entered:
+	default:
+		t.Error("target 0's Close was never entered")
+	}
+	select {
+	case <-b.entered:
+	default:
+		t.Error("target 1's Close was never entered")
+	}
+}

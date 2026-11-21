@@ -621,6 +621,209 @@ func TestSendAfterCloseIsInert(t *testing.T) {
 	}
 }
 
+// neverAnswers starts a plane that hangs every request until the test ends or
+// the client cancels. It is the black-holing load balancer CLA-484 is about:
+// the request is accepted and then nothing comes back.
+func neverAnswers(t *testing.T) string {
+	t.Helper()
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+	return srv.URL
+}
+
+// The stopping beacon is the last POST a shutdown makes; it must not outlive the
+// deadline the caller gave. Deriving it from context.Background meant a hanging
+// plane held Ctrl-C for a full reportTimeout per target.
+func TestCloseStoppingBeaconIsBoundedByTheDeadline(t *testing.T) {
+	rep := New(neverAnswers(t), "k")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	rep.Close(ctx, Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Close took %s with a 100ms deadline — the stopping POST ran its own %s timeout", elapsed, reportTimeout)
+	}
+}
+
+// Close waits for the pump's in-flight POST under postMu. That wait must be
+// abandonable: a pump POST that started a moment before the shutdown would
+// otherwise spend the whole budget before Close's own turns started.
+func TestCloseAbandonsThePumpWaitAtItsDeadline(t *testing.T) {
+	first := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(first) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+
+	rep := New(srv.URL, "k")
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+	select {
+	case <-first:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pump never started its POST")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	rep.Close(ctx, Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Close took %s with a 100ms deadline — it waited out the pump's POST instead of abandoning the lock", elapsed)
+	}
+}
+
+// The flush loop used to check its budget BEFORE each send, so a send started at
+// the last moment still ran a full reportTimeout and the stopping POST after it
+// ran another. Every send draws its timeout from what the deadline leaves now.
+func TestCloseFlushCannotOvershootTheDeadline(t *testing.T) {
+	rep := New(neverAnswers(t), "k").(*httpReporter)
+	// Queue without starting the pump: this test is about Close's own sends.
+	for i := 0; i < 3; i++ {
+		rep.queue <- Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	rep.Close(ctx, Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Close took %s with a 100ms deadline — the flush ran a send at its full %s timeout and then the stopping POST", elapsed, reportTimeout)
+	}
+}
+
+// Once the goodbye has begun, the pump must start no further POST: a queued
+// report landing after Close returned would overwrite the presence row of the
+// daemon that replaced this one.
+func TestCloseStopsThePumpFromPostingAfterItReturns(t *testing.T) {
+	var mu sync.Mutex
+	posts := 0
+	first := make(chan struct{})
+	release := make(chan struct{})
+	later := make(chan struct{}, 4)
+	var once sync.Once
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		posts++
+		n := posts
+		mu.Unlock()
+		if n == 1 {
+			once.Do(func() { close(first) })
+			<-release
+		} else {
+			select {
+			case later <- struct{}{}:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+
+	rep := New(srv.URL, "k")
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // the pump takes it and wedges
+	select {
+	case <-first:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the pump never started its POST")
+	}
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // queued behind it
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	rep.Close(ctx, Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	unblock() // the wedged POST completes and the pump wakes
+
+	select {
+	case <-later:
+		t.Fatal("a report was posted after Close returned — once the goodbye begins the pump must start no further POST")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// gatedReporter is a Reporter whose Close can be held open, to observe when
+// each target's Close starts and finishes.
+type gatedReporter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGatedReporter() *gatedReporter {
+	return &gatedReporter{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (g *gatedReporter) Send(Report) {}
+
+func (g *gatedReporter) Close(context.Context, Report) {
+	g.entered <- struct{}{}
+	<-g.release
+}
+
+func (g *gatedReporter) unblock() { g.once.Do(func() { close(g.release) }) }
+
+// Every target's Close must be entered while the others are still blocked: one
+// serial Close per target is what made total shutdown N times the per-target
+// worst case.
+func TestShutdownClosesEveryTargetConcurrently(t *testing.T) {
+	a, b := newGatedReporter(), newGatedReporter()
+	t.Cleanup(a.unblock)
+	t.Cleanup(b.unblock)
+	done := make(chan struct{})
+	go func() {
+		Shutdown(context.Background(), []ShutdownBeacon{{Reporter: a}, {Reporter: b}})
+		close(done)
+	}()
+	for i, g := range []*gatedReporter{a, b} {
+		select {
+		case <-g.entered:
+		case <-time.After(time.Second):
+			t.Fatalf("target %d's Close was never entered while another was blocked — Shutdown is serial", i)
+		}
+	}
+	a.unblock()
+	b.unblock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not return after every Close did")
+	}
+}
+
+// The deadline is the guarantee, not the wait: a Reporter that ignores its
+// context must not be able to hold process exit past the budget.
+func TestShutdownAbandonsAReporterThatIgnoresTheDeadline(t *testing.T) {
+	g := newGatedReporter()
+	t.Cleanup(g.unblock)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	Shutdown(ctx, []ShutdownBeacon{{Reporter: g}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Shutdown took %s with a 100ms deadline — a Close that ignores its context held the wait", elapsed)
+	}
+}
+
 func TestProbeDistinguishesTheFourAnswers(t *testing.T) {
 	t.Run("400 empty-body refusal means wired", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

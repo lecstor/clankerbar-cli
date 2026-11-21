@@ -552,6 +552,27 @@ func TestBeaconsCarryThePlannerRole(t *testing.T) {
 	}
 }
 
+// Every target gets its goodbye. A target skipped at shutdown leaves its
+// presence row silent until the plane's stale window, which reads as a crashed
+// instance rather than a planned stop.
+func TestCloseBeaconsReachesEveryTarget(t *testing.T) {
+	a, b := &fakeFleet{}, &fakeFleet{}
+	p := &Planner{targets: []Target{{Fleet: a}, {Fleet: b}}, instance: "x", host: "h"}
+	p.closeBeacons()
+
+	for i, f := range []*fakeFleet{a, b} {
+		f.mu.Lock()
+		got := append([]fleet.Report(nil), f.closed...)
+		f.mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("target %d got %d close beacon(s), want one", i, len(got))
+		}
+		if got[0].State.Kind != fleet.StateStopping {
+			t.Errorf("target %d close state = %q, want %q", i, got[0].State.Kind, fleet.StateStopping)
+		}
+	}
+}
+
 // The per-turn wall clock is the CLI's: the plane's claim lease is derived from
 // the same figure, so a turn that ran past it could not post its reply.
 func TestInvokeBoundsTheTurnByTheWallClock(t *testing.T) {
