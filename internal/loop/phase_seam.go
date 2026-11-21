@@ -113,7 +113,7 @@ func (r *phaseRun) classifyEmpty(at *phaseAttempt) {
 	ph := r.ph
 	a := r.a
 	reviewOnly := r.shape.reviewOnly
-	// A held-but-empty exit (2026-08-24): a would-be checkpoint refused by the evidence gate — not
+	// A held-but-empty exit: a would-be checkpoint refused by the evidence gate — not
 	// by any of the older vetoes (dead, untrusted, not checkpointable) — so this is a FAILED phase,
 	// not a completed one.
 	at.empty = at.reviewable && !at.evidenceOK

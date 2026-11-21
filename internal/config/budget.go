@@ -96,7 +96,7 @@ func (b Budget) SessionTokenCeilingFor(harness string) int {
 
 // SessionTokenCeiling resolves the per-session runaway ceiling: the operator's own dial, else 2x
 // the run's max_tokens, else the floor. There is deliberately no "disabled": the whole point of
-// CLA-343 is that nothing was able to stop the 285.9M session, so a ceiling that can be left unset
+// CLA-343 is that nothing was able to stop the runaway session, so a ceiling that can be left unset
 // by accident is the bug.
 func (b Budget) SessionTokenCeiling() int {
 	if b.MaxSessionTokens > 0 {

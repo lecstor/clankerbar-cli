@@ -153,7 +153,7 @@ walk:
 				labelOf(t), drainNum, st.ph.Label(s.i), st.end.windowWhy)
 			break
 		}
-		// A held-but-empty exit is a FAILED phase (2026-08-24), not a checkpoint and not an ordinary
+		// A held-but-empty exit is a FAILED phase, not a checkpoint and not an ordinary
 		// "ended without holding the task" end: the claim was held to the end, it just carried no
 		// durable, origin-reachable branch evidence.
 		if st.end.empty {

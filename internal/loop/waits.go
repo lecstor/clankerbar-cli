@@ -74,9 +74,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	}
 
 	// CLA-728: the wait can outlast the plane's liveness window many times over, and a healthy daemon
-	// that stops talking reads on the console as dead - which is what sent the operator looking for a
-	// crash on 2026-10-20. Say `limited` on entry and keep saying it at limitBeaconInterval; the next
-	// ordinary beacon (`iteration` or `idle`) is what replaces it on resume, so there is no exit call.
+	// that stops talking reads on the console as dead. Say `limited` on entry and keep saying it at
+	// limitBeaconInterval; the next ordinary beacon (`iteration` or `idle`) is what replaces it on
+	// resume, so there is no exit call.
 	beaconInterval := d.limitBeaconInterval
 	if beaconInterval <= 0 {
 		// A Driver built by hand in a test carries the zero value; the default is the production window,

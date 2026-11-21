@@ -33,8 +33,7 @@ const quietThreshold = 3
 
 // quietTokenThreshold is the token-denominated replacement for the old session-count trigger. The
 // drift is deliberate and lenient, and it buys the property the session count could never give: ONE
-// huge fruitless drain trips the first 15-minute sit-out on its own — the 285.9M runaway would
-// have earned it at under a third of its spend instead of running three sessions past it.
+// huge fruitless drain trips the first 15-minute sit-out on its own, before a session count would.
 const quietTokenThreshold = 80_000_000
 
 // judgeProgress reads this poll as the verdict on the target's last drain, and backs the target off

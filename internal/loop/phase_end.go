@@ -42,10 +42,10 @@ type phaseEnd struct {
 	// record reads it.
 	session *fleet.Session
 
-	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape: the phase ended
-	// cleanly still holding the task with NO durable, origin-reachable branch evidence on the plane
-	// record. Deliberately distinct from dead, which keys on the "unknown" finish reason — the
-	// incident's sessions finished with reason "stop", so the dead signature alone did not catch them.
+	// empty reports a held-but-empty exit: the phase ended cleanly still holding the task with NO
+	// durable, origin-reachable branch evidence on the plane record. Deliberately distinct from dead,
+	// which keys on the "unknown" finish reason; these sessions finish with reason "stop", so the
+	// dead signature alone does not catch them.
 	empty bool
 
 	emptyWhy string

@@ -119,7 +119,7 @@ func checkBudget(cfg *config.Config) check {
 	// CLA-288 reading, now including the two ways a per-harness block can be inert.
 	anyLive := b.MaxTokens > 0 || costLive || b.MaxWallClock > 0 || perHarnessLive
 
-	// The guards that were silently absent from the config that ran a 285.9M single session: doctor's
+	// The guards that were silently absent from the config that ran one huge session: doctor's
 	// job is preflight, so the dials most likely to be missing are the ones it should name.
 	var guardNotes []string
 	var guardDials []string
@@ -223,7 +223,7 @@ func checkBudget(cfg *config.Config) check {
 	} else {
 		c.detail = strings.Join(set, ", ")
 		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single huge session coming,
-		// which is exactly what happened to the 285.9M run under max_tokens=75M.
+		// which is exactly what happened to that run under max_tokens=75M.
 		if b.MaxTokens > 0 || spawnedBlockTokens {
 			c.detail += " — the token ceiling is enforced BETWEEN sessions, so one session can overrun it"
 			// sessionTokenBounds is EMPTY when no spawned harness has a mid-session ceiling, which is every

@@ -1067,7 +1067,7 @@ func (r *Result) markWallClockCapped() {
 
 // ZeroUsageUnknown reports whether this session ended with the CLA-398 quiet-death signature: a
 // FINAL step_finish carrying reason "unknown" whose OWN usage was all-zero — whatever the earlier
-// steps cost (the 2026-08-20 dead sessions had done real paid work before the silent final step).
+// steps cost (a dead session may have done real paid work before the silent final step).
 // The marker is the adapter's own (a terminal_reason it writes, never text the CLI or an agent
 // could emit), and it exists so the driver can NAME the end instead of logging "iteration done
 // (tokens=0 cost=$0.00)" over a session that produced nothing.
