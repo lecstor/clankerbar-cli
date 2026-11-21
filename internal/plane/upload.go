@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -157,7 +158,12 @@ func (r *mcpReleaser) CreateUpload(ctx context.Context, req CreateUploadRequest)
 // process: HTTPS everywhere (or loopback HTTP for local dev) and, when the
 // client has a configured endpoint, the exact same origin as that endpoint.
 func validateUploadURL(endpoint, uploadURL string) error {
-	uploadOrigin, err := secureurl.Origin(uploadURL)
+	// Validate the origin-only spelling, never the raw URL. secureurl.Origin
+	// embeds the string it was given in its error, and this error is printed to
+	// stderr and copied into logs while the raw URL's path carries the
+	// single-use upload token. Origin reads only scheme and host, so the
+	// refusal is the one the raw URL would get.
+	uploadOrigin, err := secureurl.Origin(originOnly(uploadURL))
 	if err != nil {
 		return fmt.Errorf("unsafe upload URL: %w", err)
 	}
@@ -172,6 +178,23 @@ func validateUploadURL(endpoint, uploadURL string) error {
 		return fmt.Errorf("upload URL origin %q does not match plane endpoint origin %q", uploadOrigin, endpointOrigin)
 	}
 	return nil
+}
+
+// originOnly drops the path, query and fragment so a refusal can name where the
+// request was headed without copying the single-use upload token into stderr and
+// the logs.
+func originOnly(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable URL>"
+	}
+	if u.Scheme == "" || u.Host == "" {
+		if u.Scheme == "" {
+			return "<no scheme>"
+		}
+		return u.Scheme + "://"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // sameOriginRedirect extends noDowngradeRedirect for upload PUTs: every redirect

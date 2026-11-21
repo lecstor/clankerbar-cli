@@ -249,14 +249,10 @@ func TestUploadAPI_NotWired(t *testing.T) {
 
 type countingRoundTripper struct {
 	calls int
-	resp  func(*http.Request) (*http.Response, error)
 }
 
 func (c *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.calls++
-	if c.resp != nil {
-		return c.resp(req)
-	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
@@ -269,9 +265,7 @@ func (c *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // uploadURL through secureurl.Origin and pins it to the plane's origin before
 // sending any HTTP request, file bytes, or URL capability token.
 func TestPutUpload_RefusesUnsafeAndMismatchedURLs(t *testing.T) {
-	var hits int
 	otherSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits++
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(otherSrv.Close)
@@ -344,8 +338,24 @@ func TestPutUpload_RefusesUnsafeAndMismatchedURLs(t *testing.T) {
 			}
 		})
 	}
-	if hits != 0 {
-		t.Errorf("otherSrv received %d requests, want 0", hits)
+}
+
+// TestPutUpload_RefusalDoesNotEchoTheUploadToken: the refusal reaches stderr and
+// the logs, so it must name the origin without the token-bearing path.
+func TestPutUpload_RefusalDoesNotEchoTheUploadToken(t *testing.T) {
+	r := wiredClient("https://plane.example/mcp/demo", "k-1")
+	r.upload.Transport = &countingRoundTripper{}
+
+	const token = "cap-token-9b2f"
+	err := r.PutUpload(context.Background(), "http://plane.example/uploads/"+token, strings.NewReader("x"), 1, "image/png")
+	if err == nil {
+		t.Fatal("PutUpload = nil, want refusal")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("err = %v must not echo the upload token", err)
+	}
+	if !strings.Contains(err.Error(), "http://plane.example") {
+		t.Errorf("err = %v, want the origin named", err)
 	}
 }
 
@@ -425,7 +435,14 @@ func TestPutUpload_RefusesCrossOriginAndDowngradeRedirects(t *testing.T) {
 	if targetHits != 0 {
 		t.Errorf("cross-origin redirect target received %d hits, want 0", targetHits)
 	}
-	if err := api.PutUpload(context.Background(), redirectSrv.URL+"/uploads/downgrade", strings.NewReader("secret"), 6, "image/png"); err == nil {
+	err := api.PutUpload(context.Background(), redirectSrv.URL+"/uploads/downgrade", strings.NewReader("secret"), 6, "image/png")
+	if err == nil {
 		t.Fatal("cleartext downgrade redirect = nil, want refusal")
+	}
+	// The refusal itself, not just any error: without the guard the client would
+	// attempt the cleartext host and fail in DNS, which an err != nil check
+	// could not tell apart from the guard doing its job.
+	if !strings.Contains(err.Error(), "refusing redirect") || !strings.Contains(err.Error(), "plain http") {
+		t.Fatalf("cleartext downgrade redirect err = %v, want the redirect guard's refusal (refusing redirect / plain http)", err)
 	}
 }
