@@ -157,6 +157,9 @@ func TestRunReviewSinglePassReport(t *testing.T) {
 	if !got.AllowUnclaimed {
 		t.Error("AllowUnclaimed = false: a standalone review holds no claim and the adapter would refuse its turns")
 	}
+	if !got.NoBacklogMCP {
+		t.Error("NoBacklogMCP = false: a checkout's checked-in clankerbar MCP server would give the review the operator's backlog tools (CLA-927)")
+	}
 	if got.MaxTurns != config.DefaultMaxTurns {
 		t.Errorf("MaxTurns = %d, want the built-in default %d: a standalone review has no phase cap", got.MaxTurns, config.DefaultMaxTurns)
 	}
@@ -183,6 +186,31 @@ func TestRunReviewSinglePassReport(t *testing.T) {
 	}
 	if worktrees := r.git("worktree", "list", "--porcelain"); strings.Count(worktrees, "worktree ") != 1 {
 		t.Errorf("the repository carries worktree metadata after the run:\n%s", worktrees)
+	}
+}
+
+// A harness whose adapter does not implement the no-backlog switch cannot keep
+// the command's promise, so review run refuses it before spending a session.
+func TestRunReviewRefusesAHarnessWithoutTheNoBacklogSwitch(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("sample.go", "package sample\n")
+	base := r.commit("base")
+	r.write("sample.go", "package sample\n\nvar _ = 1\n")
+	head := r.commit("head")
+
+	invoked := false
+	_, err := RunReview(context.Background(), ReviewRunOptions{
+		Repo: r.dir, Base: base, Head: head, Harness: "codex", cfg: &config.Config{},
+		invoke: func(context.Context, harness.Invocation) (harness.Result, error) {
+			invoked = true
+			return harness.Result{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "no-backlog") {
+		t.Fatalf("RunReview err = %v, want a refusal naming the no-backlog switch", err)
+	}
+	if invoked {
+		t.Error("the session ran even though the adapter cannot keep the backlog out")
 	}
 }
 
@@ -230,6 +258,9 @@ func TestRunReviewMapsSessionTurnsAndModels(t *testing.T) {
 	}
 	if got.Console != nil {
 		t.Errorf("Console = %v, want nil in a test that did not ask for one", got.Console)
+	}
+	if !got.NoBacklogMCP {
+		t.Error("the maps-session invocation does not carry NoBacklogMCP: the review would get the backlog preflight and its tools")
 	}
 	if got.Turns[len(got.Turns)-1].Model != "test/findings-model" {
 		t.Errorf("the findings turn runs on %q, want test/findings-model", got.Turns[len(got.Turns)-1].Model)

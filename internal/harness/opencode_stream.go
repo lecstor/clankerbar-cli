@@ -74,7 +74,10 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string, 
 	runArgs := args
 	runEnv := env
 	var srv *opencodeServer
-	if !in.Probe {
+	// CLA-927: a NoBacklogMCP session has its clankerbar servers switched off in
+	// the content layer, so there is nothing to wait for and no tools to lose a
+	// race against. It keeps `--standalone` and starts immediately.
+	if !in.Probe && !in.NoBacklogMCP {
 		// Only a session with a clankerbar server gets the preflight. That
 		// server is resolved across the config layers opencode actually loads:
 		// the named file when there is one, otherwise the global config dir and
