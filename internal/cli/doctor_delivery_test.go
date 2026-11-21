@@ -79,13 +79,27 @@ func TestDoctorRunWarnsOnAnUnverifiableWorkdir(t *testing.T) {
 		t.Fatalf("a WARN must not fail the command: %v\n%s", err, out.String())
 	}
 	rendered := out.String()
-	if !strings.Contains(rendered, "WARN  delivery") {
-		t.Errorf("the delivery check never reached stdout:\n%s", rendered)
+	lines := strings.Split(rendered, "\n")
+	at := -1
+	for i, line := range lines {
+		if strings.Contains(line, "WARN  delivery") {
+			at = i
+			break
+		}
 	}
-	for _, want := range []string{"no non-bare git repository", dir, "-> "} {
-		if !strings.Contains(rendered, want) {
+	if at < 0 {
+		t.Fatalf("the delivery check never reached stdout:\n%s", rendered)
+	}
+	for _, want := range []string{"no non-bare git repository", dir} {
+		if !strings.Contains(lines[at], want) {
 			t.Errorf("the rendered delivery line is missing %q:\n%s", want, rendered)
 		}
+	}
+	// The remedy must be this check's own arrow line, not any other WARN's: this
+	// path emits no info lines, so the remedy is the line directly below.
+	if at+1 >= len(lines) || !strings.HasPrefix(strings.TrimSpace(lines[at+1]), "-> ") ||
+		!strings.Contains(lines[at+1], "point the project's workdir") {
+		t.Errorf("the delivery WARN's own remedy line is missing:\n%s", rendered)
 	}
 }
 
@@ -136,6 +150,31 @@ func TestDeliveryRepositoryWithoutRemoteWarns(t *testing.T) {
 	}
 	if !strings.Contains(c.remedy, "origin") {
 		t.Errorf("remedy should name the remote to add, got %q", c.remedy)
+	}
+}
+
+// git itself failing is not a configured remote: the line must carry the error,
+// and the check must WARN rather than FAIL — the delivery verifier fails open in
+// exactly this state.
+func TestDeliveryRemoteReadFailureWarns(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	e := okEnv()
+	e.repos = func(context.Context, string) []string { return []string{repo} }
+	e.gitRun = func(context.Context, string, ...string) (string, error) {
+		return "", errors.New("git remote: exit status 128")
+	}
+
+	c := deliveryCheck(context.Background(), "delivery", t.TempDir(), nil, "", e)
+
+	if c.status != warn {
+		t.Fatalf("status = %v (%s), want WARN", c.status, c.detail)
+	}
+	if len(c.info) != 1 || !strings.Contains(c.info[0], "cannot be judged: ") ||
+		!strings.Contains(c.info[0], "exit status 128") {
+		t.Errorf("info should carry the git error, got %v", c.info)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN must carry a remedy")
 	}
 }
 
@@ -245,6 +284,28 @@ func TestDeliveryReachesDeclaredCheckoutOutsideTheWorkdir(t *testing.T) {
 	}
 	if len(c.info) != 1 || !strings.Contains(c.info[0], f.repo+" -> origin") {
 		t.Errorf("the declared checkout should be the one named, got %v", c.info)
+	}
+}
+
+// A declared checkout that is a linked worktree of a repository the workdir scan
+// also finds is ONE repository: two paths, one ref database, and naming it twice
+// misreports the inventory the check exists to produce.
+func TestDeliveryDedupesAWorktreeOfARepositoryTheScanAlsoFinds(t *testing.T) {
+	f := strandedEnvOnBranch(t, "clanker/x") // root holds repo and repo-wt/abcd1234
+	cfg := validCfgIn(t, f.root)
+	cfg.Repos = map[string]string{"owner/repo": f.wt}
+	cfg.PrimaryRepo = "owner/repo"
+
+	c := deliveryCheck(context.Background(), "delivery", f.root, cfg.Repos, cfg.PrimaryRepo, realGitEnv(t))
+
+	if c.status != pass {
+		t.Fatalf("status = %v (%s), want PASS", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "1 repository") {
+		t.Errorf("one repository must be counted once, got %q", c.detail)
+	}
+	if len(c.info) != 1 || !strings.Contains(c.info[0], "-> origin") {
+		t.Errorf("the repository should be named once with its remote, got %v", c.info)
 	}
 }
 

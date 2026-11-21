@@ -2,6 +2,7 @@ package delivery
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -517,6 +518,47 @@ func TestBareRepositoryIsNotACandidate(t *testing.T) {
 	mustStatus(t, rep, BranchPushed, Pass)
 	if rep.Repo != env.work {
 		t.Errorf("checked %q, want the working tree %q", rep.Repo, env.work)
+	}
+}
+
+// ProbeRemote is the one remote-selection rule the verifier, the doctor and the
+// deploy-lag check share. A runner error is passed through, not read as "no
+// remotes"; the unreadable cases say why, so a caller can report the reason.
+func TestProbeRemoteUsesOneSelectionRule(t *testing.T) {
+	cases := []struct {
+		name      string
+		listing   string
+		preferred string
+		runErr    error
+		want      string
+		wantErr   string
+	}{
+		{name: "preferred present", listing: "origin\n", preferred: "origin", want: "origin"},
+		{name: "only remote", listing: "upstream\n", preferred: "origin", want: "upstream"},
+		{name: "several and none preferred", listing: "upstream\nfork\n", preferred: "origin", wantErr: "2 remotes and none is origin"},
+		{name: "no remote", listing: "", preferred: "origin", wantErr: "no remote configured"},
+		{name: "other preferred", listing: "origin\nfork\n", preferred: "fork", want: "fork"},
+		{name: "git failed", preferred: "origin", runErr: errors.New("exit status 128"), wantErr: "exit status 128"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := func(context.Context, string, ...string) (string, error) {
+				return tc.listing, tc.runErr
+			}
+			got, err := ProbeRemote(context.Background(), run, "/repo", tc.preferred)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("remote = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

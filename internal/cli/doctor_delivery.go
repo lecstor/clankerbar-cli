@@ -2,11 +2,11 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 )
 
 // --- 7b. delivery verifier reach ---------------------------------------------
@@ -64,7 +64,16 @@ func deliveryCheck(ctx context.Context, name, workdir string, repos map[string]s
 			continue
 		}
 		for _, repo := range e.repos(ctx, root) {
-			key := resolvePath(repo)
+			// A declared checkout can be a linked worktree of a repository the
+			// workdir scan also found: two paths, one repository. Key on the
+			// shared git dir, as strandedRepos does, so it is named once; the
+			// first path is kept because it is the one the operator can act on.
+			key := repoCommonDir(ctx, e.gitRun, repo)
+			if key == "" {
+				// Unreadable: no common dir to compare on, so its path is the
+				// only identity there is.
+				key = resolvePath(repo)
+			}
 			if seen[key] {
 				continue
 			}
@@ -82,7 +91,7 @@ func deliveryCheck(ctx context.Context, name, workdir string, repos map[string]s
 
 	reachable := 0
 	for _, repo := range found {
-		remote, err := deliveryRemote(ctx, e.gitRun, repo)
+		remote, err := delivery.ProbeRemote(ctx, e.gitRun, repo, "origin")
 		if err != nil {
 			c.info = append(c.info, fmt.Sprintf("%s -> cannot be judged: %v", repo, err))
 			continue
@@ -136,31 +145,4 @@ func deliveryRoots(workdir string, repos map[string]string, primary string) []st
 		add(checkout)
 	}
 	return out
-}
-
-// deliveryRemote resolves the remote the delivery check will read for repo, and
-// reports the cases where there is none: the same rule as
-// delivery.Verifier.resolveRemote — "origin" when present, a repository's only
-// remote otherwise — with the fallback made explicit. Several remotes and no
-// origin is an error because the verifier keeps "origin" there and fails the
-// read, which is an Unknown check, not a verified one.
-func deliveryRemote(ctx context.Context, run gitRunner, repo string) (string, error) {
-	out, err := run(ctx, repo, "remote")
-	if err != nil {
-		return "", err
-	}
-	names := strings.Fields(out)
-	for _, n := range names {
-		if n == "origin" {
-			return n, nil
-		}
-	}
-	switch len(names) {
-	case 0:
-		return "", errors.New("no remote configured")
-	case 1:
-		return names[0], nil
-	default:
-		return "", fmt.Errorf("%d remotes and none is origin", len(names))
-	}
 }
