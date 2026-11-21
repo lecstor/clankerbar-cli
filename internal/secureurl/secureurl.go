@@ -1,5 +1,5 @@
-// Package secureurl holds one rule, in one place: where a bearer token may be
-// sent.
+// Package secureurl holds the URL safety rules shared across packages: where a
+// bearer token may be sent, and how URL credentials are kept out of logs.
 //
 // CLANKERBAR_API_KEY is ACCOUNT-scoped — it covers every project the operator is
 // a member of. CLA-257 was the account key being sent to a host named by a file

@@ -232,6 +232,65 @@ func TestCloneFailureRedactsURLCredentials(t *testing.T) {
 	}
 }
 
+// The scoped clone env must be built over a STRIPPED parent environment:
+// duplicate env keys have unspecified precedence, so an inherited
+// GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS could shadow the credential rewrite
+// the clone is scoped by. The owned non-interactive vars must likewise survive
+// exactly once, with our value.
+func TestCloneStripsInheritedGitConfigEnv(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.https://github.com/.insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "https://evil.example.com/")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'url.https://github.com/.insteadOf'='https://evil.example.com/'")
+	t.Setenv("GIT_TERMINAL_PROMPT", "1")
+
+	// A github.com base with a token-serving gh stub is what makes the clone
+	// carry a scoped GIT_CONFIG_* entry for the inherited one to collide with.
+	// The base is explicit because this package's TestMain points the default at
+	// a local file:// remote, which scopes nothing.
+	ghShim(t)
+
+	shimDir := t.TempDir()
+	record := filepath.Join(t.TempDir(), "clone-env")
+	script := "#!/bin/sh\n" +
+		"env > " + shellQuote(record) + "\n" +
+		"exit 128\n"
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cloneErr := cloneRepo(context.Background(), filepath.Join(t.TempDir(), "widgets"), "acme/widgets", "https://github.com/")
+	if cloneErr == nil {
+		t.Fatal("cloneRepo succeeded against a failing git shim")
+	}
+	raw, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("the git shim did not record its environment: %v", err)
+	}
+	counts := map[string][]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if i := strings.IndexByte(line, '='); i > 0 {
+			counts[line[:i]] = append(counts[line[:i]], line)
+		}
+	}
+	for name, want := range map[string]string{
+		"GIT_CONFIG_COUNT":    "GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_VALUE_0":  "GIT_CONFIG_VALUE_0=https://github.com/",
+		"GIT_TERMINAL_PROMPT": "GIT_TERMINAL_PROMPT=0",
+	} {
+		if got := counts[name]; len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %v, want single [%q]", name, got, want)
+		}
+	}
+	if got := counts["GIT_CONFIG_KEY_0"]; len(got) != 1 || !strings.Contains(got[0], "x-access-token:gho_stub_token@github.com") {
+		t.Errorf("GIT_CONFIG_KEY_0 = %v, want the single scoped token rewrite", got)
+	}
+	if got := counts["GIT_CONFIG_PARAMETERS"]; len(got) != 0 {
+		t.Errorf("inherited GIT_CONFIG_PARAMETERS should be stripped, got %v", got)
+	}
+}
+
 // An ssh base is cloned as git@<alias>:owner/name.git, and no gh token is
 // resolved for it: the key is the credential, so the session's environment does
 // not need one (CLA-713).

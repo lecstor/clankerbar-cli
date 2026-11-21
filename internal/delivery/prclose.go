@@ -32,6 +32,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // PRVerdict is the one word the close-out acts on.
@@ -314,7 +316,7 @@ func (v *Verifier) ConflictPaths(ctx context.Context, repo, baseRef, headRef str
 	if runErr == nil {
 		return nil, fmt.Errorf("merge-tree %s..%s: %w", baseRef, headRef, parseErr)
 	}
-	return nil, fmt.Errorf("merge-tree %s..%s: %v (output: %s)", baseRef, headRef, runErr, firstLine(out))
+	return nil, fmt.Errorf("merge-tree %s..%s: %v (output: %s)", baseRef, headRef, runErr, secureurl.RedactUserinfo(firstLine(out)))
 }
 
 // parseMergeTreeConflicts reads the path section of `git merge-tree --write-tree

@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -71,6 +72,33 @@ func TestParseOriginRefs(t *testing.T) {
 				t.Errorf("parseOriginRefs(%q) = (%v, %q), want (%v, %q)", tc.integ, onOrigin, defaultBr, tc.onOrigin, tc.defaultBr)
 			}
 		})
+	}
+}
+
+// A scoped ls-remote that fails can quote the token-bearing URL on stderr, and
+// prBaseFor logs the error into daemon.log. The redactor must strip the
+// credential while keeping the host for diagnosis.
+func TestRunOriginLsRemoteRedactsURLCredentials(t *testing.T) {
+	const secret = "gho_super_secret_token_966"
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo \"fatal: unable to access 'https://x-access-token:" + secret + "@github.com/lecstor/private.git/': The requested URL returned error: 502\" >&2\n" +
+		"exit 128\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, _, err := runOriginLsRemote(context.Background(), ".", "staging", nil)
+	if err == nil {
+		t.Fatal("a failing git must return an error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, secret) || strings.Contains(msg, "x-access-token:") {
+		t.Fatalf("runOriginLsRemote leaked the credential in its error: %q", msg)
+	}
+	if !strings.Contains(msg, "https://redacted@github.com/lecstor/private.git/") {
+		t.Fatalf("runOriginLsRemote should keep the redacted URL for diagnosis, got %q", msg)
 	}
 }
 
