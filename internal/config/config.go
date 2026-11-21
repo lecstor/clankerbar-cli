@@ -2,10 +2,13 @@
 // format) overlaid with explicit command-line flags. Rationale: docs/config-rationale.md.
 package config
 
+// defaultBacklogURL is also the default TRUSTED ORIGIN: the only host the account API key goes to.
 const defaultBacklogURL = "https://clankerbar.com"
 
+// DefaultCloneURLBase is the HTTPS prefix fleet clones are made from.
 const DefaultCloneURLBase = "https://github.com/"
 
+// defaultPrompt asks for exactly ONE task; the served protocol reads it literally.
 const defaultPrompt = "Work the next backlog item."
 
 const DefaultMaxTurns = 400

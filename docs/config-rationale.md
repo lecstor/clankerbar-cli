@@ -67,6 +67,15 @@ section note.
 > block while an unreadable claude session does not — unless a global dial covers
 > them both, which is what every pre-CLA-367 config has.
 
+### sessionTokenCeilingMultiplier
+
+> sessionTokenCeilingMultiplier derives the ceiling from budget.max_tokens
+> when the operator set one. 2x is defensible because the runaway this
+> exists to stop ran 3.8x its run's ceiling: a detector at 2x catches that
+> class of runaway while sitting far above what a large task can plausibly
+> cost (~66M measured, CLA-309). It is a DETECTOR, deliberately not a
+> tighter budget.
+
 ### SessionTokenCeilingFor
 
 > SessionTokenCeilingFor resolves the per-session runaway ceiling for a session
@@ -189,6 +198,26 @@ section note.
 > 4: a session refused `external_directory` on four shell calls in a row, which
 > then recovered and carried on. So 5 sits just above what a session that is
 > still working does, and every call past it re-sends the whole context.
+
+### VerifyPhaseName
+
+> VerifyPhaseName is the fix-verification round (CLA-638): it re-reviews the
+> fix delta, adjudicates the prior round's open MUSTs by their plane finding
+> ids, and carries the terminal step only when no MUST remains open. It is a
+> review-shaped phase — it writes a sealed durable review record like the
+> review gate — and it must be the LAST phase of the sequence, because the
+> driver repeats the fix→verify pair after it until a round finds no open
+> MUST or the round cap parks the task.
+
+### ReviewRoundCap
+
+> ReviewRoundCap is the hard round cap per review cycle (B8): a human verdict
+> starts a new cycle, a takeover or reclaim does not, and a void round does not
+> count. The plane derives the count from its non-void records and serves it as
+> `reviews.counted`; the driver refuses to spawn another fix after the third
+> round. It is a constant rather than a config knob on purpose: "never one more
+> round" is the stopping rule, not a tuning dial, and a config value of 0 would
+> be a sequence with no bound at all.
 
 ### Role
 
@@ -439,6 +468,25 @@ section note.
 > so a too-long name fails loudly at startup instead of silently dropping
 > every beacon. The resolved default is truncated to the same cap.
 
+### MaxIterations
+
+> MaxIterations stops the loop after N respawns. 0 = no iteration ceiling:
+> the loop runs until a STOP/HALT marker or a signal stops it (or a budget
+> ceiling is reached); an empty queue idle-polls rather than exiting — the
+> same falsehood-corrected shape CLA-290 applied to doctor's no-ceiling
+> detail, kept in lockstep because this comment is where the old lie
+> survived longest.
+
+### MaxTurns
+
+> MaxTurns is the run-wide turn cap any phase inherits when it sets none of
+> its own (see Phase.MaxTurns for the resolution chain). It exists because
+> the cap used to be reachable ONLY through per-phase config, so an unphased
+> run — the default — had no cap at all: one measured session ran 1093 turns
+> / 285.9M tokens with nothing able to interrupt it (CLA-343). 0 = defer
+> upward to the built-in default; "uncapped" is not a value this config
+> accepts.
+
 ### MaxSessionWallClock
 
 > MaxSessionWallClock is the run-wide per-SESSION wall-clock cap any phase
@@ -557,6 +605,16 @@ section note.
 > `omitempty` is load-bearing for the same reason as ProjectRoot: the
 > config's marshalled form is its identity, and the default must not change
 > a daemon's identity merely because this field now exists.
+
+### SettingsPath
+
+> SettingsPath points the harness at an extra settings file (Claude Code's
+> --settings) carrying the headless permission policy — the allow/deny rules
+> that gate what an unattended run may call, since there is no human to prompt
+> and no interactive auto-mode classifier. It MERGES with (does not replace)
+> the config-dir's own settings, and deny rules win — so this file's job is to
+> grant the few tools the run needs and to deny the exfil vectors the ambient
+> allowlist leaves open. Claude-specific; other harnesses ignore it. ~ expands.
 
 ### Repos
 
@@ -747,6 +805,16 @@ section note.
 > `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
 > key must not change a daemon's identity, and a set one correctly does.
 
+### harnessFromFlag
+
+> harnessFromFlag / modelFromFlag record that --harness / --model overrode
+> the file. Both flags say "the run has ONE harness and this is it", which a
+> mixed-harness config contradicts: --harness would re-point which harness
+> SessionFor treats as top-level, so the other one would start inheriting the
+> run-wide claude fields it must never see, and --model would silently apply
+> to one phase's sessions and not the rest. Validate refuses rather than
+> resolving either; see there.
+
 ### MCPConfigPaths
 
 > MCPConfigPaths is this project's MCP config PER HARNESS (harness name ->
@@ -823,6 +891,16 @@ section note.
 > The whole list is carried because the conflict session runs the same fallback
 > ladder a phase does (CLA-890): resolving only the first route left a free-tier
 > quota death with nowhere to go.
+
+### ConflictResolution
+
+> ConflictResolution reads the LAST resolution marker in outcome. It returns the
+> kind, the first explanatory line after that marker (the note for a behavioural
+> resolution, the reason for a failure) and whether a marker was found at all.
+> The brief tells a session to copy the stored outcome verbatim and APPEND its
+> block, so the newest marker is the last one. Total and forgiving: the outcome
+> is written by a model, so a marker among prose is found line by line rather
+> than required to be the whole outcome.
 
 ### ConflictResolutionSince
 
@@ -947,6 +1025,19 @@ section note.
 > Not a loosening, a total lockout, which is the CLA-441 wall itself.
 
 
+## `internal/config/done_bounds.go`
+
+### The plane's durable-record bounds, mirroring REVIEWBOUNDS in clankerba
+
+> The plane's durable-record bounds, mirroring REVIEW_BOUNDS in clankerbar's
+> apps/web/src/repositories/task-reviews.ts. The plane refuses an over-bound
+> record whole rather than clipping it, so the runner refuses it first.
+> Only the session-authored fields are mirrored; the runner-filled ones
+> (reviewerRole, harness, model, branch, reviewedTip, scope, raisedByModel) are
+> not, because an over-long one is a config fault the plane reports, not
+> something a session can fix.
+
+
 ## `internal/config/done_report.go`
 
 ### ParseDone
@@ -998,6 +1089,15 @@ section note.
 > and no slug). That is deliberate: New("") yields a not-wired poller, so the loop
 > falls into blind drain — which still makes progress — rather than retrying
 > forever against a slug-less base the plane can only reject.
+
+### A pre-CLA-99 file names a bare /mcp with no slug to lift out
+
+> A pre-CLA-99 file names a bare `/mcp` with no slug to lift out. Take its
+> path verbatim, but only once its origin is proven to BE the trusted one —
+> which Validate has already refused the file for otherwise. Dropping to ""
+> here instead would silently disable the driver's one write (the CLA-242
+> release-on-interrupt) for those setups: a security fix quietly deleting an
+> unrelated feature.
 
 ### ProjectEndpoint
 
@@ -1112,6 +1212,15 @@ section note.
 > already refused such a file outright (checkMCPConfigOrigins fails closed), so
 > this is never reached with one.
 
+### retiredHarnessHint
+
+> retiredHarnessHint names what replaced a harness that used to be registered,
+> so a config written for it fails with the fix in the message rather than a
+> bare "unknown harness". `opencode2` drove the 2.x preview; since CLA-675 the
+> `opencode` harness drives 2.x itself and the preview adapter is gone. It is
+> not kept as an alias: one name per adapter keeps the binary doctor looks up,
+> the harnesses block, budgets and logs all agreeing.
+
 
 ## `internal/config/env.go`
 
@@ -1133,6 +1242,15 @@ section note.
 > or {"fromCommand": "..."} run FRESH AT EVERY SPAWN so tokens rotate without a
 > restart. A failing command REFUSES the spawn rather than degrading: a session
 > without its declared env is the incident, not a mode to run in.
+
+### RunEnvCommand
+
+> RunEnvCommand executes one declared fromCommand and returns its trimmed
+> stdout. Package-level so tests can stub it (a counter script proves
+> freshness; a failing stub proves the refusal); the default runs the command
+> under `sh -c` with the command timeout. It comes from the operator's own
+> config file — the same trust root as everything else in the config — never
+> from a workdir file, whose credential-origin rule (origin.go) is untouched.
 
 ### validateEnvDecls
 
@@ -1180,6 +1298,24 @@ section note.
 > single-project case, which reaches here with "") gets the top-level and
 > harness layers only, exactly as envOverlay does.
 
+### validateEnvAllowlist
+
+> validateEnvAllowlist checks one declared allowlist. A list that is present
+> but EMPTY is refused rather than read as "inherit everything": `[]` is the
+> shape of a half-edited config, and silently giving it the most permissive
+> meaning is the wrong direction to be wrong in. Omit the key for full
+> inheritance. Duplicates are refused too — a set with one member spelled twice
+> tells the operator something about the list that is not true of its effect.
+
+### resolveEnvValue
+
+> resolveEnvValue turns one declared value into the string the child sees.
+> Literals go through the same "@path" handling resolveEnv has always applied;
+> command-derived values run now and must SUCCEED with non-empty output — an
+> empty success is a token source that has stopped issuing tokens, and handing
+> the child an empty GH_TOKEN would move the failure from spawn time (loud,
+> named) into git/gh deep inside a session (silent, misattributed).
+
 ### resolveLiteral
 
 > resolveLiteral resolves a literal value, expanding the "@path" form against
@@ -1191,6 +1327,28 @@ section note.
 > own config, and a deliberately set-but-empty variable is a real pattern — so
 > it passes through untouched. The underlying error — the insecure-mode
 > sentinel included — stays wrapped, so callers can still classify it.
+
+### VerifyEnvFilePath
+
+> VerifyEnvFilePath checks that an "@path" secret file is readable, meets its
+> owner-only rule, and is not EMPTY — the same refusal spawn-time resolution
+> applies (an emptied token file is the silent-misattribution failure this map
+> exists to end) — without returning its contents. It is the check Validate
+> used to run on every @path value; it lives here so `doctor` can keep making
+> that preflight before a run leans on a file resolution now deferred to spawn
+> time.
+
+
+## `internal/config/filemode_other.go`
+
+### permissionBitsAreMeaningful
+
+> Windows and friends. Go synthesises 0666 (or 0444 for a read-only file) for an
+> ordinary file here, so the permission bits describe the platform rather than the
+> file: enforcing them would refuse every config and every @path secret, making
+> the tool unusable rather than safer. The releases are darwin/linux
+> (.goreleaser.yaml), so this is the source-build path, and it says plainly that
+> the mode-based guarantees do not hold on it.
 
 
 ## `internal/config/jsonc.go`
@@ -1226,6 +1384,15 @@ section note.
 > DISCOVERY IS HOME-ONLY (CLA-260). An explicit --config is honoured wherever it
 > points, including into the working directory; what is gone is the implicit
 > candidate. See refuseImplicitWorkDirConfig.
+
+### probe
+
+> CLA-639: whether the file named `review_panel` with a JSON ARRAY. A
+> present-but-empty array is the operator's own panel of none, which Validate
+> refuses; absent (nil after unmarshal), or an explicit JSON `null` (what a
+> marshalled config with no panel used to write), is the single reviewer,
+> exactly as before the panel existed. Only an array counts as set: `null`
+> carries no panel to honour.
 
 ### refuseImplicitWorkDirConfig
 
@@ -1461,6 +1628,25 @@ section note.
 > and brief placeholder is unchanged, and a config that names one route (or a
 > plain string) behaves exactly as it did before this type existed.
 
+### UnmarshalJSON
+
+> UnmarshalJSON accepts either the historical plain string or an ordered JSON
+> array of strings. A JSON `null` or an empty string, like an absent key, is no
+> routes at all. A
+> non-string element is refused with a message naming the field's shape rather
+> than the decoder's, because a mistyped route list must be visible in the
+> config load that refused it.
+
+### An explicit "model"
+
+> An explicit `"model": ""` is the historical "no model", so it decodes to no
+> routes rather than one blank route. A one-element slice is non-empty to
+> `omitempty` (Phase.Model) and to len()-based checks (HarnessConfig.Empty),
+> so keeping it would emit a key the string field omitted, moving
+> Config.Identity(), and make a block holding only `"model": ""` read as
+> configured. Only the exact empty string: a whitespace alias always
+> marshalled as itself, and still does.
+
 ### MarshalJSON
 
 > MarshalJSON emits a plain string for zero or one route and only uses the array
@@ -1674,6 +1860,26 @@ section note.
 >
 > It WARNS rather than refusing, deliberately - see OpencodeAmbientConflicts.
 
+### The file names opencode discovers by itself
+
+> The file names opencode discovers by itself. `opencode.json` is the name
+> 2.0.32 was observed loading in both the global dir and a project; the `.jsonc`
+> spelling and the global `config.json` are carried over from 1.x, where a live
+> run logged loading all three, and are scanned because a stale file there is
+> cheap to report and an unread one costs nothing. `config.json` is a GLOBAL
+> name only: a project-level `config.json` is an ordinary file thousands of
+> repos carry for something else entirely.
+
+### opencodeGlobalConfigDirs
+
+> opencodeGlobalConfigDirs is the directory opencode 2.x reads global config
+> from: `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode` when that is unset
+> - unless OPENCODE_CONFIG_DIR is set, which REPLACES it (verified against
+> 2.0.32). The adapter exports `config_dir` as OPENCODE_CONFIG_DIR, so a run
+> with a config_dir reads that directory and not the default one. 2.x does NOT
+> read ~/.opencode, ~/.claude, ~/.agents or ~/.config/opencode2 as config
+> (verified; 1.x read ~/.opencode).
+
 ### OpencodeAmbientConflicts
 
 > OpencodeAmbientConflicts lists every discovered opencode config whose
@@ -1881,6 +2087,16 @@ section note.
 > as "there is nothing in it to object to". An absent file is the one benign
 > case — there is then nothing to hand over either.
 
+### Only an entry that would actually START something carries a command
+
+> Only an entry that would actually START something carries a command.
+> Raw "null", and args-without-command, used to be reported as a
+> process (doctor named an entry whose command read "null --serve"),
+> which made this disclosure disagree with startsProcess — the same
+> predicate CLA-266's gate applies to the very same entry. Disclosure
+> and gate must answer "does this start a process" identically: a WARN
+> listing entries that never run trains the operator to skim it.
+
 ### LocalMCPServers
 
 > LocalMCPServers lists every entry in the resolved MCP config(s) that spawns a
@@ -1999,6 +2215,16 @@ section note.
 > CONCURRENTLY by default (CLA-697), each in its own detached worktree at the
 > reviewed tip; `review_panel_concurrency: 1` restores the sequential sequence
 
+### PanelMemberLabel
+
+> PanelMemberLabel is the LOG LABEL of the member at position i: the name the
+> operator gave it, or the deterministic `review-<i+1>` derived from its
+> position. It names the member in daemon logs and iteration-log filenames; it
+> is NOT the reviewer role the durable record is keyed on. Roles are positional
+> (review-1..review-N), derived from the effective sequence by the driver, so
+> naming a member cannot change which record it writes or which record the seam
+> gate matches (CLA-639).
+
 ### Phase
 
 > Phase is one session in a task's sequence. A task runs as an ordered list of
@@ -2035,6 +2261,24 @@ section note.
 > protocol and the repo's agent guide — is paid per PHASE rather than per task.
 > That is real, and it is why phases are opt-in and why splitting thin is a bad
 > trade: the saving falls off per extra cut while the ramp does not.
+
+### Prompt
+
+> Prompt is what this phase's session is asked to do. Empty means "use the
+> built-in prompt for Name". Two placeholders are substituted by the driver
+> from the claim the previous phase left held: {{taskId}} and {{runId}}.
+> They are the whole reason a later phase can RESUME a run instead of
+> claiming a new task, and they are only available once a phase has held a
+> claim — so they are meaningless in the first phase.
+
+### MaxTurns
+
+> MaxTurns caps the session's turns (harness permitting) so the boundary
+> lands even if the model works past its brief. 0 = defer upward: the
+> top-level Config.MaxTurns, then the built-in default (see
+> Config.EffectivePhases). It is never "uncapped" — CLA-343 measured the
+> unphased run that reading produced (1093 turns / 285.9M tokens, nothing
+> able to stop it), so the cap chain always resolves to a number.
 
 ### MaxWallClock
 
@@ -2129,6 +2373,15 @@ section note.
 > otherwise), and only a harness that can continue one session across turns
 > can run it (opencode today).
 
+### ConfiguredIndex
+
+> ConfiguredIndex is the index, in Config.Phases, of the phase the operator
+> actually wrote for this one. It differs from the effective position only for
+> an expanded review-panel member: every member reports the single `review`
+> phase it came from. The driver reads a phase's CONFIGURED prompt through it —
+> a handoff continuation must match the brief the operator asked for, not the
+> member's resolved copy of it.
+
 ### ReviewPanelMember
 
 > ReviewPanelMember is one reviewer in a review panel (CLA-639): a
@@ -2140,6 +2393,16 @@ section note.
 > sealed durable record under its own reviewer role (see Config.ReviewPanel).
 > Two entries naming the same harness/model are two INDEPENDENT REVIEWS of the
 > same revision — never a mistake to be deduplicated.
+
+### Name
+
+> Name is the member's LOG LABEL only. Empty = the driver derives it from
+> the member's position: `review-1` .. `review-N`. It names the member in
+> daemon logs and iteration-log filenames; it is NOT the reviewer role the
+> durable record is keyed on. The role is always positional (`review-N`,
+> counted over the review-shaped phases of the sequence), so naming a member
+> cannot change which record it writes or which record the seam gate matches,
+> and a resumed or retried round maps a member to the same record either way.
 
 ### Optional
 
@@ -2161,6 +2424,15 @@ section note.
 > Validate refuses a panel whose members are ALL optional: with no required
 > seat there is no review a round could ever be said to have produced.
 
+### MapsSession
+
+> MapsSession overrides the phase's maps-session options for this member.
+> Nil inherits the phase's block, so a member that only tunes the options
+> keeps the inherited method and profile. A member that NAMES a method takes
+> its own options with it, and nil then means the benchmark defaults — a seat
+> opting out of maps-session must not silently keep the phase's knobs for a
+> method that has no use for them.
+
 ### HarnessConfig
 
 > HarnessConfig is one harness's own invocation fields, for a run whose phases
@@ -2178,6 +2450,33 @@ section note.
 > failure with the operator's own config as the cause. Better an empty field,
 > which the adapter falls back on and `doctor` can talk about.
 
+### Models
+
+> Models is this harness's tier map (bucket name -> model alias), the
+> per-harness twin of Config.Models. A phase's Tier resolves against the map
+> belonging to the harness that phase runs on, because a bucket NAME is
+> portable across harnesses and the alias inside it is not — which is what
+> lets one `"tier": "strong"` mean opus here and something else there. Each
+> bucket's value also accepts the ordered route-list form (CLA-782).
+
+### Env
+
+> Env is this harness's own extra session environment, overlaid ON TOP of the
+> top-level env map (per-key winner) — see Config.Env for what the map holds.
+> Unlike the fields above it does NOT inherit the top-level value only for the
+> run-wide harness: environment is not dialect-shaped, so every layer of the
+> overlay applies to every harness, with SessionEnv stacking them in
+> most-specific-wins order.
+
+### phaseNameRe
+
+> phaseNameRe is what a phase name may contain, because it becomes part of an
+> iteration log's filename. It is the PLANE's own pattern verbatim
+> (/^[a-z0-9]+(-[a-z0-9]+)*$/, RUN_CONFIG built-ins aside): a proposal is
+> ratified by that validator, so a name this file accepts but the plane refuses
+> (a double hyphen, a leading or trailing one) would be a config `propose-config`
+> could never lift.
+
 ### The placeholders a phase prompt may carry, substituted by the driver f
 
 > The placeholders a phase prompt may carry, substituted by the driver from the
@@ -2194,6 +2493,16 @@ section note.
 > exists for the other placeholders to come from. It replaced literal
 > "(staging)" text in these briefs — the literal was wrong for every repo
 > whose PRs do not target staging, and the resolution above is what knows.
+
+### PhaseBasePlaceholder
+
+> PhaseBasePlaceholder names the commit a brief's `git diff` starts from:
+> the merge-base of origin/<prBase> and the worktree tip, as the runner
+> computed it during worktree prep, or origin/<prBase> when no SHA was
+> available. Never a bare local <prBase>: the local base branch can be far
+> behind origin (the MAK-362 review's was 124 commits), and a diff from it
+> carries unrelated files. Filled in every phase, like {{prBase}} — it needs
+> no claim.
 
 ### ReviewerRolePlaceholder
 
@@ -2220,6 +2529,24 @@ section note.
 > record, assigned by the plane; a hard-coded "round 1" would be false on any
 > later run of the same task.
 
+### reviewPhaseHarness
+
+> reviewPhaseHarness is the harness a panel member with none of its own
+> inherits: the REVIEW phase's, which is itself the run-wide harness when that
+> phase names none — exactly the chain EffectivePhases' panelMember copies into
+> each member. The FIRST built-in review phase is the one that expands, so it is
+> the one whose harness a member inherits; nothing here assumes a review phase
+> exists (the caller checks).
+
+### EffectivePanel
+
+> EffectivePanel is the review panel this config actually runs: the operator's
+> own list, and nothing else — an absent key (nil) means the historical single
+> review, not a panel of one (decision a0b1373b). There is no trial panel and no
+> preset: the CLI cannot know which harnesses, providers or models an operator
+> has, so it never names one. A FILE that writes `"review_panel": []` is refused
+> by Validate rather than silently meaning either thing (reviewPanelSet).
+
 ### EffectivePanelConcurrency
 
 > EffectivePanelConcurrency is how many members of a panel of n review AT ONCE
@@ -2232,6 +2559,35 @@ section note.
 > A negative cap is a config error refused by Validate; this method is the
 > read path and stays total so a hand-built Config cannot make the driver
 > spawn a negative number of sessions.
+
+### panelMember
+
+> panelMember is the review phase one panel member runs as: the configured
+> review phase's knobs (its turn and wall-clock caps, its tier, its prompt)
+> with the member's own identity, harness and model on top. Copying the phase
+> rather than synthesizing a fresh one is what lets an operator cap the whole
+> panel in one place — `{"name": "review", "max_turns": 80, "review_panel":
+> [...]}` caps every member — while a member that names its own harness or
+> model still wins where it does.
+
+### Model and Tier are the same choice at two levels of indirection, and a
+
+> Model and Tier are the same choice at two levels of indirection, and a
+> member states one of them: either is the more specific statement than
+> whatever the review phase carries, so setting one clears the other. An
+> empty member field leaves the review phase's own value in place (itself
+> empty on a config that resolved neither), which is the fall-through to
+> the harness default.
+
+### The method is the same kind of per-member statement as the model
+
+> The method is the same kind of per-member statement as the model: the
+> member's own wins, an empty one inherits the phase's (copied above), and a
+> member that sets only the options keeps the inherited method so a panel can
+> tune one seat's chunking without restating `maps-session`. Naming a METHOD
+> takes the member's own options with it — nil means the benchmark defaults —
+> so a seat that opts OUT of maps-session cannot keep inheriting the phase's
+> knobs into a method that has no use for them.
 
 ### EffectivePhases
 
@@ -2310,6 +2666,15 @@ section note.
 
 ## `internal/config/projects.go`
 
+### DefaultIntegrationBranch
+
+> DefaultIntegrationBranch is the branch whose tip doctor's deploy_lag check
+> (CLA-322) judges the deployed build against when neither the project nor the
+> top-level config names one. Both of this project's repos integrate through
+> `staging`, so that is the convention the default encodes; an operator whose
+> project integrates elsewhere sets integration_branch explicitly rather than
+> getting an answer about a branch they do not have.
+
 ### PRBaseFor
 
 > PRBaseFor resolves the operator's per-repo PR-base override for one project
@@ -2333,6 +2698,16 @@ section note.
 > relative reference, or a scheme no HTTP client speaks - which would
 > otherwise surface as an opaque "unsupported protocol scheme" error from
 > doctor instead of as the misfiled config line it is.
+
+### validateIntegrationBranch
+
+> validateIntegrationBranch holds integration_branch to a bare ref-name shape.
+> The value is passed to `git fetch` and `git ls-remote` by doctor's deploy_lag
+> check (CLA-322); a value carrying refspec syntax (":") would make the fetch
+> argument a src:dst spec and MUTATE LOCAL REFS during a preflight, a leading
+> "-" reads as option syntax, and whitespace or anything outside a branch
+> name's alphabet is rejected by git downstream anyway. Empty is legal: it
+> means the default branch.
 
 ### validatePRBase
 
@@ -2487,6 +2862,25 @@ section note.
 > the panel member's unverified variant appends reviewHandoffUnverified and its
 > self-verification step. The remainder is identical in every variant.
 
+### panelMemberReviewOnlyBrief
+
+> panelMemberReviewOnlyBrief is a PANEL MEMBER's brief (CLA-639 M5): the same
+> core, with the durable-record-only shape and an ending that forbids the
+> outcome write. It is selected by the driver at spawn time — the member's
+> captured prompt is the review-only brief, exactly as for the single reviewer
+> — and only for a checkpoint that carries a branch: a branchless checkpoint
+> cannot run a panel at all (no live holder accepts a durable record), so its
+> single reviewer keeps the shipped no-code brief.
+
+### panelMemberUnverifiedReviewOnlyBrief
+
+> panelMemberUnverifiedReviewOnlyBrief is panelMemberReviewOnlyBrief for a
+> checkpoint the driver could not verify against the origin remote (CLA-576,
+> CLA-702). It cannot reuse the verified core: that core asserts the driver
+> verified the branch, which is exactly what an unreadable checkpoint cannot
+> support, while its record shape says the driver could NOT read the tip. It
+> keeps the panel's record-only contract and ending unchanged.
+
 ### noCodeReviewOnlyTerminalStep
 
 > noCodeReviewOnlyTerminalStep ends a branchless review-only phase. There is no
@@ -2532,6 +2926,34 @@ section note.
 > is one more session startup and a hand-off the fixer must read; the review
 > record on the task is what makes that hand-off cheap and auditable.
 
+### fixVerifyBrief
+
+> fixVerifyBrief is the fix phase when a VERIFICATION round follows it (CLA-638,
+> B12). The verification round re-reviews the delta and adjudicates the prior
+> MUSTs, and IT carries the PR/in_review terminal step; a fix session that
+> opened the PR here would ship fixes no verifier has looked at. The rest of the
+> contract is identical, because it reads the same record and applies the same
+> findings.
+
+### noCodeFixBrief
+
+> noCodeFixBrief is fixBrief for a branchless checkpoint: the review judged the
+> plane's record, and the fix is an amendment to that record, never invented
+> code. The branchless review writes no durable record (question 03a12578,
+> option 1), so this brief reads the legacy `## Review` block ALONE and applies
+> its findings by amending the task's record - there is no `reviews.records`
+> entry and no plane-assigned id to update. Its terminal step is the no-code
+> handover alone.
+
+### verifyStoppingRule
+
+> verifyStoppingRule is the stopping rule's core: what counts as a MUST that is
+> still open (CLA-638, D7/A6/B7/B12/B13). It is shared by the code and no-code
+> variants so the bar cannot drift between them; the ID-based machinery that
+> enforces it — the round cap and the non-convergence breaker — is
+> verifyDriverBounds, because the branchless variant has no plane finding ids
+> to count or park on.
+
 ### noCodeVerifyTerminalStep
 
 > noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
@@ -2575,6 +2997,16 @@ section note.
 > defect this feature rides on into the feature itself. A plain punctuated
 > uppercase line does neither.
 
+### HandoffPromptMax
+
+> HandoffPromptMax bounds the successor prompt a handoff block may carry, in
+> bytes. A session-authored respawn prompt is self-directed prompt injection,
+> and the size cap is one of the non-negotiable guards on it: an over-cap
+> prompt is refused (logged, normal path) rather than truncated, because a
+> truncated brief is a successor confidently working half an instruction. "A
+> few KB" is the spec; a genuine continuation prompt — decisions made, state
+> verified, exact next steps — fits in far less.
+
 ### HandoffPreamble
 
 > HandoffPreamble is driver-authored framing prepended to a handoff respawn's
@@ -2613,6 +3045,16 @@ section note.
 > phase carries the bound alone: it has no terminal step, because it stops
 > rather than hands its task to in_review.
 
+### The fix phase owns the branch-shaped terminal step, exactly as a final
+
+> The fix phase owns the branch-shaped terminal step, exactly as a final
+> review did before the split. A handoff mid-fix must not be a way to
+> lose the commit/push/PR/in_review sequence, NOR the record contract:
+> fixTerminalRecord is what makes the successor keep the review block
+> verbatim and add the ### Fixes list. Dropping it here loses the only
+> durable record of the round, which is the exact loss the split exists
+> to prevent.
+
 ### HandoffContinuationFor
 
 > HandoffContinuationFor is HandoffContinuation for a review phase whose mode is
@@ -2638,6 +3080,16 @@ section note.
 > B12 says the fix phase must not do — and carrying fixTerminalRecord would do
 > the same thing in prose (CLA-686 D1): the record requirement here is
 > fixVerifyRecord, which keeps the finding updates and drops the hand-over.
+
+### NoCodeFixVerifyHandoffContinuation
+
+> NoCodeFixVerifyHandoffContinuation is FixVerifyHandoffContinuation for a
+> BRANCHLESS fix: the amendment is to the plane's record, so there is nothing
+> to commit or push, but the terminal step still belongs to the verifier.
+> NoCodeFixHandoffContinuation would carry the legacy no-code hand-over and tell
+> the successor to move the task to in_review before the verification round has
+> seen the amendment — the same B12 leak the branch-shaped variant exists to
+> close.
 
 ### driverRenewsLease
 
@@ -2788,6 +3240,15 @@ section note.
 
 ## `internal/config/prompts_maps.go`
 
+### promptsmaps.go
+
+> prompts_maps.go — the maps-session review method's turn prompts (CLA-864,
+> CLA-869). This is not a brief of its own: the phase's review brief stays the
+> first turn's substance (runner context, read-only rules, the bar, the done
+> report), and the section below is APPENDED to it. The later turns are
+> deliberately lean — they rely on the first turn's transcript, which the same
+> session still holds.
+
 ### MapsSessionFirstTurn
 
 > MapsSessionFirstTurn is the section appended to the phase's review brief for
@@ -2869,6 +3330,16 @@ section note.
 > worktree was rejected: it is invisible to the plane, dies with the worktree,
 > and cannot be read from another machine.
 
+### panelMemberTerminalStep
+
+> panelMemberTerminalStep ends a PANEL MEMBER's phase (CLA-639 M5). It is
+> reviewOnlyTerminalStep with the legacy outcome write REMOVED, not moved: the
+> member's only task write is the durable record, and the member after it must
+> not be able to read this member's findings through the task's outcome. A
+> session told to write both would have its outcome write refused by the plane
+> (the round is sealed the moment the record lands, CLA-636 B3) and could
+> easily read that refusal as the phase failing.
+
 ### reviewRecordOutcomeShape
 
 > reviewRecordOutcomeShape is the LEGACY half of the review record: the
@@ -2910,6 +3381,24 @@ section note.
 > plane refuses that run's outcome, body and decision writes (CLA-636 B3), so
 > the legacy outcome block must be written FIRST. The driver closes the round
 > before spawning the fix phase, which releases the findings to it.
+
+### reviewOnlyRecordShape
+
+> reviewOnlyRecordShape is the verified review-only phase's full record
+> contract: the legacy outcome block, then the durable record. The driver
+> injected the phases' RESOLVED harness/model and the verified round, role and
+> tip, because a session cannot reliably name its own model, cannot see its
+> predecessor's, and cannot see whether the branch tip it read is the one the
+> driver verified.
+
+### noCodeReviewOnlyRecordShape
+
+> noCodeReviewOnlyRecordShape is the branchless review-only phase's record
+> contract: the LEGACY outcome block alone, with no durable-record half —
+> the plane accepts review writes only from the task's LIVE holder and a
+> settled task has none (operator decision on question 03a12578, option 1), so
+> the seam gates this variant on the block (changed since the spawn, heading on
+> its own line, and a last block the baseline did not carry).
 
 ### panelMemberRecordIntro
 
@@ -3043,6 +3532,16 @@ section note.
 > the MUST bar and the done report stay the phase's own constants. That is what
 > keeps the command's review the same review the phase runs.
 
+### reviewRunMUSTBarGrades
+
+> reviewRunMUSTBarGrades is reviewMUSTBarGrades for a review with no done-when
+> bar. Two clauses name the task's doneWhen as an input this review does not
+> have, so they are removed rather than left to reach a session as an
+> instruction it cannot follow; every other grading rule — the evidence kinds,
+> the seventh kind, and the not-a-MUST list — is the phase's verbatim. A test
+> pins that both replacements landed, because a silently failed Replace would
+> hand the session a bar that names a bar it was told does not exist.
+
 ### reviewRunGateScope
 
 > reviewRunGateScope is reviewGateScope for a review with no phase sequence.
@@ -3116,6 +3615,15 @@ section note.
 
 ## `internal/config/repos.go`
 
+### ErrRepoNotFound
+
+> ErrRepoNotFound is the sentinel for a repo identity that resolves to no local
+> checkout. Its text is the iteration-failure code the loop surfaces verbatim:
+> a session that would otherwise start in the multi-repo parent — the exact
+> wrong-repo-reads and cwd-scoped-grant shape this resolution exists to kill
+> (docs/proposals/agent-rule-scoping.md, test cases 1 and 2) — is refused
+> instead, loudly, with the identity that could not be resolved.
+
 ### ResolveCheckout
 
 > ResolveCheckout maps one repo identity to the local checkout a session for it
@@ -3166,6 +3674,16 @@ section note.
 > The output is deduplicated (two identities may share a checkout) and sorted
 > (stable policy bytes across otherwise-identical configs).
 
+### validateRepos
+
+> validateRepos is the structural half of repo-map validation, run by Validate:
+> keys and values must be non-blank. It deliberately does NOT stat the
+> configured paths - a checkout that appears later (or sits on another machine
+> sharing the config) must not refuse every run; resolution fails the iteration
+> only when a session actually needs it, and doctor reports each entry's
+> reachability before that. A primary naming no declared key is likewise left
+> alone: the convention steps of the resolution can still legitimately match it.
+
 
 ## `internal/config/reviewmethod.go`
 
@@ -3182,6 +3700,25 @@ section note.
 > the runner prepared — so a harness that cannot continue one session across
 > turns cannot run it, and Validate refuses rather than silently running only
 > the first turn.
+
+### MaxBytesTotal
+
+> MaxBytesTotal caps the hunk text embedded across all M items. Zero
+> selects DefaultMapsSessionHunkBytesTotal. The prompt is NOT chunked
+> before it reaches a harness: opencode receives it as one argv string,
+> and Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN), so the
+> default's ~80 KiB first turn leaves only ~48 KiB of headroom before a
+> raised budget fails the spawn with E2BIG.
+
+### StageModels
+
+> StageModels resolves the model each stage runs on for a phase whose resolved
+> model is phaseModel: a stage's own model wins, an empty one inherits the
+> phase's, and a findings stage with neither runs on the notes stage's model —
+> a live session cannot return to the harness's own default mid-conversation, so
+> the notes model is what the findings turn actually produces. The runner and
+> doctor both read this one function so the record and the preflight cannot
+> disagree about which model wrote the findings.
 
 
 ## `internal/config/role.go`
@@ -3208,6 +3745,15 @@ section note.
 > bad planner role must not refuse a project's worker drain config, and a
 > machine that serves several projects may serve a planner on only some of
 > them. `doctor` and the planner loop report/refuse it at the point of use.
+
+### ResolvePlanner
+
+> ResolvePlanner resolves the stored planner role into a session. It is strict
+> where the phase chain is forgiving: a role naming an unknown harness, or a
+> tier that resolves to nothing, yields an error and NO session rather than
+> running on a default. A planner answering under the wrong model is a policy
+> breach the operator cannot see, which is why the whole no-fallback rule
+> exists.
 
 
 ## `internal/config/routeschedule.go`
@@ -3317,6 +3863,15 @@ section note.
 > stored document must stay a trial seat when the overlay applies it, or every
 > fleet applying that pipeline would silently promote it to a required reviewer.
 
+### RunConfigEvents
+
+> RunConfigEvents mirrors the plane's `events` block (CLA-601/603/887). Absent
+> reads as both dials off. Activity carries tool names, one identifying string
+> per call and todo snapshots; Transcript is the second opt-in and adds a
+> completed call's output and each assistant text block. The consumer is
+> resolveRunConfigEvents on the plane; this side must fail closed on its own, and
+> a stored `transcript: true` without activity is only ever read as off.
+
 ### RunConfigRole
 
 > RunConfigRole is one stored role block (`roles.planner`), mapped onto
@@ -3399,6 +3954,25 @@ section note.
 > supervisor's per-instance harness override rides the same check through
 > CheckHarnessSwap: it re-points the same top-level over the same machine
 > layer through a different door.
+
+### The event channel's dials (CLA-603) are reset FIRST, before the empty
+
+> The event channel's dials (CLA-603) are reset FIRST, before the empty
+> document returns: the stored, effective document is the authority, so an
+> absent block means both dials off (fail closed) — including the plane's
+> default `{}` document, so a caller reusing a live config cannot keep the
+> channel on a project that says nothing. No local-file value can turn one
+> on; the machine can only opt out (NoEvents), which this overlay never
+> touches.
+
+### The roles section is the stored document's alone too (studio-chat.md
+
+> The `roles` section is the stored document's alone too (studio-chat.md
+> §1/§2): a nil map means the project inherited no planner and chat is OFF,
+> which is the fail-closed answer for a project that never ratified one.
+> The empty document cannot swap a harness, so the fail-closed reset happens
+> before its early return; a non-empty one is assigned only AFTER the swap
+> gate, so a refused document leaves c untouched as the contract says.
 
 ### The PIPELINE is one section (decision 6bf1fa15)
 
@@ -3672,6 +4246,16 @@ section note.
 > with the same rename hint. Names are checked in sorted order so the message
 > does not depend on map iteration.
 
+### A per-harness block keyed by a name no adapter answers to is a ceiling
+
+> A per-harness block keyed by a name no adapter answers to is a ceiling that
+> can never trip: nothing is ever charged to it, so the run is unbounded on
+> exactly the side the operator meant to bound. Refuse it here, against the
+> same registry as `harness` above, rather than at 3am with an inert breaker.
+> Names are checked in sorted order so the message does not depend on map
+> iteration. A negative ceiling INSIDE a block is doctor's finding, not this
+> one, exactly as for the dials beside it — see checkBudget.
+
 ### Two answers to the same question
 
 > Two answers to the same question. A phased task is asked its PHASE's
@@ -3702,6 +4286,25 @@ section note.
 > whole per-harness block exists to make impossible), and --model applies to
 > one phase's sessions while the rest quietly ignore it.
 
+### A phase on some OTHER harness inherits none of the run-wide
+
+> A phase on some OTHER harness inherits none of the run-wide
+> harness-shaped fields, by design (see HarnessConfig), so with no block
+> of its own it would spawn with no config dir, no MCP config and no
+> settings — a session with no clankerbar tools, which looks from the log
+> like a model that declined the work. Refuse here, where the operator can
+> see it, rather than at 3am.
+
+### The conflict-only session step (CLA-759)
+
+> The conflict-only session step (CLA-759). It names a harness the SUPERVISOR
+> will start a session on, so it is held to the same two rules as a phase's
+> own harness above: it must exist in the registry, and when it is not the
+> run-wide one it must carry a block of its own — inheriting another
+> harness's dialect is the 3am failure the phase rule exists to prevent.
+> Checked even when the block only pins the model, because the effective
+> harness is then the implement step's and has already been checked.
+
 ### The review panel (CLA-639)
 
 > The review panel (CLA-639). Its members run one review phase each, so a
@@ -3723,6 +4326,24 @@ section note.
 > refusing it would break the marshalled round trip of a config that never
 > mentioned a panel.
 
+### A panel expands exactly ONE built-in review phase
+
+> A panel expands exactly ONE built-in review phase. A sequence with more
+> than one is refused rather than resolved: the panel would multiply one and
+> leave the other as a lone review, and which one it picked would be
+> positional trivia the operator could only discover from the log. A review
+> with its own prompt is not built-in and is not counted here; the
+> no-expand refusal below catches a sequence whose only review is custom.
+
+### CLA-784
+
+> CLA-784: an OPTIONAL member is a TRIAL seat — a reviewer the operator is
+> evaluating, whose failure is recorded against that seat and never blocks
+> the fix. A panel made ONLY of optional seats therefore has no reviewer a
+> round could ever be said to have produced: every task would run the
+> members, take whatever they wrote as nobody's review, and spawn no fix.
+> Refused at the door rather than discovered from a log line.
+
 ### The label is also the iteration-log tag, the phasesRun entry and the
 
 > The label is also the iteration-log tag, the phasesRun entry and the
@@ -3733,6 +4354,25 @@ section note.
 > refused rather than renamed because the operator wrote it; a DERIVED
 > label that collides is refused with the remedy (set `name`), because
 > the position alone cannot avoid the collision.
+
+### A member runs one review phase of the sequence, so it is held to the
+
+> A member runs one review phase of the sequence, so it is held to the
+> same claim-tracking rule a configured phase is (the rule above): a
+> member that cannot observe or resume the task claim would end the
+> sequence early or hand the task back over its own work. Checked on the
+> RESOLVED harness, so a member that inherits the review phase's
+> harness is covered too.
+
+### A panel multiplies the review phase, so a config that names one but ha
+
+> A panel multiplies the review phase, so a config that names one but has a
+> review phase it cannot multiply is two contracts for one sequence. Refused
+> rather than resolved: a FINAL review runs the historical combined brief and
+> a review phase with its own prompt owns its own contract, so in either
+> shape the panel would be a no-op the operator could only discover from the
+> log. An UNPHASED config has no phase sequence at all — the key is inert
+> there, not a no-op a run could have honoured.
 
 ### Phases rest on EVERY phase's adapter observing the session's claim, no
 
@@ -3854,6 +4494,16 @@ section note.
 > Only when both files name a slug: a file that names none (or that this
 > cannot parse) constrains nothing, which is the same latitude the
 > per-project check allows.
+
+### A phase on a harness other than the run's needs its own MCP config PER
+
+> A phase on a harness other than the run's needs its own MCP config PER
+> PROJECT, because that file carries both the schema (the harness's) and the
+> slug (the project's). Falling back to the single
+> `harnesses.<name>.mcp_config_path` would point every project's phase at one
+> project's queue, which is the split-brain the slug check above refuses when
+> it is written down — so refuse it here too, where it would otherwise be
+> arrived at by omission.
 
 ### The KEY is checked against the harness registry too, and here that
 

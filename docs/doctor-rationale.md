@@ -133,6 +133,53 @@ section note.
 > never fires. Harnesses with no mid-session ceiling are omitted, not
 > listed as zero - claiming one is "still active" there would be false.
 
+### The usual advice is "add maxcostusd" - which under a harness that
+
+> The usual advice is "add max_cost_usd" - which under a harness that
+> cannot report cost is advice to set a dial that does nothing, and it
+> would be FOLLOWED, landing the operator in the cost-only case the
+> sibling branch below warns about. Gated on the HARNESS, not on
+> inertCost: the commonest codex config is a bare wall clock with cost
+> unset, and that is the one that needs the corrected advice most.
+
+### The run-wide breaker is checked BETWEEN sessions
+
+> The run-wide breaker is checked BETWEEN sessions: it cannot see a single
+> huge session coming, which is exactly what happened to the 285.9M run
+> under max_tokens=75M. Say so on the line that reports it (CLA-344).
+> Gated on a token ceiling from EITHER place: a run whose only token
+> ceiling is in its harness's per_harness block is enforced between
+> sessions in exactly the same way, so it needs the same warning and the
+> same number (CLA-367).
+
+### sessionTokenBounds is EMPTY when no spawned harness has a mid-session
+
+> sessionTokenBounds is EMPTY when no spawned harness has a mid-session
+> ceiling, which is every opencode-only and codex-only run. Appending it
+> unguarded printed a bare "()" there - a broken sentence in the one
+> surface whose whole job is not making sloppy or false statements. The
+> two cases need different sentences, not one sentence with a hole:
+> with a bound, name it; without, say plainly that nothing bounds the
+> overrun, which is the sharper finding and was previously unsaid.
+
+### A missing guard turns the verdict WARN (a FAIL above stays a FAIL
+
+> A missing guard turns the verdict WARN (a FAIL above stays a FAIL — a
+> broken budget is worse than a bare one). The findings ride as info lines
+> so the detail line stays the budget's own story; the remedy names the
+> dials, whose specifics are one info line each — unless the branch above
+> already had a more specific one (the wall-clock-only case's "add
+> max_cost_usd" is the better advice there).
+
+### harnessReportsCost
+
+> harnessReportsCost asks the registry whether this harness ever populates
+> Result.CostUSD. An UNKNOWN harness is treated as reporting cost - i.e. the
+> warning is withheld - because config.Validate has already refused that name, so
+> the only way to get here is a doctor run over a config too broken to run at
+> all, and warning about an inert dial on a harness that does not exist would bury
+> the real finding under a speculative one.
+
 ### inertSessionWallClock
 
 > inertSessionWallClock names the wall-clock dial this config sets that will not
@@ -168,6 +215,15 @@ section note.
 > config.Validate has already refused the name, and a speculative inert-dial
 > warning would bury the real finding.
 
+### Phase dials first, so the operator is pointed at the line they wrote
+
+> Phase dials first, so the operator is pointed at the line they wrote - and
+> read off cfg.Phases, NOT EffectivePhases, for exactly that reason: the
+> effective phases have the run-wide dial resolved into every one of them, so
+> iterating those would report an operator's `max_session_wall_clock` back to
+> them as `max_wall_clock (phases)`, a line they never wrote. The HARNESS still
+> comes from the resolver, since that is what a phase inherits.
+
 ### noSessionBackstop
 
 > noSessionBackstop names a harness whose sessions in THIS run are bounded by
@@ -195,6 +251,25 @@ section note.
 > would claim a guard that never fires. A harness without one is OMITTED rather
 > than shown as zero, which is the same choice the check makes everywhere else.
 
+### Gated on the run spawning ONE harness, not on one harness having a cei
+
+> Gated on the run spawning ONE harness, not on one harness having a ceiling.
+> The bare number is only unambiguous when there is a single session kind for
+> it to bound: on a mixed run it reads as a bound on every session, when in
+> fact the opencode phase beside it has no mid-session ceiling at all. So the
+> common unphased config's line is unchanged byte for byte, and a mixed run
+> always names whose ceiling it is quoting.
+
+### anyPhaseRunsTheDefaultTurnCap
+
+> anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any
+> session by the built-in default rather than an operator-chosen cap — i.e.
+> whether CLA-343's default is load-bearing for this run. The effective phases
+> resolve phase → top-level → default, so a phase carrying DefaultMaxTurns is
+> exactly a phase the operator never capped (an operator who set the same
+> number explicitly is indistinguishable, and the statement "the default
+> applies" is still true for them).
+
 
 ## `internal/cli/doctor_config.go`
 
@@ -216,6 +291,24 @@ section note.
 > Empty when no panel is configured or none expands: a config whose review
 > carries its own prompt, an unphased run, or the absent key (the single
 > reviewer) has no panel to report rather than an empty one to apologise for.
+
+### singleReviewerLabel
+
+> singleReviewerLabel renders the single reviewer a config runs when it sets no
+> panel (CLA-639): the built-in, non-final review phase at the harness/model it
+> will spawn on, parenthesized and followed by its review method when it names
+> one (CLA-869). Empty when no such phase exists, so an unphased config or one
+> whose review runs the final combined brief reports nothing extra — matching
+> how doctor reports a phase detail only when the phase is there to report.
+
+### reviewMethodLabel
+
+> reviewMethodLabel renders the review method doctor reports after a reviewer's
+> harness/model (CLA-869): empty for the shipped single-pass review, and for
+> maps-session the model each stage will actually run on — an unset stage model
+> inherits the phase's, and with no phase model the findings stage inherits the
+> resolved notes stage (the live-session inheritance). Only a review naming no
+> model at any level runs the harness's default.
 
 
 ## `internal/cli/doctor_harness.go`
@@ -257,8 +350,26 @@ section note.
 > The PASS line says nothing about the mechanism: a check that explains a hazard
 > nobody has is a line the operator learns to skip past.
 
+### shaping
+
+> The two kinds are counted and remedied SEPARATELY. They share a scan and
+> nothing else: one is a file naming the wrong backlog, mitigated for
+> spawned sessions by the content pin; the other is a file that shapes
+> what the session may do, which the pin does nothing about. A single
+> sentence covering both said the mitigation out loud on findings it does
+> not apply to (CLA-441 second review).
+
 
 ## `internal/cli/doctor_opencode.go`
+
+### sqliteOpencodeCredentials
+
+> sqliteOpencodeCredentials counts the ACTIVE rows of opencode.db's credential
+> table per integration. It selects the integration id, the `active` flag and a
+> count only: no column holding a secret is ever read. The database is opened
+> read-only. A row whose `active` is 0 is not counted; NULL counts as active.
+> The table records no expiry, so a counted credential may still be expired or
+> revoked at the provider - presence is not validity, and the check says so.
 
 ### checkOpencodeAuth
 
@@ -344,6 +455,16 @@ section note.
 
 ## `internal/cli/doctor_power.go`
 
+### unknownSleepRemedy
+
+> unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep
+> policy — `pmset -g` not running at all, and running but reporting no
+> idle-sleep field. The two states are the same state, so they say the same
+> thing; keeping one string means a future edit cannot improve the advice for
+> one of them and leave the other behind. It has to be actionable for a reader
+> who has just been told the command doctor would send them to did not answer,
+> so it names the mitigation as well as the manual check.
+
 ### checkPower
 
 > checkPower answers the most basic precondition of an unattended run, and the
@@ -402,6 +523,16 @@ section note.
 > carrying the `<n>(<proc>):` tail; the summary row demands exactly two fields
 > because any token beyond name-plus-count is an unknown in BOTH directions —
 > "1 (inactive)" no less than "0" (CLA-306 review).
+
+### Per-process detail line
+
+> Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
+> presence means a live process holds the assertion. Matched on the raw
+> line so a process name containing spaces or even nested parens
+> ("Google Chrome Helper (Renderer)") still reads as one
+> `<pid>(<name>):` head; greedy to the LAST `):` is safe because the
+> anchored pid head and the assertion-name pre-filter above already
+> exclude every other line shape.
 
 
 ## `internal/cli/doctor_prgate.go`
@@ -505,6 +636,25 @@ section note.
 > workdir is whatever the operator pointed it at, and its repos are wherever
 > the `repos` map says, by design.
 
+### The project root and everything the layout puts under it are checked o
+
+> The project root and everything the layout puts under it are checked on
+> CANONICAL paths: a lexical comparison says <root>/worktrees is inside
+> <root> even when that name is a symlink to a directory on another disk.
+> The supervisor refuses a symlink at any of these paths (see
+> supervisor.DeriveWorkdir), so doctor must fail for the same layout rather
+> than pass a config the derivation will refuse at reconcile time.
+
+### Two FULL identities that end in the same name derive the SAME director
+
+> Two FULL identities that end in the same name derive the SAME directory
+> (<project root>/<name>), so only one of them can ever be the clone there
+> and the other reads as a wrong-origin checkout. Name the conflict here,
+> where the operator can fix the config, rather than letting the layout
+> report the symptom. A bare key beside a full identity of the same name is
+> NOT a conflict: it is that repo spelled short, and the derivation
+> materializes the full identity (the only spelling with a clone URL).
+
 
 ## `internal/cli/doctor_routewindows.go`
 
@@ -538,6 +688,16 @@ section note.
 > spawn is NOT plane trouble — it is ratified policy that would silently not
 > run here — so that one deliberately FAILs, and `doctor && run` refuses to
 > start until it is fixed.
+
+### she
+
+> A stored STEP this machine cannot spawn is the one refusal that
+> earns FAIL: the document is ratified policy that silently will not
+> run here, and the operator has to know before an unattended drain
+> quietly falls back to local rules instead (CLA-598). That FAIL is
+> the point — `doctor && run` refuses to start on such a document.
+> Every OTHER refusal stays WARN, because plane trouble must not make
+> `doctor && run` unusable (applyRunConfig's own posture).
 
 
 ## `internal/cli/doctor_session.go`
@@ -685,6 +845,15 @@ section note.
 
 ## `internal/cli/doctor_statedir.go`
 
+### WHERE the state dir sits is a capability question, not a tidiness one
+
+> WHERE the state dir sits is a capability question, not a tidiness one: STOP
+> and HALT live there, and a session may write anywhere under the workdir it is
+> spawned in. A state dir inside one hands every spawned session the daemon's
+> own stop switch. CLA-259 moved the DEFAULT out; an explicit state_dir still
+> wins, including one pointed back inside, so the operators this catches are
+> exactly the ones the new default never reached.
+
 ### workDirMatch
 
 > workDirMatch is the configured workdir a state dir was found at or under. dir
@@ -788,6 +957,25 @@ section note.
 > detectToolchains: a missed report is a one-off, a wall of irrelevant
 > warnings buries the one that mattered.
 
+### delivery.Repos returns working-tree dirs deduplicated by repository, s
+
+> delivery.Repos returns working-tree dirs deduplicated by repository, so
+> linked worktrees never double-report. The declared checkouts can collide
+> with the scan the other way round — a declared path that is a WORKTREE of
+> a repo the scan also found: two paths, one repository. Dedupe the
+> combined list by the shared git directory, the same identity
+> candidateRepos uses, so a repository is checked once no matter how many
+> of its trees the config names.
+
+### strandedLine
+
+> strandedLine is one report line for a repo: a finding naming a tip that
+> reaches stranded commits, or an error line naming a git read that failed.
+> err lines are prefixed with the repo path by the caller even in single-repo
+> mode, so the repo the remedy points at ("run the failing git command by hand
+> in the repo named above") is actually named; finding lines stay bare, the
+> ref or worktree path being the handle a human rescues by.
+
 ### strandedFindings
 
 > strandedFindings returns the lines to report for one repository — a finding
@@ -799,6 +987,15 @@ section note.
 > the only handle a detached commit has), how many commits are stranded, and
 > the newest one's subject and date: the three facts a human needs to tell live
 > work from debris at a glance.
+
+### parseStrandedWorktrees
+
+> parseStrandedWorktrees reads `git worktree list --porcelain`: blank-line-
+> separated blocks, each led by `worktree <path>` with `HEAD <sha>` and, when a
+> branch is checked out, `branch refs/heads/<name>`. A `detached` block has no
+> branch line and is exactly the tip no branch names. Bare blocks (no working
+> tree) are dropped: their HEAD is a branch, so the branch enumeration already
+> covers it.
 
 
 ## `internal/cli/doctor_toolchain.go`

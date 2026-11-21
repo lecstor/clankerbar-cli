@@ -116,6 +116,15 @@ section note.
 > the same stream-drain path the scanner already handles: EOF, clean
 > parse, and any bytes past the window counted in OutputDropped.
 
+### Studio chat (studio-chat.md §3)
+
+> Studio chat (studio-chat.md §3): the handle this session ran under, and
+> the one failure the planner must recover from in-turn. Claude refuses a
+> resume of a session its local store no longer has with
+> "No conversation found with session ID: <id>" and exit 1. The failed
+> attempt produces no assistant output, so scanning the CLI-authored text
+> (never raw stdout) cannot be fooled by conversation prose.
+
 ### noteToolResult
 
 > noteToolResult applies one clankerbar call's RESULT to res: it resolves the
@@ -145,6 +154,15 @@ section note.
 > `ready` over a task that is waiting on the operator, dropping it back into the
 > claimable queue with the question unanswered.
 
+### This one takes a questionId, so the held task cannot be confirmed from
+
+> This one takes a questionId, so the held task cannot be confirmed from
+> the arguments. Escalating blocks the question's task and ends that run,
+> and a session escalating a question about some OTHER task while holding
+> its own is not a thing the loop does. Treat it as settling: the cost of
+> being wrong is one expiring lease, which is the behaviour this whole
+> change replaces — versus un-blocking a task awaiting the operator.
+
 ### noteClaimed
 
 > noteClaimed records the task/run a successful claim_task returned. A payload
@@ -158,6 +176,15 @@ section note.
 > recorded is indistinguishable from a session that never claimed — no handback,
 > no checkpoint, no complaint. A diagnostic here is the only place the difference
 > is still visible.
+
+### Which task the session ASKED for, read off the tooluse arguments
+
+> Which task the session ASKED for, read off the tool_use arguments. Not
+> enough to record a claim - the run id exists only in the result, and a claim
+> that lost the race would otherwise be tracked as won - but exactly what a
+> diagnostic needs. Without it the operator gets "something went wrong"
+> followed by "ended without holding the task"; with it they get the id of the
+> lease now ticking down unattended.
 
 ### persistedOutputMarker
 
@@ -244,6 +271,15 @@ section note.
 > model's price. A budget dial that undercounts by an order of magnitude is worse
 > than no dial: max_tokens would silently allow roughly ten times what an
 > operator set it to.
+
+### normalised
+
+> normalised maps claude's report onto the CLI's own usage vocabulary (CLA-691).
+> The mapping is the identity on three fields because claude's `input_tokens` is
+> UNCACHED input only — the cache fields sit beside it, not inside it — and zero
+> on Reasoning because Anthropic folds thinking tokens into `output_tokens` and
+> reports no separate figure. Inventing one (or splitting output on a guess)
+> would make the buckets disagree with the harness's own total.
 
 ### probeResult
 
@@ -359,6 +395,25 @@ section note.
 > unknown flag exits 1 with "error: unknown option"), so this is a dependency on
 > an undocumented flag, pinned here against a named version deliberately.
 
+### tokenCeilingReason
+
+> tokenCeilingReason is the terminal_reason the ADAPTER writes into a Result
+> when it killed the session for crossing Invocation.MaxSessionTokens
+> (CLA-343). It is deliberately not a reason the CLI ever emits: the marker
+> exists so the driver can tell an orderly ceiling kill from a genuine failure,
+> and a marker the CLI itself could produce would be indistinguishable from
+> one — same reasoning as claudeMaxTurnsReason, except that one is the CLI's
+> own word and this one is ours.
+
+### Spend first, and off the Result on every path
+
+> Spend first, and off the Result on every path: a probe that exited non-zero
+> still cost what it cost, and under-counting is the one direction a budget
+> breaker must not err in. On the error return this is whatever the probe
+> managed to parse from its output before the run error was classified
+> (probeResult, CLA-299): a probe that emitted its answer and then died in
+> Wait reports the spend it announced, not zero.
+
 ### parseClaudeReset
 
 > parseClaudeReset extracts the reset time from a message like
@@ -458,6 +513,16 @@ section note.
 > final `result` event carries the CUMULATIVE session total, which overwrites
 > the sum on arrival. The running total is what the mid-stream ceiling kill
 > reads; the result total is what the budget sees.
+
+### The API's per-turn usage rides on the assistant event's message, and i
+
+> The API's per-turn usage rides on the assistant event's message, and it
+> is a usage-bearing event in its own right: a session killed mid-stream
+> never reaches the result event, and it still told us what it had spent
+> by the time it died (CLA-288). A zero object (a turn that spent
+> nothing, or a shape change) adds nothing to the SUM - the result event
+> remains authoritative for the total - but the report is recorded either
+> way, because a report of zero is not silence.
 
 
 ## `internal/harness/codex.go`
@@ -631,6 +696,25 @@ section note.
 > allowance exhaustion this adapter recognises is a Limit.Stop; the budget
 > breaker is the control. The CLI's session/weekly/model RATE limits are short
 > rolling windows and are retried as transient instead.
+
+### copilotAccounting
+
+> copilotAccounting is the session's cumulative usage snapshot.
+> `tokenDetails` is already disjoint - its input excludes cache reads and writes
+> (a real session reported input 15811 + cache_read 29824 against model
+> usage.inputTokens 45635) - so the four buckets are copied unchanged. The
+> modelMetrics fallback is INCLUSIVE of the cache buckets and is normalised in
+> noteUsage.
+
+### copilotErrorText
+
+> copilotErrorText collects the CLI's OWN diagnostic text: all of stderr, the
+> stdout lines that are not events, and the CLI's session-level error events. The
+> agent's narration (assistant.message content) and any tool output are
+> EXCLUDED: a backlog task body quoting "Plan: 100% used" must not stop the run
+> on a limit that never happened (the CLA-258 class). warnings are excluded too,
+> deliberately - the CLI's 75%-used quota notice is a warning, and it is not a
+> limit.
 
 ### copilotLimitRe
 
@@ -814,6 +898,15 @@ section note.
 > that is the question doctor used to ask, and opencode answers it yes while
 > still dying on the file. It is "does that file MEAN anything to that harness".
 
+### MCPConfigNative
+
+> MCPConfigNative: the path is handed over, but read in the HARNESS'S OWN
+> schema. A Claude-shaped `.mcp.json` here is not merely useless, it is a
+> config error the harness refuses to start on - so pointing this harness at
+> one is worse than pointing it at nothing. opencode is this: the path becomes
+> OPENCODE_CONFIG, whose servers live under `mcp`, and opencode rejects an
+> unrecognised top-level key outright.
+
 ### TracksClaims
 
 > TracksClaims reports whether this adapter watches the session's clankerbar
@@ -827,6 +920,15 @@ section note.
 > then stop after phase 1 on every task, announced by a log line that reads
 > like an ordinary early finish. config.Validate refuses `phases` without
 > this rather than let that happen quietly.
+
+### HonoursSessionWallClock
+
+> HonoursSessionWallClock reports whether this adapter enforces
+> Invocation.MaxSessionWallClock. False means `max_session_wall_clock` is
+> INERT for this harness — the same class of fact as ReportsCost, and stated
+> for the same reason: an operator who set the dial as their phase backstop
+> has to hear before the run that nothing will enforce it, not discover it
+> from a session that ran all night.
 
 ### ReportsCost
 
@@ -854,6 +956,53 @@ section note.
 > today, which doctor used to encode as a literal `== "claude"` - a comparison
 > that silently became wrong the moment a phase could name its own harness
 > (CLA-366), because the question is about the harness running the PHASE.
+
+### RunsTurnSequences
+
+> RunsTurnSequences reports whether this adapter can run Invocation.Turns:
+> follow-up messages in the SAME session the first turn created. False means
+> a planned sequence has no meaningful execution here — the adapter refuses
+> it up front (ErrTurnsUnsupported) rather than run only the first turn — so
+> config.Validate refuses a review method that needs one, naming the harness,
+> instead of letting a run reach a phase that cannot start. opencode is the
+> adapter with session continuation today.
+
+### EmitsEvents
+
+> EmitsEvents reports whether this adapter normalizes its structured tool
+> events into the agent event channel (CLA-603, transcript tier CLA-887)
+> — the activity tier always, and the transcript tier while its dial is on.
+> False means the loop must not build a sink: there is no mapping, and an
+> unclosed sink would leak its batch goroutine. codex is out of v1 by scope;
+> copilot's tool events exist but its activity mapping is out of v1 too.
+
+### DeliversMessages
+
+> DeliversMessages reports whether this adapter can receive console -> agent
+> messages (CLA-606, CLA-911). True for claude, whose `-p --input-format
+> stream-json` reads user messages from stdin for the session's lifetime, and
+> for opencode, whose private `opencode serve` takes a steer through its
+> session API. codex and copilot run one-shot prompts with no equivalent
+> channel, and an interactive session waits for its hook. The loop sets
+> Invocation.Inbox only when this is true.
+
+### ResumesSessions
+
+> ResumesSessions reports whether this adapter can continue an existing
+> session by id (studio-chat.md §3): claude's `--resume <id>` and
+> opencode's `run -s <id>`. False means a conversation cannot keep one
+> session across turns, so `doctor` says a planner on this harness re-primes
+> every turn. It is deliberately separate from RunsTurnSequences: that one
+> is about follow-up turns inside ONE Invoke, this one is across Invokes.
+
+### Routes
+
+> Routes is the ordered model route list this session may FALL BACK through
+> (CLA-782): the free route first, its paid twin after it. Model is always
+> the same value as Routes[0], so a single-route invocation is byte-for-byte
+> the argv it was before this field existed; an adapter with no route support
+> ignores it. A session that switches mid-flight resumes ITSELF on the next
+> route, and reports the switch through Result.Raw (see RouteFallback).
 
 ### ExtraDirs
 
@@ -893,6 +1042,15 @@ section note.
 > whatever the tree holds — so a hit cap costs a scruffy commit, not work.
 > An adapter whose CLI has no equivalent ignores it, and the phase then
 > relies on the prompt alone.
+
+### MaxSessionTokens
+
+> MaxSessionTokens is the per-session runaway ceiling: when the session's
+> own cumulative usage crosses it, the ADAPTER kills the process mid-stream
+> and marks the Result so the driver treats the end like a turn cap (end
+> the phase, salvage what it left, do not retry or fail). The driver
+> resolves it from Budget.SessionTokenCeiling, so an unset value never
+> reaches here. 0 = no ceiling for this invocation (probes).
 
 ### MaxSessionWallClock
 
@@ -944,6 +1102,16 @@ section note.
 > delivery check, so an unseeded resumed phase runs with all three inert,
 > and it is the phase that does the pushing. Seeding restores them, and
 > leaves Settled/HasWIP to be observed from the stream as usual.
+
+### AllowUnclaimed
+
+> AllowUnclaimed runs this session without a clankerbar claim. A runner
+> phase is seeded with ResumeClaim and holds one throughout; a STANDALONE
+> caller (clankerbar review run) neither claims nor consumes the report into
+> plane records, so the adapter's resume guards must not treat the absent
+> claim as an end. It covers BOTH uses of that guard: the one report
+> re-emit, and the later turns of a multi-turn sequence, which would
+> otherwise stop after the first one with "claim_not_held".
 
 ### OnClaim
 
@@ -1074,6 +1242,16 @@ section note.
 > resumable, where the quiet death's stream was dropped. The driver names the
 > end with it in place of its generic "never moved the task on" line.
 
+### OutputCapReasoningKey
+
+> OutputCapReasoningKey is the Result.Raw key carrying the stalled final step's
+> OWN reasoning-token count, which is what makes the stall legible in a log
+> line — how much thinking bought nothing. Read by the driver's named
+> `stalled: output cap hit with no output (reasoning=<n>)` line. Because it
+> describes ONE step, mergeResume recomputes it from the continuation rather
+> than summing it: a second consecutive stall replaces the first's figure, and
+> a recovered resume clears it with the marker.
+
 ### TokenUsage
 
 > Usage is one session's token accounting in the CLI's OWN normalised
@@ -1113,6 +1291,24 @@ section note.
 > second time (CLA-692 tracks the fix). These buckets sum to codex's own
 > total_tokens, which is the correct figure.
 
+### SessionRef
+
+> SessionRef is the harness session this Result ran as/into, when the
+> adapter can name it (studio-chat.md §3): claude echoes the id it was
+> given, opencode reports the id its stream carried. It is the handle the
+> planner records and resumes on the next turn. It is populated for ANY run
+> that carried a session handle, a task drain included — only a harness with
+> no session ids (or an invocation given no ref) leaves it empty.
+
+### SessionMissing
+
+> SessionMissing reports that this invocation asked to RESUME a session the
+> harness no longer has (a pruned local store), so the planner must re-prime
+> a fresh session from the plane's transcript within the same turn. It is
+> the adapter's verdict, not a text the driver matches: only the adapter
+> knows its CLI's wording. False whenever ResumeSession was false and for
+> every adapter whose `resume` creates instead of refusing (opencode).
+
 ### TurnMessages
 
 > TurnMessages is the final message of EACH turn of a multi-turn invocation,
@@ -1124,6 +1320,16 @@ section note.
 > Empty for a single-turn invocation (the pre-Turns shape), and shorter than
 > the planned sequence when a turn ended it early - len(TurnMessages) is how
 > many turns actually ran.
+
+### TurnStopReason
+
+> TurnStopReason names why the sequence stopped: "usage_limit",
+> "output_cap_stall", "quiet_death", "claim_not_held", "untrusted_stream",
+> "tool_loop", "idle_killed", "nonzero_exit", "cancelled", "no_session",
+> "wall_clock" or "run_error" (the last also returns the run error). Empty
+> when no turn stopped the sequence. The vocabulary is the same one the
+> adapter's own resume guards use, so a caller can name the end without
+> re-diagnosing it.
 
 ### Usage
 
@@ -1181,6 +1387,25 @@ section note.
 > The driver's contract, in loop.drainWithRetries: do not count the spend, do
 > not release the claim, do not classify the exit. See CLA-262.
 
+### IdleKilled
+
+> IdleKilled is the cause when the ADAPTER killed this session for silence:
+> "no output for <MaxSessionIdle>", or "tool call <id> open for
+> <MaxToolCallDuration>" when a call was open. Empty for every other end.
+> opencode clears it when the child exited cleanly anyway (its stream was
+> parsed to the end); claude keeps it and marks the Result untrusted, because
+> its reader stopped at the trip. Like ToolLoop it is a verdict about the
+> session, set after the stream is parsed, never a figure parsed out of it.
+
+### IdleToolCall
+
+> IdleToolCall reports that the kill named by IdleKilled landed while a tool
+> call was open — the TOOL CAP, not the idle clock. The distinction decides
+> how the death is read: a cap kill says the driver's own bound ended a
+> session that was waiting inside one call (a CI wait, a long test run), so
+> it is not evidence that the provider or harness is failing. False before
+> any kill and for an idle-clock kill.
+
 ### ReportResumeFailed
 
 > ReportResumeFailed is the cause when the adapter's bounded re-emission of
@@ -1233,6 +1458,16 @@ section note.
 > session is told to verify the hand-off itself. False for every verified
 > checkpoint and for the branch-less plane-record forms (CLA-497).
 
+### CheckpointTip
+
+> CheckpointTip is the origin tip the driver VERIFIED for Claim.Branch at
+> the checkpoint (CLA-637): the remote commit the branch was at when the
+> evidence gate read it. The review phase's brief carries it as the tip the
+> reviewer must check out and record, and the durable-record seam gate
+> matches the record's reviewedTip against it. Empty for a branchless
+> checkpoint and for an unverified one (where the driver never read a tip),
+> which is exactly the pair of cases where no tip can be demanded.
+
 ### scanCache
 
 > scanCache holds the scoped text a classifier scans, built once per session
@@ -1271,6 +1506,16 @@ section note.
 > otherwise cost a network round trip, a duplicate log line, and a duplicate write
 > to the plane.
 
+### Deduplicated on the CLAIM, not on the whole call, and the later one wi
+
+> Deduplicated on the CLAIM, not on the whole call, and the later one wins: two
+> updates can restate the same branch under different statuses, and it is the
+> most recent status that says whether the work is being handed to review or
+> declared landed. The replace carries the PRIOR Repo when the restatement
+> drops it (CLA-351): a session that declared `repo` on one update and then
+> restates `branch` with a status change — the protocol-encouraged shape —
+> must not have its repo wiped, or the resolved branch check is lost.
+
 ### Report
 
 > Report is a delivery claim the plane accepted: the branch a session recorded as
@@ -1281,6 +1526,15 @@ section note.
 > branch recorded but never pushed past its first commits reads as a hand-off to
 > the next clanker and is a dead end. The driver is local and in the git tree, so
 > it can simply look (CLA-253).
+
+### Repo
+
+> Repo is the repository the session declared its work lives in
+> ("owner/name") (CLA-351). Empty when the session did not declare one — and
+> the cutover to intent-specific tools left no call that carries `repo`
+> beside a branch, so it is normally empty and the plane's own task row is
+> the authority (CLA-437). The verifier then falls back to its existing
+> behaviour, and the driver resolves the ambiguity-free case as before.
 
 ### ClaimsMerge
 
@@ -1329,6 +1583,15 @@ section note.
 > holder for every status except `in_progress`. An allowlist here drifts the
 > moment a status is added — and a status this side has not heard of would be
 > read as "still held", which is the reading that produces a wrong write.
+
+### Stop
+
+> Stop marks a HARD limit the loop cannot wait out: a budget/credit
+> exhaustion (out of credits, spend-cap or monthly-limit reached) with no
+> rolling-window reset to poll for. The loop stops the run cleanly instead of
+> entering the supervised wait. Zero value (false) keeps the wait-and-poll
+> behaviour for the rolling-window subscription caps that claude, codex and
+> opencode hit.
 
 ### Window
 
@@ -1551,6 +1814,53 @@ section note.
 > cap bounds the whole loop; after it, the last Result falls through to the
 > driver's existing dead-phase path unchanged.
 
+### delivery
+
+> Console -> agent delivery (CLA-911). The RUN id is not known at spawn for
+> a fresh claim — the session claims inside itself — so the adapter learns it
+> from ResumeClaim (a resumed phase) or the OnClaim watcher, exactly as
+> claude does. One delivery target serves the WHOLE Invoke: a resurrection or
+> a turn continuation is the same session, and each process attaches its own
+> private server to it.
+
+### completed
+
+> A planned multi-turn session (CLA-867): the follow-up turns run in
+> this same session before any recovery pass, because a turn that ends
+> badly must stop the sequence rather than be resumed behind the
+> caller's back. A completed sequence hands back the FINAL turn's
+> invocation: everything below judges the turn that actually ended the
+> session, never the first one's model or route list.
+
+### CLA-584
+
+> CLA-584: the output-cap stall. A final step that hit the output token
+> limit with zero output is NOT the quiet death the loop below resumes —
+> the session is alive and its transcript is intact; the step failed
+> because the model spent its whole output budget thinking. It gets ONE
+> resume carrying a steer (opencode_stall.go), and this runs BEFORE the
+> quiet-death loop so a stall resume that then dies quietly still gets
+> CLA-406's probe on its own terms.
+
+### An UNTRUSTED stream is never resurrected
+
+> An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
+> state off an over-run capture, and both the coherence ref and the
+> continuation's seed come from exactly that state - while the driver's
+> own untrusted path declines to count further spend, so probing would
+> enlarge the accounting blind spot endUntrustedDrain exists to bound.
+> The conjunct mirrors the driver's own gate (!capped && !ceiling &&
+> !wallclock && untrusted) so adapter and tallyDead agree on what is dead.
+
+### Charge the probe's spend UNCONDITIONALLY, before any verdict
+
+> Charge the probe's spend UNCONDITIONALLY, before any verdict: a
+> resume re-sends the whole transcript, so this is real money even when
+> the answer is garbage. Under-counting is the one direction a budget
+> breaker must not err in. Deliberately NOT via mergeResume — a probe
+> must never donate raw/terminal state or a process outcome; its CLAIM
+> observation folds separately, just as unconditionally.
+
 ### The claim observation folds ONLY when it is still about THIS task
 
 > The claim observation folds ONLY when it is still about THIS task
@@ -1577,6 +1887,15 @@ section note.
 > the conjunct makes "untrusted reply is not evidence" hold BY RULE,
 > so a future parser that survives a bad line cannot quietly start
 > continuations on debris. Same CLA-262 reasoning as the fold above.
+
+### Coherent
+
+> Coherent: continue the session for real. The continuation's parser is
+> seeded with the DEAD RUN'S live claim (not in.ResumeClaim, which on a
+> phase 2+ holds the staler predecessor): `opencode run -s` streams only
+> the new turn, so without the seed every progress write the continuation
+> makes would go unobserved — no settle, no HasWIP, no delivery report —
+> and releaseHeldClaim would post ready over work the session pushed.
 
 ### opencodeArgs
 
@@ -1774,6 +2093,16 @@ section note.
 > (CLA-441 reviews). The cost is a WITHDRAWN grant: a declared tree containing
 > the workdir is unreadable outside the workdir itself.
 
+### opencodeWorkdirPatterns
+
+> opencodeWorkdirPatterns derives two pattern forms from a directory. abs is the
+> pattern for external_directory asks, which are absolute globs. rootRel is the
+> root-relative form 1.x read/edit asks used (the absolute path minus its
+> leading separator); 2.x never asks in it, and the policy no longer emits it,
+> but the helper keeps returning it for the tests that pin its derivation. An
+> empty workdir (the config default: run in the driver's cwd) falls back to the
+> resolved cwd so the policy still scopes the session to where it actually runs.
+
 ### and hand the session config over again as OPENCODECONFIGCONTENT,
 
 > ...and hand the session config over again as OPENCODE_CONFIG_CONTENT,
@@ -1942,6 +2271,15 @@ section note.
 > opencodeRollingQuotaRe; a plain 429 "rate limit" with no quota wording is a
 > transient blip (IsTransient), not this.
 
+### opencodeGenericLimitRe
+
+> opencodeGenericLimitRe names an exhausted quota WITHOUT naming a window or a
+> hard condition: the legacy "usage limit reached", and "insufficient
+> [provider] quota". On its own that is still a Stop — nothing in it says the
+> window lifts — but DetectLimit lets the rolling classification win when the
+> same event is typed provider.quota or states a reset instant, which is the
+> whole difference between a top-up and a wait (CLA-736 review).
+
 ### opencodeRollingQuotaRe
 
 > opencodeRollingQuotaRe recognizes the OTHER kind of provider limit: a rolling
@@ -1973,6 +2311,25 @@ section note.
 > Deliberately narrow. A bare 429 "rate limit" names no window and stays
 > transient, and the hard budget arms above are checked FIRST — so a monthly cap
 > typed as provider.quota is still a Stop.
+
+### opencodeResetInRe
+
+> opencodeResetInRe captures a RELATIVE reset a rolling quota states by duration,
+> e.g. "Usage limit reached. Resets in 4 hours." or "reset in 45m". The same
+> provider family emits either form, and a relative window is the same statement
+> of when the limit lifts — the classifier's own rule is that "a message that
+> says when it lifts is a wait" (review 1.review-2.2), and reading only the
+> absolute form turned the wait into an engineer-visible stop.
+
+### The generic exhausted-quota phrasings are a Stop only when nothing mak
+
+> The generic exhausted-quota phrasings are a Stop only when nothing makes
+> the limit waitable. A provider.quota type or a rolling window is the case
+> above; here the one remaining signal is a STATED reset — absolute
+> ("resets at <RFC3339>") or relative ("resets in 4 hours") — a message that
+> says when it lifts is a wait, not a top-up, so it must not be turned into a
+> hard stop by wording that names no hard condition (CLA-736 review,
+> 1.review-2.2).
 
 ### opencodeRateLimitWindows
 
@@ -2008,6 +2365,15 @@ section note.
 > window seen on a 5xx is not a plan cap, and a 429 that names no window stays
 > the transient burst limit IsTransient already handles — that is the difference
 > between waiting out a plan cap and backing off a burst.
+
+### The body NAMED a window
+
+> The body NAMED a window. The closed map decides the label — including
+> "no label" for a token it does not know. The failure is still a plan
+> limit (a rate-limited failure that names a window is one by the task's
+> own rule); what it is NOT is the 5-hour default, which would label a
+> cap the provider never described as 5-hour and turn an unknown window
+> into an unbounded wait (reviews 1.review-1.4, 1.review-2.2).
 
 ### opencodeNamedWindowRe
 
@@ -2342,6 +2708,15 @@ section note.
 > that never gets a private server (a probe, or one whose config declares no
 > clankerbar MCP server) runs no delivery goroutine at all.
 
+### postOpencodePrompt
+
+> postOpencodePrompt steers one message into a live opencode session. Verified
+> against the installed opencode 2.2.7 and its published OpenAPI
+> (/docs/openapi.json): POST /api/session/{sessionID}/prompt takes
+> {"text": ..., "delivery": "steer"|"queue"} and authenticates the same way the
+> adapter's MCP preflight does (basic auth, user "opencode", the server's
+> announced password).
+
 
 ## `internal/harness/opencode_interrupt.go`
 
@@ -2490,6 +2865,25 @@ section note.
 > Adding it lets the status wait observe `disabled` and fail fast with
 > ErrMCPNotConnected (CLA-703 review, finding 4.3).
 
+### opencodeMCPEntryShaped
+
+> opencodeMCPEntryShaped reports whether a value carries any field an MCP entry
+> has, with a VALUE, exactly as config's entryIsZero reads the same document: an
+> all-zero "servers" value is the 2.x container, one with any non-zero entry
+> field is a 1.x server named "servers". The field set and the "non-zero" test
+> mirror that decoder deliberately — an empty URL, a null map and an absent key
+> are all zero there, so they are absent here.
+
+### A shutdown inside the preflight window is NOT a clean exit
+
+> A shutdown inside the preflight window is NOT a clean exit. Returning
+> a zero Result would reach the driver as ExitCode 0 with no error — a
+> review-only phase would book it no_mcp and a panel would record the
+> member failed, while other phases walk the held-but-empty ladder and
+> spawn one doomed backstop. The driver's `ierr != nil && ctx.Err() != nil`
+> path is the shutdown classification, so hand it the cancellation
+> (CLA-703 review, finding 4.1).
+
 
 ## `internal/harness/opencode_report.go`
 
@@ -2551,6 +2945,15 @@ section note.
 > mergeResume replaces FinalMessage with the continuation's, so a corrected
 > report is what the runner reads off this Result.
 
+### stalled is the first attempt's idle cause, made STICKY
+
+> stalled is the first attempt's idle cause, made STICKY: once a resume has
+> gone silent, every later return that leaves the report refused must fail
+> closed on that stall. Returning without the marker would leave the
+> session's own clean exit as the phase's whole verdict, which is how an
+> implement phase checkpoints on its branch and advances to review with no
+> delivery record (review finding 1.review-1.1).
+
 ### The resume ran
 
 > The resume ran. Judge BEFORE merging: the runner applies a report only
@@ -2561,6 +2964,15 @@ section note.
 > phase with the resume's process outcome, and NOT merging it while
 > leaving the marker empty is the fail-open this finding is about: the
 > session's own clean exit would read as a finished phase.
+
+### chargeReportResume
+
+> chargeReportResume charges one report-resume process's spend and folds its
+> CLAIM observation, without adopting its process outcome. A stalled or errored
+> resume re-sends the whole transcript, so its spend is real even when it helped
+> nothing (mergeResume sums the success path instead), and a turn that ran may
+> have touched the claim — under the same trusted-capture, same-task guard the
+> stall and errored paths use.
 
 
 ## `internal/harness/opencode_resume.go`
@@ -2599,6 +3011,24 @@ section note.
 >     this into a perpetual churn of probe-and-die;
 >   - a resurrected-and-recovered phase counts as never-dead for the dead-phase
 >     counters; only FAILED probes reach that accounting.
+
+### opencodeResurrectionsKey
+
+> opencodeResurrectionsKey is the Raw key counting completed resurrections
+> on the final Result. Nothing in the driver reads it today — the operator-
+> visible record is the `!! resurrection …` console lines, which land in
+> the iteration log — so this is correlation/debugging state, kept because
+> a merged Result that does not say it was stitched together invites the
+> next reader to assume one process ran.
+
+### opencodeWallClockExhaustedMsg
+
+> opencodeWallClockExhaustedMsg is the console line for BOTH places the
+> wall-clock gate ends a resurrection attempt — before a round starts and
+> between its probe and its continuation — so greps and tests see one
+> string. One message has to fit both sites, hence "exhausted" rather than
+> site-precise wording: at either point there is no budget left worth
+> resurrecting against.
 
 ### opencodeResumeRoundFloor
 
@@ -2725,6 +3155,36 @@ section note.
 >     accumulates; the continuation's own count stands, and its absence clears
 >     the dead run's.
 
+### finishreason recomputed SYMMETRICALLY with terminalreason
+
+> finish_reason recomputed SYMMETRICALLY with terminal_reason: the parser
+> writes the key only when the stream carried a step_finish reason, so
+> inheriting the corpse's would leave a merged Result asserting the dead
+> run's "unknown" while the mark above cleared - ZeroUsageUnknown says
+> recovered while deadPhase/tallyDead/deadscan (which read THIS key) say
+> dead, and the phase parks despite a successful resurrection. No
+> continuation verdict, no key.
+
+### The stall's reasoning count is recomputed from the continuation for th
+
+> The stall's reasoning count is recomputed from the continuation for the
+> same reason as the two verdict keys above: it describes ONE step — the
+> one OutputCapReason names — so it may not be SUMMED. Stall 1 (32000) into
+> a resume that stalls again (28000) would otherwise leave 60000, a figure
+> no step ever burned, and the driver's named line prints this exact
+> number. Absent on a recovered continuation, it is cleared with the
+> marker, so Raw never carries a count for a stall that no longer stands.
+
+### The recovered-error marker is recomputed from the continuation for the
+
+> The recovered-error marker is recomputed from the continuation for the
+> reason spelled out in the field list above: the parser writes it only when
+> the stream did NOT end on an error, so its presence is the continuation's
+> own verdict that this session recovered, and its absence — a terminal
+> error, or nothing to recover from — must clear the dead run's. A positive
+> count is carried as-is rather than added: the merged session needs to know
+> THAT it recovered, not how many runs' blips to add up.
+
 ### mergeObservation
 
 > mergeObservation folds one run's CLAIM OBSERVATION - claim state plus
@@ -2736,6 +3196,15 @@ section note.
 > advance the claim exactly as the continuation could, and dropping what it
 > observed would re-create ERROR 1 one turn earlier - releaseHeldClaim posting
 > ready over a task the probe just moved.
+
+### LATER WINS, matching settleReport's own rule
+
+> LATER WINS, matching settleReport's own rule: sameClaim
+> ignores Status, and the most recent status is the one that
+> says whether the work is headed to review or declared
+> landed. Keeping the earlier duplicate would drop exactly
+> that upgrade — an in_review declaration superseded by a
+> done — and skip merge attestation.
 
 
 ## `internal/harness/opencode_routes.go`
@@ -2895,6 +3364,15 @@ section note.
 > continuation), and NO further resume is attempted — the second consecutive
 > stall is terminal, as designed.
 
+### The claim observation folds even here, under the probe's guard
+
+> The claim observation folds even here, under the probe's guard: an
+> errored resume still ran a real turn, and one that recorded a branch
+> (or settled the task) before the failure is describing STATE THIS
+> SESSION REACHED. Dropping it would let releaseHeldClaim act on the
+> stale pre-resume claim and hand a task back to `ready` over work the
+> resume just pushed.
+
 
 ## `internal/harness/opencode_stream.go`
 
@@ -2925,6 +3403,15 @@ section note.
 > phase ran. The driver never sets the field on a probe either — this is the
 > belt to that braces, so a future caller reusing an Invocation cannot turn a
 > probe into a capped session by accident.
+
+### One canonical directory for the permission policy, the server process,
+
+> One canonical directory for the permission policy, the server process,
+> the status query and the run: the server keys its MCP state by the
+> resolved path, so a raw `/var/...` query would poll a location no session
+> uses (see opencodeWorkDir). The policy's absolute paths must agree with
+> the directory the session actually runs in, or an in-tree write can look
+> external on a symlinked temp dir.
 
 ### CLA-703
 
@@ -3119,6 +3606,16 @@ section note.
 > Because it sums, it has to see EVERY step — which is exactly why it runs on the
 > live stream instead of over the retained tail (see Invoke).
 
+### lastStepZeroUsage
+
+> lastStepZeroUsage reports that the MOST RECENT step_finish's own usage
+> summed to zero — no tokens block, an all-zero tokens block, or no cost
+> are all the same quiet end. Reset for every step: the CLA-398
+> quiet-death signature is a FINAL step whose OWN usage is all-zero — a
+> session can do hours of real paid work and then die with an "unknown"
+> final step that reported nothing, so the session total (p.total/p.cost)
+> is NOT the discriminator. Only the final step's own usage is.
+
 ### lastStepReason
 
 > lastStepOut and lastStepReason are the MOST RECENT step_finish's OWN
@@ -3142,6 +3639,15 @@ section note.
 > finished stream, tracked here as the stream arrives so the two cannot
 > disagree about how the session ended.
 
+### newOpencodeParse
+
+> newOpencodeParse builds the parser a session streams into. It exists so the
+> CLAIM SEED is exercised by tests: a resumed phase never calls claim_task, so
+> without newSessionResult here its Claim would be the zero value and
+> Claim.Held() — the gate on the handback, the salvage and the delivery check —
+> would be false for the phase that pushes the branch and opens the PR. Assigned
+> inline in Invoke, deleting it would leave the whole suite green.
+
 ### idleStepCall
 
 > idleStepCall is the synthetic tool call an opencode STEP opens in the idle
@@ -3163,6 +3669,25 @@ section note.
 
 ### CLA-900
 
+> CLA-900: the step is the call window this stream exposes. step_start opens
+> it - the last line before the step's tools run, because a tool's own part
+> arrives only after it returned - and step_finish closes it. Handled before
+> the Part check so a step boundary moves the window whatever its part looks
+> like; a fresh step_start RESTARTS the window, so a step that ended without
+> a step_finish (a provider retry, the final answer) cannot leave an old start
+> to cap a live session.
+
+### A new step has begun, so the previous step is no longer the final one
+
+> A new step has begun, so the previous step is no longer the final one.
+> The final step of a 2.x session (the plain answer) emits no
+> step_finish, so without this reset the last TOOL step's "tool-calls"
+> would be reported as how the session ended. With it, a session whose
+> last step never finished on the stream reports no streamed reason, and
+> the export supplies the real one.
+
+### CLA-900
+
 > CLA-900: the step window is CLOSED above, before the Part check. A
 > step_finish must never OPEN one: it is published after the step's tools
 > have returned, so the silence that follows it is the model's NEXT
@@ -3171,6 +3696,16 @@ section note.
 > The reason rides on the same part as the usage. The LAST one wins: it
 > is the step the session's stream ended on, which is the step that says
 > whether a final answer was produced.
+
+### CLA-584
+
+> CLA-584: the stalled step's own figures move WITH the reason, so
+> the pair always describes ONE event. A reason-less step_finish is
+> skipped for this pair exactly as deadscan skips it for its own —
+> otherwise the previous step's "length" would be paired with THIS
+> event's zero output (or its output paired with the previous
+> reason), and the live adapter would resume a session the
+> retrospective scan reads as a mere long answer.
 
 ### tokens and cost are siblings on the part; count each independently so
 

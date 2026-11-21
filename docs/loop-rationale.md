@@ -74,6 +74,24 @@ section note.
 > Harnesses are consulted in name order so a run with two blocks reports the
 > same dial every time rather than whichever the map yielded first.
 
+### targetElapsed
+
+> targetElapsed is how long target i has been draining. The stored budget's
+> wall clock runs on THIS clock, not the run's: a project polled into a daemon
+> two hours old has not thereby spent two hours of its own ratified ceiling.
+> Zero until the target's first drain. stateMu is not decorative: a parallel
+> panel's members run budget checks on their own goroutines while the run's next
+> boundary may stamp the clock.
+
+### notePauseHeld
+
+> notePauseHeld books wall-clock time a scheduled pause held target ti at a
+> phase boundary (CLA-906). It is idle time, not draining time, so the budget
+> clocks credit it back rather than ending a sequence for waiting out a window
+> the operator configured. The run-wide clock the local-file budget reads is
+> shared, so it always carries the credit; the per-target clock a stored
+> overlay reads is credited for the target the hold served.
+
 ### markBudgetExhausted
 
 > markBudgetExhausted records a trip against the target(s) its account governs,
@@ -137,6 +155,24 @@ section note.
 > narrow loosening of CLA-457: a session that recorded a branch it never
 > pushed, during a remote outage, reaches a review phase, which is the
 > backstop.
+
+### The branch form (a) accepted, and the origin tip the accepting check r
+
+> The branch form (a) accepted, and the origin tip the accepting check read
+> (CLA-637): the tip rides the checkpoint as the revision the review phase
+> verifies and records, and the seam matches the record's reviewedTip
+> against it. Recorded rather than returned on the spot: the review-record
+> gate below needs the plane read FIRST, and both the read and the gate are
+> one decision.
+
+### Form (a) short-circuits for every phase that does not need the plane's
+
+> Form (a) short-circuits for every phase that does not need the plane's
+> record: a verified branch is the strongest evidence there is, and asking
+> the plane anyway was never the contract. A review-shaped phase is the one
+> exception, because its checkpoint additionally needs the durable review
+> record (below) and its freshness baseline (reviewGate), so it pays the
+> extra reads.
 
 ### CLA-576
 
@@ -214,6 +250,15 @@ section note.
 > stays worthless here — and a task still sitting in `ready` is still the
 > empty exit, however orderly the session that said nothing about it.
 
+### readTaskOutcome
+
+> readTaskOutcome reads the claimed task's outcome from the plane, best-effort:
+> a failure returns read=false and the caller decides what to do without it.
+> purpose and consequence compose the log line, because two callers read the
+> same field for different reasons — the review seam's freshness baseline, and
+> the fix phase's structural grading (CLA-635) — and a shared message would
+> misname one of them.
+
 ### planeSeamReadAttempts
 
 > planeSeamReadAttempts bounds the retries of a plane read whose failure fails
@@ -268,6 +313,16 @@ section note.
 > checkpoint, because a fix phase spawned against findings the plane still
 > holds sealed is a session spawned to apply nothing.
 
+### readTaskState
+
+> readTaskState reads the plane's record of one task, for the verification
+> round's BEST-EFFORT reads (CLA-638): the fix phase's panel digest and its
+> open-MUST digest, where a failure degrades to "judge on other evidence" — the
+> fix brief's own instruction to read `reviews.openMustIds` itself. Best-effort
+> like every other plane read: ok is false when there is no task id, no wired
+> reader, or the read fails. The reads that fail the sequence CLOSED instead use
+> readTaskStateRetry, which shares this implementation with a retry bound.
+
 ### readTaskStateRetry
 
 > readTaskStateRetry is readTaskState for the verification round's FAIL-CLOSED
@@ -307,6 +362,16 @@ section note.
 > lease unattended. Both loop back to a session that re-claims, so both have to
 > undo the hold first.
 
+### The session rides the reconstruction (CLA-630)
+
+> The session rides the reconstruction (CLA-630): it is record data for the
+> fleet iteration record, not a hold to undo, and the pass it names really
+> did spawn. The limit branch calls this BEFORE its stop paths return — a
+> reset past the run's ceiling, a stop during the wait, a retry that fails
+> to launch — and dropping the field there would omit a spawned session
+> from the record. On the paths that loop back, the next attempt's own end
+> replaces this one, so carrying it costs nothing.
+
 ### releaseHeldClaim
 
 > countUndeclared says whether THIS call site is the one where a held-with-work
@@ -323,6 +388,24 @@ section note.
 > or a release the plane refused, is still live and a fresh session would only be
 > refused); the other callers ignore it.
 
+### handBackClaim
+
+> handBackClaim is releaseHeldClaim with the two outcomes split: handed says
+> the claim was actually let go (back in the ready queue, or its lease ended on
+> pushed work), queued says it specifically returned to the ready queue. Only
+> the phase seam reads handed — it must drop the drain's carried claim when the
+> handback landed, but keep it for the deferred retry when it did not, and
+> releaseHeldClaim's bool cannot tell those apart on the pushed-work path.
+
+### A stream read only in part tells us which calls we SAW, never which th
+
+> A stream read only in part tells us which calls we SAW, never which the
+> session made: the settle that released the task may simply be in the bytes
+> that never arrived. Handing the task back on that reading posts `ready` over
+> work already in review, which is the one outcome worse than a lease expiring
+> (CLA-262). Let it expire instead — the plane's own sweep does the right thing
+> with it, and keeps the takeover hand-off if there is one.
+
 ### CLA-708
 
 > CLA-708: the claim has pushed work, so ReleaseDriver is forbidden — it
@@ -335,6 +418,16 @@ section note.
 > (an unwired plane, a plane older than the field, a refused write), and
 > it is the ONLY behaviour for the `res.Untrusted` path above, which does
 > not reach here by design.
+
+### A stalled session is named by its cause on THIS path too (CLA-584), no
+
+> A stalled session is named by its cause on THIS path too (CLA-584), not
+> only on the held-with-work branch above: a stall that never pushed a
+> branch is the shape that leaves nothing behind, so "handed back to the
+> queue" alone would send the next clanker to rediscover the cause — the
+> MAK-123 post-mortem's complaint. Computed before the release so the line
+> that reports its outcome can carry it; the named line REPLACES the
+> generic one on success, as it does above.
 
 ### expireHeldClaim
 
@@ -366,6 +459,15 @@ section note.
 > waits) and — for STOP and RESTART — at a verified PHASE SEAM (CLA-879, see
 > stopAtSeamMarker). Never inside a session's lifetime for anything but
 > RESTART_NOW, whose whole point is to cut that lifetime short.
+
+### restartCheckInterval
+
+> restartCheckInterval is how often the daemon looks for a RESTART_NOW marker
+> while it has work in flight. The graceful markers need no watcher — they are
+> picked up at the next boundary by construction — but --now exists to end an
+> in-flight session that may have hours left, so it is polled for. Two seconds
+> keeps the operator's wait short next to a session measured in minutes without
+> making the state dir hot.
 
 ### watchRestartNow
 
@@ -476,6 +578,15 @@ section note.
 > answer), no branch was recorded, and no cap or stream failure explains the
 > end — the "produced nothing" shape CLA-386 and CLA-398 were built around.
 
+### unbookDead
+
+> unbookDead removes a dead booking tallyDead made for an exit that is later
+> classified as an infrastructure miss (CLA-703) rather than a death. It is the
+> counterpart of the booking and exists because the booking has to happen when
+> the exit arrives, before the review seam has decided whether the session ever
+> reached the backlog. The run count is deliberately NOT decremented: the
+> session did run; only its dead classification was wrong.
+
 ### tallyEmpty
 
 > tallyEmpty books one held-but-empty implement exit into the run's dead-phase
@@ -552,6 +663,24 @@ section note.
 > unwired plane falls back to the session's declaration, then to this
 > target's primary repo.
 
+### Detached and bounded PER REPORT
+
+> Detached and bounded PER REPORT: a shared deadline would silently degrade
+> every claim after the first slow one to "cannot check". Detached because a
+> cancel arriving mid-check should not turn a real answer into a half one —
+> the guard above is what makes cancellation prompt. The PR check's own
+> polling budget sits well inside this deadline, so one slow GitHub read
+> cannot starve the git checks that share the report.
+
+### attestMerge
+
+> attestMerge writes the driver's verdict onto the task's delivery record, so the
+> answer survives the log. Only for a check that RAN: `mergeVerified` means "I ran
+> the ancestor check and this is what it said", and writing it off the back of a
+> check that could not run would be the same false attestation this exists to
+> catch. Best-effort throughout — an unreachable or unwired plane costs the record,
+> not the run, and the loud log above already carries the finding.
+
 
 ## `internal/loop/digests.go`
 
@@ -569,6 +698,15 @@ section note.
 > open list is not an empty digest — the session is still told the delta base
 > and that the gate currently reads as clear, so a verifier that sees a problem
 > states it rather than silently passing a hand-over it cannot explain.
+
+### settledIDs
+
+> CLA-671: the fix phase marks the MUSTs it answers `fixed` or `refuted`
+> itself, so a verifier handed only the OPEN list never sees a refutation —
+> it changes no code, so the delta does not show it either — and a wrong one
+> rode to in_review unexamined. Every MUST of this cycle already marked
+> settled is listed for the verifier to confirm (leave it) or reject (set it
+> back to open). Bounded: the round cap keeps a cycle to three rounds.
 
 ### mergedFindingsDigest
 
@@ -626,6 +764,35 @@ section note.
 > merged list look for an `alpha` record and report a member that recorded as
 > INCOMPLETE (CLA-639).
 
+### branchlessVerificationDigest
+
+> branchlessVerificationDigest is verificationDigest for a BRANCHLESS task
+> (CLA-638 × CLA-670): the branchless review writes no durable record (question
+> 03a12578, option 1), so there are no plane finding ids for the round to
+> adjudicate. The digest therefore hands the verifier the LAST `## Review`
+> block itself — the block IS this shape's round record — and says so up front,
+> because the empty record set is expected here and must not read as a failed
+> hand-off.
+
+### resolvedFindingIDs
+
+> resolvedFindingIDs lists the MUST ids on released records that a verifier has
+> ALREADY marked resolved (fixed, filed or refuted). The driver remembers them
+> across the round loop: an id that is open again in a later round was reopened
+> after a verifier marked it resolved, which is non-convergence and parks the
+> task (A6). Sealed and void records contribute nothing, exactly as in the
+> digest.
+
+### nonConvergenceReason
+
+> nonConvergenceReason reports why the round loop must stop and park rather than
+> spawn another fix (CLA-638, A6): a MUST a previous verifier marked resolved
+> that the latest round has open again, or a MUST still open after two fix
+> attempts (its id's round prefix is at least two behind the round that just
+> closed). Empty means the loop may continue. It reads plane state plus the
+> driver's in-memory resolved set, so a takeover (empty set) loses the reopened
+> half but the round-prefix half still holds.
+
 ### parkVerification
 
 > parkVerification parks a task whose verification round cannot proceed
@@ -657,6 +824,18 @@ section note.
 > returned branch is recorded but NOT verified, and the caller that builds the
 > successor's brief must read Result.CheckpointUnverified and select the
 > unverified brief: this function names the branch, it does not vouch for it.
+
+
+## `internal/loop/done_apply.go`
+
+### reportKindFor
+
+> reportKindFor decides the kind from the CAPTURED phase's prompt, never the
+> live one: a handoff respawn replaces ph.Prompt with the predecessor's
+> successor text, and the successor still owes the same report its phase does.
+> The checkpoint variant is resolved first, exactly as invocationFor does, so a
+> branchless or unverified phase - which still runs a shipped brief that writes
+> its own records - expects no report.
 
 
 ## `internal/loop/drain_claim.go`
@@ -760,6 +939,15 @@ section note.
 > The second value is the task's repo identity (CLA-437), used for the
 > pr_base override; the first is the spawn directory.
 
+### The branch this task's repo PRs target, resolved ONCE per phase like t
+
+> The branch this task's repo PRs target, resolved ONCE per phase like the
+> spawn directory above, and for the same reason: it does not change between
+> attempts. Filled into the prompt's {{prBase}} placeholder by invocationFor
+> (CLA-608). Never fails here: an unresolvable probe falls back to the
+> configured integration branch, which is the text the briefs carried
+> before this feature existed.
+
 ### Rescue whatever the session left uncommitted, FIRST
 
 > Rescue whatever the session left uncommitted, FIRST — before the handback,
@@ -808,6 +996,25 @@ section note.
 > CLA-638: a verification round that left an OPEN MUST holds the seam
 > even though it is the last phase, because the driver spawns another
 > fix against it. A clean round does not hold.
+
+### CLA-703 backstop
+
+> CLA-703 backstop: the primary fix is the adapter's MCP preflight, but
+> a session can still end with no clankerbar call and no record (an
+> older build, a session that acted before its tools were offered, a
+> harness whose preflight does not exist). Re-run it ONCE with the same
+> brief before the panel records the member as failed. The claim was
+> deliberately kept above, so a resumed phase retries the same run; the
+> spend is already counted, so the retry is visible to the budget.
+
+### Stopping here ends the whole run, so say WHAT was judged non-retryable
+
+> Stopping here ends the whole run, so say WHAT was judged non-retryable.
+> Without it the operator gets "exited 1 (non-retryable)" and no way to
+> tell a genuine failure from a blip the classifier merely does not know
+> yet — which is the one thing they need in order to report the gap. The
+> text is the harness's own diagnostic scope, never the raw stream, so
+> the agent's narration is not quoted back at them (CLA-258).
 
 
 ## `internal/loop/drain_phase_prep.go`
@@ -859,6 +1066,15 @@ section note.
 > would relist an earlier cycle's findings after a verify rewind and count
 > a member that recorded in an earlier round as having recorded this one.
 
+### CLA-671
+
+> CLA-671: on a fix round after a verification round, the newest record
+> holds only the verifier's NEW findings, so a MUST an earlier round left
+> open is not in the block the grading above reads; the fixer used to leave
+> it untouched and the breaker parked the task as non-convergence. Prepend
+> the plane's own open list. Best-effort: an unreadable task state leaves
+> the brief's instruction to read reviews.openMustIds itself.
+
 ### CLA-638
 
 > CLA-638: the VERIFICATION round's brief carries the prior open MUST ids and
@@ -903,6 +1119,16 @@ section note.
 > the in-flight fix successor's terminal step, and a custom-prompt phase
 > later covered by a built-in gains one.
 
+### CLA-639
+
+> CLA-639: whether this position is one reviewer of a review panel. The
+> members are consecutive review-shaped phases, so "before the next
+> configured phase" is the same test the shipped sequence already uses.
+> Captured BEFORE the handoff branch replaces ph.Prompt with a
+> continuation: a panel member never honours a handoff, but the
+> continuation's own review position must still be read from the phase
+> identity, not from a prompt that is no longer a brief.
+
 ### CLA-703
 
 > CLA-703: a LONE review-only phase (no panel) that never reached the
@@ -915,6 +1141,26 @@ section note.
 > CLA-738: the name is a log line only. The iteration Outcome stays the
 > four-word enum the plane accepts — prose there makes marshalReport
 > refuse the whole report, presence refresh included.
+
+### CLA-784
+
+> CLA-784: an optional (trial) seat's invocation error is that seat's
+> result, not the drain's — the same rule the parallel join applies with
+> its `!m.optional` guard. A member that recorded and THEN hit a harness
+> error has already delivered its record; ending the drain on it would
+> throw away the required members' round and the fix, the exact harm the
+> trial-seat contract exists to prevent. A REQUIRED member's error still
+> ends the drain exactly as before.
+
+### CLA-947 review 1.review-1.6
+
+> CLA-947 review 1.review-1.6: a pricing window opened between the
+> boundary check and the spawn, so the spawn was refused and nothing was
+> spent. That is a SCHEDULING condition, not the evidence-gate empty
+> shape above: no retry (there is nothing to retry — the window is
+> still open), no tally, no park. The walk ends here; the ordinary
+> no-checkpoint handback releases the claim and the next drain's
+> boundary holds the spawn until the window ends.
 
 ### A held-but-empty exit is a FAILED phase (2026-08-24), not a checkpoint
 
@@ -937,6 +1183,15 @@ section note.
 >
 > A runner-claimed retry re-claims first: the empty exit handed the
 > task back, so nothing is held to resume.
+
+### A non-final phase that did not reach its checkpoint leaves the next on
+
+> A non-final phase that did not reach its checkpoint leaves the next one
+> nothing to resume: the session settled the task itself (worked past its
+> brief and finished it), its stream could not be trusted to say either way,
+> or the adapter does not observe claims at all. The sequence is over, and
+> none of those is a failure — a task that reached in_review in one session
+> is a task that got done.
 
 ### CLA-396
 
@@ -977,6 +1232,15 @@ section note.
 
 
 ## `internal/loop/drain_seq.go`
+
+### panelIncomplete
+
+> CLA-639: the panel's members that wrote no record this round, and the round
+> the panel's released records landed in. A dead, capped or otherwise
+> record-less member does not stop the panel: it is listed here, the round
+> still closes, and the fix phase is told the panel was incomplete. The
+> round number is the one the seam MATCHED on a member that did record, so a
+> later member's failure can still release the records already written.
 
 ### panelRecorded
 
@@ -1087,6 +1351,34 @@ section note.
 > counter. This is the discriminator CLA-402's retrospective scan must
 > agree with.
 
+### CLA-877
+
+> CLA-877: a resume-only failure KEPT its claim on purpose (see
+> settleWithoutCheckpoint), so the retry resumes that same run without a
+> re-claim. Its retry is safe in ANY phase position, not only the phase
+> the walk started at: the kept claim is still `prev`, so invocationFor
+> seeds the retry's brief exactly as it seeded the failed attempt's. Only
+> the start phase carries the prep facts (s.prep), and those it keeps —
+> minus the stale tip, dropped below.
+
+### CLA-900
+
+> CLA-900: a TOOL-CAP kill is still a death, so it still counts - a run
+> of them across tasks must keep the fleet bound, or a fleet-wide stuck
+> call (a hung MCP server) would spin sessions forever: the per-task
+> counter resets whenever a retry lands a different task. What changes is
+> the QUESTION: fleetTrip words a cap kill by what was observed instead
+> of blaming the provider (see trips.go).
+
+### A runner-claimed start must re-claim before the respawn when the
+
+> A runner-claimed start must re-claim before the respawn when the
+> dead phase handed the task back. The reclaim can land a DIFFERENT
+> task when this one is gone, so the counters below follow what is
+> actually held now, not what died. A report-resume failure handed
+> nothing back: its claim is still held, and re-claiming it would be
+> a plane round trip against a live lease (and could only be refused).
+
 ### The handoff was REFUSED, so its exemption from the evidence gate ends
 
 > The handoff was REFUSED, so its exemption from the evidence gate ends
@@ -1115,6 +1407,44 @@ section note.
 >   - open MUST(s) → another fix is spawned, unless the round cap or the
 >     non-convergence breaker parks the task first. Never one more round
 >     on the driver's own initiative.
+
+### The seam could not judge the round
+
+> The seam could not judge the round: no durable record this run
+> wrote, a round that would not close, or a task that could not
+> be read back. That is the same fail-closed shape CLA-637 gives
+> a refused review checkpoint — the drain ends without the
+> hand-over and the claim is released/lapses, so a takeover can
+> retry it. It is not the stopping rule parking a disagreement.
+
+### The local fallback counts the same ROUNDS the plane does (CLA-686
+
+> The local fallback counts the same ROUNDS the plane does (CLA-686
+> D2). A review cycle is one review round plus the verification
+> rounds that follow it, and the plane's `counted` includes the
+> review round — so comparing verification rounds ALONE against the
+> cap allowed a cycle one round longer than the counted path, and
+> the park then read "Round 4 of the 3-round cap". `+1` is the
+> review round that opened this cycle.
+
+### CLA-879
+
+> CLA-879: the rewind spawns the fix phase on the same verified
+> checkpoint, so it is a phase seam too: a STOP or RESTART dropped
+> during the verification round must act here, not after the fix
+> round it would otherwise start. The start table may resume at
+> verify instead of fix (open MUSTs not at the tip), so the log
+> names "a later phase" rather than promising the fix.
+
+### CLA-639
+
+> CLA-639: the merged panel list belongs to the FIRST fix after
+> the panel, before any verification round has run. A verify
+> rewind is a later fix round: its grading is the verifier's own
+> record (plus the plane's open-MUST list), and reprinting the
+> panel's list would replace the verifier's findings with a
+> stale round. Clear the panel round so drainPhase falls back to
+> the shipped single-review path unchanged.
 
 ### CLA-662
 
@@ -1197,6 +1527,33 @@ section note.
 > nobody recorded. With cap = 1 (or a single member) this block does
 > nothing at all and the old path runs byte for byte.
 
+### CLA-947 review 1.review-1.2
+
+> CLA-947 review 1.review-1.2: the boundary check above saw only the
+> FIRST member's phase. A later member whose own route list is inside
+> a "wait" pricing window would reach invocationFor and be refused
+> there — booked as a reviewer that recorded nothing, charging its
+> failure streak and the dead rate for a scheduled peak. Hold the WHOLE
+> panel until every member can start, over every member's list.
+
+### The member claims are the same run the panel resumed; keep
+
+> The member claims are the same run the panel resumed; keep
+> the CARRIED claim (with its verified branch and tip) rather
+> than adopting one member's copy. A member that recorded
+> nothing can end holding a claim that never had the tip
+> folded onto it, and adopting that one would hand the fix
+> phase an unverified-looking checkpoint.
+
+### The run-level endings, in the order the sequential handler
+
+> The run-level endings, in the order the sequential handler
+> checks them: a close that failed is fail-closed and stops the
+> drain; a member's budget stop ends the drain and exhausts that
+> target (other projects continue); a limit or transient end
+> hands the drain its wait (the claim is left to lapse into a
+> takeover, never released); no record at all means no fix.
+
 ### CLA-639
 
 > CLA-639: the panel's members are skippable where a lone review phase is
@@ -1215,6 +1572,16 @@ section note.
 > would release the earlier members' findings to that member, which is
 > exactly the panel independence the seal exists to protect. It is closed
 > when the panel is over, whichever way the last member ends.
+
+### CLA-639 M4
+
+> CLA-639 M4: whether the NEXT member, or the fix phase after the
+> panel, could still resume this run. The member's own claim is the
+> live one when it observed any; a member that observed NOTHING (a
+> launch failure) leaves the predecessor's carried claim in place, and
+> that is still the run the panel is working. A claim the session
+> settled itself, or one already handed back, is not live: nothing may
+> be resumed from it, and only the live holder may close a round.
 
 ### A member ends the PANEL's stage when it recorded (its record passed
 
@@ -1278,6 +1645,15 @@ section note.
 > that follows hits the same limit it says so itself, with the
 > wait that belongs to ITS end.
 
+### CLA-784
+
+> CLA-784: a panel where ONLY optional seats recorded has no review
+> to apply — an optional seat's record is that seat's result, not a
+> review the fix was waiting for. Treat it exactly as a panel where
+> nobody recorded: leave the round sealed (no close) and spawn no
+> fix. Reached only at the panel's LAST member; an earlier optional
+> seat's record is kept while a required member may still record.
+
 ### This member recorded
 
 > This member recorded. A recorded mid-panel member whose session was
@@ -1293,6 +1669,16 @@ section note.
 > that applies the merged list. A close that fails is fail-closed —
 > the drain ends with the wait and no fix runs against a sealed
 > round.
+
+### Close only when the seam did not already close the round for
+
+> Close only when the seam did not already close the round for
+> this member. A session the adapter ALSO classifies as a limit
+> or transient can exit cleanly (or be capped with WIP), so the
+> seam runs first, matches the record and closes the round; the
+> sequence-end is then read by the arm below. A second close is
+> the plane's no_open_round, and failing closed on it would skip
+> the fix against a round that is already released.
 
 
 ## `internal/loop/drain_seq_phase.go`
@@ -1343,6 +1729,16 @@ section note.
 > ending, never the commit/push/PR/in_review terminal step. A
 > fix phase carries that terminal step by name.
 
+### CLA-637
+
+> CLA-637: the checkpoint that OPENED this phase decides which
+> review-only variant the successor continues. A branchless
+> checkpoint's successor gets the no-tip shape; an UNVERIFIED
+> one has no driver-known tip to hand over either, so its
+> successor gets the variant that tells the reviewer to
+> establish the tip itself — the verified shape's {{reviewedTip}}
+> could not be filled and would leak as a literal.
+
 ### The breaker at a phase boundary
 
 > The breaker at a phase boundary — the third place a session ends and
@@ -1380,6 +1776,16 @@ section note.
 > 1.review-1.2), so a whole-panel wait answers STOP / RESTART / HALT and a lost
 > claim exactly as the per-phase boundary does.
 
+### CLA-466
+
+> CLA-466: announce the phase change NOW rather than at the next poll, so
+> the console sees which phase is running without waiting out an idle
+> interval. taskRef is empty until a claim has been observed (the first
+> phase claims inside drainPhase); from then on it rides every beacon.
+> CLA-510: a first-phase claim no longer waits for the next phase
+> boundary — the renewer's claim reflector (startLeaseRenewal) revises
+> the in-flight ref and beacons the moment the session's claim lands.
+
 ### What, if anything, is still owed a handback
 
 > What, if anything, is still owed a handback. Three cases, and getting any
@@ -1399,6 +1805,15 @@ section note.
 > still-live claim and hand back a task the sequence was never meant to
 > touch. Keep what we had: the task phase 1 is holding is the one owed a
 > handback, whatever its successor went and did.
+
+### CLA-497
+
+> CLA-497: whether the checkpoint that opened THIS phase was evidenced
+> by the plane's record (no verified branch). Read from the PRE-switch
+> claim - the one the seam advanced with: after the switch, carried is
+> this phase's OWN claim, whose branch says nothing about the checkpoint
+> that opened the phase, and the handoff continuation must match the
+> brief this phase's FIRST session ran, not what its last one recorded.
 
 ### CLA-639 M4
 
@@ -1478,6 +1893,15 @@ section note.
 > check's repair onto the branch in this worktree, so there is no close-out
 > shape that provably needs no tree.
 
+### markPhaseDone
+
+> markPhaseDone records the phase marker a later claim's start choice reads: an
+> evidenced, non-handoff checkpoint of implement, fix or review. A review marker
+> says only that the review phase finished — never that the review was clean;
+> only phasesDone.implement is read today. Verify is excluded by name because its
+> checkpoint means open MUSTs remain, so the seam it holds is for another fix
+> round, not a finished phase.
+
 
 ## `internal/loop/fleet.go`
 
@@ -1502,6 +1926,25 @@ section note.
 > (beginIteration / endIteration), and since CLA-510 the lease renewer's
 > goroutine ALSO revises the ref mid-session (reflectClaim), so these are no
 > longer touched by the loop alone.
+
+### fleetIdentity
+
+> fleetIdentity composes what every beacon for target ti carries: who it is,
+> where it runs, what build, which config. The fingerprint is the target's
+> EFFECTIVE config — the CLA-410 overlay when one is in force, else the base
+> file, the same rule the drain reads through d.targetCfg — because that is
+> what the drain runs on. Read fresh per report, so a RELOAD moves it without a
+> restart: at once for a target with no overlay in force, and for an overlaid
+> one when the refetch at the next poll boundary lands (d.invalidateRunConfigs).
+
+### A target INDEX, not a captured Target
+
+> A target INDEX, not a captured Target: the poll beacons a target before
+> checkRunConfigVersion rebuilds its overlay, so a copy would fingerprint
+> the document being replaced. d.cfg is read under controlMu because a
+> RELOAD swaps it on another goroutine (a panel member parked in
+> waitResponsive); the pointer taken there is immutable — a reload installs
+> a new config rather than editing this one.
 
 ### fleetState
 
@@ -1607,6 +2050,24 @@ section note.
 > rather than the machine's zone. TaskRef/Phase mirror the plane POST's pair
 > (the running iteration's, or the task and phase a hold is waiting behind the
 > window).
+
+### writeLocalBeacon
+
+> writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
+> plane beacon: telemetry is never control flow, so a write failure is logged
+> (once per streak) and dropped — the daemon's own life never depends on it.
+> The write is remove-then-create, like the roster cache write: a concurrent
+> reader (the roll) sees either the absent name or complete bytes, never a
+> torn file, and a symlink planted at the name is removed, not followed.
+
+### A concurrent beacon won the remove-then-create race
+
+> A concurrent beacon won the remove-then-create race — the claim
+> reflector (CLA-510) beacons from the lease-renewer goroutine, so
+> two beacons can write this file at once. The winner's file is a
+> complete, fresh beacon from the same daemon, which is exactly
+> what this write was going to produce: not a failure, and not a
+> reason to tell the operator the roll cannot verify.
 
 ### reflectClaim
 
@@ -1864,6 +2325,25 @@ section note.
 
 ## `internal/loop/heartbeat.go`
 
+### heartbeatGiveUp
+
+> heartbeatGiveUp is how many consecutive failed renewals the renewer
+> tolerates before standing down. One failure is a blip (the plane restarting,
+> a network blip); three in a row across a third-of-lease cadence means the
+> plane is unreachable for this session's remaining lifetime, and retrying
+> every tick would only fill the log. The lease may then expire mid-session -
+> which is the pre-CLA-358 behaviour, not a worse one.
+
+### heartbeatInterval
+
+> heartbeatInterval reports how often a live claim's lease should be renewed:
+> a third of the lease, the cadence the served clankerbar protocol itself
+> prescribes ("heartbeat every ~10 minutes - a third of the 30-minute lease").
+> Beating faster costs a round-trip per tick and buys nothing; beating slower
+> spends the margin the protocol built in. A lease under three ticks wide
+> degrades to one millisecond rather than zero, so a degenerate value still
+> renews (and a test can pin the arithmetic without waiting).
+
 ### leaseRenewer
 
 > leaseRenewer renews the lease of whatever backlog task the spawned session
@@ -1885,6 +2365,15 @@ section note.
 > CLA-406) is spanned deliberately: those processes continue the SAME session
 > on the SAME claim, and the claim's lease does not pause just because the
 > child between them died.
+
+### claimFile
+
+> claimFile, when non-nil, is called synchronously from observe with every
+> observed claim snapshot to maintain CURRENT_CLAIM (CLA-708) - the record
+> a supervisor uses to hand a dead child's claim back. It must run before
+> observe returns so a branch is never left queued behind a parked
+> Heartbeat. Nil in the heartbeat unit tests, which construct the renewer
+> directly.
 
 ### presence
 
@@ -1992,6 +2481,15 @@ section note.
 > RunID would make it unreachable and keep beating a lease the plane already
 > released.
 
+### A claim transition queued by observe() wins over the tick,
+
+> A claim transition queued by observe() wins over the tick,
+> every time. Without draining here, select's random pick can
+> hand the tick to a loop whose `current` is still the pre-settle
+> claim, and beat ONCE MORE on a lease the session already
+> settled - the flake that made the pause test fail on CI. The
+> settle is newer truth than the cadence the ticker carries.
+
 ### CLA-771
 
 > CLA-771: the presence beacon rides THIS tick - the one cadence
@@ -2095,6 +2593,16 @@ section note.
 > models therefore runs on opencode's own configured model — which is where
 > opencode's model lives — rather than on a claude alias its CLI would die on.
 
+### A pinned Phase.Model would otherwise make the rule INERT
+
+> A pinned Phase.Model would otherwise make the rule INERT:
+> ModelForPhase resolves Model before Tier, so setting the tier
+> alone leaves the session on the pinned alias while the log
+> claims an escalation (CLA-379's whole point is to raise the
+> review to the escalated tier's alias). The rule fires on a
+> phase, not the operator's per-phase wish, so the tier wins and
+> the pinned alias is dropped.
+
 ### CLA-782
 
 > CLA-782: the ordered route list this phase may fall back through, with
@@ -2139,6 +2647,15 @@ section note.
 > brief, whose variants must stay review-only (record, never fix or
 > hand over). The mode is selected by the resolved prompt text, not by a
 > flag, so a custom prompt is never rewritten into a shipped one.
+
+### CLA-639 M5
+
+> CLA-639 M5: a panel MEMBER writes the durable record and nothing else
+> on the task, so its brief is the panel variant — same core, no outcome
+> write. A branchless checkpoint has no panel variant and must not be
+> given one: its record IS the legacy block (no live holder accepts a
+> durable one), so the first member keeps the shipped no-code brief and
+> the driver skips the members after it (see drainPhases).
 
 ### Every placeholder is filled in ONE pass (CLA-split review finding)
 
@@ -2197,6 +2714,15 @@ section note.
 > timed-out or empty-output command, an unreadable @path file — REFUSES the
 > spawn: the caller reports it and no session starts, because a session without
 > its declared env is the incident, not a degraded mode.
+
+### The agent event channel (CLA-603)
+
+> The agent event channel (CLA-603). The loop's top-level probe is a one-word
+> liveness check, not a session doing work, so it never emits. A recovery
+> probe inside an already-started session is different: it inherits this
+> factory (opencode's resurrection sets Probe on a copy) and its tool calls
+> are part of that session's activity, so they do emit. The destination is
+> the project's run config dial, and the machine can only have opted out.
 
 ### sessionDir
 
@@ -2261,6 +2787,16 @@ section note.
 > With nothing declared and no worktree area found this returns nil, which leaves
 > each adapter's policy exactly as it shipped before CLA-437.
 
+### With the per-project layout declared, every grant must stay INSIDE the
+
+> With the per-project layout declared, every grant must stay INSIDE the
+> project root. The scope below is additive: declared checkouts are added
+> before it, so a stale `repos` override pointing at a developer checkout
+> would be granted outright even though the session is scoped to the
+> project — the escape the layout exists to close (CLA-678 review round 2,
+> finding 3). sessionDir refuses such a checkout as a spawn dir; this also
+> keeps it out of the reach list, alongside the conventional worktree area.
+
 ### The PROJECT ROOT and its children (CLA-678), when the config declares
 
 > The PROJECT ROOT and its children (CLA-678), when the config declares the
@@ -2276,8 +2812,57 @@ section note.
 > it a session starting in one of `~/dev`'s ~150 trees would be handed every
 > sibling it happens to have there. Nothing is granted on a guess.
 
+### projectScope
+
+> projectScope reports the PROJECT ROOT a session's reach is bounded to: the
+> workdir, when the session starts strictly INSIDE it — the per-project layout,
+> where the session runs in <project root>/<repo name> and the project's other
+> repos and its worktrees sit beside that checkout. "" means there is no scope
+> to widen, which is every legacy shape (the workdir is the checkout itself, or
+> the session starts nowhere near it).
+
+
+## `internal/loop/limitstop.go`
+
+### LimitStopName
+
+> LimitStopName is the marker a daemon leaves in its state dir when it ends on
+> a Stop-class usage limit (budget or credits exhausted, no reset to wait for).
+> First line is the reason, the route that stopped and the provider's message.
+> The supervisor reads it to leave the child stopped instead of respawning it
+> into the same wall; deleting the file is the operator's resume. See
+> docs/limit-stop.md.
+
+### limitStopMessage
+
+> limitStopMessage is the provider's own message for the marker. It reads the
+> adapter's diagnostic scope - stderr plus a terminal error event, never the
+> agent's narration - and prefers the terminal error event's message, so a
+> JSON envelope does not become the reason. Nothing an agent wrote can reach
+> this: the adapter's Diagnostic is the boundary that keeps it out, the same
+> boundary DetectLimit reads.
+
+### terminalErrorMessage
+
+> terminalErrorMessage picks the provider's own message out of the last JSON
+> error event in an adapter's diagnostic text. opencode nests the provider's
+> response under error.message (2.x) or error.data.message (the older APIError
+> shape); an adapter that reports a whole event with the error as a plain
+> string is read too. Anything else yields "" and the caller falls back to the
+> diagnostic text.
+
 
 ## `internal/loop/loop.go`
+
+### Package loop is the driver
+
+> Package loop is the driver: a long-running daemon that gates each iteration on
+> a cheap backlog read, spends a fresh harness session only when there is
+> claimable work, and — crucially — stays alive and keeps polling when the queue
+> is empty, so it reacts when questions are answered, items are promoted, or new
+> work is filed. On a usage limit it pauses and polls for an early reset; on a
+> transient blip it backs off and retries. All durable state lives in the backlog
+> (over MCP), so a session killed mid-task is reclaimed by the next iteration.
 
 ### errZeroSpendLoop
 
@@ -2361,6 +2946,15 @@ section note.
 > sidelining 2h and retrying, with nothing filed and nothing paused. Five is
 > the same conservative signal as the fleet bound, and triage may move it.
 
+### MCPConfigPaths
+
+> MCPConfigPaths is this project's MCP config PER HARNESS, for a sequence
+> whose phases are not all on one harness (CLA-366). MCPConfigPath above is
+> the top-level harness's file; a phase on another harness needs the same
+> project in that harness's schema, which is a different file. Empty on every
+> single-harness run, and config.Validate refuses the combination that would
+> need an entry here and lacks one.
+
 ### Repos
 
 > Repos is this project's repo -> local-checkout map (CLA-437, agent-rule-
@@ -2373,6 +2967,15 @@ section note.
 > config.ResolveCheckout's; this field only carries what the operator
 > declared. Both empty = the feature is off and every spawn behaves exactly
 > as before.
+
+### ProjectRoot
+
+> ProjectRoot says this target's workdir is a FLEET PROJECT ROOT (CLA-678):
+> a directory holding this project's clones and its worktrees directory,
+> with each session's checkout inside it. It is the config's own
+> `project_root` flag, carried here because the session, not the config, is
+> what the permission policy is built for. See extraDirsFor for what it
+> widens.
 
 ### Cfg
 
@@ -2544,6 +3147,15 @@ section note.
 > sideline (harnessFails) stays for the first startupFailBound-1 attempts
 > and only the Nth escalates to a pause-and-raise, mirroring fleetTrip.
 
+### limitBeaconInterval
+
+> limitBeaconInterval is how often a paused wait re-beacons `limited`
+> (CLA-728). The plane calls an instance dead once its last beacon is
+> INSTANCE_STALE_AFTER_MS (15 minutes) old, and a limit wait can be hours,
+> so the wait speaks at half that window — 5 minutes, since half is 7.5 and
+> the task takes the shorter of the two. A field for the same reason as
+> waitGrace: no test should sleep five minutes to watch a beacon repeat.
+
 ### probePRBase
 
 > probePRBase reads the origin remote of the checkout in dir to resolve a
@@ -2566,6 +3178,16 @@ section note.
 > with. That is what keeps every existing test (which passes a fake and never
 > names a harness on a phase) driving its fake rather than reaching for a real
 > binary through the registry.
+
+### stateMu
+
+> stateMu serialises the run-scoped ledgers and maps below. They are written
+> by whatever goroutine a session's result is processed on: with a review
+> panel's members running concurrently (CLA-697) that is more than one at a
+> time, and a Go map written from two goroutines is a data race, not a lost
+> update. Every read-modify-write of tgtSpend, startRefusals, deadTally and
+> panelFailStreak holds it; nothing that calls out to the plane or a harness
+> may hold it.
 
 ### controlMu
 
@@ -2601,6 +3223,15 @@ section note.
 > rcFails counts consecutive transient failures for rcAttemptVer, so the
 > window widens exponentially (CLA-481) instead of fixed 30s spam; a
 > permanent latch (ErrNoConfig/ErrNotWired) or any success resets it.
+
+### resumedTransientKey
+
+> resumedTransientKey names the target a resumed phase's transient failure is
+> charged to (CLA-662): the project (its index in targets) and the harness the
+> failed phase runs on. The harness is part of the key because the failure is
+> the provider's, not the project's — the per-phase shape (implement on
+> opencode, review on claude) drains a healthy opencode while claude blips,
+> and a project-keyed streak would let an opencode success reset it.
 
 ### adapterFor
 
@@ -2639,6 +3270,15 @@ section note.
 > The identity comes from the CAPTURED prompt: a handoff respawn replaces
 > ph.Prompt with the predecessor's continuation, and that successor is not the
 > phase that maps a diff — it continues work the predecessor already read.
+
+### A blank Turn.Model means "inherit the session's current model", which
+
+> A blank Turn.Model means "inherit the session's current model", which after
+> the notes turns is the notes model. Name the findings model whenever that
+> inheritance would land somewhere else — including when the phase names no
+> model and only the notes stage did. There is no per-turn way back to a
+> harness default inside a live session, so that one combination runs the
+> findings turn on the notes model; the README says so.
 
 
 ## `internal/loop/panel_parallel.go`
@@ -2745,6 +3385,24 @@ section note.
 > is what made an Invoke-entry assertion race (CLA-755
 > 1.review-5.1).
 
+### CLA-784
+
+> CLA-784: a CANCEL is the run's, not the member's, so it stops the run
+> whoever the seat is. A budget stop is account-scoped (CLA-480): it
+> ends this drain and exhausts the target, and the run continues with
+> its siblings. A member's OWN Stop — credit exhaustion — is converted
+> to a recorded failure in drainPhase before it reaches here, so an
+> optional seat cannot end the run through this flag.
+
+### createPanelWorktree
+
+> createPanelWorktree makes the member's own DETACHED checkout at tip. The
+> directory is unique and does not pre-exist: git itself refuses an existing
+> path, so the driver cannot accidentally adopt a tree somebody else owns. It
+> lives in the fleet's worktrees directory when that exists (the project-root
+> layout), else beside the checkout's conventional `-wt` area, else the OS temp
+> directory — each still inside a directory the session is allowed to use.
+
 
 ## `internal/loop/pause_boundary.go`
 
@@ -2765,6 +3423,15 @@ section note.
 > drain-level run-lost ending. A nil claim (a session-claimed drain that has not
 > spawned yet) still waits: there is no lease to renew, but a window must not
 > start a session either.
+
+### The poll that normally carries presence does not run mid-drain, and th
+
+> The poll that normally carries presence does not run mid-drain, and the
+> phase's own renewer stopped when its session ended: without this a window
+> hours long would make a healthy instance — and every sibling project this
+> daemon serves — read as dead. The held target's row is a `draining` state
+> carrying the schedule reason, the window's end and the held ref and phase,
+> which is what the console's pause banner reads.
 
 
 ## `internal/loop/pausewindows.go`
@@ -2837,6 +3504,25 @@ section note.
 > refuses an existing path either way; this stops it turning into a denial
 > of the log itself.
 
+### blocked
+
+> CLA-947: every route is inside a pricing window. The phase boundary is
+> where that normally holds the spawn (checkPhaseBoundary); reaching it
+> here means the window opened between the boundary check and this spawn,
+> so end the phase without spending. windowHeld marks it as a scheduling
+> condition rather than a failed phase (review 1.review-1.6): the claim
+> goes back through the ordinary no-checkpoint path and the next drain's
+> boundary holds the spawn until the window ends.
+
+### The session env refused to resolve (a failing or empty-output
+
+> The session env refused to resolve (a failing or empty-output
+> fromCommand, an unreadable @path file — the error names the
+> variable). REFUSING THE SPAWN is the fail-closed contract: no
+> session starts without its declared env (CLA-462). This is not a
+> retryable failure — nothing was spawned and the cause is config,
+> not a blip — so it fails the phase like a bad spawnDir does.
+
 ### echo
 
 > The console is where the adapter streams the session: the file, and
@@ -2857,6 +3543,16 @@ section note.
 > the iteration log with the rest of it, and a session worth watching
 > live is why the opt-in exists.
 
+### The spawn line stamps what the session was actually spawned WITH
+
+> The spawn line stamps what the session was actually spawned WITH:
+> phase and the resolved model id inv.Model carries (ModelForPhase's
+> output, never the tier alias). A token/cost line in an old log is then
+> attributable to the settings of THAT day rather than inferred from
+> whatever the config file says now (CLA-345). An empty model= is itself
+> evidence: no explicit model was configured at spawn time, and the
+> harness ran its own default.
+
 ### CLA-358
 
 > CLA-358: while THIS child runs, renew whatever task-lease it holds.
@@ -2872,6 +3568,33 @@ section note.
 > itself stays on the parent context: it still has its log line to write,
 > and a cancelled parent is the operator stopping the whole run, not a lost
 > claim.
+
+### The orderly-cap classifications, computed here (before the salvage) so
+
+> The orderly-cap classifications, computed here (before the salvage) so
+> the salvage can tell whether a clean tree means "produced nothing" — a
+> question the caps answer: a capped session is an orderly end with its
+> own marker, not a silent death, and an untrusted stream's finish reason
+> cannot be read at all. Purely adapter reads of `res`, so moving them up
+> changes nothing else (review finding).
+
+### CLA-739
+
+> CLA-739: the adapter killed this session for making the same failing
+> tool call over and over. That is a DEAD session - no delivery, whatever
+> it pushed before it started looping - and it joins the dead signature
+> everywhere below: the seam veto, the dead-phase ladder, the tally, the
+> panel's failed-member path and the fleet record. Not a cap: a cap is an
+> orderly end of a session doing its job, and this one had stopped.
+
+### CLA-900
+
+> CLA-900: a kill that landed with a tool call OPEN is the call's own cap
+> ending a session that was waiting inside one call (a CI wait, a long test
+> run), not the idle clock finding a provider that stopped answering. It is
+> still a dead phase - no delivery came of it - and it still counts toward
+> the fleet bound, so a fleet-wide stuck call cannot spin sessions forever;
+> what changes is how the fleet question words it (openCallKill, trips.go).
 
 ### Hand back anything the session was still holding, BEFORE deciding what
 
@@ -2994,8 +3717,35 @@ section note.
 > session: an entry reporting only the surviving attempt's money would
 > not add up to the iteration total.
 
+### CLA-638
+
+> CLA-638: a verification round does not chain via a handoff. Its record
+> is the deliverable, and the DRIVER decides what follows (another fix, a
+> park, or nothing) from the open MUSTs the record releases; a successor
+> prompt here would have nothing to continue that this round has not
+> already written, and honoring it would defer the close/evaluation the
+> driver owes the round.
+
 
 ## `internal/loop/phase_end.go`
+
+### failed
+
+> failed maps a member's role to the reason it recorded nothing, so the fix
+> brief names the incomplete members AND what happened to them, not only
+> that the list is short. The entry also carries whether the seat was a
+> TRIAL seat (CLA-784), so the fix brief can mark it `(optional)` exactly as
+> the daemon log does — a fixer must not read a lost trial seat as a lost
+> required reviewer.
+
+### recorded
+
+> recorded reports that a REQUIRED member has already recorded in this
+> panel (CLA-784). The last panel member's seam closes the round; an
+> OPTIONAL seat may only trigger that close when a required member has
+> actually recorded, because a round where only trial seats recorded is no
+> review at all and must stay sealed — the same path as a panel where none
+> recorded.
 
 ### phaseEnd
 
@@ -3005,6 +3755,35 @@ section note.
 > The three fields are deliberately independent. A phase can end holding a claim
 > without it being a checkpoint (it was the last one), and can observe claim
 > state without owing anything (it settled the task, or already handed it back).
+
+### dead
+
+> dead reports the CLA-386 dead-phase signature: the session's final step
+> finished with reason "unknown" and no branch was recorded on the task, so
+> the phase produced nothing. It is a FAILED phase, not a completed one —
+> the seam must not hand it on to the next phase's brief. The claim has
+> already been released (a retry re-claims) EXCEPT for a report-resume failure,
+> which kept it (reportResumeFailed); drainPhases owns the retry-once-then-
+> park decision and its per-task budget.
+
+### producedNothing
+
+> producedNothing is the WIDER dead classification (the tally's, CLA-402):
+> the same signature WITHOUT the !last conjunct end.dead carries, because a
+> dead LAST phase is still a death even though no retry/park machinery can
+> apply to it. Only the fleet record reads this field (CLA-466) — the
+> iteration record must say `dead` when the drain ended on exactly such a
+> final-phase death — so it deliberately does not feed the counters or the
+> seam, whose !last gating is pinned by its own tests.
+
+### deadBooked
+
+> deadBooked reports that the run's dead-phase tally (CLA-402) already
+> counted THIS exit as a dead phase: either tallyDead's own predicate fired
+> or the seam's held-but-empty branch booked it (tallyEmpty). The review
+> panel's member handler books a failed member into the same tally (CLA-639
+> M4), and this is how it avoids counting one exit twice — see
+> notePanelMemberFailure's caller.
 
 ### empty
 
@@ -3029,6 +3808,45 @@ section note.
 > until the window ends. Deliberately NOT empty, which is the evidence-gate
 > FAILED shape (the 2026-08-24 incident): a schedule must never be counted
 > as a harness failure.
+
+### branch
+
+> branch is the branch name when this phase checkpointed — the
+> plane-record evidence the checkpoint is gated on (CLA-457), carried here
+> so the successor's brief can name it instead of asserting an unverified
+> phase-1 success. Folded onto the carried claim by the seam, which marks
+> it UNVERIFIED (CLA-576) when the origin could not be read; the brief
+> selection reads that mark, so the branch reaches the successor named but
+> never presented as verified.
+
+### handoff
+
+> handoff is the successor prompt the session emitted in its final message's
+> handoff block, already past the parse-time guards (marker present, prompt
+> non-empty and under the size cap, clean exit, trusted stream, task still
+> held — see detectHandoff). Non-empty implies checkpoint: the lease is
+> being held for the successor. drainPhases owns the remaining guards — the
+> chain cap, max-iterations, the budget breaker — and either respawns on it
+> or falls back to the standard path (CLA-352).
+
+### noMCP
+
+> noMCP reports that this pass ended with NO review record and NO successful
+> clankerbar MCP call at all (CLA-703). That is an infrastructure miss, not
+> a reviewer's verdict: the tools the brief tells it to use were not there.
+> The panel handler names it distinctly and keeps it off the member's
+> failure streak; drainPhases books it apart from dead/capped so analytics
+> can exclude it. It is set only on the FINAL attempt — the one bounded
+> retry the same pass already took is not reported as the member's outcome.
+
+### toolLoop
+
+> toolLoop is the cause when the adapter killed this pass's session for
+> repeating a failing tool call (CLA-739), "" otherwise. It is also
+> `idle: <IdleKilled>` when the adapter killed the session for silence. Both
+> are driver kills: the pass is also dead (when !last and held), and this
+> carries the NAME of the death, so the panel handler records the member as
+> failed with the cause rather than with "died producing nothing".
 
 ### reportResumeFailed
 
@@ -3112,6 +3930,15 @@ section note.
 > untrusted branch below and endUntrustedDrain (CLA-262) - counted
 > nowhere, so no breaker ever acts on a figure that cannot be known.
 
+### CLA-703
+
+> CLA-703: an MCP preflight failure is infrastructure, not a verdict
+> on the phase. The session never reached its first turn, so the
+> claim it was seeded with is untouched and the same run can be
+> retried. One retry — the same bound the no-record backstop uses —
+> then the run fails loudly with the reason rather than producing a
+> silent empty phase.
+
 ### held is nil here by construction
 
 > held is nil here by construction — an untrusted stream never holds a
@@ -3121,6 +3948,25 @@ section note.
 > either (recordPassSpend runs only where the loop counts an attempt),
 > so the record says "unknown" instead of publishing a FLOOR from a
 > stream with a hole in it as if it were a report.
+
+### Count THIS attempt's spend toward the budget breaker regardless of how
+
+> Count THIS attempt's spend toward the budget breaker regardless of how it
+> ends — usage-limit, transient, stop, or clean. A failed/retried attempt
+> still burned tokens, and a "leave headroom" breaker must err toward seeing
+> real spend, not under-counting it. Each attempt is a distinct session, so
+> summing per attempt (and returning the accumulator, not the final res)
+> counts every session exactly once.
+
+### CLA-784
+
+> CLA-784: an OPTIONAL panel seat is a trial reviewer. A hard
+> stop on its account is recorded against that seat — never the
+> run. Today's stop path would end the daemon for a reviewer we
+> were only evaluating, throwing away the required members' round
+> with it. The optional member's failure rides the usual
+> per-member bookkeeping: named INCOMPLETE with this reason, and
+> the panel moves on.
 
 ### A RESUMED phase must not wait one out (CLA-631)
 
@@ -3134,6 +3980,15 @@ section note.
 > the daemon left a whole fleet idle until an operator noticed — so the
 > wait is handed to drainPhases, which owes it only once the sequence's
 > handback has run and no lease is held.
+
+### Waiting out a reset that lands past the wall-clock ceiling buys
+
+> Waiting out a reset that lands past the wall-clock ceiling buys
+> nothing: the budget check runs between drains, so the loop would
+> sleep through the window, run one session on the freshly reset quota
+> and stop on the very next check — having spent the night waiting for
+> headroom it then declines to use. Stop now and say when the quota
+> returns, so the operator can start a fresh run against it.
 
 ### The wait's own probe spend lands in the SAME account as the sessions'
 
@@ -3164,6 +4019,26 @@ section note.
 > still a report (CLA-288). Counted here, enforced at the top of the loop,
 > so the bound fires on the decision to spawn again rather than on this
 > attempt's exit.
+
+### CLA-739
+
+> CLA-739: killed for repeating a failing tool call. Ahead of the exit
+> status, because the session can exit 0 in the instant before the kill
+> lands. Never retried here as a transient (a fresh session would loop
+> the same way, and each call re-sends the whole context), and never a
+> run failure (the kill did its job). The dead classification above has
+> already decided what follows: drainPhases' dead-phase ladder, or the
+> panel's failed-member path.
+
+### A clean exit is the shape the CLA-398 quiet death wears, so the
+
+> A clean exit is the shape the CLA-398 quiet death wears, so the
+> marker gets named here rather than inferred downstream: a final
+> step_finish with reason "unknown" and all-zero usage used to read
+> as "iteration done (tokens=0 cost=$0.00)" — indistinguishable from
+> a cheap clean run, which is exactly what made these deaths
+> invisible. The adapter's own marker is the only thing that can
+> tell them apart.
 
 ### CLA-700
 
@@ -3242,6 +4117,15 @@ section note.
 > CLA-784: like a usage limit, an OPTIONAL seat's transient end is
 > its own result — never the sequence's, resumed or not.
 
+### A retry the adapter could not NAME is bounded on its own, because
+
+> A retry the adapter could not NAME is bounded on its own, because
+> nothing else bounds it: the dials are off by default and the
+> zero-spend counter is reset by the usage this heuristic requires. The
+> diagnostic goes in the error because it is the whole remedy - the
+> adapter has no pattern for this text, so an operator who can see it
+> can say whether one should be added (CLA-381).
+
 
 ## `internal/loop/phase_run.go`
 
@@ -3284,6 +4168,15 @@ section note.
 
 
 ## `internal/loop/phase_seam.go`
+
+### The verification seam runs even on the LAST phase
+
+> The verification seam runs even on the LAST phase. Unlike every
+> other terminal phase its evidence is not a checkpoint (nothing
+> follows to resume) but the durable record plus the open-MUST set:
+> that set is what decides whether ANOTHER fix is spawned, whether
+> the sequence is done, or whether the round cap parks the task
+> (CLA-638, B12).
 
 ### CLA-638 × CLA-670
 
@@ -3372,6 +4265,15 @@ section note.
 > unverified variant - never the verified wording, which this
 > checkpoint cannot support.
 
+### CLA-637
+
+> CLA-637: the origin tip the verified branch check read. The
+> review brief hands it to the reviewer as the revision to
+> check out and record, and the seam matches the record's
+> reviewedTip against it. Empty exactly when no tip could be
+> read (branchless or unverified), which is when no tip can be
+> demanded of the reviewer either.
+
 ### CLA-685
 
 > CLA-685: a HANDOFF is the one checkpoint this session's own
@@ -3402,6 +4304,15 @@ section note.
 > folded: it is the live truth about where the work is. An exit
 > that WAS evidenced keeps its own verdict untouched, so the
 > verified path is unaffected.
+
+### The cause is the CHECK not completing, named by evidenceWhy
+
+> The cause is the CHECK not completing, named by evidenceWhy
+> (the Unknown check's own detail) — never "the origin remote
+> could not be read" asserted as fact: delivery.Unknown also
+> covers a check that never reached the remote (a branch no
+> local repository has, an ambiguous repo, no git on PATH), and
+> the log must not contradict the detail it prints.
 
 ### released records only a handback that could actually have happened
 
@@ -3491,6 +4402,25 @@ section note.
 > recorded as failed and the round still closes — while a lone review phase
 > is the sequence's only record and keeps the shipped fail-closed path.
 
+### CLA-784
+
+> CLA-784: an OPTIONAL member is a trial seat. Its end is recorded against
+> that seat and nothing more: it may not end the sequence, hand the panel's
+> shared claim back, or stop the run. The member handler below reads this
+> flag instead of the member's end shape, so every end the task names
+> (transient, usage limit, hard stop, death, tool-loop kill, setup error) is
+> covered by one branch rather than a list that can rot.
+
+### A BRANCHLESS checkpoint runs exactly ONE reviewer
+
+> A BRANCHLESS checkpoint runs exactly ONE reviewer: the record this shape
+> can write is the legacy `## Review` block, not a durable one, so
+> drainPhases skips the members after the first. That first member is the
+> panel's last member in every sense the seam cares about — its record is
+> the panel's only record and the "no member recorded → no fix" rule must
+> apply to it — so the position test alone (`no review-shaped phase follows`)
+> is not enough here.
+
 
 ## `internal/loop/prbase.go`
 
@@ -3530,6 +4460,24 @@ section note.
 > degrades to running unscoped, the same fail-open shape delivery keeps; the
 > probe has no correctness cliff on top of it because its own failure mode is
 > prBaseFor's fallback.
+
+### runOriginLsRemote
+
+> runOriginLsRemote is ProbeOriginPRBase's one git exec, split out so the probe
+> reads as its two answers. The environment discipline is delivery.Verifier's
+> gitRun: an unattended run has no terminal, and a git that decides to ask for
+> a password would hang the phase rather than answer. WaitDelay reaps the
+> helpers ls-remote spawns — they inherit the pipes behind these buffers, and a
+> killed git can otherwise leave the call sitting past its deadline.
+
+### parseOriginRefs
+
+> parseOriginRefs reads runOriginLsRemote's output: the "ref: refs/heads/X
+> HEAD" symref line when the remote's HEAD is symbolic, and any line naming
+> refs/heads/<integration>. A detached remote HEAD prints no symref line, so
+> the default comes back empty and prBaseFor falls back. Exact-field matching,
+> never substring: "refs/heads/staging" must not be read as a match for an
+> integration branch named "ging".
 
 
 ## `internal/loop/progress.go`
@@ -3639,6 +4587,16 @@ section note.
 > from zero the ordinary way, and reaching the threshold again takes
 > quietThreshold fresh fruitless drains.
 
+### An idle stretch clears the no-progress (quiet) back-off - with no work
+
+> An idle stretch clears the no-progress (quiet) back-off - with no work
+> there is nothing to judge, and the blocker may have resolved itself.
+> A CLA-507 harness sit-out is different: the harness itself is broken,
+> and an empty queue does not fix it. Clearing skipUntil here would cut
+> the laddered sit-out short the moment the queue momentarily empties
+> (a sibling daemon consuming the work), so it is preserved until it
+> elapses or the harness succeeds again.
+
 ### No drain outstanding
 
 > No drain outstanding. Progress can still arrive from elsewhere — the
@@ -3666,6 +4624,15 @@ section note.
 > nothing too, the retry's spend is charged like any other, so the rung it
 > reaches depends on how big it was (a whole-threshold retry escalates at once,
 > a smaller one repeats the band) — the retry is never an exemption.
+
+### Bands, matching the old session-count ladder at the ~26M-per-drain
+
+> Bands, matching the old session-count ladder at the ~26M-per-drain
+> calibration: 3 fruitless drains (~78M) earned 15m, 4 (~104M) earned 30m,
+> 5 (~130M) earned 1h, 6+ (~156M) earned the 2h cap. In whole thresholds:
+> acc in [80M,160M) → rung 3 → 15m; [160M,240M) → 30m; [240M,320M) → 1h;
+> 320M+ → 2h. One huge fruitless drain (≥80M) trips the FIRST band on its
+> own — the property the session count could never give (CLA-343).
 
 ### sidelineTarget
 
@@ -3766,6 +4733,15 @@ section note.
 > the driver then closes to release the findings to the fix phase. Zero means
 > no record matched.
 
+### reviewerRoleFor
+
+> reviewerRoleFor is the reviewer role of the review-shaped phase at idx
+> (CLA-637): `review-N`, counting the review-shaped phases up to and including
+> it, so two review phases in one sequence (a panel, CLA-639) write distinct
+> records and the plane's one-row-per-role-per-round rule is not tripped. The
+> role is a name both sides read: the brief hands it to the session and the
+> seam gate keys the record on it. Empty for a phase that is not review-shaped.
+
 ### matchingReviewRecord
 
 > matchingReviewRecord finds the durable review record a review-shaped phase's
@@ -3807,6 +4783,15 @@ section note.
 > it here or the member is recorded as a failure while its record sits in the
 > round (CLA-639 fix pass 4). Best-effort: an unreadable task or an unwired
 > reader leaves the member classified as failed, exactly as before this check.
+
+### runUUID
+
+> runUUID is a run id's identity: the part before the first dot. Since CLA-509
+> claim_task returns a run as the credential `<uuid>.<secret>`, but the plane
+> keys everything it stores (review records, claimedByRun) on the bare uuid,
+> so two ids name the same run exactly when their uuids match. A bare id (a
+> run claimed before credentials, or one read back from the plane) is its own
+> uuid. This is the plane's own split (parseRunCredential).
 
 ### reviewRecordLine
 
@@ -3879,6 +4864,15 @@ section note.
 > it. When the run produced a report but cleanup failed, the report is returned
 > WITH the error so a caller can still write the JSON; the command exits non-zero
 > either way.
+
+### reviewRunInvocation
+
+> reviewRunInvocation composes the session: the taskless brief, the maps
+> section when the method asks for it, and the harness/session fields the
+> phase driver would resolve from config. It deliberately leaves MCPConfigPath
+> empty: this command has no plane identity to hand a session, and a session
+> that tried a clankerbar call would be talking to the operator's backlog in a
+> review that must not touch it.
 
 
 ## `internal/loop/route_fallback.go`
@@ -4058,6 +5052,15 @@ section note.
 > cannot forget it. (The closure, not `defer d.sweepPendingStop(runErr)`:
 > arguments evaluate at registration, and runErr is not assigned yet.)
 
+### Every harness this run will SPAWN, not just the configured one
+
+> Every harness this run will SPAWN, not just the configured one: a mixed
+> sequence's banner naming one of them is a log that disagrees with the
+> sessions underneath it from the first line (CLA-366). SpawnedHarnesses
+> rather than PhaseHarnesses, so a run-wide harness every phase overrides is
+> not announced as being driven when nothing will ever run on it - the banner
+> is the operator's first line of output, and it should describe the run.
+
 ### A STOP marker already sitting here PREDATES this process
 
 > A STOP marker already sitting here PREDATES this process: markers are only
@@ -4068,6 +5071,25 @@ section note.
 > what the upgraded clanker1 did seconds after its start banner. Consume it
 > with a loud note instead. A stop dropped AFTER this point is fresh and
 > still lands on every read below.
+
+### The budget breaker's between-iterations pass (CLA-480)
+
+> The budget breaker's between-iterations pass (CLA-480): every target's
+> own account is judged against the budget in force for it, and a target
+> that reaches a ceiling stops draining while its siblings carry on. The
+> run ends only when every target is exhausted. Run here, before the poll
+> gate, so an already-elapsed wall-clock ceiling still stops the loop
+> before it spends or even polls.
+
+### Gate on cheap control-plane reads
+
+> Gate on cheap control-plane reads: only spend a session when some target
+> has work to spawn for — ready work, or abandoned work the plane would
+> offer for takeover (Summary.Spawnable, CLA-274). When idle, keep polling
+> (and logging) so the loop reacts to answered questions / promotions /
+> newly filed work. With several targets (CLA-142) every queue is polled
+> each cycle, and the drain goes to the next spawnable one after the last
+> drained (round-robin) — a busy queue can't starve a quiet one.
 
 ### The drain's spend is already in the target's ledger
 
@@ -4084,6 +5106,26 @@ section note.
 > force for it is exhausted for the rest of the run; the run stops only
 > when every target is.
 
+### Classify before acting (CLA-507)
+
+> Classify before acting (CLA-507). The run-wide causes are the ones
+> the poll loop already hard-stops on - a bad key or a missing project
+> selector is shared by every target, so no target can make progress
+> and sidelining would just defer the same exit. They never originate
+> in a drain today; the guard keeps that boundary explicit rather than
+> incidental. Context cancellation arrives as stop=true with err=nil,
+> so it needs no classification here.
+
+### CLA-562
+
+> CLA-562: the startup-failure escalation rides on top of the
+> sideline, mirroring the fleet trip. A startup failure is an ERROR
+> with no usage reported (no session ever ran); a dead phase is
+> err == nil, so one failure never ticks both counters. The sideline
+> stays for the first startupFailBound-1 attempts; only the Nth
+> escalates to a pause-and-raise. An error WITH usage proves a
+> session ran, so it breaks startup consecutiveness without tripping.
+
 ### CLA-564
 
 > CLA-564: every task boundary is a stop boundary, not just idle waits.
@@ -4099,6 +5141,16 @@ section note.
 > A cancelled context outranks both markers here exactly as at the
 > cycle top: falling through lets the top report the cancel, and the
 > exit sweep clears any pending STOP (CLA-491).
+
+### Blind mode has no counts to gate on, so it idles between sessions rath
+
+> Blind mode has no counts to gate on, so it idles between sessions rather
+> than spinning. Note this is a PER-TASK pause now: the default prompt asks
+> for one task, so a blind run alternates task / idle / task, where the old
+> drain default spent one idle on the whole queue. An operator tuning
+> `idle_poll_interval` on a blind run is setting the gap between tasks.
+> In wired mode, loop straight back — the next cheap poll decides whether
+> more work appeared.
 
 ### sweepPendingStop
 
@@ -4125,6 +5177,24 @@ section note.
 > Still a hard stop: the mismatch won't self-heal, and idle-retrying or
 > blind-draining would just burn doomed sessions (CLA-133/CLA-142).
 
+### The stored execution-config boundary (CLA-410)
+
+> The stored execution-config boundary (CLA-410): a moved
+> runConfigVersion — including the first poll, which is
+> "start of run" — refetches and re-overlays BEFORE the
+> spawn gate reads anything, so the drain that follows this
+> poll runs on the current document. Mid-session is
+> unreachable by construction: polls happen only here.
+
+### staleclaimable is reported beside claimable, not folded into it
+
+> stale_claimable is reported beside claimable, not folded into it: an
+> operator watching the console has to be able to tell "spawning
+> because there is fresh work" from "spawning to recover an abandoned
+> branch", and before CLA-274 those were indistinguishable — the
+> second did not happen at all, and now that it does it must not look
+> like the first.
+
 ### Console pause (CLA-76 plane / CLA-130 driver)
 
 > Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
@@ -4136,6 +5206,26 @@ section note.
 > STOP (which exits the instance) and from an empty queue. A pause
 > landing mid-drain is only seen here, between iterations, so it never
 > kills an in-flight session (exactly like STOP).
+
+### A poll taken while the loop has stopped spawning cannot tell "our
+
+> A poll taken while the loop has stopped spawning cannot tell "our
+> last drain settled nothing" from "nothing happened because we
+> stopped", so the verdict waits until the loop is live again. A
+> budget-exhausted target is one of those stops (CLA-480): judging
+> its poll would charge the drain that reached the ceiling to the
+> quiet accumulator and log a back-off for a project that will
+> never spawn again this run.
+
+### CLA-466
+
+> CLA-466: the presence beacon rides THIS poll — no new cadence. It
+> fires AFTER the switch, whose default arm writes the pause flags
+> fleetState reads (CLA-483); every poll beacons bar the two hard-stop
+> arms, which get their `stopping` from fleetShutdown. A session blocks
+> the poll, so the in-session renewal tick carries the same lap (CLA-771).
+> The plane gets one report per target; the local file is written once
+> after the loop (see localState above).
 
 ### Blind mode has no counts to route on - rotate across targets so every
 
@@ -4180,6 +5270,51 @@ section note.
 > retried at a poll-bounded rate; a document that arrives but fails local
 > validation is refused loudly and the previous config stays. Neither converts
 > an operator's ratify click into a daemon outage.
+
+### liveCfg
+
+> liveCfg is targetCfg re-read NOW: the same answer invocationFor gets, taken
+> fresh at the moment of asking rather than held from the drain's start. A
+> boundary hold calls it at every wake (CLA-947 review 1.review-1.1) because
+> d.cfg is swapped by a RELOAD on another goroutine — it is read under controlMu
+> the way pauseState reads it — so the hold decides from the config the next
+> spawn will use, not from a schedule the operator has since removed.
+
+### overlayBudgetAt
+
+> overlayBudgetAt reports whether target i is judged by a stored budget of its
+> own. A stored document that sets no budget leaves the target in the local
+> pool: the README's exception is the document's BUDGET, not its mere existence,
+> and applying a model-only document must not quietly split the instance-wide
+> pool into one-per-project ceilings. Set at applyRunConfig time from
+> doc.Budget != nil.
+
+### Permanent nothing-stored (CLA-481)
+
+> Permanent nothing-stored (CLA-481): version 0 IS the plane's "never set"
+> answer, so when nothing is in force (unfetched or already at none) the
+> answer is known without a fetch. Latch silently — staying at none is not
+> news — instead of fetching every boundary only to learn ErrNoConfig.
+> A 0 arriving while a stored overlay is in force (rcVersions > 0) still
+> fetches below, so the drop to local is confirmed and logged.
+
+### Rate-limit RETRIES after a failed fetch of the SAME version to one per
+
+> Rate-limit RETRIES after a failed fetch of the SAME version to one per
+> backoff window, so a blip at ratify time retries without spamming the log.
+> A DIFFERENT version always fetches: the operator moved the document again,
+> and no throttle may delay that past the boundary it arrived on. The window
+> widens with consecutive failures (CLA-481), so a permanently unreachable
+> plane backs off instead of logging every 30s forever.
+
+### Permanent
+
+> Permanent: nothing to fetch, ever, for this version. ErrNotWired
+> is the slug-less / project-scoped-key shape (rcNotWired) — the
+> same "local file rules" posture as nothing stored, silent
+> thereafter, never retried. Say it once per transition, not every
+> poll — dropping from a stored doc to none is real news, staying
+> at none is not.
 
 ### invalidateRunConfigs
 
@@ -4368,6 +5503,34 @@ section note.
 >
 > Nothing here pushes or opens a PR; that is the close-out's job (B7).
 
+### adoptBranchWorktree
+
+> adoptBranchWorktree takes over the tree the task's branch is already checked
+> out in, or refuses it by name. A tree under the task-worktree roots is this
+> task's own; one elsewhere is adopted only when it holds nothing origin does
+> not, because another cut of the same branch would otherwise be refused here
+> and burn the task's claim. Getting here means this run holds the task's claim,
+> so the previous holder's lease has ended, and nothing in the tree is moved
+> until the check below proved it holds nothing origin lacks.
+
+### taskWorktreeUnsafeToAdopt
+
+> taskWorktreeUnsafeToAdopt names what a tree outside the task-worktree roots
+> holds that origin does not, or "" when adopting it would discard nothing: a
+> tree at or behind origin (or the PR base, for a branch never pushed) carries
+> no unpushed work, and this run holds the task's claim. Untracked files are
+> cleared by reuse, so they are unsafe only when HEAD could hold work origin
+> lacks.
+
+### reuseTaskWorktree
+
+> reuseTaskWorktree takes over a worktree that is already registered for this
+> repo. It only adopts one that is demonstrably the task's own tree; anything
+> that could hold committed work is refused by name, because the alternative is
+> discarding work. Untracked files cannot hold committed work once HEAD is
+> proven to be at or behind origin: they are moved aside, never deleted, and
+> the tree is reused.
+
 ### finishTaskWorktreePrep
 
 > finishTaskWorktreePrep records the tip HEAD afterwards, plus where origin's
@@ -4427,6 +5590,15 @@ section note.
 > never moved on: the MAK-123 post-mortem found only "the phase finished but
 > never moved the task on", with nothing in the daemon log saying the model had
 > spent its whole output budget thinking (reasoning=32000) and emitted nothing.
+
+### openCallKill
+
+> openCallKill reports that this session's kill landed while a tool call was
+> open. In practice that is the TOOL CAP: the guard pauses the idle clock while a
+> call is open precisely so the cap, not the idle clock, ends it, and an adapter
+> reports the open call alongside whatever ended it. Only the adapter can see that
+> window, so the predicate reads its verdict rather than re-deriving one from the
+> cause string (CLA-900).
 
 ### fleetTrip
 
@@ -4504,6 +5676,16 @@ section note.
 > failure; the driver must. The claim was released before this ran (the retry
 > re-claimed, then died again), so the park is a plain status write signed by
 > the dead phase's own run.
+
+### How the sessions died
+
+> How the sessions died. A CLA-739 tool-loop kill is dead whatever it
+> pushed, so "no branch recorded" may be false for it and the finish reason
+> says nothing: the cause names what happened instead. The cause is the
+> LAST attempt's, which is the one the operator is being asked about.
+> CLA-877: a report-resume failure delivered its work too — only the reply
+> that re-emits the done report kept failing — so it is named for what it
+> is rather than as a session that produced nothing.
 
 ### parkStartRefusal
 
@@ -4597,6 +5779,34 @@ section note.
 > sessions, CLA-287), and a probe in flight — a harness session with no ceiling
 > of its own — never silences the beacon.
 
+### CLA-728
+
+> CLA-728: the wait can outlast the plane's liveness window many times over,
+> and a healthy daemon that stops talking reads on the console as dead -
+> which is what sent the operator looking for a crash on 2026-10-20. Say
+> `limited` on entry and keep saying it at limitBeaconInterval; the next
+> ordinary beacon (`iteration` or `idle`) is what replaces it on resume, so
+> there is no exit call.
+
+### resetMu
+
+> What the beacon carries is the harness's stated reset only while the wait
+> still believes it. The fallback below measures a stated reset false, and
+> from that moment the console must read "probing for a reset" rather than a
+> countdown to an instant this loop already knows did not lift the limit.
+> Mutex-guarded because the re-beacon goroutine reads it while this loop
+> writes it.
+
+### The re-beacon runs on its OWN goroutine, not as another wake in the pr
+
+> The re-beacon runs on its OWN goroutine, not as another wake in the probe
+> loop below. A probe is a harness session with no ceiling of its own — the
+> session wall-clock cap exempts probes (CLA-368) — so a cadence driven by
+> the same loop goes silent for the whole probe, and a probe longer than the
+> plane's liveness window puts the instance back to `dead`: the exact
+> failure this state exists to fix. The goroutine is joined before the wait
+> returns, so the boundary's next ordinary beacon is still the last word.
+
 ### Probe time
 
 > Probe time.
@@ -4621,6 +5831,15 @@ section note.
 > cadence the CLA-287 breaker cannot see. The attempt counts as finished
 > before its verdict is read, so an error path that retries is spaced
 > exactly like a successful one.
+
+### A probe whose own output could not be read is not a blip that clears
+
+> A probe whose own output could not be read is not a blip that clears
+> itself: it reports no verdict AND no spend, so a wait that keeps polling
+> on it re-spawns a paid session every interval against a ceiling that can
+> never see the cost — the one shape this loop's breaker exists to end
+> (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
+> ceiling there is nothing to protect, so it waits on as before.
 
 ### waitOrStop
 
@@ -4651,6 +5870,15 @@ section note.
 > idle polls are not this wait: widening those is a change to every wait in the
 > loop, and this task is about the limit pause.
 
+### Round(0) strips the monotonic reading, so wallStart measures REAL elap
+
+> Round(0) strips the monotonic reading, so wallStart measures REAL elapsed
+> time. Everything else here runs on the monotonic clock, which does not
+> advance while the machine is suspended — so comparing the two is the only
+> way a slept-through wait becomes visible. Without it, a laptop that idle
+> sleeps turns a 30-minute pause into a multi-hour silence that looks exactly
+> like a hung process.
+
 ### consumeWaitControls
 
 > consumeWaitControls reads and consumes the control markers waitOrStop honours:
@@ -4675,4 +5903,13 @@ section note.
 > a symlink at the name is refused rather than followed, and the read is capped.
 > Following one would let whoever planted it choose a file for us to open and a
 > line of it to echo into the daemon's log.
+
+### randomTail
+
+> randomTail is the unguessable part of an iteration log's name. crypto/rand,
+> not math/rand: the whole point is that the session whose transcript this is
+> cannot predict it, and a seeded PRNG in a daemon it can watch start is not
+> unpredictable. rand.Read never fails on any supported platform (it panics
+> internally rather than returning an error), so there is no fallback branch to
+> get wrong.
 
