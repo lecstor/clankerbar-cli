@@ -1038,6 +1038,14 @@ section note.
 > something a session can fix.
 
 
+## `internal/config/done_marker.go`
+
+### DoneMarker
+
+> DoneMarker reads "=====CLANKERBAR DONE=====". Two constraints govern it: it
+> must not collide with HandoffMarker (the two markers are read out of the same
+> final message), and the parser and the briefs must name the same string.
+
 ## `internal/config/done_report.go`
 
 ### ParseDone
@@ -2135,7 +2143,7 @@ section note.
 > there and passes, exactly the tool-less-session config this predicate exists
 > to refuse.
 
-### checkMCPConfigNamesClankerbar
+### checkMCPConfigOrigins
 
 > checkMCPConfigOrigins refuses a harness MCP config that would send the API key
 > somewhere this config does not trust.
@@ -2155,6 +2163,9 @@ section note.
 > A refusal, not a silent drop: dropping the file would spawn a session with no
 > clankerbar tools at all, which burns an iteration and reads as "the backlog was
 > empty". The operator gets a named host and a remedy instead.
+
+### checkMCPConfigNamesClankerbar
+
 > checkMCPConfigNamesClankerbar refuses a resolved MCP config file that is
 > PRESENT but silent about clankerbar (CLA-448): a file a daemon hands to every
 > session, whose sessions would therefore start with no clankerbar tools at
@@ -2832,7 +2843,7 @@ section note.
 > that fits it - `gate` for a command that fails, `failure` for behaviour
 > reproduced by hand - not under a new one this brief alone would know.
 
-### reviewOnlyBriefOpening
+### reviewOnlyBrief
 
 > reviewOnlyBrief is the review phase's brief when a LATER phase will apply its
 > findings (the shipped [implement, review, fix] sequence). It is the split's
@@ -2893,7 +2904,7 @@ section note.
 > round this variant never closes — so attempting the append would be a
 > refused call at best and a wedged run at worst, and the seam does not need it.
 
-### fixCore
+### fixBrief
 
 > fixBrief is the phase that APPLIES a review's findings. It is deliberately not
 > named "review": reviewTerminalStep is injected by phase name, and a fix phase
@@ -2906,12 +2917,15 @@ section note.
 > The reviewer keeps the judgement; the cheap harness gets the typing. The cost
 > is one more session startup and a hand-off the fixer must read; the review
 > record on the task is what makes that hand-off cheap and auditable.
+
+### fixCore
+
 > fixCore is the part both fix variants share: read the released record, check
 > the reviewed tip, apply every finding by its plane id, re-verify scoped. The
 > variants differ ONLY in their terminal step, because whether the fix phase is
 > the last one depends on whether a verification round follows it (CLA-638).
 
-### fixBrief
+### fixBrief (last phase)
 
 > fixBrief is the phase that APPLIES a review's findings when it is the LAST
 > phase of the sequence. It is deliberately not named "review":

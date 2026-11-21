@@ -182,8 +182,9 @@ func (c *Config) ZeroSpendAttemptBound() int {
 	return DefaultMaxZeroSpendAttempts
 }
 
-// RepeatedToolFailureBound is the effective repeated-failing-tool-call threshold: the operator's
-// own, else the built-in default.
+// RepeatedToolFailureBound is the effective repeated-failing-tool-call threshold: nil inherits
+// DefaultMaxRepeatedToolFailures, while an explicit 0 stays 0 and disables the guard — unlike
+// ZeroSpendAttemptBound, where 0 means "use the default".
 func (c *Config) RepeatedToolFailureBound() int {
 	if c.MaxRepeatedToolFailures != nil {
 		return *c.MaxRepeatedToolFailures

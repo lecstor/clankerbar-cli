@@ -124,7 +124,9 @@ func taskWorktreeMoveUntracked(ctx context.Context, dir, scratchRoot, taskID str
 	return dest, nil
 }
 
-// taskWorktreeScratchDir makes the timestamped directory cleared files go to.
+// taskWorktreeScratchDir makes the timestamped directory cleared files go to. It must sit OUTSIDE the
+// worktree — a moved-aside file still inside it would keep the tree dirty — so an empty, relative or
+// inside-the-tree scratchRoot falls back to `.scratch-aside` beside the worktree.
 func taskWorktreeScratchDir(dir, scratchRoot, taskID string) (string, error) {
 	if !filepath.IsAbs(scratchRoot) || taskWorktreeUnder(scratchRoot, dir) {
 		scratchRoot = filepath.Join(filepath.Dir(dir), ".scratch-aside")

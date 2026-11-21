@@ -30,8 +30,8 @@ func defaultIdleBounds(harnessName string) (idle, toolCall time.Duration) {
 	return 0, 0
 }
 
-// SessionIdleFor resolves one harness's no-output watchdog: the operator's own bounds when the
-// block names them, else the shipped default.
+// SessionIdleFor resolves one harness's no-output watchdog: a field the block leaves nil inherits the
+// shipped default, while an explicit 0 stays 0 and disables that bound.
 func (c *Config) SessionIdleFor(harnessName string) (idle, toolCall time.Duration) {
 	idle, toolCall = defaultIdleBounds(harnessName)
 	b, ok := c.SessionIdle[harnessName]

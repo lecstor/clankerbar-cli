@@ -242,7 +242,8 @@ func (d *Driver) clearResumedTransient(key resumedTransientKey) {
 }
 
 // resumedTransientDuration is the wait a resumed phase's transient sequence-end owes before the
-// next drain: backoff(n) in production, where n is noteResumedTransient's streak.
+// next drain: backoff(n) in production, where n is noteResumedTransient's streak, with
+// resumedTransientWait overriding it so tests can drive the ladder without sleeping.
 func (d *Driver) resumedTransientDuration(n int) time.Duration {
 	if d.resumedTransientWait != nil {
 		return d.resumedTransientWait(n)

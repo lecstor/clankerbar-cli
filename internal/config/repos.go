@@ -134,7 +134,9 @@ func absAgainst(p, base string) (string, error) {
 	return filepath.Clean(p), nil
 }
 
-// isCheckoutDir reports whether path exists and is a directory.
+// isCheckoutDir reports whether path exists and is a directory. It deliberately does not require a
+// .git entry: a checkout's worktrees carry .git as a FILE, and refusing those would refuse exactly the
+// trees sessions work in.
 func isCheckoutDir(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()

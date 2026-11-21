@@ -56,11 +56,11 @@ func mcpPath(origin, slug string) string {
 	return origin + "/mcp/" + url.PathEscape(slug)
 }
 
-// BacklogSummaryURL returns the URL of the driver's cheap backlog read: the plane's `GET
-// .../backlog-summary` surface, which returns {version, counts, claimable, openQuestions,
-// loopPaused} in one authenticated call (counts to gate on, plus the console-driven pause the
-// driver honours). - `/api/backlog-summary` — the legacy slug-less route, where only a
-// project-scoped key can select the project.
+// BacklogSummaryURL returns the URL of the driver's cheap backlog read:
+// `/api/projects/<slug>/backlog-summary` when a slug is derivable, else the legacy
+// `/api/backlog-summary` (only a project-scoped key can select the project there). One authenticated
+// call returns {version, counts, claimable, openQuestions, loopPaused}, including the console pause
+// the driver honours.
 func (c *Config) BacklogSummaryURL() string {
 	origin := c.CredentialOrigin()
 	if origin == "" {

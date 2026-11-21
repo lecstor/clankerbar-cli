@@ -496,7 +496,7 @@ section note.
 > gate over a machine that may well be fine, which is why the read-failure
 > branch above is a WARN too.
 
-### pidDetailLine
+### holdsNoIdleSleep
 
 > holdsNoIdleSleep reports whether `pmset -g assertions` shows a live
 > PreventUserIdleSystemSleep. Only two line shapes count as evidence, because
@@ -682,15 +682,6 @@ section note.
 > under opencode, a cost ceiling on a harness that never reports cost), which is
 > the validation split the design memo draws.
 >
-> Plane trouble never FAILs: an unreadable stored document leaves the loop
-> running its previous config (the same posture applyReload takes), so doctor
-> says WARN and keeps `doctor && run` usable. A stored step this machine cannot
-> spawn is NOT plane trouble — it is ratified policy that would silently not
-> run here — so that one deliberately FAILs, and `doctor && run` refuses to
-> start until it is fixed.
-
-### she
-
 > A stored STEP this machine cannot spawn is the one refusal that
 > earns FAIL: the document is ratified policy that silently will not
 > run here, and the operator has to know before an unattended drain
@@ -1000,7 +991,7 @@ section note.
 
 ## `internal/cli/doctor_toolchain.go`
 
-### runsHarness
+### checkToolchains
 
 > checkToolchains cross-references the build tools the backlog's repos need
 > against what the permission policy actually grants.
@@ -1015,6 +1006,9 @@ section note.
 > Every finding here is a WARN, never a FAIL: doctor reads the settings files it
 > knows about, and a grant can also arrive by a rule form it does not parse or a
 > flag on the harness invocation. A false FAIL would block a run that works.
+
+### runsHarness
+
 > runsHarness reports whether the named harness will actually START A SESSION in
 > this config. SpawnedHarnesses, not PhaseHarnesses: a run-wide `harness` that
 > every phase overrides is declared and never spawned, and a check reasoning

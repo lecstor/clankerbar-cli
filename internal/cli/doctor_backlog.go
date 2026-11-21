@@ -66,7 +66,8 @@ func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
 	}
 
 	// The probe POSTs an EMPTY body: auth is checked before body validation, so a 400 proves reachable
-	// + routed + key accepted without writing anything.
+	// + routed + key accepted without writing anything. It must stay empty — a real beacon would upsert
+	// this machine's presence row with doctor's own state and fight a live daemon on the host.
 	err := e.fleetProbe(ctx, endpoint, e.apiKey)
 	switch {
 	case err == nil:

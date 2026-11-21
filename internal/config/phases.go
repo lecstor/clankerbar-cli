@@ -23,9 +23,9 @@ func PanelMemberLabel(members []ReviewPanelMember, i int) string {
 type Phase struct {
 	Name string `json:"name"`
 
-	// Prompt is what this phase's session is asked to do. They are the whole reason a later phase can
-	// RESUME a run instead of claiming a new task, and they are only available once a phase has held a
-	// claim — so they are meaningless in the first phase.
+	// Prompt is what this phase's session is asked to do, with {{taskId}} and {{runId}} substituted
+	// from the claim — the whole reason a later phase can RESUME a run instead of claiming a new task,
+	// and they are meaningless in the first phase. Empty means "use the built-in prompt for Name".
 	Prompt string `json:"prompt"`
 
 	MaxTurns int `json:"max_turns"`

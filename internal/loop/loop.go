@@ -150,6 +150,8 @@ type Driver struct {
 	routeMarks   map[string]time.Time
 	routeMarksMu sync.Mutex
 
+	// resumedTransientWait overrides the backoff for a resumed phase's transient wait. Nil in
+	// production (nil means backoff); a test seam so the ladder can be driven without sleeping.
 	resumedTransientWait func(n int) time.Duration
 
 	// The fleet dead-phase counter. Per-target because a multi-target driver runs several projects,

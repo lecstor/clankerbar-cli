@@ -165,6 +165,8 @@ func checkBudget(cfg *config.Config) check {
 		guardDials = append(guardDials, "max_iterations")
 	}
 	if runsHarness(cfg, "copilot") {
+		// INERT dials are noted but never added to guardDials: the remedy advises setting those, and
+		// under copilot the dial cannot fire.
 		if cfg.MaxRepeatedToolFailures != nil && *cfg.MaxRepeatedToolFailures > 0 {
 			guardNotes = append(guardNotes, fmt.Sprintf(
 				"max_repeated_tool_failures: %d is INERT under copilot - its adapter does not arm the tool-loop guard", *cfg.MaxRepeatedToolFailures))

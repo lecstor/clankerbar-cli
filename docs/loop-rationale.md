@@ -339,7 +339,7 @@ section note.
 
 ## `internal/loop/claims.go`
 
-### releaseCarried
+### releaseHeldClaim
 
 > releaseHeldClaim hands a task the session was still holding back to the queue,
 > instead of leaving its lease to run out with nobody heartbeating it.
@@ -352,6 +352,9 @@ section note.
 > earned; the budget is two before the plane parks the task for the operator.
 >
 > A claim with pushed work is left alone; Claim.Releasable says why.
+
+### releaseCarried
+
 > releaseCarried hands back a claim a phase was holding open for a successor
 > that is not going to run, and returns nil so the caller cannot hand it back
 > twice. A nil carried claim is a no-op, so callers need not check first.

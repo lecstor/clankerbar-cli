@@ -10,8 +10,7 @@ import (
 )
 
 // consume reads the session's stream-json stdout to the end: parsing and rendering every line as it
-// arrives, and retaining a bounded tail in keep. - A claim's settle is never observed, so the
-// driver reads a task the session handed to review as one it abandoned, and posts `ready` over it.
+// arrives, and retaining a bounded tail in keep.
 func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result, ceiling int, kill context.CancelFunc) {
 	// The no-output watchdog. Armed here because this is where the session's kill switch is in hand,
 	// and the stream below is what feeds it.

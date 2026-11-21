@@ -155,7 +155,8 @@ func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
 	return fs
 }
 
-// Doctor parses the `doctor` flags and runs the preflight checks.
+// Doctor parses the `doctor` flags and runs the preflight checks. It returns a non-zero error when any
+// check FAILs, so `clankerbar doctor && clankerbar run` is a usable cron gate.
 func Doctor(ctx context.Context, args []string) error {
 	var f doctorFlags
 	fs := newDoctorFlagSet(&f)

@@ -26,9 +26,9 @@ func (codex) MCPConfigUse() MCPConfigUse {
 	}
 }
 
-// codexArgs maps an Invocation to `codex exec`'s CLI dialect. CORRECTION to this commit's first
-// message, which justified the reorder as dropping a reliance on "last-wins" for the pinned
-// --sandbox/--ask-for-approval posture: that reliance never existed.
+// codexArgs maps an Invocation to `codex exec`'s CLI dialect. The `--` terminator has two jobs: a
+// prompt that looks like a flag would be parsed as one, and an exec subcommand (`resume`, …) would
+// otherwise swallow the prompt as its argument.
 func codexArgs(in Invocation) []string {
 	if in.Probe {
 		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}

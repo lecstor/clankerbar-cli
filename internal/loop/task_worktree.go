@@ -123,6 +123,7 @@ func adoptBranchWorktree(ctx context.Context, req worktreeRequest, prep worktree
 	if main != "" && taskWorktreeSamePath(wt.path, main) {
 		return prep, fmt.Errorf("the branch %s is checked out in the main checkout %s — refusing to run a session there", req.Branch, wt.path)
 	}
+	// req.Checkout may itself be a linked worktree (the fleet layout), so it is another run's tree too.
 	if taskWorktreeSamePath(wt.path, req.Checkout) {
 		return prep, fmt.Errorf("the branch %s is checked out in %s — refusing to run a session there", req.Branch, wt.path)
 	}
@@ -378,9 +379,9 @@ func taskWorktreeAddNew(ctx context.Context, req worktreeRequest, dir string) er
 	return err
 }
 
-// taskWorktreeSyncBranch fast-forwards a reused worktree's branch to origin/<branch>. A branch that
-// has DIVERGED is refused: it holds commits of its own AND origin moved, and deciding which side
-// wins is not this function's call.
+// taskWorktreeSyncBranch fast-forwards a reused worktree's branch to origin/<branch>. An ahead-only
+// branch is left alone — unpushed local commits, not a conflict with origin — while a DIVERGED one is
+// refused: deciding which side wins is not this function's call.
 func taskWorktreeSyncBranch(ctx context.Context, dir, branch string) error {
 	remote := "origin/" + branch
 	if !taskWorktreeCommitishExists(ctx, dir, remote) {
@@ -421,7 +422,8 @@ func taskWorktreeCounts(out string) (ahead, behind int, err error) {
 	return ahead, behind, nil
 }
 
-// taskWorktreeMerge merges base into HEAD with a merge commit, never a rebase.
+// taskWorktreeMerge merges base into HEAD with a merge commit, never a rebase. A conflict is returned
+// as its paths with a nil error, after aborting the merge so the tree is left clean.
 func taskWorktreeMerge(ctx context.Context, dir, base string) (merged, upToDate bool, conflicts []string, err error) {
 	before, err := taskWorktreeHead(ctx, dir)
 	if err != nil {
@@ -598,7 +600,8 @@ func taskWorktreeGit(ctx context.Context, dir string, args ...string) (string, e
 }
 
 // taskWorktreeRepoEnvVars name a repository rather than configure git; an inherited one would
-// override the -C that taskWorktreeGit passes.
+// override the -C that taskWorktreeGit passes. A driver started from a hook or a rebase can carry
+// GIT_DIR/GIT_WORK_TREE, and `-C` would then address the wrong repository.
 var taskWorktreeRepoEnvVars = []string{
 	"GIT_DIR",
 	"GIT_WORK_TREE",

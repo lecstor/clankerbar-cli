@@ -94,6 +94,8 @@ func chooseStartPhase(phases []config.Phase, f startFacts) startChoice {
 		return startAtName(phases, f, config.FixPhaseName, true,
 			"open MUSTs on the released record at the tip: fix")
 	case open:
+		// The findings outlived the tip they were raised on, so adjudicating them is not the fix's
+		// job: the verifier does it when the sequence has a fix->verify pair, else review does.
 		if i := verifyAfterFix(phases); i >= 0 {
 			return startAtIndex(f, i, true, "open MUSTs with none on the record at the tip: verify")
 		}
@@ -170,9 +172,8 @@ func verifyAfterFix(phases []config.Phase) int {
 	return at
 }
 
-// countedAtTip reports whether a released (State "open") record reviewed this exact tip. A sealed
-// record's findings are withheld and a void record is an aborted round, so neither can hand work
-// over.
+// countedAtTip reports whether a released (State "open") record reviewed this exact tip. Sealed and
+// void records cannot hand work over, and an empty tip matches nothing — two empties are not equal.
 func countedAtTip(records []plane.ReviewRecordState, tip string) bool {
 	if tip == "" {
 		return false
