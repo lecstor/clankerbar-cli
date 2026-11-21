@@ -51,6 +51,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // Status is the outcome of one check. The three-way split is the whole point: see
@@ -803,21 +805,14 @@ func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, ar
 func (v *Verifier) gitRunOut(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	)
-	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Env = GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
+			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, secureurl.RedactUserinfo(firstLine(msg)))
 		}
 		return stdout.String(), fmt.Errorf("git %s: %w", args[0], err)
 	}

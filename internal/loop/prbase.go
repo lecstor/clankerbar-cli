@@ -12,6 +12,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // prBaseProbeTimeout bounds the one network round-trip prBaseFor runs. It is a
@@ -108,21 +109,17 @@ func originRemoteURL(ctx context.Context, dir string) (string, error) {
 // killed git can otherwise leave the call sitting past its deadline.
 func runOriginLsRemote(ctx context.Context, dir, integration string, extraEnv []string) (bool, string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "ls-remote", "--symref", "origin", "HEAD", "refs/heads/"+integration)
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	)
-	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Env = delivery.GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return false, "", fmt.Errorf("git ls-remote: %w: %s", err, firstLineOf(msg))
+			// extraEnv scopes the read with delivery.ScopeEnv's token-bearing
+			// insteadOf, which git can echo on failure; prBaseFor logs this
+			// error into daemon.log.
+			return false, "", fmt.Errorf("git ls-remote: %w: %s", err, secureurl.RedactUserinfo(firstLineOf(msg)))
 		}
 		return false, "", fmt.Errorf("git ls-remote: %w", err)
 	}
