@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,30 @@ func TestDeliveryWorkdirThatIsNotARepositoryWarns(t *testing.T) {
 	}
 	if c.remedy == "" {
 		t.Error("a WARN must carry a remedy")
+	}
+}
+
+// A workdir the verifier cannot read must reach stdout as a WARN and must not
+// fail the command: `doctor && run` still drains a backlog from it.
+func TestDoctorRunWarnsOnAnUnverifiableWorkdir(t *testing.T) {
+	dir := t.TempDir() // not a repository
+	cfgPath := filepath.Join(t.TempDir(), "clankerbar.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"harness":"claude","workdir":"`+dir+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := doctorRun(context.Background(), &out, cfgPath, config.Overrides{}, realGitEnv(t)); err != nil {
+		t.Fatalf("a WARN must not fail the command: %v\n%s", err, out.String())
+	}
+	rendered := out.String()
+	if !strings.Contains(rendered, "WARN  delivery") {
+		t.Errorf("the delivery check never reached stdout:\n%s", rendered)
+	}
+	for _, want := range []string{"no non-bare git repository", dir, "-> "} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the rendered delivery line is missing %q:\n%s", want, rendered)
+		}
 	}
 }
 
