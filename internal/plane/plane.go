@@ -263,14 +263,15 @@ func (rcNotWired) ProposeRunConfig(context.Context, map[string]any, string) erro
 }
 
 func wiredClient(mcpURL, apiKey string) *mcpReleaser {
+	endpoint := strings.TrimRight(mcpURL, "/")
 	return &mcpReleaser{
-		endpoint: strings.TrimRight(mcpURL, "/"),
+		endpoint: endpoint,
 		apiKey:   apiKey,
 		client:   &http.Client{Timeout: 20 * time.Second, CheckRedirect: noDowngradeRedirect},
-		// The PUT carries a whole file, so it gets its own, longer deadline
-		// (see uploadTimeout); same redirect rule, since a downgrade would put
-		// the URL's capability token on the wire in cleartext.
-		upload: &http.Client{Timeout: uploadTimeout, CheckRedirect: noDowngradeRedirect},
+		// The PUT carries a whole file and a URL capability token, so it gets
+		// its own longer deadline and must never redirect off the plane's
+		// origin or downgrade to cleartext.
+		upload: &http.Client{Timeout: uploadTimeout, CheckRedirect: sameOriginRedirect(endpoint)},
 	}
 }
 
