@@ -17,13 +17,9 @@ type runnerBriefing struct {
 	closeOut bool         // close-out claim (only ever true with start)
 }
 
-// runnerPrompt swaps a variant-resolved shipped brief for its runner-claimed
-// counterpart. The runner owns the claim, the worktree and the lease, so the
-// shipped text that tells a session to do those things would be wrong.
-//
-// Everything else is left alone: a custom prompt owns its own wording, a panel
-// member does its own job, and the no-code and unverified variants still work in
-// a resumed run (runner versions of those are a follow-up).
+// runnerPrompt swaps a variant-resolved shipped brief for its runner-claimed counterpart. The
+// runner owns the claim, the worktree and the lease, so the shipped text that tells a session to do
+// those things would be wrong.
 func runnerPrompt(prompt string, rb *runnerBriefing, panelMember bool) string {
 	if rb == nil || panelMember {
 		return prompt
@@ -31,10 +27,7 @@ func runnerPrompt(prompt string, rb *runnerBriefing, panelMember bool) string {
 	return runnerBriefSwap(prompt, rb.closeOut)
 }
 
-// runnerBriefSwap is the one mapping from a shipped brief to its runner
-// counterpart. It exists apart from runnerPrompt for the caller that must name a
-// phase's runner brief WITHOUT a briefing: the done-report note a handoff
-// successor is given is chosen from the captured phase, not from a live spawn.
+// runnerBriefSwap is the one mapping from a shipped brief to its runner counterpart.
 func runnerBriefSwap(prompt string, closeOut bool) string {
 	switch prompt {
 	case config.BuiltinImplementBrief():
@@ -54,10 +47,9 @@ func runnerBriefSwap(prompt string, closeOut bool) string {
 	return prompt
 }
 
-// runnerTaskContext fills the block a runner-claimed session starts with. The
-// prep facts are the START phase's only: the runner prepared the tree once,
-// before the walk, so a later phase reporting them would describe a merge it
-// did not see happen.
+// runnerTaskContext fills the block a runner-claimed session starts with. The prep facts are the
+// START phase's only: the runner prepared the tree once, before the walk, so a later phase
+// reporting them would describe a merge it did not see happen.
 func runnerTaskContext(rb *runnerBriefing, phases []config.Phase, phaseIdx int, worktree, branch, prBase, tip string) config.TaskContext {
 	c := config.TaskContext{
 		Ref:         rb.task.Ref,
@@ -104,11 +96,11 @@ func runnerTaskContext(rb *runnerBriefing, phases []config.Phase, phaseIdx int, 
 	return c
 }
 
-// runnerNextSentence states what the runner does after this session, which is
-// the one piece of the walk a session cannot infer from its own brief.
+// runnerNextSentence states what the runner does after this session, which is the one piece of the
+// walk a session cannot infer from its own brief.
 func runnerNextSentence(rb *runnerBriefing, phases []config.Phase, phaseIdx int) string {
-	// A close-out ends the run whatever the configured sequence says: the
-	// approved task is handed back with release_task, not carried on.
+	// A close-out ends the run whatever the configured sequence says: the approved task is handed back
+	// with release_task, not carried on.
 	if rb.closeOut {
 		return "When this session ends, the close-out is over and the runner ends the run."
 	}

@@ -7,32 +7,22 @@ import (
 	"time"
 )
 
-// PauseWindows is the operator's recurring "start no new work" schedule: local
-// wall-clock windows in which the loop spawns no new session. It is checked
-// between iterations exactly like the console pause, and at every phase boundary
-// (CLA-906): a running session is never interrupted, but the next phase, a
-// handoff respawn or a drain's first session waits out the window with the claim
-// held and its lease renewed.
-//
-// It exists for pricing and quiet hours - "do not spend on peak rates" - which
-// is why the windows are wall-clock times in an operator-named zone rather than
-// a UTC offset that would drift across a DST change.
+// PauseWindows is the operator's recurring "start no new work" schedule: local wall-clock windows
+// in which the loop spawns no new session.
 type PauseWindows struct {
-	// Timezone is the IANA name the windows' wall-clock times are in, e.g.
-	// "Australia/Brisbane". Required when Windows is non-empty.
+	// Timezone is the IANA name the windows' wall-clock times are in, e.g. "Australia/Brisbane".
+	// Required when Windows is non-empty.
 	Timezone string        `json:"timezone"`
 	Lead     Duration      `json:"lead,omitempty"` // also pause this long BEFORE each window starts; 0 = none
 	Windows  []PauseWindow `json:"windows"`
 
-	// loc caches Timezone once Validate has parsed it: ActiveAt and NextStart
-	// are called every iteration and LoadLocation re-reads the zone database.
-	// Nil until then, so the methods stay correct when nothing validated this.
+	// loc caches Timezone once Validate has parsed it: ActiveAt and NextStart are called every
+	// iteration and LoadLocation re-reads the zone database.
 	loc *time.Location
 }
 
-// PauseWindow is one recurring window: days are the day it STARTS in the
-// configured zone, which is what makes an overnight window readable as
-// "fri 22:00-06:00" rather than as two entries.
+// PauseWindow is one recurring window: days are the day it STARTS in the configured zone, which is
+// what makes an overnight window readable as "fri 22:00-06:00" rather than as two entries.
 type PauseWindow struct {
 	Days string `json:"days"` // "mon-fri", "sat,sun", "mon,wed-fri", "daily"; case-insensitive three-letter names; ranges may not wrap
 	From string `json:"from"` // "HH:MM", 24h
@@ -48,10 +38,9 @@ const pauseEveryDay = pauseDays(0x7f)
 
 func (d pauseDays) has(w time.Weekday) bool { return d&(pauseDays(1)<<uint(w)) != 0 }
 
-// Validate reports the first problem, naming the window index and field.
-//
-// A nil schedule, and one with no windows, are valid: the scheduler is optional,
-// and an absent one must never be read as "paused".
+// Validate reports the first problem, naming the window index and field. A nil schedule, and one
+// with no windows, are valid: the scheduler is optional, and an absent one must never be read as
+// "paused".
 func (p *PauseWindows) Validate() error {
 	if p == nil || len(p.Windows) == 0 {
 		return nil
@@ -85,8 +74,8 @@ func (p *PauseWindows) Validate() error {
 	return nil
 }
 
-// validatePauseWindows is Validate's labelled hook: the config key is prepended
-// so the error names the line an operator edits.
+// validatePauseWindows is Validate's labelled hook: the config key is prepended so the error names
+// the line an operator edits.
 func (c *Config) validatePauseWindows() error {
 	if err := c.PauseWindows.Validate(); err != nil {
 		return fmt.Errorf("pause_windows: %w", err)
@@ -94,9 +83,9 @@ func (c *Config) validatePauseWindows() error {
 	return nil
 }
 
-// ActiveAt reports whether now falls inside a window (or its Lead), and if so
-// when the pause ends (the end of the window, as an absolute time; windows that
-// overlap or abut are merged so the returned end is the true resume time).
+// ActiveAt reports whether now falls inside a window (or its Lead), and if so when the pause ends
+// (the end of the window, as an absolute time; windows that overlap or abut are merged so the
+// returned end is the true resume time).
 func (p *PauseWindows) ActiveAt(now time.Time) (active bool, until time.Time) {
 	loc := p.zone()
 	if loc == nil || len(p.Windows) == 0 {
@@ -117,9 +106,8 @@ func (p *PauseWindows) ActiveAt(now time.Time) (active bool, until time.Time) {
 	if !active {
 		return false, time.Time{}
 	}
-	// Extend across every window that begins at or before the current end: an
-	// abutting or overlapping window (or its lead) is the same pause, and its
-	// end is the time work actually resumes.
+	// Extend across every window that begins at or before the current end: an abutting or overlapping
+	// window (or its lead) is the same pause, and its end is the time work actually resumes.
 	for extended := true; extended; {
 		extended = false
 		for _, in := range insts {
@@ -132,16 +120,16 @@ func (p *PauseWindows) ActiveAt(now time.Time) (active bool, until time.Time) {
 	return true, until
 }
 
-// NextStart is when the next pause begins (lead included) strictly after now;
-// ok=false when there are no windows.
+// NextStart is when the next pause begins (lead included) strictly after now; ok=false when there
+// are no windows.
 func (p *PauseWindows) NextStart(now time.Time) (start time.Time, ok bool) {
 	loc := p.zone()
 	if loc == nil || len(p.Windows) == 0 {
 		return time.Time{}, false
 	}
 	lead := p.Lead.Duration()
-	// A week plus a day either side is enough for any weekday mask to recur,
-	// however the window straddles midnight.
+	// A week plus a day either side is enough for any weekday mask to recur, however the window
+	// straddles midnight.
 	insts := p.instancesAround(now.In(loc), loc, 8)
 
 	for _, in := range insts {
@@ -156,9 +144,8 @@ func (p *PauseWindows) NextStart(now time.Time) (start time.Time, ok bool) {
 	return start, ok
 }
 
-// Describe is a one-line human summary, e.g.
-// "mon-fri 11:00-14:00, mon-fri 16:00-20:00 (Australia/Brisbane, lead 30m)".
-// An unset schedule describes as empty.
+// Describe is a one-line human summary, e.g. "mon-fri 11:00-14:00, mon-fri 16:00-20:00
+// (Australia/Brisbane, lead 30m)". An unset schedule describes as empty.
 func (p *PauseWindows) Describe() string {
 	if p == nil || len(p.Windows) == 0 {
 		return ""
@@ -177,8 +164,8 @@ func (p *PauseWindows) Describe() string {
 	return fmt.Sprintf("%s (%s)", strings.Join(parts, ", "), inside)
 }
 
-// describeLead renders a lead the way an operator writes it ("30m", "1h30m"),
-// dropping the zero seconds field time.Duration always prints.
+// describeLead renders a lead the way an operator writes it ("30m", "1h30m"), dropping the zero
+// seconds field time.Duration always prints.
 func describeLead(d time.Duration) string {
 	s := d.String()
 	if strings.HasSuffix(s, "m0s") {
@@ -190,9 +177,8 @@ func describeLead(d time.Duration) string {
 	return s
 }
 
-// zone resolves the configured location, or nil when it cannot be: callers then
-// report "not paused", which is the only safe answer for a schedule whose times
-// cannot be placed on the clock.
+// zone resolves the configured location, or nil when it cannot be: callers then report "not
+// paused", which is the only safe answer for a schedule whose times cannot be placed on the clock.
 func (p *PauseWindows) zone() *time.Location {
 	if p == nil {
 		return nil
@@ -211,13 +197,13 @@ func (p *PauseWindows) zone() *time.Location {
 	return loc
 }
 
-// pauseInstance is one window's occurrence on one local calendar day; the pause
-// runs from Lead before start until end.
+// pauseInstance is one window's occurrence on one local calendar day; the pause runs from Lead
+// before start until end.
 type pauseInstance struct{ start, end time.Time }
 
-// instance builds this window's occurrence on day, in loc. Both ends are built
-// with time.Date in the ZONE, so a window means wall-clock time on either side
-// of a DST change rather than a fixed offset.
+// instance builds this window's occurrence on day, in loc. Both ends are built with time.Date in
+// the ZONE, so a window means wall-clock time on either side of a DST change rather than a fixed
+// offset.
 func (w PauseWindow) instance(day time.Time, loc *time.Location) (pauseInstance, bool) {
 	fromH, fromM, err := parseClock(w.From)
 	if err != nil {
@@ -227,8 +213,8 @@ func (w PauseWindow) instance(day time.Time, loc *time.Location) (pauseInstance,
 	if err != nil {
 		return pauseInstance{}, false
 	}
-	// A From inside a spring-forward gap normalises past the gap, so that day's
-	// window can be shorter or empty: the wall-clock window does not exist that day.
+	// A From inside a spring-forward gap normalises past the gap, so that day's window can be shorter
+	// or empty: the wall-clock window does not exist that day.
 	start := time.Date(day.Year(), day.Month(), day.Day(), fromH, fromM, 0, 0, loc)
 	endDay := day.Day()
 	if toH*60+toM <= fromH*60+fromM {
@@ -238,16 +224,15 @@ func (w PauseWindow) instance(day time.Time, loc *time.Location) (pauseInstance,
 	return pauseInstance{start: start, end: end}, true
 }
 
-// instancesAround returns every window occurrence that starts within days local
-// calendar days of now, either side. Days are matched against the day the
-// window STARTS on, which is the documented meaning of a window's days.
+// instancesAround returns every window occurrence that starts within days local calendar days of
+// now, either side. Days are matched against the day the window STARTS on, which is the documented
+// meaning of a window's days.
 func (p *PauseWindows) instancesAround(now time.Time, loc *time.Location, days int) []pauseInstance {
 	y, m, d := now.Date()
 	var out []pauseInstance
 	for off := -days; off <= days; off++ {
-		// Noon, not midnight: a DST change at local midnight normalises 00:00 to
-		// 23:00 of the previous day, which drops that day's window. No zone
-		// transitions happen at noon.
+		// Noon, not midnight: a DST change at local midnight normalises 00:00 to 23:00 of the previous
+		// day, which drops that day's window.
 		day := time.Date(y, m, d+off, 12, 0, 0, 0, loc)
 		for _, w := range p.Windows {
 			mask, err := w.dayMask()
@@ -262,8 +247,7 @@ func (p *PauseWindows) instancesAround(now time.Time, loc *time.Location, days i
 	return out
 }
 
-// dayMask parses the days spec: "daily", or comma-separated three-letter names
-// and "lo-hi" ranges.
+// dayMask parses the days spec: "daily", or comma-separated three-letter names and "lo-hi" ranges.
 func (w PauseWindow) dayMask() (pauseDays, error) {
 	spec := strings.ToLower(strings.TrimSpace(w.Days))
 	if spec == "" {
@@ -306,9 +290,8 @@ func pauseDayIndex(name string) (int, bool) {
 	return 0, false
 }
 
-// parseClock parses "HH:MM" (24h). Strict on purpose: "9:30" and "09:30:00"
-// are the two shapes a hand-edited config gets wrong, and a permissive parser
-// would accept one and misread the other.
+// parseClock parses "HH:MM" (24h). Strict on purpose: "9:30" and "09:30:00" are the two shapes a
+// hand-edited config gets wrong, and a permissive parser would accept one and misread the other.
 func parseClock(s string) (hour, minute int, err error) {
 	s = strings.TrimSpace(s)
 	if len(s) != 5 || s[2] != ':' || !isDigit(s[0]) || !isDigit(s[1]) || !isDigit(s[3]) || !isDigit(s[4]) {

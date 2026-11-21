@@ -18,20 +18,17 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// The opencode 2.x doctor checks (CLA-675): the binary is 2.x, a credential is
-// stored, and the posture the adapter pins on every session is fail-closed with
-// every MCP server out of Code Mode.
+// The opencode 2.x doctor checks: the binary is 2.x, a credential is stored, and the posture the
+// adapter pins on every session is fail-closed with every MCP server out of Code Mode.
 
-// opencodeShellGapNote is the known, accepted gap doctor states beside the
-// permission posture. It is information, never a failure: the operator accepted
-// it on 2026-10-18 (CLA-675).
+// opencodeShellGapNote is the known, accepted gap doctor states beside the permission posture.
 const opencodeShellGapNote = "known, accepted gap: opencode 2.x does not path-gate the shell tool - only its `workdir` argument hits external_directory, so a shell command can touch paths outside the workdir (accepted 2026-10-18: unattended sessions can already run arbitrary commands inside the workdir)"
 
 var opencodeVersionRe = regexp.MustCompile(`(\d+)\.(\d+)\.(\d+)`)
 
-// checkOpencodeVersion fails a 1.x binary. The adapter speaks only the 2.x
-// dialect: a 1.x `opencode run` rejects --standalone, ignores the content
-// layer's codemode keys, and reads its policy from the env var 2.x dropped.
+// checkOpencodeVersion fails a 1.x binary. The adapter speaks only the 2.x dialect: a 1.x `opencode
+// run` rejects --standalone, ignores the content layer's codemode keys, and reads its policy from
+// the env var 2.x dropped.
 func checkOpencodeVersion(c *check, ver string) {
 	m := opencodeVersionRe.FindStringSubmatch(ver)
 	if m == nil {
@@ -56,12 +53,8 @@ func opencodeDataDir() string {
 	return filepath.Join(home, ".local", "share", "opencode")
 }
 
-// sqliteOpencodeCredentials counts the ACTIVE rows of opencode.db's credential
-// table per integration. It selects the integration id, the `active` flag and a
-// count only: no column holding a secret is ever read. The database is opened
-// read-only. A row whose `active` is 0 is not counted; NULL counts as active.
-// The table records no expiry, so a counted credential may still be expired or
-// revoked at the provider - presence is not validity, and the check says so.
+// sqliteOpencodeCredentials counts the ACTIVE rows of opencode.db's credential table per
+// integration. The database is opened read-only.
 func sqliteOpencodeCredentials(ctx context.Context, dbPath string) (map[string]int, error) {
 	sq, err := exec.LookPath("sqlite3")
 	if err != nil {
@@ -89,10 +82,8 @@ func sqliteOpencodeCredentials(ctx context.Context, dbPath string) (map[string]i
 	return counts, nil
 }
 
-// modelProvider is the provider a model id names: opencode ids are
-// `<provider>/<model>` ("opencode-go/deepseek-v4-flash"). ok is false for an id
-// with no provider half - a bare alias names nothing this can look up in the
-// credential store, and guessing a provider from it would invent a finding.
+// modelProvider is the provider a model id names: opencode ids are `<provider>/<model>`
+// ("opencode-go/deepseek-v4-flash").
 func modelProvider(id string) (provider string, ok bool) {
 	p, _, found := strings.Cut(id, "/")
 	p = strings.TrimSpace(p)
@@ -102,22 +93,9 @@ func modelProvider(id string) (provider string, ok bool) {
 	return p, true
 }
 
-// checkOpencodeAuth reports on 2.x's credential store when the run spawns
-// opencode. A missing store or an empty one is a WARN, not a FAIL: a provider
-// key can also come from the provider config (`{env:...}`), which this cannot
-// see.
-//
-// A NON-EMPTY store is not by itself a green (CLA-687). Credentials are stored
-// per provider (the `integration_id` column) and a session only works on the
-// provider its model names, so a store holding `google` says nothing about a
-// config whose models run on `opencode-go`: every session dies with
-// `provider.auth` (401) on its first call, and the check used to report PASS
-// because it counted rows rather than matching them. The providers are therefore
-// taken from the models the run will ACTUALLY use - Config.ModelIDsFor, which
-// resolves the phase/tier/panel chain - and compared with the ids the store
-// holds. A named provider with no stored credential is a WARN rather than a
-// FAIL, for the same reason an empty store is: the key may be declared in the
-// opencode config instead, which this cannot read.
+// checkOpencodeAuth reports on 2.x's credential store when the run spawns opencode. A missing store
+// or an empty one is a WARN, not a FAIL: a provider key can also come from the provider config
+// (`{env:...}`), which this cannot see.
 func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	if !slices.Contains(cfg.SpawnedHarnesses(), "opencode") {
 		return nil
@@ -153,8 +131,8 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	// Which providers the configured models name, and which models put them
-	// there (so the detail can point at the model, not just the provider).
+	// Which providers the configured models name, and which models put them there (so the detail can
+	// point at the model, not just the provider).
 	needed := map[string][]string{}
 	var unattributed []string
 	for _, id := range cfg.ModelIDsFor("opencode") {
@@ -172,9 +150,8 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 		}
 	}
 	if len(unattributed) > 0 {
-		// Said, not warned: an id with no provider half cannot be matched against
-		// the store either way, and inventing a provider for it would report a
-		// gap nobody can act on.
+		// Said, not warned: an id with no provider half cannot be matched against the store either way,
+		// and inventing a provider for it would report a gap nobody can act on.
 		c.info = append(c.info, "model ids naming no provider, so not checked against the store: "+strings.Join(unattributed, ", "))
 	}
 	if len(missing) > 0 {
@@ -195,16 +172,12 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 	return []check{c}
 }
 
-// checkOpencodePermissions reports the posture the adapter pins via
-// OPENCODE_CONFIG_CONTENT, built by the adapter's own code. It does not ask
-// opencode (`opencode debug config` talks to the operator's background service,
-// which doctor must not start or attach to); the content layer is merged last,
-// so what it carries is what wins for every key it sets.
+// checkOpencodePermissions reports the posture the adapter pins via OPENCODE_CONFIG_CONTENT, built
+// by the adapter's own code.
 func checkOpencodePermissions(cfg *config.Config, label, harnessName string) check {
 	c := check{name: label}
-	// The gated path, as the adapter is handed it: "none" or a discovered
-	// .mcp.json resolve to "" here (CLA-318), and reporting on the raw field
-	// would certify a document no session receives.
+	// The gated path, as the adapter is handed it: "none" or a discovered .mcp.json resolve to ""
+	// here, and reporting on the raw field would certify a document no session receives.
 	sess := cfg.SessionFor(harnessName)
 	sess.MCPConfigPath = cfg.ResolveMCPConfig(harnessName, "", nil)
 	doc, err := harness.OpencodeSessionConfig(sess.MCPConfigPath, cfg.WorkDir, false)
@@ -251,9 +224,8 @@ func checkOpencodePermissions(cfg *config.Config, label, harnessName string) che
 		var named map[string]json.RawMessage
 		if data, err := os.ReadFile(sess.MCPConfigPath); err == nil && json.Unmarshal(data, &named) == nil {
 			if raw, ok := named["permission"]; ok && string(raw) != "null" {
-				// Verified on 2.0.32 (CLA-675 review): a top-level permission
-				// block in the OPENCODE_CONFIG layer neither loosened nor locked
-				// out the pinned policy. Said, not warned: it does nothing.
+				// Verified on 2.0.32: a top-level permission block in the OPENCODE_CONFIG layer neither
+				// loosened nor locked out the pinned policy.
 				c.info = append(c.info, sess.MCPConfigPath+" declares a top-level `permission` block; on opencode 2.x the pinned policy wins over it, so it has no effect - remove it to avoid confusion")
 			}
 		}
@@ -276,14 +248,10 @@ func checkOpencodePermissions(cfg *config.Config, label, harnessName string) che
 	return c
 }
 
-// checkOpencodeMCPDisables flags MCP entries in the opencode mcp config files
-// that carry no `type`: partial entries such as `"context7": {"enabled":
-// false}`, meant to switch off a server the global config declares. Verified
-// on 2.0.32 (CLA-675 review), a partial entry in a later layer does NOT stop
-// that server, in either dialect (`servers.X: {"disabled": true}` included);
-// only a full entry with its `type` and `command`/`url` and the off switch
-// does. The adapter cannot repair it either: it moves only typed entries out of
-// the 1.x dialect, because a typeless one is not a server it can describe.
+// checkOpencodeMCPDisables flags MCP entries in the opencode mcp config files that carry no `type`:
+// partial entries such as `"context7": {"enabled": false}`, meant to switch off a server the global
+// config declares. The adapter cannot repair it either: it moves only typed entries out of the 1.x
+// dialect, because a typeless one is not a server it can describe.
 func checkOpencodeMCPDisables(cfg *config.Config) []check {
 	if !slices.Contains(cfg.SpawnedHarnesses(), "opencode") {
 		return nil
@@ -316,9 +284,8 @@ func checkOpencodeMCPDisables(cfg *config.Config) []check {
 	return []check{c}
 }
 
-// opencodePartialMCPEntries names the entries under `mcp` (1.x dialect) and
-// `mcp.servers` (2.x) of one file that carry no `type`. An unreadable file
-// yields nothing: other checks report that.
+// opencodePartialMCPEntries names the entries under `mcp` (1.x dialect) and `mcp.servers` (2.x) of
+// one file that carry no `type`.
 func opencodePartialMCPEntries(path string) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {

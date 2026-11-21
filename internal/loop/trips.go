@@ -10,14 +10,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// deadReason renders the finish reason a dead phase was classified on, for a log
-// line. The classification fired on FinishReasonUnknown, so a nil claim — a
-// session that observed no task — still has a reason to name.
-//
-// The adapter's OWN terminal_reason marker wins when present: ZeroUsageReason
-// (CLA-398) names the quiet-death signature more precisely than the bare
-// "unknown" it rides on, so the operator's log says which flavour of death this
-// was instead of the driver re-inferring it from the zero usage downstream.
+// deadReason renders the finish reason a dead phase was classified on, for a log line.
 func deadReason(res *harness.Result) string {
 	if res != nil {
 		if r, ok := res.Raw[harness.TerminalReasonKey].(string); ok && r != "" {
@@ -30,16 +23,10 @@ func deadReason(res *harness.Result) string {
 	return harness.FinishReasonUnknown
 }
 
-// outputCapStallReasoning reports whether this session ended on the CLA-584
-// output-cap stall, and the stalled final step's own reasoning-token count when
-// it did. The question is asked of the adapter's own terminal_reason marker —
-// the same channel deadReason reads — never re-derived from the finish reason,
-// so a harness that cannot produce the stall simply never answers true.
-//
-// It exists so the hand-back can say WHY a session stopped holding a task it
-// never moved on: the MAK-123 post-mortem found only "the phase finished but
-// never moved the task on", with nothing in the daemon log saying the model had
-// spent its whole output budget thinking (reasoning=32000) and emitted nothing.
+// outputCapStallReasoning reports whether this session ended on the CLA-584 output-cap stall, and
+// the stalled final step's own reasoning-token count when it did. The question is asked of the
+// adapter's own terminal_reason marker — the same channel deadReason reads — never re-derived
+// from the finish reason, so a harness that cannot produce the stall simply never answers true.
 func outputCapStallReasoning(res harness.Result) (int, bool) {
 	if r, _ := res.Raw[harness.TerminalReasonKey].(string); r != harness.OutputCapReason {
 		return 0, false
@@ -48,46 +35,19 @@ func outputCapStallReasoning(res harness.Result) (int, bool) {
 	return n, true
 }
 
-// openCallKill reports that this session's kill landed while a tool call was
-// open. In practice that is the TOOL CAP: the guard pauses the idle clock while a
-// call is open precisely so the cap, not the idle clock, ends it, and an adapter
-// reports the open call alongside whatever ended it. Only the adapter can see that
-// window, so the predicate reads its verdict rather than re-deriving one from the
-// cause string (CLA-900).
+// openCallKill reports that this session's kill landed while a tool call was open. In practice that
+// is the TOOL CAP: the guard pauses the idle clock while a call is open precisely so the cap, not
+// the idle clock, ends it, and an adapter reports the open call alongside whatever ended it.
 func openCallKill(res *harness.Result) bool {
 	return res != nil && res.IdleKilled != "" && res.IdleToolCall
 }
 
-// fleetTrip pauses a target whose fleet dead-phase counter has reached
-// fleetDeadBound (CLA-396): that many consecutive dead phases across tasks mean
-// the harness or provider is broken right now, not the tasks, and every further
-// session would pay the same death rate for nothing. The target stops spawning
-// until the operator answers the raised project-level question (the open-question
-// count falls back to what it was at the raise — see the poll gate in Run).
-//
-// A death that reached the bound while a call was open had a different
-// observation: the last session was waiting inside one open tool call, not silent
-// on a provider. The pause is the same, but the question and the log line name
-// what was seen instead of asserting the provider broke (CLA-900).
-//
-// The question is PROJECT-level — ask_question with no taskId — because a fleet
-// trip is not one task's triage: pinning it to whichever task happened to be in
-// flight would make the operator answer about a bystander. It is filed as a
-// non-blocking `decision` — there is no task to block (the loop's pause is the
-// enforcement), and the operator's ruling on a fleet incident is a project-level
-// judgment worth standing in the decision log, unlike the park's one-task
-// clarification.
-//
-// "Exactly one" is guaranteed by fleetRaised: while the pause is in force the
-// flag is set, so a later trip in the same episode does not re-raise. The flag
-// clears with the pause, so a NEW episode — the operator answered, the loop
-// resumed, and the fleet died again — raises a fresh question.
-//
-// If the question cannot be filed, the pause is NOT set: a pause the operator
-// can never be told about and can never resume is a permanent stall, which is
-// worse than the fall-through (per-task parking still bounds each task). The
-// dead-phase counter stays at the bound, so the next dead phase tries again —
-// loudly.
+// fleetTrip pauses a target whose fleet dead-phase counter has reached fleetDeadBound: that many
+// consecutive dead phases across tasks mean the harness or provider is broken right now, not the
+// tasks, and every further session would pay the same death rate for nothing. The question is
+// PROJECT-level — ask_question with no taskId — because a fleet trip is not one task's triage:
+// pinning it to whichever task happened to be in flight would make the operator answer about a
+// bystander.
 func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res *harness.Result) {
 	pk, ok := t.Releaser.(plane.ParkAPI)
 	if !ok {
@@ -97,8 +57,8 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 	}
 	if !d.fleetRaised[ti] {
 		d.fleetRaised[ti] = true
-		// The baseline the resume signal is measured against: the open-question
-		// count at the last poll, BEFORE the question below raises it by one.
+		// The baseline the resume signal is measured against: the open-question count at the last poll,
+		// BEFORE the question below raises it by one.
 		d.fleetOpenQ[ti] = d.openQs[ti]
 		why := fmt.Sprintf("Each task died producing nothing (final step reason %q, no branch recorded) before this", deadReason(res))
 		headline, against := "the provider or harness looks broken, not the tasks", "a provider that is already known to be failing"
@@ -106,11 +66,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		case res != nil && res.ReportResumeFailed != "":
 			why = fmt.Sprintf("Each task's session delivered its work but could not re-emit its done report (%s) before this", res.ReportResumeFailed)
 		case openCallKill(res):
-			// CLA-900: the death that reached the bound landed while a call was
-			// open. A call that never returned is a stuck call or a wait longer
-			// than the cap, not a provider that went silent, and the operator
-			// needs to tell those apart before deciding whether the provider
-			// recovered.
+			// CLA-900: the death that reached the bound landed while a call was open.
 			headline = "the last session was killed waiting inside one open tool call"
 			against = "a call that is not returning"
 			why = fmt.Sprintf("Each task died before delivering anything, and the last was killed while a tool call it was waiting on stayed open (%s)", res.IdleKilled)
@@ -138,10 +94,8 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		d.prefix(ti), drainNum, d.fleetDead[ti], fleetHeadline(res))
 }
 
-// fleetHeadline is the one-clause summary of how the death that reached the
-// bound ended, for fleetTrip's log line. It mirrors the question's headline
-// (CLA-900): a tool-cap kill names the open call, everything else keeps the
-// provider-broke wording.
+// fleetHeadline is the one-clause summary of how the death that reached the bound ended, for
+// fleetTrip's log line.
 func fleetHeadline(res *harness.Result) string {
 	if openCallKill(res) {
 		return "the last session was killed waiting inside one open tool call"
@@ -149,29 +103,12 @@ func fleetHeadline(res *harness.Result) string {
 	return "the provider or harness looks broken, not the tasks"
 }
 
-// startupTrip pauses a target whose harness-startup counter has reached
-// startupFailBound (CLA-562): that many consecutive spawns failing before any
-// usage report means the harness or provider is broken right now, not the
-// tasks, and every further spawn would pay the same sideline-and-retry for
-// nothing. Same shape as fleetTrip: the target stops spawning until the
-// operator answers the raised project-level question (the open-question count
-// falls back to what it was at the raise - see the poll gate in Run).
-//
-// The question is PROJECT-level - ask_question with no taskId - because a
-// startup trip is not one task's triage: pinning it to whichever drain happened
-// to be in flight would make the operator answer about a bystander. It is filed
-// as a non-blocking `decision` - there is no task to block (the loop's pause is
-// the enforcement), and the ruling is project-level judgment for the decision
-// log.
-//
-// The body carries the harness exit signature (the sideline cause), as the
-// sideline log line does: "provider looks broken" without the error string
-// sends the operator grep-hunting through state-dir logs.
-//
-// "Exactly one" is guaranteed by startupRaised, cleared with the pause so a new
-// episode raises fresh. If the question cannot be filed, the pause is NOT set
-// and the counter stays at the bound, so the next startup failure retries the
-// raise - loudly - while the sideline backoff keeps bounding each attempt.
+// startupTrip pauses a target whose harness-startup counter has reached startupFailBound: that many
+// consecutive spawns failing before any usage report means the harness or provider is broken right
+// now, not the tasks, and every further spawn would pay the same sideline-and-retry for nothing.
+// The question is PROJECT-level - ask_question with no taskId - because a startup trip is not one
+// task's triage: pinning it to whichever drain happened to be in flight would make the operator
+// answer about a bystander.
 func (d *Driver) startupTrip(ctx context.Context, t Target, ti, drainNum int, cause error) {
 	pk, ok := t.Releaser.(plane.ParkAPI)
 	if !ok {
@@ -181,8 +118,8 @@ func (d *Driver) startupTrip(ctx context.Context, t Target, ti, drainNum int, ca
 	}
 	if !d.startupRaised[ti] {
 		d.startupRaised[ti] = true
-		// The baseline the resume signal is measured against: the open-question
-		// count at the last poll, BEFORE the question below raises it by one.
+		// The baseline the resume signal is measured against: the open-question count at the last poll,
+		// BEFORE the question below raises it by one.
 		d.startupOpenQ[ti] = d.openQs[ti]
 		body := fmt.Sprintf(
 			"**%d consecutive harness-startup failures - the harness or provider looks broken, not the tasks.** Each spawn failed before reporting any usage (workdir %s), so the driver paused this project rather than sidelining and retrying forever against a harness that is already known to be failing.\n\nCause: %v\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next startup failure will pause it again and raise a fresh question. Iteration logs are in %s.",
@@ -207,33 +144,15 @@ func (d *Driver) startupTrip(ctx context.Context, t Target, ti, drainNum int, ca
 		d.prefix(ti), drainNum, d.startupFails[ti], cause)
 }
 
-// parkDeadPhase parks the task after four consecutive dead phases, filing an
-// OPEN question so the park reaches the operator instead of vanishing into the
-// Done tab (CLA-395). The question is a non-blocking `clarification` — the task
-// is already parked, so there is nothing left to block, and a `decision` would
-// read as project-wide standing law rather than one task's triage. Its body and
-// options are modelled on the plane's own escalateExhausted shape: what
-// happened, the dead-phase signature, how many sessions it cost, where the
-// iteration logs are, and options covering retry / re-scope / leave parked /
-// drop (CLA-386, per the 2026-08-20 operator decision: retry the implement
-// phase four times, then park; the budget is per task).
-//
-// The phase is dead — its sessions are gone — so nobody is left to declare the
-// failure; the driver must. The claim was released before this ran (the retry
-// re-claimed, then died again), so the park is a plain status write signed by
-// the dead phase's own run.
+// parkDeadPhase parks the task after four consecutive dead phases, filing an OPEN question so the
+// park reaches the operator instead of vanishing into the Done tab. The phase is dead — its
+// sessions are gone — so nobody is left to declare the failure; the driver must.
 func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string, res *harness.Result) {
 	if res == nil || res.Claim.TaskID == "" {
 		log.Printf("%sdead-phase park: no claim observed, so there is no task to park", labelOf(t))
 		return
 	}
-	// How the sessions died. A CLA-739 tool-loop kill is dead whatever it
-	// pushed, so "no branch recorded" may be false for it and the finish reason
-	// says nothing: the cause names what happened instead. The cause is the
-	// LAST attempt's, which is the one the operator is being asked about.
-	// CLA-877: a report-resume failure delivered its work too — only the reply
-	// that re-emits the done report kept failing — so it is named for what it
-	// is rather than as a session that produced nothing.
+	// How the sessions died.
 	death := fmt.Sprintf("died producing nothing (final step reason %q, no branch recorded)", deadReason(res))
 	switch {
 	case res.ReportResumeFailed != "":
@@ -269,14 +188,12 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 			labelOf(t), claimLabel(res.Claim), err)
 		return
 	}
-	// Parked is a let-go: the record describes a run that no longer holds the
-	// task, and a supervisor must not try to hand it back (CLA-708).
+	// Parked is a let-go: the record describes a run that no longer holds the task, and a supervisor
+	// must not try to hand it back.
 	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
-		// The task IS parked — it will not be retried — so saying it was "left
-		// for the next claim" would be the opposite of what happened. The park
-		// outcome stands alone; the missing question is the failure the operator
-		// needs to know about (review finding).
+		// The task IS parked — it will not be retried — so saying it was "left for the next claim"
+		// would be the opposite of what happened.
 		log.Printf("%sparked %s — four consecutive dead phases, but the question for the operator could not be filed: %v",
 			labelOf(t), claimLabel(res.Claim), err)
 		return
@@ -285,15 +202,9 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 		labelOf(t), claimLabel(res.Claim))
 }
 
-// parkStartRefusal parks a task whose worktree the runner refused on two
-// consecutive claims, and reports whether the task IS parked: only a Park that
-// took makes the claim safe to let go. The caller logs the outcome, because only
-// it knows the refusal count and the cause. Unlike a dead phase the claim is LIVE
-// here, so the park signs it with its own run and then lets it go: a dirty or
-// diverged tree refuses every claim identically, so another claim buys nothing and
-// only a human can clear it. The question is a non-blocking `clarification` for
-// the same reason parkDeadPhase's is — the task is already parked, so there is
-// nothing to block.
+// parkStartRefusal parks a task whose worktree the runner refused on two consecutive claims, and
+// reports whether the task IS parked: only a Park that took makes the claim safe to let go. The
+// caller logs the outcome, because only it knows the refusal count and the cause.
 func (d *Driver) parkStartRefusal(ctx context.Context, t Target, res *harness.Result, why string) bool {
 	if res == nil || res.Claim.TaskID == "" {
 		log.Printf("%sstart-refusal park: no claim observed, so there is no task to park", labelOf(t))
@@ -325,12 +236,12 @@ func (d *Driver) parkStartRefusal(ctx context.Context, t Target, res *harness.Re
 			labelOf(t), claimLabel(res.Claim), err)
 		return false
 	}
-	// Parked is a let-go: the record describes a run that no longer holds the
-	// task, and a supervisor must not try to hand it back.
+	// Parked is a let-go: the record describes a run that no longer holds the task, and a supervisor
+	// must not try to hand it back.
 	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
-		// The task IS parked — it will not be retried — so the park stands and the
-		// missing question is the failure the operator needs to know about.
+		// The task IS parked — it will not be retried — so the park stands and the missing question
+		// is the failure the operator needs to know about.
 		log.Printf("%sparked %s — two consecutive worktree refusals, but the question for the operator could not be filed: %v",
 			labelOf(t), claimLabel(res.Claim), err)
 	}

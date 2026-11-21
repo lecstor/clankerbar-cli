@@ -6,81 +6,34 @@ import (
 	"os/exec"
 )
 
-// This file holds the two bounds every adapter puts on a child's output, and the
-// reason they exist at all.
-//
-// A session is an agentic run that may last hours, and its stdout is the whole
-// event stream: every assistant message, every tool_use, and every tool_result —
-// which includes the verbatim content of any file the agent read. Hundreds of
-// megabytes is an ordinary night's work. The adapters used to accumulate all of
-// it, both streams, for the life of the drain, so a runaway child could OOM the
-// SUPERVISOR — the process whose entire job is to outlive the child (CLA-262).
-//
-// Nothing needs the whole of it. The parsed figures (tokens, cost, the claim, the
-// delivery reports) are taken line by line as the stream arrives, and the only
-// consumer of the retained bytes is the limit/transient classification, which is
-// a regex scan over the harness's OWN output and whose answer is always at the
-// END: a usage-limit notice, a terminal_reason, the last error the CLI printed.
+// This file holds the two bounds every adapter puts on a child's output, and the reason they exist
+// at all.
 
 const (
-	// maxStreamLine is the largest single line an adapter will assemble from a
-	// child's stdout. One stream-json event carrying a large file read can be
-	// megabytes, so this is generous; it is a bound, not a budget.
-	//
-	// A line ABOVE it is not silently shortened. The event it carried is lost to
-	// the parser, so the Result's figures are incomplete in ways nothing
-	// downstream can see — which is why crossing this marks the Result untrusted
-	// rather than trimming and carrying on. See Result.Untrusted.
+	// maxStreamLine is the largest single line an adapter will assemble from a child's stdout. One
+	// stream-json event carrying a large file read can be megabytes, so this is generous; it is a
+	// bound, not a budget.
 	maxStreamLine = 16 << 20 // 16 MiB
 
-	// retainedTail is how much of each stream (stdout, stderr) a session KEEPS,
-	// for the classifiers and for the operator-facing diagnostic.
-	//
-	// Two MiB per stream, so a session RETAINS at most 4 MiB whatever the child
-	// does. (The process's peak is higher: assembling one line costs up to
-	// maxStreamLine on top, in the scanner's buffer or a lineSink's. Those are
-	// transient per-line working space; this is what is held for the session.)
-	// Two MiB is far more than any classification needs — the widest pattern here
-	// matches inside one line, and failureDetail renders 400 runes of it — and it
-	// keeps enough context that an operator reading the tail can see what led up
-	// to the failure.
-	//
-	// The cost, stated rather than implied: a signal emitted MORE than a window
-	// ago is no longer read. A session that announced a retryable API error in its
-	// first minute, then produced 6 MiB of stream and exited non-zero with nothing
-	// retryable near the end, is now classified non-retryable and stops the run
-	// where it used to back off and retry. Accepted, because the alternative is
-	// unbounded retention in a process built to outlive its child, and because
-	// what the CLI says LAST about how a session ended is the better evidence
-	// anyway. Not configurable: a dial here is a way to reintroduce the OOM.
+	// retainedTail is how much of each stream (stdout, stderr) a session KEEPS, for the classifiers
+	// and for the operator-facing diagnostic. Accepted, because the alternative is unbounded retention
+	// in a process built to outlive its child, and because what the CLI says LAST about how a session
+	// ended is the better evidence anyway.
 	retainedTail = 2 << 20 // 2 MiB
 )
 
-// newline is the separator a line-oriented reader has to put back when it writes
-// scanned lines to a tail (bufio.Scanner strips it).
+// newline is the separator a line-oriented reader has to put back when it writes scanned lines to a
+// tail (bufio.Scanner strips it).
 var newline = []byte("\n")
 
-// tail is a bounded io.Writer that keeps the LAST retainedTail bytes written to
-// it and discards the rest as it goes, so a stream of any size costs a fixed
-// amount of memory.
-//
-// It hands back whole lines only. When anything has been dropped, the leading
-// partial line goes with it: a half line does not parse as an event, and the
-// classifiers deliberately read a non-event stdout line as the CLI's own words
-// (that is how a usage-limit notice arrives when the stream never starts), so
-// handing them the back half of a truncated tool_result would re-open exactly
-// the injection CLA-258 closed — the agent's narration, and the backlog text it
-// quotes, read as a harness diagnostic.
-//
-// Not safe for concurrent use: each stream gets its own tail, which is how
-// os/exec already treats the writers it is given.
+// tail is a bounded io.Writer that keeps the LAST retainedTail bytes written to it and discards the
+// rest as it goes, so a stream of any size costs a fixed amount of memory.
 type tail struct {
 	max int
 	buf []byte
-	// partial reports that buf now STARTS mid-line, recomputed on every trim from
-	// the byte that fell off. A trim that happens to land on a newline boundary
-	// leaves a whole line at the front, and throwing it away would be a small
-	// silent loss for nothing.
+	// partial reports that buf now STARTS mid-line, recomputed on every trim from the byte that fell
+	// off. A trim that happens to land on a newline boundary leaves a whole line at the front, and
+	// throwing it away would be a small silent loss for nothing.
 	partial bool
 	dropped int64
 }
@@ -90,8 +43,8 @@ func newTail() *tail { return &tail{max: retainedTail} }
 func (t *tail) Write(p []byte) (int, error) {
 	n := len(p)
 	if t.max < 0 {
-		// Retain nothing. Not constructed anywhere here; kept total rather than
-		// letting a negative window reach make() and panic.
+		// Retain nothing. Not constructed anywhere here; kept total rather than letting a negative window
+		// reach make() and panic.
 		t.dropped += int64(n)
 		return n, nil
 	}
@@ -126,17 +79,10 @@ func (t *tail) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// reserve makes room for need more bytes, growing by doubling and CLAMPING at max
-// so the buffer's capacity is bounded and not merely its length.
-//
-// Both halves matter. Unclamped, append's growth factor overshoots the window by
-// about a quarter for the life of the session; allocated eagerly at max, every
-// stream pays for the whole window up front — including a probe, which produces a
-// few hundred bytes and of which a week-long wait runs hundreds. Doubling with a
-// clamp costs a handful of copies on the way up and nothing after.
-//
-// Callers must have trimmed first: this never allocates past max, so it relies on
-// len(buf)+need <= max, which is what the trims in Write establish.
+// reserve makes room for need more bytes, growing by doubling and CLAMPING at max so the buffer's
+// capacity is bounded and not merely its length. Callers must have trimmed first: this never
+// allocates past max, so it relies on len(buf)+need <= max, which is what the trims in Write
+// establish.
 func (t *tail) reserve(need int) {
 	want := len(t.buf) + need
 	if want > t.max {
@@ -161,44 +107,31 @@ func (t *tail) reserve(need int) {
 	t.buf = grown
 }
 
-// String returns the retained tail, with a leading PARTIAL line dropped — see the
-// type comment for why a half line must never be handed to a classifier.
+// String returns the retained tail, with a leading PARTIAL line dropped — see the type comment
+// for why a half line must never be handed to a classifier.
 func (t *tail) String() string {
 	b := t.buf
 	if t.partial {
 		if i := bytes.IndexByte(b, '\n'); i >= 0 {
 			b = b[i+1:]
 		} else {
-			// Everything held is the middle of one line. There is no whole line to
-			// report, and a fragment is worse than nothing.
+			// Everything held is the middle of one line. There is no whole line to report, and a fragment is
+			// worse than nothing.
 			b = nil
 		}
 	}
 	return string(b)
 }
 
-// Dropped is how many bytes this stream produced that are no longer held. Zero
-// means the retained text IS the whole stream.
+// Dropped is how many bytes this stream produced that are no longer held. Zero means the retained
+// text IS the whole stream.
 func (t *tail) Dropped() int64 { return t.dropped }
 
-// lineSink turns a byte stream into whole lines for a live parser, with an
-// explicit cap on how long one line may get.
-//
-// It exists so an adapter can parse as the stream arrives — rather than
-// accumulating the whole of stdout and walking it afterwards — while writing to
-// the same os/exec-managed writer it always did. bufio.Scanner is the equivalent
-// on the reader side, and claude uses it because it reads the pipe itself;
-// maxStreamLine is the cap for both, so neither path holds an order of magnitude
-// more than the other (they may disagree by a byte at the exact boundary, which
-// nothing depends on).
-//
-// A line that overruns max is DISCARDED, not shortened, and Overran reports it:
-// half an event parses as no event, and the caller marks its Result untrusted
-// rather than reporting figures with a hole in them.
-//
-// onLine is handed a slice that is REUSED by the next line: copy anything you
-// keep, as both parsers do. It must not be nil — a sink with nowhere to deliver a
-// line is a programming error, not a mode.
+// lineSink turns a byte stream into whole lines for a live parser, with an explicit cap on how long
+// one line may get. bufio.Scanner is the equivalent on the reader side, and claude uses it because
+// it reads the pipe itself; maxStreamLine is the cap for both, so neither path holds an order of
+// magnitude more than the other (they may disagree by a byte at the exact boundary, which nothing
+// depends on).
 type lineSink struct {
 	onLine func([]byte)
 	max    int
@@ -232,13 +165,8 @@ func (s *lineSink) take(p []byte) {
 		return
 	}
 	if len(s.cur)+len(p) > s.max {
-		// Drop what we have and everything up to this line's newline. Keeping the
-		// head would hand the parser a truncated JSON object, which is
-		// indistinguishable from a line the CLI wrote itself.
-		//
-		// nil rather than cur[:0]: the array behind an overrun line is up to
-		// maxStreamLine, and keeping it alive for the rest of the session is the
-		// memory this file exists to bound.
+		// Drop what we have and everything up to this line's newline. Keeping the head would hand the
+		// parser a truncated JSON object, which is indistinguishable from a line the CLI wrote itself.
 		s.cur, s.skipping, s.overran = nil, true, true
 		return
 	}
@@ -257,16 +185,8 @@ func (s *lineSink) emit() {
 	s.cur = s.recycle()
 }
 
-// keepLineBuffer is how large an assembly buffer may be and still be REUSED for
-// the next line. Above it the array is released instead.
-//
-// Reuse is what keeps the ordinary case allocation-free: a stream is thousands of
-// events of a few KiB each, and re-growing for every one of them would be silly.
-// But a single legal 15 MiB event would otherwise leave 15 MiB pinned behind a
-// `cur[:0]` for the rest of a session that may run for hours — the same
-// hold-forever shape this file exists to remove, just moved from the tail to the
-// line buffer. So the buffer survives while it is cheap and is dropped once it is
-// not.
+// keepLineBuffer is how large an assembly buffer may be and still be REUSED for the next line.
+// Above it the array is released instead.
 const keepLineBuffer = 64 << 10
 
 func (s *lineSink) recycle() []byte {
@@ -276,23 +196,18 @@ func (s *lineSink) recycle() []byte {
 	return s.cur[:0]
 }
 
-// Flush emits a trailing line that arrived without a newline. Call it once the
-// child has exited and every write has landed.
+// Flush emits a trailing line that arrived without a newline. Call it once the child has exited and
+// every write has landed.
 func (s *lineSink) Flush() { s.emit() }
 
-// Overran reports that some line was longer than max and was therefore never
-// parsed.
+// Overran reports that some line was longer than max and was therefore never parsed.
 func (s *lineSink) Overran() bool { return s.overran }
 
-// capture is one child's output, wired the way an adapter that lets os/exec do
-// the copying needs it: a bounded tail per stream, a live line parser fed from
-// stdout, and the console tee.
-//
-// Shared by codex and opencode because the wiring is the whole of what they had
-// in common here, and because a helper is drivable by a test without executing a
-// binary — the alternative left the untrusted arm of both adapters unpinned.
-// claude does its own reading (it needs the pipe to render progress and to drain
-// after a failed scan), so it composes the same two pieces by hand.
+// capture is one child's output, wired the way an adapter that lets os/exec do the copying needs
+// it: a bounded tail per stream, a live line parser fed from stdout, and the console tee. Shared by
+// codex and opencode because the wiring is the whole of what they had in common here, and because a
+// helper is drivable by a test without executing a binary — the alternative left the untrusted
+// arm of both adapters unpinned.
 type capture struct {
 	stdout *tail
 	stderr *tail
@@ -303,9 +218,8 @@ func newCapture(onLine func([]byte)) *capture {
 	return &capture{stdout: newTail(), stderr: newTail(), sink: newLineSink(onLine)}
 }
 
-// attach points cmd's streams at this capture, teeing to console when there is
-// one (a probe passes nil: nobody is watching, and its output is a few hundred
-// bytes).
+// attach points cmd's streams at this capture, teeing to console when there is one (a probe passes
+// nil: nobody is watching, and its output is a few hundred bytes).
 func (c *capture) attach(cmd *exec.Cmd, console io.Writer) {
 	out := []io.Writer{c.stdout, c.sink}
 	errs := []io.Writer{c.stderr}
@@ -316,22 +230,18 @@ func (c *capture) attach(cmd *exec.Cmd, console io.Writer) {
 	cmd.Stdout, cmd.Stderr = io.MultiWriter(out...), io.MultiWriter(errs...)
 }
 
-// result closes the capture and returns the Result skeleton for the adapter to
-// fill: the retained tails, a scan memo, and — if a line overran the cap — the
-// reason the figures that follow cannot be believed. `harness` names the CLI in
-// that message, since it is read by an operator.
-//
-// Call it after cmd.Run/Wait: that is what joins os/exec's copy goroutines, and
-// so what makes everything written here safe to read.
+// result closes the capture and returns the Result skeleton for the adapter to fill: the retained
+// tails, a scan memo, and — if a line overran the cap — the reason the figures that follow
+// cannot be believed.
 func (c *capture) result(harness string) Result {
 	var res Result
 	c.finishInto(&res, harness)
 	return res
 }
 
-// finishInto is result for an adapter that already holds a Result — copilot's
-// parser writes the shared observer's claim state into one as the stream arrives
-// — so the two paths cannot drift on the untrusted message or the scan memo.
+// finishInto is result for an adapter that already holds a Result — copilot's parser writes the
+// shared observer's claim state into one as the stream arrives — so the two paths cannot drift on
+// the untrusted message or the scan memo.
 func (c *capture) finishInto(res *Result, harness string) {
 	c.sink.Flush() // a final line that arrived without a newline
 	res.Stdout = c.stdout.String()

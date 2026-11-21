@@ -1,15 +1,7 @@
 package loop
 
-// review_run.go — `clankerbar review run` (CLA-870): review ONE local
-// base..head outside any task, claim or plane, and emit the findings as JSON.
-//
-// It is a driver, not a second review: the brief is the review phase's own
-// substance without a task (config.ReviewRunBrief), the maps are built by the
-// phase's planner (planMapsSession), and the report is the phase's done report
-// read by the same ParseDone/ValidateReview pair. What it does NOT do is any
-// part of the task lifecycle — no claim, no MCP config, no plane record — so the
-// eval harness scores the review the driver really runs, not a reimplementation
-// of it.
+// review_run.go — `clankerbar review run`: review ONE local base..head outside any task, claim or
+// plane, and emit the findings as JSON.
 
 import (
 	"context"
@@ -27,10 +19,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/reviewmap"
 )
 
-// ReviewRunOptions is one standalone review. Base is required; Head defaults to
-// HEAD. Method is config.ReviewMethodSinglePass or config.ReviewMethodMapsSession;
-// empty means single-pass. Harness is a registered adapter name (the CLI defaults
-// it to opencode, which the maps-session method needs).
+// ReviewRunOptions is one standalone review. Base is required; Head defaults to HEAD.
 type ReviewRunOptions struct {
 	Repo          string
 	Base          string
@@ -42,24 +31,24 @@ type ReviewRunOptions struct {
 	FindingsModel string
 	ChunkSize     int
 	FlowMax       int
-	// EmbedHunks puts each change-map item's hunk in the prompt, as the review
-	// phase's maps_session.embed_hunks does, at the default budgets.
+	// EmbedHunks puts each change-map item's hunk in the prompt, as the review phase's
+	// maps_session.embed_hunks does, at the default budgets.
 	EmbedHunks  bool
 	Title       string
 	Description string
 	Console     io.Writer
 
-	// Seams for the tests; production leaves them nil and gets the real harness,
-	// the discovered config and a real `git worktree remove`.
+	// Seams for the tests; production leaves them nil and gets the real harness, the discovered config
+	// and a real `git worktree remove`.
 	invoke         func(context.Context, harness.Invocation) (harness.Result, error)
 	cfg            *config.Config
 	removeWorktree func(repo, path string) error
 }
 
-// ReviewRunReport is the JSON document the command emits. Every field is a fact
-// the caller needs to score a run: the resolved commits (never the raw flag
-// values), the model each stage ran on, the findings in the phase's own shape,
-// the notes the map method wrote, the session's spend, and how many turns ran.
+// ReviewRunReport is the JSON document the command emits. Every field is a fact the caller needs to
+// score a run: the resolved commits (never the raw flag values), the model each stage ran on, the
+// findings in the phase's own shape, the notes the map method wrote, the session's spend, and how
+// many turns ran.
 type ReviewRunReport struct {
 	Base       string               `json:"base"`
 	Head       string               `json:"head"`
@@ -74,9 +63,9 @@ type ReviewRunReport struct {
 	Turns      int                  `json:"turns"`
 }
 
-// ReviewRunUsage is the session's token accounting in the harness package's
-// normalised buckets, plus the money the harness reported (0 when it reported
-// none, which only cost-reporting adapters distinguish).
+// ReviewRunUsage is the session's token accounting in the harness package's normalised buckets,
+// plus the money the harness reported (0 when it reported none, which only cost-reporting adapters
+// distinguish).
 type ReviewRunUsage struct {
 	Input      int     `json:"input"`
 	Output     int     `json:"output"`
@@ -86,23 +75,18 @@ type ReviewRunUsage struct {
 	CostUSD    float64 `json:"cost_usd"`
 }
 
-// reviewRunStage is what building the invocation decided beyond the invocation
-// itself: the models JSON names per stage, and how many of the result's turn
-// messages are notes rather than findings.
+// reviewRunStage is what building the invocation decided beyond the invocation itself: the models
+// JSON names per stage, and how many of the result's turn messages are notes rather than findings.
 type reviewRunStage struct {
 	models     map[string]string
 	notesTurns int
 }
 
-// RunReview reviews opts.Base..opts.Head in a temporary detached worktree at
-// Head, removes that worktree whatever happened, and returns the parsed report.
-//
-// The worktree is the isolation contract: the reviewed repository's own checkout
-// is only ever read from (rev-parse, worktree add/remove), so a dirty tree, a
-// branch in the middle of something, or a review that edits files cannot disturb
-// it. When the run produced a report but cleanup failed, the report is returned
-// WITH the error so a caller can still write the JSON; the command exits non-zero
-// either way.
+// RunReview reviews opts.Base..opts.Head in a temporary detached worktree at Head, removes that
+// worktree whatever happened, and returns the parsed report. The worktree is the isolation
+// contract: the reviewed repository's own checkout is only ever read from (rev-parse, worktree
+// add/remove), so a dirty tree, a branch in the middle of something, or a review that edits files
+// cannot disturb it.
 func RunReview(ctx context.Context, opts ReviewRunOptions) (*ReviewRunReport, error) {
 	start := time.Now()
 	method, err := NormalizeReviewMethod(opts.Method)
@@ -174,8 +158,8 @@ func RunReview(ctx context.Context, opts ReviewRunOptions) (*ReviewRunReport, er
 	return report, runErr
 }
 
-// reviewRunSession builds the invocation, runs it and parses what it produced.
-// Split from RunReview so the worktree's create/remove brackets every path here.
+// reviewRunSession builds the invocation, runs it and parses what it produced. Split from RunReview
+// so the worktree's create/remove brackets every path here.
 func reviewRunSession(ctx context.Context, opts ReviewRunOptions, cfg *config.Config, method string, invoke func(context.Context, harness.Invocation) (harness.Result, error), wt, base, head string, start time.Time) (*ReviewRunReport, error) {
 	inv, stage, err := reviewRunInvocation(opts, cfg, method, wt, base, head)
 	if err != nil {
@@ -229,12 +213,8 @@ func reviewRunSession(ctx context.Context, opts ReviewRunOptions, cfg *config.Co
 	return report, nil
 }
 
-// reviewRunInvocation composes the session: the taskless brief, the maps
-// section when the method asks for it, and the harness/session fields the
-// phase driver would resolve from config. It deliberately leaves MCPConfigPath
-// empty: this command has no plane identity to hand a session, and a session
-// that tried a clankerbar call would be talking to the operator's backlog in a
-// review that must not touch it.
+// reviewRunInvocation composes the session: the taskless brief, the maps section when the method
+// asks for it, and the harness/session fields the phase driver would resolve from config.
 func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, base, head string) (harness.Invocation, reviewRunStage, error) {
 	stage := reviewRunStage{models: map[string]string{}}
 	env, err := cfg.SessionEnv(opts.Harness, "")
@@ -243,10 +223,8 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	}
 	hc := cfg.SessionFor(opts.Harness)
 	idle, toolCall := cfg.SessionIdleFor(opts.Harness)
-	// A standalone review has no phase of its own, so it takes the run-wide cap
-	// and then the built-in default, exactly as resolveMaxTurns does for a phase
-	// with no cap. A harness that honours Invocation.MaxTurns (claude) would
-	// otherwise have no turn backstop at all.
+	// A standalone review has no phase of its own, so it takes the run-wide cap and then the built-in
+	// default, exactly as resolveMaxTurns does for a phase with no cap.
 	maxTurns := cfg.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = config.DefaultMaxTurns
@@ -294,8 +272,8 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	if err != nil {
 		return inv, stage, fmt.Errorf("map the changed definitions: %w", err)
 	}
-	// A standalone review has no task, so its findings turn grades MUST against
-	// the repo's gates and correctness/safety only — never a done-when bar.
+	// A standalone review has no task, so its findings turn grades MUST against the repo's gates and
+	// correctness/safety only — never a done-when bar.
 	plan := planMapsSession(mapOpts, inv.Model, base, diff, flow, config.MapsSessionSeverityTaskless, config.MapsSessionDoneReportEnding)
 	var reportModel string
 	inv, reportModel = wireMapsPlan(inv, plan)
@@ -304,10 +282,9 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	return inv, stage, nil
 }
 
-// reviewRunParseDone reads the session's final message as the phase's review
-// report. The error is what CheckReport steers the one re-emit with, and what a
-// run that still failed ends with, so it names the marker and the fields rather
-// than saying "unparseable".
+// reviewRunParseDone reads the session's final message as the phase's review report. The error is
+// what CheckReport steers the one re-emit with, and what a run that still failed ends with, so it
+// names the marker and the fields rather than saying "unparseable".
 func reviewRunParseDone(final, head string) (config.DoneReport, error) {
 	rep, found, err := config.ParseDone(final)
 	if err != nil {
@@ -334,11 +311,9 @@ func reviewRunUsage(res harness.Result) ReviewRunUsage {
 	}
 }
 
-// reviewRunTurns reports the review's own turns: one for a single-pass
-// invocation, and for a maps-session one entry per turn that ran (TurnMessages
-// includes a turn that ended the sequence early). The harness's one report
-// re-emit and a stall or interrupt resume are the harness's turns, not the
-// review's, so neither is counted.
+// reviewRunTurns reports the review's own turns: one for a single-pass invocation, and for a
+// maps-session one entry per turn that ran (TurnMessages includes a turn that ended the sequence
+// early).
 func reviewRunTurns(method string, res harness.Result) int {
 	if method != config.ReviewMethodMapsSession {
 		return 1
@@ -346,10 +321,8 @@ func reviewRunTurns(method string, res harness.Result) int {
 	return len(res.TurnMessages)
 }
 
-// NormalizeReviewMethod normalises the --method vocabulary. "single" is
-// accepted as the shorthand for the shipped method so the flag reads naturally,
-// but the report always names the canonical value. The CLI and the driver share
-// it so the two cannot disagree about what a spelling means.
+// NormalizeReviewMethod normalises the --method vocabulary. The CLI and the driver share it so the
+// two cannot disagree about what a spelling means.
 func NormalizeReviewMethod(method string) (string, error) {
 	switch strings.TrimSpace(method) {
 	case "", "single", config.ReviewMethodSinglePass:
@@ -361,8 +334,8 @@ func NormalizeReviewMethod(method string) (string, error) {
 	}
 }
 
-// reviewRunRepo resolves the checkout the review reads from. The worktree add
-// runs inside it, so it must be a real path now rather than a later surprise.
+// reviewRunRepo resolves the checkout the review reads from. The worktree add runs inside it, so it
+// must be a real path now rather than a later surprise.
 func reviewRunRepo(repo string) (string, error) {
 	repo = strings.TrimSpace(repo)
 	if repo == "" {
@@ -380,9 +353,9 @@ func reviewRunRepo(repo string) (string, error) {
 	return abs, nil
 }
 
-// reviewRunCommit resolves a revision to the full commit SHA the report and the
-// brief carry. Resolving before the worktree exists means a typo fails with the
-// revision named, not with git's worktree error.
+// reviewRunCommit resolves a revision to the full commit SHA the report and the brief carry.
+// Resolving before the worktree exists means a typo fails with the revision named, not with git's
+// worktree error.
 func reviewRunCommit(repo, label, rev string) (string, error) {
 	rev = strings.TrimSpace(rev)
 	if rev == "" {
@@ -403,8 +376,8 @@ func reviewGit(dir string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// reviewGitDetail renders git's own message for an error line, or nothing when
-// it said nothing (the command's exit status is then the whole story).
+// reviewGitDetail renders git's own message for an error line, or nothing when it said nothing (the
+// command's exit status is then the whole story).
 func reviewGitDetail(out string) string {
 	if s := strings.TrimSpace(out); s != "" {
 		return ": " + s
@@ -412,10 +385,10 @@ func reviewGitDetail(out string) string {
 	return ""
 }
 
-// removeReviewWorktree removes the temporary worktree and its enclosing temp
-// root, then prunes the metadata git keeps for it. Best effort on every step:
-// the directory may already be gone, and the prune is what keeps a failed
-// removal from leaving a stale worktree record in the operator's repository.
+// removeReviewWorktree removes the temporary worktree and its enclosing temp root, then prunes the
+// metadata git keeps for it. Best effort on every step: the directory may already be gone, and the
+// prune is what keeps a failed removal from leaving a stale worktree record in the operator's
+// repository.
 func removeReviewWorktree(repo, path string) error {
 	var errs []error
 	if out, err := reviewGit(repo, "worktree", "remove", "--force", path); err != nil {

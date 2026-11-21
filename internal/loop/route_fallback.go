@@ -1,18 +1,6 @@
 package loop
 
 // route_fallback.go — the driver's half of CLA-782's model route fallback.
-//
-// The opencode adapter switches routes INSIDE one session: a usage limit on the
-// free route resumes the same session on the paid route and reports the switch on
-// Result.Raw (see harness.RouteFallback). This file is what makes the switch
-// STICKY across the run AND across restarts (marks persist in the state dir, ROUTE_MARKS): it records a mark per denied route, keeps later phases
-// off a marked route until the mark lifts, and writes the switch to both logs
-// with the route, the reason and when the denied route is worth trying again.
-//
-// The mark's length is the provider's stated reset when it gave one, else the
-// same default interval the supervised wait probes at (config `poll_interval`,
-// 30 minutes). Nothing here waits: a marked route is simply not offered at the
-// next phase's spawn, so the clanker keeps working on the route that worked.
 
 import (
 	"encoding/json"
@@ -28,24 +16,20 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
-// defaultRouteMarkInterval is how long a denied route with no stated reset is
-// treated as limited. It matches supervisedWait's default probe interval: that
-// is how often the driver would otherwise ask whether the limit lifted, so a
-// marked route is retried on the same cadence rather than on a second, invented
-// one.
+// defaultRouteMarkInterval is how long a denied route with no stated reset is treated as limited.
 const defaultRouteMarkInterval = 30 * time.Minute
 
-// routeMarkInterval is the configured supervised-wait probe interval, or the
-// built-in default when the config names none. Read per call: a RELOAD landing
-// mid-run applies to the next mark without a restart.
+// routeMarkInterval is the configured supervised-wait probe interval, or the built-in default when
+// the config names none. Read per call: a RELOAD landing mid-run applies to the next mark without a
+// restart.
 func (d *Driver) routeMarkInterval() time.Duration {
 	return d.cfg.PollInterval.OrDefault(defaultRouteMarkInterval)
 }
 
-// markRouteLimited records that route is denied until the given instant. A later
-// expiry wins over an earlier one: the provider's own stated reset is a better
-// estimate than a fallback interval computed earlier, and shortening a mark on a
-// stale report would send the next phase back into the same limit.
+// markRouteLimited records that route is denied until the given instant. A later expiry wins over
+// an earlier one: the provider's own stated reset is a better estimate than a fallback interval
+// computed earlier, and shortening a mark on a stale report would send the next phase back into the
+// same limit.
 func (d *Driver) markRouteLimited(route string, until time.Time) {
 	route = strings.TrimSpace(route)
 	if route == "" || until.IsZero() {
@@ -62,9 +46,8 @@ func (d *Driver) markRouteLimited(route string, until time.Time) {
 	}
 }
 
-// persistRouteMarksLocked writes the live marks to the state dir so a restarted
-// process keeps them (CLA-836). Caller holds routeMarksMu. A write failure is
-// logged and dropped: the in-memory mark still governs this process.
+// persistRouteMarksLocked writes the live marks to the state dir so a restarted process keeps them.
+// Caller holds routeMarksMu.
 func (d *Driver) persistRouteMarksLocked() {
 	if d.state == nil {
 		return
@@ -85,10 +68,9 @@ func (d *Driver) persistRouteMarksLocked() {
 	}
 }
 
-// loadRouteMarks reads the marks a previous process saved, dropping any that
-// have already expired. A missing file is the normal first start; an unreadable
-// or corrupt one is logged and ignored, never fatal. Existing in-memory marks
-// are kept when later than the loaded ones.
+// loadRouteMarks reads the marks a previous process saved, dropping any that have already expired.
+// A missing file is the normal first start; an unreadable or corrupt one is logged and ignored,
+// never fatal.
 func (d *Driver) loadRouteMarks() {
 	if d.state == nil {
 		return
@@ -136,38 +118,16 @@ func (d *Driver) routeMarkExpiry(route string) (time.Time, bool) {
 	return until, true
 }
 
-// routableRoutes applies this instance's marks AND the config's route pricing
-// windows to one phase's configured route list, at the driver's clock.
-//
-// Unmarked, unwindowed routes are kept in configured order. A route inside one
-// of its schedule's windows is unavailable exactly as a marked one is; the
-// window is a filter on SELECTION, never a gate on the driver, so a route with
-// no schedule (or an empty one) is always available.
-//
-// When every route carries a usage MARK — a phase that starts while the whole
-// chain is still in its reset window — the route whose mark lifts FIRST is used,
-// alone: it is the soonest the free route can be tested again, and a phase must
-// still start rather than wait on a mark. A marked route is never offered as a
-// fallback to an unmarked one, and when_all_blocked "run" never overrides a mark:
-// only the window filter degrades.
-//
-// A WINDOW, unlike a mark, is never overridden by one: a mark only orders the
-// candidates ("test the soonest-resetting route first"), while a window is the
-// price the operator said not to pay. So the all-marked fallback is window
-// filtered too — a marked route inside its window under "wait" is dropped, the
-// marked route whose mark lifts first among those left open is used, and when
-// every marked route is windowed the phase holds until the earliest window ends.
-//
-// When no route is marked but every one is inside a window, the schedule's
-// when_all_blocked decides, through config.RouteChoiceAt: "run" offers them
-// again, "wait" returns none plus the instant the earliest window ends so the
-// caller can hold the spawn.
+// routableRoutes applies this instance's marks AND the config's route pricing windows to one
+// phase's configured route list, at the driver's clock. A route inside one of its schedule's
+// windows is unavailable exactly as a marked one is; the window is a filter on SELECTION, never a
+// gate on the driver, so a route with no schedule (or an empty one) is always available.
 func (d *Driver) routableRoutes(tc *config.Config, routes []string) config.RouteChoice {
 	return d.routableRoutesAt(tc, d.clock(), routes)
 }
 
-// routableRoutesAt is routableRoutes with its clock injected, so tests can pin
-// both sides of a window. The window arithmetic itself is config's and pure.
+// routableRoutesAt is routableRoutes with its clock injected, so tests can pin both sides of a
+// window. The window arithmetic itself is config's and pure.
 func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []string) config.RouteChoice {
 	if len(routes) == 0 {
 		return config.RouteChoice{}
@@ -192,9 +152,8 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 		if len(choice.Routes) > 0 || !choice.WaitUntil.IsZero() {
 			return choice
 		}
-		// Unreachable while RouteChoiceAt answers "open" or "wait" for every
-		// route; keep the unmarked list rather than dropping every route if that
-		// ever stops being true.
+		// Unreachable while RouteChoiceAt answers "open" or "wait" for every route; keep the unmarked
+		// list rather than dropping every route if that ever stops being true.
 		return config.RouteChoice{Routes: unmarked}
 	}
 	if earliestMarked == "" {
@@ -202,14 +161,10 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 	}
 	choice := tc.RouteChoiceAt(now, marked)
 	if len(choice.Routes) == 0 && !choice.WaitUntil.IsZero() {
-		// Every marked route is inside a "wait" window: hold rather than pay the
-		// peak price. The mark expiry needs no wait of its own — a marked route
-		// is offered the moment it is out of its window, and the hold re-decides
-		// at every wake.
+		// Every marked route is inside a "wait" window: hold rather than pay the peak price.
 		return choice
 	}
-	// The soonest-resetting marked route among those the window filter left
-	// open. With no windows this is exactly the earliest-marked route.
+	// The soonest-resetting marked route among those the window filter left open.
 	soonest := ""
 	var soonestUntil time.Time
 	for _, route := range choice.Routes {
@@ -224,14 +179,8 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 	return config.RouteChoice{Routes: []string{soonest}}
 }
 
-// noteRouteFallbacks records the marks an adapter reported and writes each
-// SWITCH to the daemon log and the iteration log. It runs on every attempt,
-// before any classification: a switch is a fact about the session that happened
-// whichever way the attempt then ended, and the next attempt (a transient retry)
-// must already start on the route that worked.
-//
-// A denied LAST route is marked but not logged here: there was no switch, and the
-// existing limit branch already says what happened to the session.
+// noteRouteFallbacks records the marks an adapter reported and writes each SWITCH to the daemon log
+// and the iteration log.
 func (d *Driver) noteRouteFallbacks(t Target, drainNum int, inv harness.Invocation, res harness.Result) {
 	_, _, fallbacks := harness.RouteFallbacks(res)
 	if len(fallbacks) == 0 {
@@ -261,10 +210,9 @@ func (d *Driver) noteRouteFallbacks(t Target, drainNum int, inv harness.Invocati
 	}
 }
 
-// routeRetryLabel renders a mark's expiry the way an operator reads a clock: a
-// bare local time for something later today, and the date too when the wait runs
-// past a day (a weekly cap's reset) so "after 12:40" cannot be misread as hours
-// away when it is days.
+// routeRetryLabel renders a mark's expiry the way an operator reads a clock: a bare local time for
+// something later today, and the date too when the wait runs past a day (a weekly cap's reset) so
+// "after 12:40" cannot be misread as hours away when it is days.
 func routeRetryLabel(until time.Time) string {
 	if until.IsZero() {
 		return "the reset"
@@ -275,27 +223,20 @@ func routeRetryLabel(until time.Time) string {
 	return until.Local().Format("15:04 MST")
 }
 
-// routeRoutesFor is the one place the driver turns a phase into the routes its
-// session will offer the adapter, marks and pricing windows applied. It keeps
-// ModelForPhase's answer authoritative when the config names no model at all
-// (the harness default), and otherwise starts on the first ROUTABLE route.
-//
-// A choice with no routes and a WaitUntil is not "no model": it means every
-// route is inside a window under a "wait" schedule, and invocationFor refuses
-// the spawn rather than running on a route the operator paused.
+// routeRoutesFor is the one place the driver turns a phase into the routes its session will offer
+// the adapter, marks and pricing windows applied. A choice with no routes and a WaitUntil is not
+// "no model": it means every route is inside a window under a "wait" schedule, and invocationFor
+// refuses the spawn rather than running on a route the operator paused.
 func (d *Driver) routeRoutesFor(tc *config.Config, ph config.Phase) config.RouteChoice {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	return d.routableRoutes(tc, routes)
 }
 
-// probeRouteFor is the route a supervised-wait probe should test for a phase
-// with a route list (review finding 1.review-1.3): the route its next session
-// would start on, marks and pricing windows applied. A wait is entered only once
-// every route is spent, so that is the route whose mark lifts first - not the
-// harness block's first route, which may be a route this run has already moved
-// off. It returns "" for a phase with one route or none, so a single-route probe
-// keeps the model it always had, and also when every route is windowed (there is
-// no preferred route to aim at; probeInvocation refuses that probe instead).
+// probeRouteFor is the route a supervised-wait probe should test for a phase with a route list
+// (review finding 1.review-1.3): the route its next session would start on, marks and pricing
+// windows applied. A wait is entered only once every route is spent, so that is the route whose
+// mark lifts first - not the harness block's first route, which may be a route this run has already
+// moved off.
 func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	if len(routes) < 2 {
@@ -308,15 +249,11 @@ func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 	return ""
 }
 
-// probeInvocation is the supervised-wait probe's Invocation: the phase harness's
-// probe invocation, aimed at probeRouteFor's route when the phase has a route
-// list.
-//
-// A phase whose every route is inside a "wait" pricing window has NO route a
-// probe may start on, so it refuses the probe rather than letting the phase's
-// model through: the probe is a paid session, and paying the peak price to learn
-// whether a limit lifted is exactly what the schedule exists to prevent. The
-// wait logs the refusal and retries on its own interval, spending nothing.
+// probeInvocation is the supervised-wait probe's Invocation: the phase harness's probe invocation,
+// aimed at probeRouteFor's route when the phase has a route list. A phase whose every route is
+// inside a "wait" pricing window has NO route a probe may start on, so it refuses the probe rather
+// than letting the phase's model through: the probe is a paid session, and paying the peak price to
+// learn whether a limit lifted is exactly what the schedule exists to prevent.
 func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (harness.Invocation, error) {
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), true)
 	if err != nil {

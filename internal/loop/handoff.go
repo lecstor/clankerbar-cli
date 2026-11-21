@@ -1,20 +1,6 @@
-// Session-initiated handoff (CLA-352): a session ends its FINAL message with a
-// marker line followed by the prompt for its successor, and the driver respawns
-// a fresh session on that prompt — same task, same run-continuity rules as a
-// phase resume — instead of moving to the next backlog iteration. The phase
-// split (v0.5.0) is this idea at two fixed, driver-chosen points; this
-// generalises it to points the session chooses.
-//
-// The prompt is parsed out of the final message, NOT a file: the state dir is
-// deliberately outside every session workdir (CLA-259) precisely so sessions
-// cannot write control markers, and the result stream is a channel the driver
-// already consumes.
-//
-// A session-authored respawn prompt is self-directed prompt injection, so it is
-// honoured only inside three non-negotiable guards, enforced in drainPhases:
-// a respawn counts as an iteration against max_iterations and the token budget
-// (checked BEFORE the respawn), an over-size prompt is refused with a logged
-// fallback, and a chain of consecutive handoffs is capped.
+// Session-initiated handoff: a session ends its FINAL message with a marker line followed by the
+// prompt for its successor, and the driver respawns a fresh session on that prompt — same task,
+// same run-continuity rules as a phase resume — instead of moving to the next backlog iteration.
 package loop
 
 import (
@@ -26,43 +12,18 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// handoffChainCap bounds CONSECUTIVE handoff respawns within one phase, so a
-// session cannot chain itself indefinitely: at the cap the emitted prompt is
-// refused and the sequence falls back to the standard brief — the next
-// configured phase, or the drain ending and the task returning to the queue,
-// whose next pickup runs on the configured prompt either way.
-//
-// The chain resets at a phase boundary (drainPhases resets `chain` to 0
-// whenever a phase ends without an accepted handoff), so a multi-phase
-// sequence can chain up to this cap PER PHASE, not once for the whole task.
-// max_iterations and the token budget still bound the total across every
-// phase, so this is never the only ceiling — just the one that stops a single
-// phase's session from respawning itself forever.
+// handoffChainCap bounds CONSECUTIVE handoff respawns within one phase, so a session cannot chain
+// itself indefinitely: at the cap the emitted prompt is refused and the sequence falls back to the
+// standard brief — the next configured phase, or the drain ending and the task returning to the
+// queue, whose next pickup runs on the configured prompt either way. max_iterations and the token
+// budget still bound the total across every phase, so this is never the only ceiling — just the
+// one that stops a single phase's session from respawning itself forever.
 const handoffChainCap = 3
 
-// parseHandoff scans a session's final message for the handoff block: a line
-// that is exactly config.HandoffMarker (surrounding whitespace ignored),
-// followed by the successor's prompt.
-//
-// found reports that a marker LINE is present at all; refusal, when non-empty,
-// says why the block cannot be honoured anyway (no prompt, or over the size
-// cap). The two are separate so a refusal can be logged as what it is — a
-// handoff the session asked for and the driver declined — rather than
-// disappearing into "no marker".
-//
-// The LAST marker line wins, because the block is defined as ending the
-// message: a session that quotes the marker while discussing it and then emits
-// a real block must get the real one, and everything above the last marker is
-// by definition not the successor's prompt. A marker mentioned inline in prose
-// does not match — it is not a line of its own.
-//
-// A marker line must be UNINDENTED, and must not sit inside a fenced code
-// block: a genuine emission is neither. Indentation catches a quotation
-// inside a list item; the fence tracking catches the other natural way a
-// session quotes the mechanism (or explains why it decided against a
-// handoff) — a ``` block, which is itself unindented and would otherwise
-// match. Both are real shapes a session explaining itself produces, and
-// neither may be mistaken for a real handoff block.
+// parseHandoff scans a session's final message for the handoff block: a line that is exactly
+// config.HandoffMarker (surrounding whitespace ignored), followed by the successor's prompt. found
+// reports that a marker LINE is present at all; refusal, when non-empty, says why the block cannot
+// be honoured anyway (no prompt, or over the size cap).
 func parseHandoff(final string) (prompt string, found bool, refusal string) {
 	at := -1
 	inFence := false
@@ -90,41 +51,8 @@ func parseHandoff(final string) (prompt string, found bool, refusal string) {
 	return prompt, true, ""
 }
 
-// detectHandoff reads a finished session's result for a handoff it is safe to
-// act on, returning the successor prompt or "".
-//
-// Each condition is load-bearing, and they are checked here rather than at the
-// seam so every refusal is logged as itself:
-//
-//   - an untrusted stream is not read for a handoff at all, for the same reason
-//     it is not read for claim state (CLA-262): the block may be cut mid-prompt,
-//     and half a session-authored prompt is worse than none. The untrusted path
-//     already logs loudly, so nothing is added here.
-//
-//   - only a CLEAN exit hands off. A turn-capped or failed session's final
-//     message is wherever it happened to stop, not a deliberate ending.
-//
-//   - the session must still HOLD its task: the successor resumes the same run,
-//     so a settled or never-claimed task leaves nothing to resume. The two ways
-//     that happens are logged as themselves (CLA-421), because they are
-//     different situations with different consequences.
-//
-//     A SETTLED task means the session moved it off in_progress itself -
-//     done, in_review, parked, blocked (settlesTask: any status but
-//     in_progress) - and there is genuinely no run to resume. The
-//     refusal is final and correct.
-//
-//     NO OBSERVED CLAIM means the adapter never saw this session claim anything,
-//     so the driver holds no task/run ids - and without them the resume
-//     preamble cannot be seeded: handing the successor a brief carrying literal
-//     placeholders is worse than refusing. A marker from an unobserved claim is
-//     therefore refused: the successor runs a SESSION-authored prompt, and the
-//     guards against self-directed injection were sized for sessions whose claim
-//     state was observed. The claim cannot be recovered from the plane either:
-//     get_task serves presence only, and a run id is a bearer credential no read
-//     returns (CLA-889). The lease is left to expire, and the plane's expiry
-//     sweep is the path that gets the work picked up with its context intact: it
-//     keeps a recorded branch attached as the takeover hand-off.
+// detectHandoff reads a finished session's result for a handoff it is safe to act on, returning the
+// successor prompt or "". - only a CLEAN exit hands off.
 func detectHandoff(drainNum int, t Target, res harness.Result) string {
 	prompt, found, refusal := parseHandoff(res.FinalMessage)
 	if !found || res.Untrusted != "" {

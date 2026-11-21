@@ -7,18 +7,17 @@ import (
 	"strings"
 )
 
-// Attribution is who wrote what: the session that produced this report, and the
-// one whose work it is about. The runner resolves it because a session cannot
-// reliably name its own model and cannot see its predecessor's.
+// Attribution is who wrote what: the session that produced this report, and the one whose work it
+// is about. The runner resolves it because a session cannot reliably name its own model and cannot
+// see its predecessor's.
 type Attribution struct {
 	Harness, Model, PrevHarness, PrevModel string
 }
 
-// RenderReviewBlock renders the LEGACY `## Review` block a runner-claimed review
-// session's report becomes. The driver parses this back - the fix phase reads
-// findings by id and the seam gates on the heading - so the shape is an
-// interface, not cosmetics: the severity bracket and the `(<kind>): <evidence>`
-// prefix after it are load-bearing (see reviewFindingsDigest).
+// RenderReviewBlock renders the LEGACY `## Review` block a runner-claimed review session's report
+// becomes. The driver parses this back - the fix phase reads findings by id and the seam gates on
+// the heading - so the shape is an interface, not cosmetics: the severity bracket and the
+// `(<kind>): <evidence>` prefix after it are load-bearing (see reviewFindingsDigest).
 func RenderReviewBlock(a Attribution, r DoneReport) string {
 	var b strings.Builder
 	b.WriteString(ReviewRecordHeading + "\n")
@@ -42,8 +41,8 @@ func RenderReviewBlock(a Attribution, r DoneReport) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderFindingLine renders one finding in the shape the driver parses back: id,
-// bracketed severity, then a MUST's evidence prefix, location, summary and fix.
+// renderFindingLine renders one finding in the shape the driver parses back: id, bracketed
+// severity, then a MUST's evidence prefix, location, summary and fix.
 func renderFindingLine(n int, f DoneFinding) string {
 	line := fmt.Sprintf("- R%d [%s]", n, f.Severity)
 	if f.Severity == "must" {
@@ -68,8 +67,8 @@ func renderFindingLine(n int, f DoneFinding) string {
 	return line
 }
 
-// findingLoc is `file:line`, or `file` when the session gave no line, or "" when
-// it named no file - the caller drops the whole location clause then.
+// findingLoc is `file:line`, or `file` when the session gave no line, or "" when it named no file -
+// the caller drops the whole location clause then.
 func findingLoc(f DoneFinding) string {
 	if f.File == "" {
 		return ""
@@ -80,10 +79,9 @@ func findingLoc(f DoneFinding) string {
 	return f.File
 }
 
-// RenderFixesSection renders the fix phase's outcome section: the disposition of
-// every finding, then the fix session's own evidence. The **Tests** section is
-// always present because the plane refuses an in_review move whose outcome lacks
-// one.
+// RenderFixesSection renders the fix phase's outcome section: the disposition of every finding,
+// then the fix session's own evidence. The **Tests** section is always present because the plane
+// refuses an in_review move whose outcome lacks one.
 func RenderFixesSection(a Attribution, r DoneReport) string {
 	var b strings.Builder
 	b.WriteString("### Fixes\n")
@@ -109,9 +107,8 @@ func RenderFixesSection(a Attribution, r DoneReport) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// fixUpdateLine renders one findingUpdate. An unrecognised status is printed as
-// given rather than guessed at; ValidateFindingUpdates refuses it before a
-// record is written.
+// fixUpdateLine renders one findingUpdate. An unrecognised status is printed as given rather than
+// guessed at; ValidateFindingUpdates refuses it before a record is written.
 func fixUpdateLine(u DoneFindingUpdate) string {
 	switch u.Status {
 	case "fixed":
@@ -127,8 +124,8 @@ func fixUpdateLine(u DoneFindingUpdate) string {
 	}
 }
 
-// RenderDeliverySection renders the delivery record an implement session's
-// report becomes: what it did, what it verified, and who did it.
+// RenderDeliverySection renders the delivery record an implement session's report becomes: what it
+// did, what it verified, and who did it.
 func RenderDeliverySection(a Attribution, r DoneReport) string {
 	parts := []string{"## Delivery"}
 	if summary := strings.TrimSpace(r.Summary); summary != "" {
@@ -143,18 +140,16 @@ func RenderDeliverySection(a Attribution, r DoneReport) string {
 const TestsHeading = "**Tests**"
 
 // testsSection mirrors the plane's in_review guard (TESTS_SECTION in the plane's
-// repositories/tasks/delivery.ts): the header must open a line, and `__Tests__`
-// and `## Tests` count too. RE2 has no lookahead, so the plane's
-// `tests(?![a-z0-9])` is spelled as an optional non-alphanumeric tail.
+// repositories/tasks/delivery.ts): the header must open a line, and `__Tests__` and `## Tests`
+// count too.
 var testsSection = regexp.MustCompile(`(?im)^[ \t]*(?:[-*+]|\d+[.)]|>|\|)?[ \t]*(?:\*\*[ \t]*tests\b[^*\n]*\*\*|__[ \t]*tests(?:[^a-z0-9_\n][^_\n]*)?__|#{1,6}[ \t]+tests\b)`)
 
-// HasTestsSection reports whether the plane would accept outcome's **Tests**
-// section, so the runner repairs exactly the outcomes it would refuse.
+// HasTestsSection reports whether the plane would accept outcome's **Tests** section, so the runner
+// repairs exactly the outcomes it would refuse.
 func HasTestsSection(outcome string) bool { return testsSection.MatchString(outcome) }
 
-// RenderTestsSection is the **Tests** block every outcome section carries. The
-// absence is stated rather than omitted: the plane requires the section, and a
-// missing one is the whole call refused.
+// RenderTestsSection is the **Tests** block every outcome section carries. The absence is stated
+// rather than omitted: the plane requires the section, and a missing one is the whole call refused.
 func RenderTestsSection(tests string) string {
 	if strings.TrimSpace(tests) == "" {
 		return TestsHeading + " — not reported by the session."
@@ -162,9 +157,7 @@ func RenderTestsSection(tests string) string {
 	return TestsHeading + "\n" + strings.TrimSpace(tests)
 }
 
-// AppendOutcome appends section to an outcome as it stands. The plane's
-// statusless outcome is a full replacement, so a fresh section written over it
-// would lose the records already there. A section already present verbatim is
+// AppendOutcome appends section to an outcome as it stands. A section already present verbatim is
 // left alone: a retried write must not stack the same block twice.
 func AppendOutcome(existing, section string) string {
 	if strings.TrimSpace(existing) == "" {
@@ -176,9 +169,9 @@ func AppendOutcome(existing, section string) string {
 	return strings.TrimRight(existing, "\n ") + "\n\n" + section
 }
 
-// harnessOr and modelOr render an attribution value for a record line. An empty
-// model is normal (the harness default) and must not render as the bare word
-// "model" followed by nothing, which reads like a truncated write.
+// harnessOr and modelOr render an attribution value for a record line. An empty model is normal
+// (the harness default) and must not render as the bare word "model" followed by nothing, which
+// reads like a truncated write.
 func harnessOr(v string) string { return doneAttributionOr(v, "unknown harness") }
 
 func modelOr(v string) string { return doneAttributionOr(v, "harness default") }

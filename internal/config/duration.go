@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// Duration is a time.Duration that unmarshals from a friendly JSON string
-// ("30m", "2h") or a bare number of seconds — so config files stay human-edited.
+// Duration is a time.Duration that unmarshals from a friendly JSON string ("30m", "2h") or a bare
+// number of seconds — so config files stay human-edited.
 type Duration time.Duration
 
 // Duration returns the underlying time.Duration.

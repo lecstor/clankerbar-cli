@@ -5,41 +5,18 @@ import (
 	"strings"
 )
 
-// taskContextBlockMax bounds the context block a runner-claimed session starts
-// with, in bytes. The block is mechanical plumbing, not the task: the plane is
-// always the fuller record, so a block that would cost more than this is
-// truncated and says where the rest lives.
+// taskContextBlockMax bounds the context block a runner-claimed session starts with, in bytes. The
+// block is mechanical plumbing, not the task: the plane is always the fuller record, so a block
+// that would cost more than this is truncated and says where the rest lives.
 const taskContextBlockMax = 8 * 1024
 
-// taskContextTruncationNote replaces whatever was cut. It names the tool rather
-// than the task because the session may not know the ref the runner gave it.
+// taskContextTruncationNote replaces whatever was cut.
 const taskContextTruncationNote = "(truncated — the full text is on the task: get_task)"
 
-// TaskContext is everything the runner hands a claimed session up front, so the
-// session does not spend its first turns on get_task, git plumbing and
-// archaeology. The runner fills it; the session reads the rendered block and
-// starts work.
-//
-// Every empty field is omitted from the block: a session must be able to tell
-// "the runner attempted no merge" from "the merge produced nothing to say".
-//
-// Resumed means the branch already carried prior work, so the session
-// re-validates the task against the merged tip before anything else. Merge is
-// "merged", "up-to-date" or "" (not attempted). Conflicts are the paths the
-// runner's merge of PRBase stopped on before the runner aborted it. MergeHint
-// is the plane's own close-out instruction: the session must be able to follow
-// it verbatim, so it is rendered as a section of its own and never shrunk.
-// DiffBase is the commit a diff in this phase starts from — the runner's
-// merge-base SHA, or origin/PRBase when no SHA was available — so a later phase
-// (a maps-building review) can reuse the base the runner resolved.
-// Questions and Decisions are newest-first except for the blocking questions,
-// which the plane appends at the END. RunnerNext is one sentence naming what
-// the runner does after this session ends.
-//
-// TaskID and RunID are the ids every task write must be signed with. A
-// runner-claimed session never claimed, so these are the only place it learns
-// them: the runner briefs name record_progress(taskId, runId) but carry no
-// placeholder for either.
+// TaskContext is everything the runner hands a claimed session up front, so the session does not
+// spend its first turns on get_task, git plumbing and archaeology. Every empty field is omitted
+// from the block: a session must be able to tell "the runner attempted no merge" from "the merge
+// produced nothing to say".
 type TaskContext struct {
 	Ref         string
 	Title       string
@@ -68,16 +45,10 @@ type TaskContext struct {
 	RunnerNext string
 }
 
-// TaskContextBlock renders the block above the brief. It is deterministic (no
-// map iteration, input order preserved) and never exceeds taskContextBlockMax
-// bytes. Decisions and questions arrive newest-first, so the oldest (the tail)
-// go first: non-blocking questions, then decisions, then blocking questions,
-// and only then is the detail truncated; the truncation note says where the
-// full text is. Blocking questions go last because the plane appends older
-// live blockers at the END of the list and one of them is the reason the task
-// stopped - trimming the tail blindly would drop exactly that. The close-out
-// instruction is header-like and is never shrunk: dropping the plane's own
-// instruction would leave the session inventing one.
+// TaskContextBlock renders the block above the brief. Decisions and questions arrive newest-first,
+// so the oldest (the tail) go first: non-blocking questions, then decisions, then blocking
+// questions, and only then is the detail truncated; the truncation note says where the full text
+// is.
 func TaskContextBlock(c TaskContext) string {
 	if block := renderTaskContext(c, false); len(block) <= taskContextBlockMax {
 		return block
@@ -107,22 +78,19 @@ func TaskContextBlock(c TaskContext) string {
 	if len(block) <= taskContextBlockMax {
 		return block
 	}
-	// Only a header field (a long ref, title, runner-next sentence or close-out
-	// instruction) can still be over the cap here, and those are not the
-	// runner's to drop silently.
+	// Only a header field (a long ref, title, runner-next sentence or close-out instruction) can still
+	// be over the cap here, and those are not the runner's to drop silently.
 	return clampTaskContextBlock(block)
 }
 
-// taskContextFits judges the TRUNCATED render, because that is the block the
-// shrinkage is buying: the note is not optional once anything was cut.
+// taskContextFits judges the TRUNCATED render, because that is the block the shrinkage is buying:
+// the note is not optional once anything was cut.
 func taskContextFits(c TaskContext) bool {
 	return len(renderTaskContext(c, true)) <= taskContextBlockMax
 }
 
-// dropTrailingQuestion removes the LAST question of the given class (blocking
-// or not), preserving the order of the rest, and reports whether it removed
-// one. It copies rather than reslices in place: callers re-render the same
-// input, and an in-place append would reorder the caller's own list.
+// dropTrailingQuestion removes the LAST question of the given class (blocking or not), preserving
+// the order of the rest, and reports whether it removed one.
 func dropTrailingQuestion(
 	questions []struct {
 		Body, Answer string
@@ -148,8 +116,8 @@ func dropTrailingQuestion(
 	return questions, false
 }
 
-// truncateTaskContextDetail returns the longest rune-boundary prefix of the
-// detail for which the block with everything else unchanged is inside the cap.
+// truncateTaskContextDetail returns the longest rune-boundary prefix of the detail for which the
+// block with everything else unchanged is inside the cap.
 func truncateTaskContextDetail(c TaskContext) string {
 	runes := []rune(c.Detail)
 	lo, hi := 0, len(runes)
@@ -166,8 +134,8 @@ func truncateTaskContextDetail(c TaskContext) string {
 	return string(runes[:lo])
 }
 
-// clampTaskContextBlock is the last resort: cut the rendered block on a rune
-// boundary rather than hand a session a block over the cap.
+// clampTaskContextBlock is the last resort: cut the rendered block on a rune boundary rather than
+// hand a session a block over the cap.
 func clampTaskContextBlock(block string) string {
 	if len(block) <= taskContextBlockMax {
 		return block
@@ -193,8 +161,8 @@ func renderTaskContext(c TaskContext, truncated bool) string {
 	if len(c.Conflicts) > 0 {
 		parts = append(parts, taskContextConflicts(c))
 	}
-	// The plane's close-out instruction sits above the fields the shrink logic
-	// may cut: the session follows it verbatim.
+	// The plane's close-out instruction sits above the fields the shrink logic may cut: the session
+	// follows it verbatim.
 	if hint := strings.TrimSpace(c.MergeHint); hint != "" {
 		parts = append(parts, "## Close-out instruction\n"+hint)
 	}
@@ -230,9 +198,8 @@ func taskContextHeader(c TaskContext) string {
 	if phase := taskContextPhase(c); phase != "" {
 		lines = append(lines, phase)
 	}
-	// The ids come right after the phase so they are read before the work, and
-	// the run line states what to do with them: a session that never claimed
-	// has nowhere else to learn them.
+	// The ids come right after the phase so they are read before the work, and the run line states
+	// what to do with them: a session that never claimed has nowhere else to learn them.
 	if id := strings.TrimSpace(c.TaskID); id != "" {
 		lines = append(lines, "Task id: "+id)
 	}
@@ -294,9 +261,9 @@ func taskContextMerge(c TaskContext) string {
 	return strings.TrimSpace(c.Merge)
 }
 
-// taskContextConflicts states the aborted merge and the session's first job.
-// The runner never asks a session to resolve a conflict it did not create, so
-// the redo command is spelled out rather than left to be re-derived.
+// taskContextConflicts states the aborted merge and the session's first job. The runner never asks
+// a session to resolve a conflict it did not create, so the redo command is spelled out rather than
+// left to be re-derived.
 func taskContextConflicts(c TaskContext) string {
 	base, branch := strings.TrimSpace(c.PRBase), strings.TrimSpace(c.Branch)
 	if base == "" {
@@ -332,8 +299,8 @@ func taskContextDecisions(items []struct{ Question, Answer string }) string {
 	return strings.Join(lines, "\n")
 }
 
-// taskContextQuestions renders the answered questions, marking a blocker so the
-// session can tell the reason the task stopped from ordinary Q&A.
+// taskContextQuestions renders the answered questions, marking a blocker so the session can tell
+// the reason the task stopped from ordinary Q&A.
 func taskContextQuestions(items []struct {
 	Body, Answer string
 	Blocking     bool
@@ -351,8 +318,8 @@ func taskContextQuestions(items []struct {
 	return strings.Join(lines, "\n")
 }
 
-// taskContextPair renders one question/answer bullet, keeping a half-answered
-// item readable rather than dropping it.
+// taskContextPair renders one question/answer bullet, keeping a half-answered item readable rather
+// than dropping it.
 func taskContextPair(question, answer string) string {
 	question, answer = strings.TrimSpace(question), strings.TrimSpace(answer)
 	switch {

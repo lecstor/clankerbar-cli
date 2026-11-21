@@ -1,16 +1,6 @@
 package config
 
 // reviewmethod.go — how a review phase produces its findings.
-//
-// The shipped method is one single-pass session: read the diff, write the
-// record. `review_method: "maps-session"` replaces that session's turns with
-// the maps+notes technique (CLA-864): the driver maps the diff into M/F items,
-// sends them in chunks, and the session writes notes per item before a final
-// findings turn turns those notes into the record. The technique is a runner
-// feature through and through — the maps are built by the DRIVER in the worktree
-// the runner prepared — so a harness that cannot continue one session across
-// turns cannot run it, and Validate refuses rather than silently running only
-// the first turn.
 
 import (
 	"fmt"
@@ -19,79 +9,66 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// The review methods a phase or panel member may name. An empty value is the
-// shipped single-pass review, so an untouched config is unchanged; naming
-// "single-pass" explicitly is accepted so a config can state it.
+// The review methods a phase or panel member may name.
 const (
 	ReviewMethodSinglePass  = "single-pass"
 	ReviewMethodMapsSession = "maps-session"
 )
 
-// The maps-session defaults, matching the benchmarked profile (CLA-864). A zero
-// field selects these, which is what lets an operator write only the knob they
-// care about.
+// The maps-session defaults, matching the benchmarked profile.
 const (
 	// DefaultMapsSessionChunkSize is how many items one notes turn receives.
 	DefaultMapsSessionChunkSize = 25
-	// DefaultMapsSessionFlowMax is the flow map's item cap. The change map has
-	// none: a reviewer that misses a changed region misses it entirely.
+	// DefaultMapsSessionFlowMax is the flow map's item cap. The change map has none: a reviewer that
+	// misses a changed region misses it entirely.
 	DefaultMapsSessionFlowMax = 40
-	// DefaultMapsSessionHunkBytesPerItem caps the hunk text embedded under one
-	// M item. The benchmarked PR's hunks are far under it; a very large generated
-	// file is cut at a line boundary and the item names the command for the rest.
+	// DefaultMapsSessionHunkBytesPerItem caps the hunk text embedded under one M item. The benchmarked
+	// PR's hunks are far under it; a very large generated file is cut at a line boundary and the item
+	// names the command for the rest.
 	DefaultMapsSessionHunkBytesPerItem = 4096
-	// DefaultMapsSessionHunkBytesTotal caps the hunk text embedded across the
-	// change map (~15k tokens). Past it the remaining items stay plain, so the
-	// embedded diffs replace reads without crowding out the brief and the notes.
+	// DefaultMapsSessionHunkBytesTotal caps the hunk text embedded across the change map (~15k
+	// tokens). Past it the remaining items stay plain, so the embedded diffs replace reads without
+	// crowding out the brief and the notes.
 	DefaultMapsSessionHunkBytesTotal = 61440
 )
 
-// MapsSessionOptions configures the maps-session review method. Every field has
-// a zero-value default, so `"maps_session": {}` is a valid profile.
+// MapsSessionOptions configures the maps-session review method. Every field has a zero-value
+// default, so `"maps_session": {}` is a valid profile.
 type MapsSessionOptions struct {
 	// ChunkSize is how many map items one notes turn carries. Zero selects
 	// DefaultMapsSessionChunkSize.
 	ChunkSize int `json:"chunk_size,omitempty"`
 
-	// NotesModel names the model the notes turns run on. Empty inherits the
-	// phase's model. It exists so a stronger model can take the per-item reading
-	// and a cheaper one write the findings (or the reverse) — the choice is the
-	// operator's, never this package's.
+	// NotesModel names the model the notes turns run on. Empty inherits the phase's model.
 	NotesModel string `json:"notes_model,omitempty"`
 
-	// FindingsModel names the model the final findings turn runs on. Empty
-	// inherits the phase's model, like NotesModel; when the phase names no model
-	// either, it inherits the resolved notes stage model, since that is the model
-	// the live session is already on (see StageModels).
+	// FindingsModel names the model the final findings turn runs on. Empty inherits the phase's model,
+	// like NotesModel; when the phase names no model either, it inherits the resolved notes stage
+	// model, since that is the model the live session is already on (see StageModels).
 	FindingsModel string `json:"findings_model,omitempty"`
 
-	// FlowMax caps the flow map's items (uses beyond the cap are summarised in
-	// an unnumbered line). Zero selects DefaultMapsSessionFlowMax.
+	// FlowMax caps the flow map's items (uses beyond the cap are summarised in an unnumbered line).
+	// Zero selects DefaultMapsSessionFlowMax.
 	FlowMax int `json:"flow_max,omitempty"`
 
-	// EmbedHunks carries each M item's hunk in the prompt. It is off by default:
-	// a harness that batches its own reads (Claude) gains little, while a
-	// step-heavy one (DeepSeek Flash) spends its turns fetching code instead of
-	// reading it. A nil block is off.
+	// EmbedHunks carries each M item's hunk in the prompt.
 	EmbedHunks *EmbedHunksOptions `json:"embed_hunks,omitempty"`
 }
 
-// EmbedHunksOptions configures maps_session.embed_hunks. Zero-value budgets
-// select the defaults above, so `{"enabled": true}` is a complete profile.
+// EmbedHunksOptions configures maps_session.embed_hunks. Zero-value budgets select the defaults
+// above, so `{"enabled": true}` is a complete profile.
 type EmbedHunksOptions struct {
 	// Enabled turns hunk embedding on. Off by default.
 	Enabled bool `json:"enabled,omitempty"`
 
-	// MaxBytesPerItem caps the hunk text embedded under one M item. Zero
-	// selects DefaultMapsSessionHunkBytesPerItem.
+	// MaxBytesPerItem caps the hunk text embedded under one M item. Zero selects
+	// DefaultMapsSessionHunkBytesPerItem.
 	MaxBytesPerItem int `json:"max_bytes_per_item,omitempty"`
 
-	// MaxBytesTotal caps the hunk text embedded across all M items. Zero
-	// selects DefaultMapsSessionHunkBytesTotal. The prompt is NOT chunked
-	// before it reaches a harness: opencode receives it as one argv string,
-	// and Linux caps a single argument at 128 KiB (MAX_ARG_STRLEN), so the
-	// default's ~80 KiB first turn leaves only ~48 KiB of headroom before a
-	// raised budget fails the spawn with E2BIG.
+	// MaxBytesTotal caps the hunk text embedded across all M items. The prompt is NOT chunked before
+	// it reaches a harness: opencode receives it as one argv string, and Linux caps a single argument
+	// at 128 KiB (MAX_ARG_STRLEN), so the default's ~80 KiB first turn leaves only ~48 KiB of headroom
+	// before a raised budget fails the spawn with E2BIG.
 	MaxBytesTotal int `json:"max_bytes_total,omitempty"`
 }
 
@@ -123,13 +100,10 @@ func (o MapsSessionOptions) Resolved() MapsSessionOptions {
 	return o
 }
 
-// StageModels resolves the model each stage runs on for a phase whose resolved
-// model is phaseModel: a stage's own model wins, an empty one inherits the
-// phase's, and a findings stage with neither runs on the notes stage's model —
-// a live session cannot return to the harness's own default mid-conversation, so
-// the notes model is what the findings turn actually produces. The runner and
-// doctor both read this one function so the record and the preflight cannot
-// disagree about which model wrote the findings.
+// StageModels resolves the model each stage runs on for a phase whose resolved model is phaseModel:
+// a stage's own model wins, an empty one inherits the phase's, and a findings stage with neither
+// runs on the notes stage's model — a live session cannot return to the harness's own default
+// mid-conversation, so the notes model is what the findings turn actually produces.
 func (o MapsSessionOptions) StageModels(phaseModel string) (notes, findings string) {
 	notes = o.NotesModel
 	if notes == "" {
@@ -149,9 +123,7 @@ func (o MapsSessionOptions) StageModels(phaseModel string) (notes, findings stri
 // UsesMapsSession reports whether this phase asked for the maps-session method.
 func (p Phase) UsesMapsSession() bool { return p.ReviewMethod == ReviewMethodMapsSession }
 
-// MapsSessionDefaults returns this phase's maps-session options with the
-// defaults filled in. It is total: a phase that names no options object gets
-// the benchmark profile, which is what the method's zero value means.
+// MapsSessionDefaults returns this phase's maps-session options with the defaults filled in.
 func (p Phase) MapsSessionDefaults() MapsSessionOptions {
 	o := MapsSessionOptions{}
 	if p.MapsSession != nil {
@@ -160,10 +132,8 @@ func (p Phase) MapsSessionDefaults() MapsSessionOptions {
 	return o.Resolved()
 }
 
-// validateReviewMethods checks every effective step that names a review method:
-// the method is known, the step can run a turn sequence, and the options are
-// not inert. It reads the EFFECTIVE sequence so a panel member's own method and
-// inherited options are judged as they will run.
+// validateReviewMethods checks every effective step that names a review method: the method is
+// known, the step can run a turn sequence, and the options are not inert.
 func (c *Config) validateReviewMethods() error {
 	for i, ph := range c.EffectivePhases() {
 		if ph.ReviewMethod == "" && ph.MapsSession == nil {
@@ -182,11 +152,8 @@ func (c *Config) validateReviewMethods() error {
 			return fmt.Errorf("%s: unknown review_method %q (want: %q or %q, or omit it for the single-pass default)",
 				step, ph.ReviewMethod, ReviewMethodSinglePass, ReviewMethodMapsSession)
 		}
-		// The method only means anything on a REVIEW phase: its prompt is what
-		// the maps section is appended to, and a non-review step has no review
-		// record for the findings turn to write. A verification round is
-		// review-SHAPED but adjudicates prior findings over a fix delta, so it is
-		// explicitly out: its done report is the verifier's, not a fresh review's.
+		// The method only means anything on a REVIEW phase: its prompt is what the maps section is
+		// appended to, and a non-review step has no review record for the findings turn to write.
 		if !ReviewShaped(ph.Prompt) || VerifyShaped(ph.Prompt) {
 			hint := ""
 			if ph.Name == ReviewPhaseName {
@@ -198,8 +165,8 @@ func (c *Config) validateReviewMethods() error {
 		h := c.HarnessFor(ph)
 		caps, known := harness.CapabilitiesOf(h)
 		if !known {
-			// validatePhaseHarnesses/validatePanelMembers already refused an
-			// unknown harness; keep this total rather than crashing.
+			// validatePhaseHarnesses/validatePanelMembers already refused an unknown harness; keep this
+			// total rather than crashing.
 			return fmt.Errorf("%s: review_method %q needs a harness that can run a turn sequence, and %q is not a registered harness",
 				step, ReviewMethodMapsSession, h)
 		}
@@ -225,9 +192,8 @@ func (c *Config) validateReviewMethods() error {
 	return nil
 }
 
-// reviewMethodStep labels a step in a review-method refusal: a configured phase
-// by its position and label, an expanded panel member by its label (its
-// position is the member's, not the operator's).
+// reviewMethodStep labels a step in a review-method refusal: a configured phase by its position and
+// label, an expanded panel member by its label (its position is the member's, not the operator's).
 func reviewMethodStep(ph Phase, i int) string {
 	if ph.IsPanelMember() {
 		return fmt.Sprintf("review_panel member %q", ph.Label(i))

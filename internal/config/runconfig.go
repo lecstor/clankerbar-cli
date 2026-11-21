@@ -1,32 +1,4 @@
-// Run-config consumption (CLA-410): the CLI side of the plane's stored
-// execution-config document (CLA-408, phase 1). The plane stores a per-project
-// document whose keys are this file's own snake_case config names; at start of
-// run and on every backlog-summary `runConfigVersion` bump, the loop overlays
-// that document over its local file — per project — so each project's sessions
-// run under its own ratified policy. Until a project has one (version 0, or a
-// document carrying nothing), the local file rules byte for byte.
-//
-// What is consumed is exactly what CLA-410's bar names plus the two numeric
-// backstops stored in this config's native units: harness, model, tier buckets
-// (`models`, and the per-harness blocks' model/models half), budget,
-// escalation rules, max_turns, max_session_wall_clock — and, since CLA-598,
-// the PIPELINE: `prompt`, `phases` and `review_panel` (operator decision
-// 30d69869 decoupled that from the CLA-454 state-machine reshape; the CLI still
-// sequences sessions itself, it now reads the sequence from the plane). Those
-// three are ONE section: carrying any of them replaces all three, so a stored
-// `phases` clears a local `prompt` and panel, and a stored `prompt` clears a
-// local sequence (decision 6bf1fa15's per-section rule).
-//
-// `review_panel_concurrency` is NOT part of that section: it is MACHINE-OWNED
-// (operator decision e1365721). The run's RESULT must be the same on every
-// machine; a machine may change only how fast it gets there, so the local
-// file's cap stays in force whatever a stored document carries, and the overlay
-// neither replaces nor clears it. A stored document that names it has the value
-// accepted and ignored, never applied.
-//
-// Deliberately NOT consumed yet: transitions (the workflow document is data for
-// the same reshape), backlog_url and allow_local_mcp_servers (part of the local
-// bootstrap core), notes (console-facing reasoning).
+// Run-config consumption: the CLI side of the plane's stored execution-config document.
 package config
 
 import (
@@ -35,29 +7,22 @@ import (
 	"strings"
 )
 
-// RunConfigSchemaVersion is the newest `$schema_version` this build
-// understands. A stored document carrying a HIGHER version is refused at both
-// consume points (the loop's applyRunConfig and doctor's checkRunConfigs),
-// loudly and keeping the previous config — never partially applied. The
-// version bump is the one signal that means "the keys you do know may no
-// longer mean what you think", which is exactly what the unknown-keys rule
-// below cannot cover: extra keys degrade to unconsumed, but a newer schema
-// may have changed the meaning of the keys this build DOES know.
+// RunConfigSchemaVersion is the newest `$schema_version` this build understands. A stored document
+// carrying a HIGHER version is refused at both consume points (the loop's applyRunConfig and
+// doctor's checkRunConfigs), loudly and keeping the previous config — never partially applied.
 const RunConfigSchemaVersion = 1
 
-// RunConfigHarnessBlock is the POLICY half of a per-harness block as the plane
-// stores it. The machine-fit twins (`config_dir`, `mcp_config_path`,
-// `settings_path`) are paths and wiring the plane never carries, so an overlay
-// can only fill these two fields of an existing local block — it cannot hand a
-// session somebody else's dialect.
+// RunConfigHarnessBlock is the POLICY half of a per-harness block as the plane stores it. The
+// machine-fit twins (`config_dir`, `mcp_config_path`, `settings_path`) are paths and wiring the
+// plane never carries, so an overlay can only fill these two fields of an existing local block —
+// it cannot hand a session somebody else's dialect.
 type RunConfigHarnessBlock struct {
 	Model  string            `json:"model"`
 	Models map[string]string `json:"models"`
 }
 
-// RunConfigBudget mirrors Budget as the plane stores it: integer seconds for
-// wall clock (Duration accepts a bare number), zero meaning unset exactly as
-// in the local file.
+// RunConfigBudget mirrors Budget as the plane stores it: integer seconds for wall clock (Duration
+// accepts a bare number), zero meaning unset exactly as in the local file.
 type RunConfigBudget struct {
 	MaxTokens        int                      `json:"max_tokens"`
 	MaxCostUSD       float64                  `json:"max_cost_usd"`
@@ -66,18 +31,15 @@ type RunConfigBudget struct {
 	PerHarness       map[string]HarnessBudget `json:"per_harness"`
 }
 
-// RunConfigEscalation mirrors Escalation. The rules stay mechanical globs and
-// category names; the CLI evaluates them at review-spawn time exactly as when
-// they came from the local file.
+// RunConfigEscalation mirrors Escalation. The rules stay mechanical globs and category names; the
+// CLI evaluates them at review-spawn time exactly as when they came from the local file.
 type RunConfigEscalation struct {
 	PathRules     map[string]string `json:"path_rules"`
 	CategoryRules map[string]string `json:"category_rules"`
 }
 
-// RunConfigPhase is the plane's stored phase shape (RunConfigPhase in the
-// plane's shared schema), mapped onto Phase by RunConfigDoc.phases. The plane
-// names `max_wall_clock` in integer seconds, which Duration accepts; `model`
-// mirrors the now operator-facing Phase.Model (CLA-722).
+// RunConfigPhase is the plane's stored phase shape (RunConfigPhase in the plane's shared schema),
+// mapped onto Phase by RunConfigDoc.phases.
 type RunConfigPhase struct {
 	Name         string   `json:"name"`
 	Prompt       string   `json:"prompt"`
@@ -86,23 +48,17 @@ type RunConfigPhase struct {
 	Tier         string   `json:"tier"`
 	Model        string   `json:"model"`
 	Harness      string   `json:"harness"`
-	// ReviewMethod and MapsSession are this build's review-method knobs. They
-	// are decoded so a plane whose stored schema learns them needs no second
-	// change here; RunConfigDocument refuses to EXPORT them until that happens
-	// (the v1 schema refuses unknown phase keys), so today they can only arrive
-	// from a hand-written document the plane accepted.
+	// ReviewMethod and MapsSession are this build's review-method knobs. They are decoded so a plane
+	// whose stored schema learns them needs no second change here; RunConfigDocument refuses to EXPORT
+	// them until that happens (the v1 schema refuses unknown phase keys), so today they can only
+	// arrive from a hand-written document the plane accepted.
 	ReviewMethod string              `json:"review_method"`
 	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
-// RunConfigPanelMember is one stored review-panel member, mapped onto
-// ReviewPanelMember. A member may set both `model` and `tier` (the alias wins
-// on expansion), exactly as in the local file — the one-model rule applies to a
-// configured PHASE, not to a member.
-//
-// Optional travels with the member (CLA-784): a trial seat configured in the
-// stored document must stay a trial seat when the overlay applies it, or every
-// fleet applying that pipeline would silently promote it to a required reviewer.
+// RunConfigPanelMember is one stored review-panel member, mapped onto ReviewPanelMember. A member
+// may set both `model` and `tier` (the alias wins on expansion), exactly as in the local file —
+// the one-model rule applies to a configured PHASE, not to a member.
 type RunConfigPanelMember struct {
 	Name         string              `json:"name"`
 	Harness      string              `json:"harness"`
@@ -113,26 +69,17 @@ type RunConfigPanelMember struct {
 	MapsSession  *MapsSessionOptions `json:"maps_session"`
 }
 
-// RunConfigEvents mirrors the plane's `events` block (CLA-601/603/887). Absent
-// reads as both dials off. Activity carries tool names, one identifying string
-// per call and todo snapshots; Transcript is the second opt-in and adds a
-// completed call's output and each assistant text block. The consumer is
-// resolveRunConfigEvents on the plane; this side must fail closed on its own, and
-// a stored `transcript: true` without activity is only ever read as off.
+// RunConfigEvents mirrors the plane's `events` block. The consumer is resolveRunConfigEvents on the
+// plane; this side must fail closed on its own, and a stored `transcript: true` without activity is
+// only ever read as off.
 type RunConfigEvents struct {
 	Activity   bool `json:"activity"`
 	Transcript bool `json:"transcript"`
 }
 
-// RunConfigRole is one stored role block (`roles.planner`), mapped onto
-// RoleAssignment. It reuses the phase block's field names, plus
-// `max_session_tokens` — the per-session bound a conversation resumes against.
-// There is no `name`: a role is keyed by its own name, and a role's `prompt` is
-// a custom brief, never a built-in selector.
-//
-// `roles` is a WHOLE SECTION of the stored document (studio-chat.md §1): absent
-// inherits the org default, `roles: {}` is the explicit opt-out. Only `planner`
-// exists in v1, and the plane refuses any other key before it is stored.
+// RunConfigRole is one stored role block (`roles.planner`), mapped onto RoleAssignment. There is no
+// `name`: a role is keyed by its own name, and a role's `prompt` is a custom brief, never a
+// built-in selector.
 type RunConfigRole struct {
 	Harness          string   `json:"harness"`
 	Model            string   `json:"model"`
@@ -143,26 +90,10 @@ type RunConfigRole struct {
 	MaxSessionTokens int      `json:"max_session_tokens"`
 }
 
-// RunConfigDoc mirrors the plane's stored execution-config document — only the
-// keys this build consumes. JSON decoding ignores everything else, so a newer
-// plane's added keys degrade to "unconsumed" rather than unmarshal errors;
-// Empty reports that case so the caller can say "nothing applied" honestly.
-// A newer `$schema_version` is NOT covered by that rule — it means the known
-// keys themselves may have changed meaning — so the consume points refuse it
-// outright; see RunConfigSchemaVersion and SchemaNewer.
-//
-// Prompt, Phases and ReviewPanel are the PIPELINE section (CLA-598). Its
-// presence is judged by KEY, not by value: a nil Phases/ReviewPanel is an
-// absent key, while an empty non-nil slice is a key that clears the local
-// value, and a `prompt` key counts however empty its string is (presence rides
-// in promptSet, which UnmarshalJSON fills — a plain string cannot tell `"prompt":
-// ""` from an absent key).
-//
-// ReviewPanelConcurrency is deliberately NOT part of that section: it is
-// machine-owned (decision e1365721), so the overlay never applies it. The field
-// stays here only because the plane stores the key and a client must be able to
-// decode the whole document; it is accepted and ignored, never copied onto the
-// config.
+// RunConfigDoc mirrors the plane's stored execution-config document — only the keys this build
+// consumes. A newer `$schema_version` is NOT covered by that rule — it means the known keys
+// themselves may have changed meaning — so the consume points refuse it outright; see
+// RunConfigSchemaVersion and SchemaNewer.
 type RunConfigDoc struct {
 	SchemaVersion          int                              `json:"$schema_version"`
 	Harness                string                           `json:"harness"`
@@ -178,32 +109,28 @@ type RunConfigDoc struct {
 	MaxSessionWallClock    Duration                         `json:"max_session_wall_clock"`
 	Budget                 *RunConfigBudget                 `json:"budget"`
 	Escalation             *RunConfigEscalation             `json:"escalation"`
-	// Events is the agent event channel's per-project opt-in. A nil pointer is an
-	// ABSENT key (both dials off, the local rules); a present block — even one
-	// with both false — is the project stating where the dials sit.
+	// Events is the agent event channel's per-project opt-in. A nil pointer is an ABSENT key (both
+	// dials off, the local rules); a present block — even one with both false — is the project
+	// stating where the dials sit.
 	Events *RunConfigEvents `json:"events"`
 
-	// Roles is the sixth whole-section (studio-chat.md §1): `roles.planner` is
-	// the conversation role's harness, model, brief and bounds. A nil map is an
-	// ABSENT key (inherit, and with nothing to inherit there is no chat); a
-	// present map replaces the section whole, so `roles: {}` is the explicit
-	// opt-out. Only `planner` is consumed in v1.
+	// Roles is the sixth whole-section (studio-chat.md §1): `roles.planner` is the conversation
+	// role's harness, model, brief and bounds. Only `planner` is consumed in v1.
 	Roles map[string]RunConfigRole `json:"roles"`
 }
 
-// UnmarshalJSON decodes the document and records whether the `prompt` KEY was
-// present, because the pipeline section is judged on key presence
-// (decision 6bf1fa15): a document carrying `"prompt": ""` is a stored statement
-// that clears the local pipeline, exactly like an empty non-nil `phases` array,
-// and a string field cannot tell that from an absent key.
+// UnmarshalJSON decodes the document and records whether the `prompt` KEY was present, because the
+// pipeline section is judged on key presence (decision 6bf1fa15): a document carrying `"prompt":
+// ""` is a stored statement that clears the local pipeline, exactly like an empty non-nil `phases`
+// array, and a string field cannot tell that from an absent key.
 func (d *RunConfigDoc) UnmarshalJSON(data []byte) error {
 	type docAlias RunConfigDoc // no methods: decoding into it cannot recurse here
 	var a docAlias
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
 	}
-	// A map probe, not a *string: `"prompt": null` still carries the key, and the
-	// section rule is about the key, not the value.
+	// A map probe, not a *string: `"prompt": null` still carries the key, and the section rule is
+	// about the key, not the value.
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
@@ -213,11 +140,10 @@ func (d *RunConfigDoc) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// SchemaNewer reports whether the document carries a `$schema_version` newer
-// than this build understands (see RunConfigSchemaVersion). The consume points
-// check this BEFORE Empty: a newer-schema document that happens to set nothing
-// else must still be refused loudly as a version mismatch, not waved through
-// as "nothing consumable".
+// SchemaNewer reports whether the document carries a `$schema_version` newer than this build
+// understands (see RunConfigSchemaVersion). The consume points check this BEFORE Empty: a
+// newer-schema document that happens to set nothing else must still be refused loudly as a version
+// mismatch, not waved through as "nothing consumable".
 func (d *RunConfigDoc) SchemaNewer() bool {
 	if d == nil {
 		return false
@@ -225,17 +151,11 @@ func (d *RunConfigDoc) SchemaNewer() bool {
 	return d.SchemaVersion > RunConfigSchemaVersion
 }
 
-// pipelineSet reports whether the stored document carries ANY key of the
-// pipeline section (prompt, phases, review_panel), which is what makes the
-// overlay replace all three: the section is one unit, exactly as the plane
-// stores it (decision 6bf1fa15). Presence is judged the way JSON can express it
-// — a nil slice is an absent key, an empty one is a key that clears — so
-// `"phases": []` still counts. `prompt` counts by KEY too: an explicitly present
-// empty string clears the local pipeline rather than reading as absent.
-//
-// `review_panel_concurrency` is NOT a section key (decision e1365721): a
-// document carrying only that is not a pipeline statement at all, so the local
-// pipeline stays untouched.
+// pipelineSet reports whether the stored document carries ANY key of the pipeline section (prompt,
+// phases, review_panel), which is what makes the overlay replace all three: the section is one
+// unit, exactly as the plane stores it (decision 6bf1fa15). `review_panel_concurrency` is NOT a
+// section key (decision e1365721): a document carrying only that is not a pipeline statement at
+// all, so the local pipeline stays untouched.
 func (d *RunConfigDoc) pipelineSet() bool {
 	if d == nil {
 		return false
@@ -243,9 +163,9 @@ func (d *RunConfigDoc) pipelineSet() bool {
 	return d.promptSet || d.Prompt != "" || d.Phases != nil || d.ReviewPanel != nil
 }
 
-// Empty reports whether the document consumes to nothing: every field a stored
-// document may set is absent. The plane's default document is exactly this —
-// `{}` with a schema version — and it means "the local file rules".
+// Empty reports whether the document consumes to nothing: every field a stored document may set is
+// absent. The plane's default document is exactly this — `{}` with a schema version — and it
+// means "the local file rules".
 func (d *RunConfigDoc) Empty() bool {
 	if d == nil {
 		return true
@@ -256,11 +176,10 @@ func (d *RunConfigDoc) Empty() bool {
 		d.Budget == nil && d.Escalation == nil && d.Events == nil && d.Roles == nil
 }
 
-// Clone returns a copy safe to overlay a run-config document onto: every map
-// ApplyRunConfig can replace or mutate is copied one level deep, so the base
-// config the driver shares across targets is never written through. Fields the
-// overlay never touches (projects, repos, env, wiring) share backing storage —
-// treat them read-only on the clone, which is all the drain path does.
+// Clone returns a copy safe to overlay a run-config document onto: every map ApplyRunConfig can
+// replace or mutate is copied one level deep, so the base config the driver shares across targets
+// is never written through. Fields the overlay never touches (projects, repos, env, wiring) share
+// backing storage — treat them read-only on the clone, which is all the drain path does.
 func (c *Config) Clone() *Config {
 	cp := *c
 	cp.Models = cloneStrMap(c.Models)
@@ -283,14 +202,12 @@ func (c *Config) Clone() *Config {
 	if c.Escalation.CategoryRules != nil {
 		cp.Escalation.CategoryRules = cloneStrMap(c.Escalation.CategoryRules)
 	}
-	// Element values are written by Validate's per-project discovery, so the
-	// slice gets its own backing array even though the overlay itself never
-	// touches projects.
+	// Element values are written by Validate's per-project discovery, so the slice gets its own
+	// backing array even though the overlay itself never touches projects.
 	cp.Projects = append([]Project(nil), c.Projects...)
-	// The pipeline is replaced wholesale by an overlay, so both slices get their
-	// own backing arrays: appending to (or writing into) the clone's phases or
-	// panel must never reach the base config the driver shares across targets,
-	// and an overlay on a clone must never alias the base (CLA-598).
+	// The pipeline is replaced wholesale by an overlay, so both slices get their own backing arrays:
+	// appending to (or writing into) the clone's phases or panel must never reach the base config the
+	// driver shares across targets, and an overlay on a clone must never alias the base.
 	cp.Phases = append([]Phase(nil), c.Phases...)
 	for i := range cp.Phases {
 		cp.Phases[i].MapsSession = cloneMapsSession(cp.Phases[i].MapsSession)
@@ -299,9 +216,9 @@ func (c *Config) Clone() *Config {
 	for i := range cp.ReviewPanel {
 		cp.ReviewPanel[i].MapsSession = cloneMapsSession(cp.ReviewPanel[i].MapsSession)
 	}
-	// The planner role is replaced wholesale by an overlay (a pointer), so the
-	// clone gets its own block: a later apply on the clone must never rewrite
-	// the base config the driver shares across targets.
+	// The planner role is replaced wholesale by an overlay (a pointer), so the clone gets its own
+	// block: a later apply on the clone must never rewrite the base config the driver shares across
+	// targets.
 	if c.Planner != nil {
 		p := *c.Planner
 		cp.Planner = &p
@@ -309,10 +226,10 @@ func (c *Config) Clone() *Config {
 	return &cp
 }
 
-// cloneMapsSession copies a maps-session options block so a clone's phases never
-// alias the base config's. The block is read-only today, but the pipeline
-// replacement and the panel expansion both hand pointers around, and a future
-// write through one must not reach the config every target shares.
+// cloneMapsSession copies a maps-session options block so a clone's phases never alias the base
+// config's. The block is read-only today, but the pipeline replacement and the panel expansion both
+// hand pointers around, and a future write through one must not reach the config every target
+// shares.
 func cloneMapsSession(o *MapsSessionOptions) *MapsSessionOptions {
 	if o == nil {
 		return nil
@@ -336,68 +253,37 @@ func cloneStrMap(m map[string]string) map[string]string {
 	return out
 }
 
-// ApplyRunConfig overlays a stored document onto c IN PLACE: a field the
-// document sets wins, a field it omits keeps the local value — except the
-// `events` and `roles` sections, which belong to the stored document alone (an
-// absent block is both events dials off, fail closed, and no planner, fail
-// closed: no local file may turn either on). Maps replace
-// wholesale when present — the document is the operator's ratified word for
-// that map, and merging would resurrect entries the ratification dropped.
-// Callers re-run Validate afterwards: an overlay CAN produce a combination the
-// local file alone could not (a stored harness name nobody registered), and a
-// refused combination must be loud, not silently half-applied.
-// A newer `$schema_version` never overlays, not even through a direct call:
-// the consume points (the loop's applyRunConfig, doctor's checkRunConfigs)
-// refuse it LOUDLY before calling; this early return is the quiet backstop
-// behind them, so a future caller that forgets the check still keeps the
-// previous config instead of running keys whose meaning may have changed.
-//
-// A harness swap is refused outright when it would hand the new harness the
-// old one's machine-local wiring (CLA-475): SessionFor attaches the run-wide
-// model, models, config_dir, mcp_config_path and settings_path to whichever
-// harness is top-level, and ResolveMCPConfig attaches a project's own
-// mcp_config_path to the top-level harness, so re-pointing `harness` over a
-// base that wires the old harness run-wide (or per project) silently re-homes
-// that dialect. The document carries no machine fields to re-wire the new
-// harness with, so the only safe swaps are the ones that inherit nothing:
-// the base sets none of those fields run-wide (or per project), or the new
-// harness already declares its own values for every one the base sets. Anything
-// else returns an error and leaves c untouched — the callers log it on the
-// existing loud "REFUSED locally" path and keep the previous config. The
-// supervisor's per-instance harness override rides the same check through
-// CheckHarnessSwap: it re-points the same top-level over the same machine
-// layer through a different door.
+// ApplyRunConfig overlays a stored document onto c IN PLACE: a field the document sets wins, a
+// field it omits keeps the local value — except the `events` and `roles` sections, which belong
+// to the stored document alone (an absent block is both events dials off, fail closed, and no
+// planner, fail closed: no local file may turn either on). Callers re-run Validate afterwards: an
+// overlay CAN produce a combination the local file alone could not (a stored harness name nobody
+// registered), and a refused combination must be loud, not silently half-applied.
 func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.SchemaNewer() {
 		return nil
 	}
 	if doc == nil {
-		// No document at all is not a stored `{}`: there is nothing to overlay
-		// and nothing to fail closed on, so leave the config untouched.
+		// No document at all is not a stored `{}`: there is nothing to overlay and nothing to fail closed
+		// on, so leave the config untouched.
 		return nil
 	}
-	// The event channel's dials (CLA-603) are reset FIRST, before the empty
-	// document returns: the stored, effective document is the authority, so an
-	// absent block means both dials off (fail closed) — including the plane's
-	// default `{}` document, so a caller reusing a live config cannot keep the
-	// channel on a project that says nothing. No local-file value can turn one
-	// on; the machine can only opt out (NoEvents), which this overlay never
-	// touches.
+	// The event channel's dials are reset FIRST, before the empty document returns: the stored,
+	// effective document is the authority, so an absent block means both dials off (fail closed) —
+	// including the plane's default `{}` document, so a caller reusing a live config cannot keep the
+	// channel on a project that says nothing.
 	c.Events = RunConfigEvents{}
 	if doc.Events != nil {
 		c.Events = *doc.Events
 	}
 	if c.Events.Transcript && !c.Events.Activity {
-		// The plane refuses this combination at save time; a document that still
-		// carries it (a hand-edited store, a future reader) fails closed.
+		// The plane refuses this combination at save time; a document that still carries it (a
+		// hand-edited store, a future reader) fails closed.
 		c.Events.Transcript = false
 	}
-	// The `roles` section is the stored document's alone too (studio-chat.md
-	// §1/§2): a nil map means the project inherited no planner and chat is OFF,
-	// which is the fail-closed answer for a project that never ratified one.
-	// The empty document cannot swap a harness, so the fail-closed reset happens
-	// before its early return; a non-empty one is assigned only AFTER the swap
-	// gate, so a refused document leaves c untouched as the contract says.
+	// The `roles` section is the stored document's alone too (studio-chat.md §1/§2): a nil map means
+	// the project inherited no planner and chat is OFF, which is the fail-closed answer for a project
+	// that never ratified one.
 	if doc.Empty() {
 		c.Planner = plannerRoleFromDoc(doc)
 		return nil
@@ -406,19 +292,9 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		return err
 	}
 	c.Planner = plannerRoleFromDoc(doc)
-	// The PIPELINE is one section (decision 6bf1fa15): a document carrying any
-	// of prompt/phases/review_panel replaces all three, and a key it omits is
-	// cleared to its zero value rather than kept from the local file. That is
-	// what keeps prompt and phases mutually exclusive ACROSS the overlay
-	// boundary — a stored phases clears a local prompt, and the reverse — and
-	// what stops a stored phases running with a local panel it never named. A
-	// document carrying none of the three leaves the local pipeline untouched,
-	// as before (handled by pipelineSet, not by this branch).
-	//
-	// `review_panel_concurrency` is deliberately absent from this block: it is
-	// machine-owned (decision e1365721), so the local file's value survives a
-	// section replace whatever the document carries, and a document that sets
-	// only that key is not a pipeline statement at all.
+	// The PIPELINE is one section (decision 6bf1fa15): a document carrying any of
+	// prompt/phases/review_panel replaces all three, and a key it omits is cleared to its zero value
+	// rather than kept from the local file.
 	if doc.pipelineSet() {
 		c.Prompt = doc.Prompt
 		if doc.Phases == nil {
@@ -450,15 +326,13 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 			}
 			c.ReviewPanel = panel
 		}
-		// reviewPanelSet records whether the panel KEY is in force, which is now
-		// the document's answer rather than the file's: a section replace that
-		// omits the key means "no panel", while an explicit empty array is still
-		// the half-edited shape Validate refuses.
+		// reviewPanelSet records whether the panel KEY is in force, which is now the document's answer
+		// rather than the file's: a section replace that omits the key means "no panel", while an
+		// explicit empty array is still the half-edited shape Validate refuses.
 		c.reviewPanelSet = doc.ReviewPanel != nil
 	}
-	// c.ReviewPanelConcurrency is NOT updated here: how many panel seats run at
-	// once is the machine's dial (decision e1365721), so the local value is kept
-	// even when the document carries one.
+	// c.ReviewPanelConcurrency is NOT updated here: how many panel seats run at once is the machine's
+	// dial (decision e1365721), so the local value is kept even when the document carries one.
 	if h := strings.TrimSpace(doc.Harness); h != "" {
 		c.Harness = h
 	}
@@ -468,11 +342,8 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.Models != nil {
 		c.Models = doc.Models
 	}
-	// The loop below writes into c.Harnesses, which the common single-harness
-	// config (no `harnesses:` key) leaves nil: defaults() never creates the map
-	// and Clone only copies a non-nil source. A stored document carrying a
-	// harnesses block over such a config must allocate rather than panic with
-	// "assignment to entry in nil map".
+	// The loop below writes into c.Harnesses, which the common single-harness config (no `harnesses:`
+	// key) leaves nil: defaults() never creates the map and Clone only copies a non-nil source.
 	if len(doc.Harnesses) > 0 && c.Harnesses == nil {
 		c.Harnesses = make(map[string]HarnessConfig, len(doc.Harnesses))
 	}
@@ -517,21 +388,17 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 			c.Escalation.CategoryRules = e.CategoryRules
 		}
 	}
-	// The event channel's dials were applied at the top, before the empty
-	// document returned: they are the stored document's alone.
+	// The event channel's dials were applied at the top, before the empty document returned: they are
+	// the stored document's alone.
 	return nil
 }
 
-// CheckHarnessSwap refuses a document that re-points the top-level harness
-// when the swap would hand the new harness the old one's machine-local wiring
-// (CLA-475) — the same guard ApplyRunConfig enforces, exported so the
-// supervisor's per-instance harness override (which re-points the top-level
-// over the same machine layer through a different door) rides exactly it. A
-// nil or harness-less document, or one naming the current top-level
-// (whitespace aside), is not a swap and always passes. An empty top-level is
-// not a free pass: run-wide wiring with no named harness would still be
-// handed to the new top-level on a swap, so it is refused like any other
-// inheritance. A refusal leaves c untouched.
+// CheckHarnessSwap refuses a document that re-points the top-level harness when the swap would hand
+// the new harness the old one's machine-local wiring — the same guard ApplyRunConfig enforces,
+// exported so the supervisor's per-instance harness override (which re-points the top-level over
+// the same machine layer through a different door) rides exactly it. An empty top-level is not a
+// free pass: run-wide wiring with no named harness would still be handed to the new top-level on a
+// swap, so it is refused like any other inheritance.
 func (c *Config) CheckHarnessSwap(doc *RunConfigDoc) error {
 	if doc == nil {
 		return nil
@@ -544,21 +411,10 @@ func (c *Config) CheckHarnessSwap(doc *RunConfigDoc) error {
 	return c.refuseHarnessSwap(doc, newH)
 }
 
-// refuseHarnessSwap reports whether re-pointing the top-level harness from the
-// base's to newH would hand newH the old harness's dialect. It is called
-// BEFORE any mutation, so an error leaves the base untouched for the caller's
-// loud refusal path.
-//
-// SessionFor fills Model, Models, ConfigDir, MCPConfigPath and SettingsPath
-// from the run-wide fields for the top-level harness only; ResolveMCPConfig
-// additionally serves a project's own mcp_config_path to the top-level
-// harness. The stored document carries none of the machine fields, so after a
-// swap the new top-level inherits whatever the base still holds run-wide (or
-// per project) unless it already declares its own value for that field —
-// from the local harnesses block, or, for the policy pair, from the document
-// itself. A "non-empty block" alone is not enough: a block carrying only a
-// model still inherits the old config dir through its gaps, which is the exact
-// failure this refuses. The check is therefore per field, not per block.
+// refuseHarnessSwap reports whether re-pointing the top-level harness from the base's to newH would
+// hand newH the old harness's dialect. SessionFor fills Model, Models, ConfigDir, MCPConfigPath and
+// SettingsPath from the run-wide fields for the top-level harness only; ResolveMCPConfig
+// additionally serves a project's own mcp_config_path to the top-level harness.
 func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 	oldH := strings.TrimSpace(c.Harness)
 	baseBlock := c.Harnesses[newH]
@@ -566,9 +422,8 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 	docModel := strings.TrimSpace(doc.Model)
 
 	var inherited []string
-	// Policy pair: the document CAN re-wire these, so a document-provided
-	// value (run-wide or per-harness) is the new harness's own, not an
-	// inheritance. Only the all-absent shape inherits the old alias.
+	// Policy pair: the document CAN re-wire these, so a document-provided value (run-wide or
+	// per-harness) is the new harness's own, not an inheritance.
 	if strings.TrimSpace(c.Model) != "" && docModel == "" &&
 		strings.TrimSpace(docBlock.Model) == "" && baseBlock.Model.Empty() {
 		inherited = append(inherited, "model")
@@ -577,8 +432,8 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 		docBlock.Models == nil && len(baseBlock.Models) == 0 {
 		inherited = append(inherited, "models")
 	}
-	// Machine twins: the document carries none, so only a local block value
-	// keeps the new harness off the run-wide (old) one.
+	// Machine twins: the document carries none, so only a local block value keeps the new harness off
+	// the run-wide (old) one.
 	if strings.TrimSpace(c.ConfigDir) != "" && strings.TrimSpace(baseBlock.ConfigDir) == "" {
 		inherited = append(inherited, "config_dir")
 	}
@@ -604,24 +459,12 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 		newH, oldH, strings.Join(inherited, ", "), strings.Join(inherited, ", "), newH, newH)
 }
 
-// RunConfigDocument renders the config's MOVABLE half as the plane-side
-// proposal document `propose-config` imports: the pipeline (prompt, phases,
-// review_panel, and each phase's model), the consumed families and the two
-// backstops, in the plane's own snake_case vocabulary with wall clock as
-// integer seconds. Nothing machine-local (workdir, wiring, env, state dirs) is
-// included — importing those would ask the plane to custody what it must not,
-// and the origin rule depends on the trusted statement staying where the
-// operator wrote it until ratified.
-//
-// `review_panel_concurrency` is deliberately NOT exported (decision e1365721):
-// it is how many panel seats run at once on THIS machine, not part of the
-// run's result, so it stays machine-owned. A ratifying round-trip therefore
-// cannot move one machine's cap onto every other.
-//
-// It returns an error for a pipeline shape the PLANE refuses even though this
-// file's Validate tolerates it: a panel with no built-in, non-final review phase
-// to expand (inert locally, a stored no-op on the plane — decision 94497792).
-// propose-config must never offer a document the operator cannot ratify.
+// RunConfigDocument renders the config's MOVABLE half as the plane-side proposal document
+// `propose-config` imports: the pipeline (prompt, phases, review_panel, and each phase's model),
+// the consumed families and the two backstops, in the plane's own snake_case vocabulary with wall
+// clock as integer seconds. Nothing machine-local (workdir, wiring, env, state dirs) is included
+// — importing those would ask the plane to custody what it must not, and the origin rule depends
+// on the trusted statement staying where the operator wrote it until ratified.
 func (c *Config) RunConfigDocument() (map[string]any, error) {
 	doc := map[string]any{}
 	if c.Harness != "" {
@@ -637,9 +480,8 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 		blocks := map[string]any{}
 		for name, hc := range c.Harnesses {
 			block := map[string]any{}
-			// The plane's schema carries plain strings (CLA-782), so a route
-			// list travels as its FIRST route: the run config is the operator's
-			// ratified policy half, and a fallback chain is a local-file shape
+			// The plane's schema carries plain strings, so a route list travels as its FIRST route: the run
+			// config is the operator's ratified policy half, and a fallback chain is a local-file shape
 			// until the plane grows one.
 			if first := hc.Model.First(); first != "" {
 				block["model"] = first
@@ -655,31 +497,16 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			doc["harnesses"] = blocks
 		}
 	}
-	// The pipeline section (CLA-598), in the plane's own vocabulary. `prompt` is
-	// exported only when it is the OPERATOR's: defaults() fills in the built-in
-	// prompt, and exporting that would have propose-config replace the plane's
-	// pipeline with prose the operator never wrote.
-	//
-	// A panel the exported sequence cannot expand is refused, not exported: the
-	// plane stores a panel only beside the sequence it multiplies, and also
-	// refuses `prompt` beside one (decision 94497792), so an unphased config's
-	// panel is a document the operator could never ratify.
+	// The pipeline section, in the plane's own vocabulary.
 	if len(c.ReviewPanel) > 0 && !c.expandsReviewPanel() {
 		return nil, fmt.Errorf("cannot propose this config: `review_panel` needs a built-in, non-final %q phase "+
 			"to expand, and this config's sequence has none, so the plane would refuse the document (a panel is "+
 			"stored policy there, never a key that can do nothing). Give the config a built-in %q phase with a "+
 			"phase after it (the fix), or remove `review_panel`", ReviewPhaseName, ReviewPhaseName)
 	}
-	// CLA-784 (review 1.review-1.3): the stored-run-config schema is the
-	// PLANE's, and it does not yet know `review_panel[].optional` — its
-	// validator refuses the key as unknown, so a document carrying a trial seat
-	// is one the operator could never ratify. Refuse here rather than emit it,
-	// and rather than silently DROPPING the flag: dropping it would promote the
-	// trial seat to a required reviewer on every machine that applies the stored
-	// pipeline, the exact harm `optional` exists to prevent. The two sides must
-	// move in lockstep — the plane's stored-run-config schema learns the key and
-	// bumps its `$schema_version`, this build's RunConfigSchemaVersion moves in
-	// step, and this gate lifts.
+	// CLA-784 (review 1.review-1.3): the stored-run-config schema is the PLANE's, and it does not yet
+	// know `review_panel[].optional` — its validator refuses the key as unknown, so a document
+	// carrying a trial seat is one the operator could never ratify.
 	if len(c.ReviewPanel) > 0 {
 		for i, m := range c.ReviewPanel {
 			if m.Optional {
@@ -693,14 +520,8 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			}
 		}
 	}
-	// CLA-869: the v1 stored-run-config schema refuses unknown PHASE keys too, so
-	// `review_method` and `maps_session` are keys the plane would reject at
-	// ratification. Refuse to export them rather than silently dropping them:
-	// a dropped method is every machine running a single-pass review while this
-	// config says maps-session — the config and the run disagreeing with nothing
-	// said. The two sides move in lockstep, exactly as the trial seat above: the
-	// day the plane's schema learns the keys and bumps `$schema_version`, this
-	// build's RunConfigSchemaVersion moves in step and this gate lifts.
+	// CLA-869: the v1 stored-run-config schema refuses unknown PHASE keys too, so `review_method` and
+	// `maps_session` are keys the plane would reject at ratification.
 	for i, ph := range c.Phases {
 		if ph.ReviewMethod != "" || ph.MapsSession != nil {
 			return nil, fmt.Errorf("cannot propose this config: `phases[%d].review_method` / `.maps_session` are "+
@@ -773,11 +594,9 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 				entry["tier"] = m.Tier
 			}
 			if m.Optional {
-				// Unreachable while the plane-side-schema gate above is in force
-				// (CLA-784 review 1.review-1.3): the field is kept so that the
-				// day the plane's stored schema learns the key — and this build's
-				// RunConfigSchemaVersion moves in step — the trial seat travels
-				// without a second edit here.
+				// Unreachable while the plane-side-schema gate above is in force: the field is kept so that the
+				// day the plane's stored schema learns the key — and this build's RunConfigSchemaVersion
+				// moves in step — the trial seat travels without a second edit here.
 				entry["optional"] = true
 			}
 			panel[i] = entry
@@ -842,9 +661,7 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 	return doc, nil
 }
 
-// planeRoutes widens the plane's plain-string model field into this package's
-// route type. The stored schema has one string per model (CLA-782 keeps it
-// that way), so a stored document can only ever name a single route.
+// planeRoutes widens the plane's plain-string model field into this package's route type.
 func planeRoutes(model string) ModelRoutes {
 	if strings.TrimSpace(model) == "" {
 		return nil
@@ -852,9 +669,8 @@ func planeRoutes(model string) ModelRoutes {
 	return ModelRoutes{model}
 }
 
-// routesToPlainMap renders a route-valued tier map back into the plane's
-// plain-string schema, first route only — the same narrowing RunConfigDocument
-// applies to a single model field.
+// routesToPlainMap renders a route-valued tier map back into the plane's plain-string schema, first
+// route only — the same narrowing RunConfigDocument applies to a single model field.
 func routesToPlainMap(m map[string]ModelRoutes) map[string]string {
 	if m == nil {
 		return nil

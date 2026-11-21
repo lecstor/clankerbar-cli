@@ -1,10 +1,6 @@
 package loop
 
-// Agent event emission in the driver (CLA-603). The dials are the project's
-// effective run-config `events` block, which the loop already applies at the
-// iteration boundary; the machine can only opt out. The emitter's sequence
-// numbers are per RUN, not per session: a phased task runs several sessions on
-// one run id, so the counter is shared and persisted in the state dir.
+// Agent event emission in the driver.
 
 import (
 	"encoding/json"
@@ -18,20 +14,16 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
-// SetEventChannel wires the plane origin and bearer the event sender uses. The
-// origin is the operator's trusted CredentialOrigin (CLA-257), never a host read
-// off a checkout, and the key is the same CLANKERBAR_API_KEY every other plane
-// call carries. Unset means the channel is unwired and no session emits.
+// SetEventChannel wires the plane origin and bearer the event sender uses.
 func (d *Driver) SetEventChannel(origin, apiKey string) {
 	d.eventOrigin = origin
 	d.eventKey = apiKey
 }
 
-// eventSenderOn reports whether this target's sessions may emit: wired, the
-// project activity dial is on, the machine has not opted out, and the adapter has
-// a mapping (codex and copilot do not in v1). The transcript dial rides on the
-// sink this gates, and is only ever on beside activity (the plane refuses the
-// pair at save time).
+// eventSenderOn reports whether this target's sessions may emit: wired, the project activity dial
+// is on, the machine has not opted out, and the adapter has a mapping (codex and copilot do not in
+// v1). The transcript dial rides on the sink this gates, and is only ever on beside activity (the
+// plane refuses the pair at save time).
 func (d *Driver) eventSenderOn(tc *config.Config, harnessName string) bool {
 	if d.eventOrigin == "" || d.eventKey == "" {
 		return false
@@ -43,10 +35,8 @@ func (d *Driver) eventSenderOn(tc *config.Config, harnessName string) bool {
 	return ok && caps.EmitsEvents
 }
 
-// newEventEmitter builds one session's sink. Batching and the HTTP call run on
-// the emitter's own goroutine; the parser only ever appends to a bounded buffer.
-// transcript is the project's events.transcript dial, which only the activity
-// dial can be on beside.
+// newEventEmitter builds one session's sink. Batching and the HTTP call run on the emitter's own
+// goroutine; the parser only ever appends to a bounded buffer.
 func (d *Driver) newEventEmitter(harnessName string, transcript bool) *events.Emitter {
 	return events.New(events.Config{
 		Origin:     d.eventOrigin,
@@ -58,10 +48,9 @@ func (d *Driver) newEventEmitter(harnessName string, transcript bool) *events.Em
 	})
 }
 
-// eventSeqCounter is the process-wide per-run counter, built once. The lock
-// matters because a review panel's members are built from more than one
-// goroutine and each would otherwise race to create its own counter (and its own
-// in-memory view of the high-water marks).
+// eventSeqCounter is the process-wide per-run counter, built once. The lock matters because a
+// review panel's members are built from more than one goroutine and each would otherwise race to
+// create its own counter (and its own in-memory view of the high-water marks).
 func (d *Driver) eventSeqCounter() *events.SeqCounter {
 	d.eventMu.Lock()
 	defer d.eventMu.Unlock()
@@ -75,10 +64,9 @@ func (d *Driver) eventSeqCounter() *events.SeqCounter {
 	return d.eventSeq
 }
 
-// stateSeqStore persists the counters in the daemon's state dir. A missing file
-// is the ordinary first-run case (no error); every other read/write failure is
-// returned to the counter, which degrades to per-process numbering rather than
-// affecting the session.
+// stateSeqStore persists the counters in the daemon's state dir. A missing file is the ordinary
+// first-run case (no error); every other read/write failure is returned to the counter, which
+// degrades to per-process numbering rather than affecting the session.
 type stateSeqStore struct{ st *statedir.Dir }
 
 func (s stateSeqStore) Load() (map[string]events.RunSeq, error) {
@@ -91,11 +79,9 @@ func (s stateSeqStore) Load() (map[string]events.RunSeq, error) {
 	}
 	var runs map[string]events.RunSeq
 	if err := json.Unmarshal(raw, &runs); err != nil {
-		// The file is already unusable. Treating it as empty lets the next Save
-		// rewrite it; returning the parse error would leave the counter unable to
-		// persist anything, so every restart would replay sequence numbers the
-		// plane drops. A plain READ error is different and stays an error: a
-		// transient fault must not overwrite a file we could not read.
+		// The file is already unusable. Treating it as empty lets the next Save rewrite it; returning the
+		// parse error would leave the counter unable to persist anything, so every restart would replay
+		// sequence numbers the plane drops.
 		return nil, nil
 	}
 	return runs, nil

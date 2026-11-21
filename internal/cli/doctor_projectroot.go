@@ -15,15 +15,10 @@ import (
 
 // --- 1b. repos ---------------------------------------------------------------
 
-// checkRepos reports, per project (or once for a single-project run), every repo
-// the config declares and whether it resolves to a local checkout (CLA-437).
-//
-// This is the preflight for two silent failures at once. A declared repo whose
-// checkout is missing fails every iteration that names it with repo_not_found —
-// better seen here than in an overnight log. And a project that declares NO
-// repos keeps the legacy workdir behaviour, which is correct but easy to mistake
-// for "sessions already start in the task's repo"; saying which mode is live is
-// the difference.
+// checkRepos reports, per project (or once for a single-project run), every repo the config
+// declares and whether it resolves to a local checkout. A declared repo whose checkout is missing
+// fails every iteration that names it with repo_not_found — better seen here than in an overnight
+// log.
 func checkRepos(cfg *config.Config) []check {
 	report := func(label string, repos map[string]string, primary, workdir string) check {
 		c := check{name: label}
@@ -77,26 +72,16 @@ func checkRepos(cfg *config.Config) []check {
 	return out
 }
 
-// checkProjectRoot reports on the per-project layout (CLA-678): with
-// `project_root` declared, every workdir in the config is a fleet project root
-// — <root>/<project slug>, holding that project's clones under
-// <project root>/<repo name> and its worktrees under
-// <project root>/worktrees — and this check FAILS when the layout does not
-// hold, because every one of those facts is load-bearing at run time:
-//
-//   - a configured repo resolving OUTSIDE the project root is a session
-//     reading a tree its permission scope does not cover, or one the fleet
-//     will try to clone over;
-//   - a clone whose origin names a different repo than the identity it sits
-//     under is the wrong-repo read the layout exists to prevent (the same
-//     attribution rule the supervisor's derivation enforces, checked here
-//     before a daemon is refused at spawn time);
-//   - a missing or outside-the-root worktrees directory is where a task
-//     worktree fails to be created, which costs an iteration its whole session.
-//
-// A config that does not declare `project_root` gets no check: there the
-// workdir is whatever the operator pointed it at, and its repos are wherever
-// the `repos` map says, by design.
+// checkProjectRoot reports on the per-project layout: with `project_root` declared, every workdir
+// in the config is a fleet project root — <root>/<project slug>, holding that project's clones
+// under <project root>/<repo name> and its worktrees under <project root>/worktrees — and this
+// check FAILS when the layout does not hold, because every one of those facts is load-bearing at
+// run time: - a configured repo resolving OUTSIDE the project root is a session reading a tree its
+// permission scope does not cover, or one the fleet will try to clone over; - a clone whose origin
+// names a different repo than the identity it sits under is the wrong-repo read the layout exists
+// to prevent (the same attribution rule the supervisor's derivation enforces, checked here before a
+// daemon is refused at spawn time); - a missing or outside-the-root worktrees directory is where a
+// task worktree fails to be created, which costs an iteration its whole session.
 func checkProjectRoot(label string, cfg *config.Config, repos map[string]string, primary, workdir string) []check {
 	if !cfg.ProjectRoot {
 		return nil
@@ -117,12 +102,9 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 	rootAbs = filepath.Clean(rootAbs)
 
 	var problems []string
-	// The project root and everything the layout puts under it are checked on
-	// CANONICAL paths: a lexical comparison says <root>/worktrees is inside
-	// <root> even when that name is a symlink to a directory on another disk.
-	// The supervisor refuses a symlink at any of these paths (see
-	// supervisor.DeriveWorkdir), so doctor must fail for the same layout rather
-	// than pass a config the derivation will refuse at reconcile time.
+	// The project root and everything the layout puts under it are checked on CANONICAL paths: a
+	// lexical comparison says <root>/worktrees is inside <root> even when that name is a symlink to a
+	// directory on another disk.
 	if fi, lerr := os.Lstat(rootAbs); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
 		problems = append(problems, "the project root "+rootAbs+" is a symlink to "+resolvePath(rootAbs)+" - it must be a real directory, never a link to a tree outside it")
 	}
@@ -130,9 +112,8 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 		problems = append(problems, "the project root "+rootAbs+" does not exist")
 	}
 	canonRoot := resolvePath(rootAbs)
-	// The worktree directory is the fleet's own, so it must be the fixed
-	// <project root>/worktrees - anything else means the layout is not what
-	// the sessions' scope (and their briefs) assume.
+	// The worktree directory is the fleet's own, so it must be the fixed <project root>/worktrees -
+	// anything else means the layout is not what the sessions' scope (and their briefs) assume.
 	wt := filepath.Join(rootAbs, config.WorktreesDirName)
 	if fi, lerr := os.Lstat(wt); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
 		problems = append(problems, "the worktree directory "+wt+" is a symlink to "+resolvePath(wt)+" - it must be a real directory inside the project root")
@@ -150,13 +131,8 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 	if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
 		idents = append(idents, p)
 	}
-	// Two FULL identities that end in the same name derive the SAME directory
-	// (<project root>/<name>), so only one of them can ever be the clone there
-	// and the other reads as a wrong-origin checkout. Name the conflict here,
-	// where the operator can fix the config, rather than letting the layout
-	// report the symptom. A bare key beside a full identity of the same name is
-	// NOT a conflict: it is that repo spelled short, and the derivation
-	// materializes the full identity (the only spelling with a clone URL).
+	// Two FULL identities that end in the same name derive the SAME directory (<project root>/<name>),
+	// so only one of them can ever be the clone there and the other reads as a wrong-origin checkout.
 	byBase := make(map[string]string, len(idents))
 	for _, id := range idents {
 		base := filepath.Base(id)
@@ -172,8 +148,8 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 	for _, id := range idents {
 		dir, err := config.ResolveCheckout(repos, primary, rootAbs, id)
 		if err != nil {
-			// The repos check above already reports an unresolvable identity;
-			// this one is about the layout, so it stays quiet here.
+			// The repos check above already reports an unresolvable identity; this one is about the layout,
+			// so it stays quiet here.
 			continue
 		}
 		if fi, lerr := os.Lstat(dir); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
@@ -204,9 +180,8 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 	return []check{c}
 }
 
-// insideDir reports whether path is dir itself or sits below it, comparing
-// CLEANED absolute paths so a symlink-free path and its ".."-normalized
-// spelling never read as different trees.
+// insideDir reports whether path is dir itself or sits below it, comparing CLEANED absolute paths
+// so a symlink-free path and its ".."-normalized spelling never read as different trees.
 func insideDir(dir, path string) bool {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -219,10 +194,9 @@ func insideDir(dir, path string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-// gitRemoteURL reads a checkout's attributable origin remote ("origin" when it
-// has one, else its only remote), the same rule the supervisor's derivation
-// applies - a checkout with several remotes and no origin cannot be attributed
-// to one repo.
+// gitRemoteURL reads a checkout's attributable origin remote ("origin" when it has one, else its
+// only remote), the same rule the supervisor's derivation applies - a checkout with several remotes
+// and no origin cannot be attributed to one repo.
 func gitRemoteURL(dir string) (string, error) {
 	out, err := exec.Command("git", "-C", dir, "remote").Output()
 	if err != nil {

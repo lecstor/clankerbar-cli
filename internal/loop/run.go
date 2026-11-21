@@ -14,18 +14,12 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
-// Run drives the daemon until STOP/HALT, a ceiling (max-iterations / budget), or
-// context cancellation. An empty queue is NOT a stop condition — it idles and
-// keeps polling. Returns nil on a graceful stop; an error only on an unexpected,
-// non-retryable failure.
-//
-// Two things hold on every way out (CLA-491): a STOP marker this run never
-// consumed is removed rather than left where the next start would read it as a
-// fresh stop request, and the last log line names why the run ended.
+// Run drives the daemon until STOP/HALT, a ceiling (max-iterations / budget), or context
+// cancellation. Returns nil on a graceful stop; an error only on an unexpected, non-retryable
+// failure.
 func (d *Driver) Run(ctx context.Context) (runErr error) {
-	// A caller may have opened the state dir already (tests, and any future entry
-	// point that wants to fail before spawning anything). Opening it here is the
-	// normal path.
+	// A caller may have opened the state dir already (tests, and any future entry point that wants to
+	// fail before spawning anything).
 	if d.state == nil {
 		dir, err := d.cfg.ResolveStateDir()
 		if err != nil {
@@ -42,51 +36,30 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		}()
 	}
 	d.clearStaleLimitStop()
-	// Belt and braces on the way out (CLA-491). Every shutdown path that does not
-	// pass a STOP read (a non-retryable phase failure, a budget or zero-spend
-	// trip, max-iterations, HALT, a cancelled context) leaves a
-	// pending STOP marker where it fell, and the next start used to read it as
-	// fresh and stop itself seconds into its first cycle: the 2026-08-25 fleet
-	// soft-stop left one behind clanker1, and the upgraded replacement DOA'd on
-	// it. Registered here rather than at each return so a future shutdown path
-	// cannot forget it. (The closure, not `defer d.sweepPendingStop(runErr)`:
-	// arguments evaluate at registration, and runErr is not assigned yet.)
+	// Belt and braces on the way out.
 	defer func() { d.sweepPendingStop(runErr) }()
-	// A run that ends in an orderly way holds nothing, so nothing is left for a
-	// supervisor to hand back (CLA-708). Every let-go path removes this file as
-	// it happens; this is the backstop for a path that forgets. A process that is
-	// KILLED never reaches it, and that is exactly the case the supervisor's exit
-	// check exists for.
+	// A run that ends in an orderly way holds nothing, so nothing is left for a supervisor to hand
+	// back.
 	defer d.clearCurrentClaim()
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
-	// Recomputed every iteration below, so a RELOAD that edits the interval is
-	// seen from the next idle poll on. This first value is only what the banner
-	// announces.
+	// Recomputed every iteration below, so a RELOAD that edits the interval is seen from the next idle
+	// poll on.
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 	d.loadRouteMarks()
-	// Every harness this run will SPAWN, not just the configured one: a mixed
-	// sequence's banner naming one of them is a log that disagrees with the
-	// sessions underneath it from the first line (CLA-366). SpawnedHarnesses
-	// rather than PhaseHarnesses, so a run-wide harness every phase overrides is
-	// not announced as being driven when nothing will ever run on it - the banner
-	// is the operator's first line of output, and it should describe the run.
+	// Every harness this run will SPAWN, not just the configured one: a mixed sequence's banner naming
+	// one of them is a log that disagrees with the sessions underneath it from the first line.
 	log.Printf("driving %s; state in %s; idle poll every %s", strings.Join(d.cfg.SpawnedHarnesses(), "+"), d.state.Path(), idle)
-	// Say it once, loudly, if the pre-CLA-259 directory is still sitting in the
-	// workdir: an operator who touches STOP there would otherwise watch the loop
-	// ignore it and conclude the stop switch is broken.
+	// Say it once, loudly, if the pre-CLA-259 directory is still sitting in the workdir: an operator
+	// who touches STOP there would otherwise watch the loop ignore it and conclude the stop switch is
+	// broken.
 	if legacy := d.cfg.LegacyStateDir(); legacy != "" {
 		log.Printf("note: %s is left over from before the state dir moved out of the workdir — markers there are IGNORED, and its old transcripts are still world-readable inside your repo; move or delete it", legacy)
 	}
-	// A STOP marker already sitting here PREDATES this process: markers are only
-	// ever read and consumed by a running daemon (the cycle top below, and
-	// waitOrStop), so one found at start-up was left behind by a previous run
-	// that exited without consuming it (CLA-491). Its intent died with that run;
-	// acting on it here would stop this daemon before it did anything: exactly
-	// what the upgraded clanker1 did seconds after its start banner. Consume it
-	// with a loud note instead. A stop dropped AFTER this point is fresh and
-	// still lands on every read below.
+	// A STOP marker already sitting here PREDATES this process: markers are only ever read and
+	// consumed by a running daemon (the cycle top below, and waitOrStop), so one found at start-up was
+	// left behind by a previous run that exited without consuming it.
 	if present, msg := d.readMarker("STOP"); present {
 		_ = d.state.Remove("STOP")
 		note := ""
@@ -99,17 +72,14 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	start := time.Now()
 	drains := 0
 
-	// CLA-461: everything below runs on a context this Run owns, so a RESTART_NOW
-	// marker can cancel it mid-session and ride the exact kill/cleanup/release
-	// machinery a Ctrl-C rides. Cancelling the caller's ctx directly is not
-	// available to us; deriving one is.
+	// CLA-461: everything below runs on a context this Run owns, so a RESTART_NOW marker can cancel it
+	// mid-session and ride the exact kill/cleanup/release machinery a Ctrl-C rides.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	d.watchRestartNow(runCtx, cancelRun)
 
-	// CLA-466: whatever ends the run — STOP/HALT, a restart marker,
-	// max-iterations, budget, signal or error — every target's final `stopping`
-	// beacon goes out first. After it, console silence means the daemon is gone.
+	// CLA-466: whatever ends the run — STOP/HALT, a restart marker, max-iterations, budget, signal
+	// or error — every target's final `stopping` beacon goes out first.
 	defer d.fleetShutdown()
 
 	for {
@@ -125,24 +95,16 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
 		}
-		// The budget breaker's between-iterations pass (CLA-480): every target's
-		// own account is judged against the budget in force for it, and a target
-		// that reaches a ceiling stops draining while its siblings carry on. The
-		// run ends only when every target is exhausted. Run here, before the poll
-		// gate, so an already-elapsed wall-clock ceiling still stops the loop
-		// before it spends or even polls.
+		// The budget breaker's between-iterations pass: every target's own account is judged against the
+		// budget in force for it, and a target that reaches a ceiling stops draining while its siblings
+		// carry on.
 		if d.sweepBudgets(time.Since(start)) {
 			log.Print("every project's budget is exhausted — stopping")
 			return nil
 		}
 
-		// Gate on cheap control-plane reads: only spend a session when some target
-		// has work to spawn for — ready work, or abandoned work the plane would
-		// offer for takeover (Summary.Spawnable, CLA-274). When idle, keep polling
-		// (and logging) so the loop reacts to answered questions / promotions /
-		// newly filed work. With several targets (CLA-142) every queue is polled
-		// each cycle, and the drain goes to the next spawnable one after the last
-		// drained (round-robin) — a busy queue can't starve a quiet one.
+		// Gate on cheap control-plane reads: only spend a session when some target has work to spawn for
+		// — ready work, or abandoned work the plane would offer for takeover.
 		target, next, perr := d.pickTarget(runCtx, idle)
 		if perr != nil {
 			return perr
@@ -157,64 +119,43 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		// The target's own budget clock starts at its first drain (CLA-480): a
-		// stored max_wall_clock measures how long THIS project has been drained,
-		// not how long the daemon has been up for its siblings.
+		// The target's own budget clock starts at its first drain: a stored max_wall_clock measures how
+		// long THIS project has been drained, not how long the daemon has been up for its siblings.
 		d.noteTargetStart(d.cursor)
 		tokens, _, handoffs, stop, err := d.drainPhases(runCtx, drains, d.cursor, target,
 			spend{start: start, ti: d.cursor})
-		// The drain's spend is already in the target's ledger: charge() books it
-		// as each session's result is counted, which is what lets the mid-drain
-		// checks and this between-iterations sweep read the same live account.
-		// Handoff respawns are charged there too (CLA-352): unlike phase sessions,
-		// which the operator priced in when they configured `phases`, each respawn
-		// is a session the SESSION chose to add, so it consumes an iteration of the
-		// operator's ceiling rather than extending the run for free.
-		//
-		// Judge the budget now, at the same between-iterations moment the old
-		// run-wide breaker read (CLA-480). A target that has reached the budget in
-		// force for it is exhausted for the rest of the run; the run stops only
-		// when every target is.
+		// The drain's spend is already in the target's ledger: charge() books it as each session's result
+		// is counted, which is what lets the mid-drain checks and this between-iterations sweep read the
+		// same live account.
 		allGone := d.sweepBudgets(time.Since(start))
 		if allGone {
 			log.Print("every project's budget is exhausted — stopping")
 			return nil
 		}
-		// Hand the drain's tokens to the verdict that will judge it: a fruitless
-		// drain is charged to the token-denominated quiet accumulator (CLA-343), and
-		// the figure must be this drain's, not whatever total happened to be in
-		// scope when judgeProgress runs.
+		// Hand the drain's tokens to the verdict that will judge it: a fruitless drain is charged to the
+		// token-denominated quiet accumulator, and the figure must be this drain's, not whatever total
+		// happened to be in scope when judgeProgress runs.
 		d.spent[d.cursor] = tokens
-		// Handoff respawns consume iterations of the operator's ceiling too
-		// (CLA-352) — see the comment above the accumulator.
+		// Handoff respawns consume iterations of the operator's ceiling too — see the comment above the
+		// accumulator.
 		drains += handoffs
-		// CLA-402: report the run's dead-phase tally with its denominator, so
-		// the operator watching the daemon log sees the rate the run is
-		// producing (the last line before the run ends IS the run total).
+		// CLA-402: report the run's dead-phase tally with its denominator, so the operator watching the
+		// daemon log sees the rate the run is producing (the last line before the run ends IS the run
+		// total).
 		d.logDeadTally()
 		if err != nil {
-			// Classify before acting (CLA-507). The run-wide causes are the ones
-			// the poll loop already hard-stops on - a bad key or a missing project
-			// selector is shared by every target, so no target can make progress
-			// and sidelining would just defer the same exit. They never originate
-			// in a drain today; the guard keeps that boundary explicit rather than
-			// incidental. Context cancellation arrives as stop=true with err=nil,
-			// so it needs no classification here.
+			// Classify before acting. The run-wide causes are the ones the poll loop already hard-stops on -
+			// a bad key or a missing project selector is shared by every target, so no target can make
+			// progress and sidelining would just defer the same exit.
 			if errors.Is(err, backlog.ErrUnauthorized) || errors.Is(err, backlog.ErrProjectRequired) {
 				return err
 			}
-			// Everything else out of drainPhases happened while trying to run
-			// THIS target's session, so it sidelines THIS target: it sits out on
-			// the escalating ladder while every other project drains on, and
-			// self-heals once its harness succeeds again.
+			// Everything else out of drainPhases happened while trying to run THIS target's session, so it
+			// sidelines THIS target: it sits out on the escalating ladder while every other project drains
+			// on, and self-heals once its harness succeeds again.
 			d.sidelineTarget(d.cursor, drains, err)
-			// CLA-562: the startup-failure escalation rides on top of the
-			// sideline, mirroring the fleet trip. A startup failure is an ERROR
-			// with no usage reported (no session ever ran); a dead phase is
-			// err == nil, so one failure never ticks both counters. The sideline
-			// stays for the first startupFailBound-1 attempts; only the Nth
-			// escalates to a pause-and-raise. An error WITH usage proves a
-			// session ran, so it breaks startup consecutiveness without tripping.
+			// CLA-562: the startup-failure escalation rides on top of the sideline, mirroring the fleet
+			// trip.
 			if tokens == 0 {
 				d.startupFails[d.cursor]++
 				if d.startupFails[d.cursor] >= startupFailBound {
@@ -232,23 +173,18 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 				d.harnessFails[d.cursor] = 0
 				d.harnessErrs[d.cursor] = nil
 			}
-			// CLA-562: any drain that spawned (err == nil) proves the harness
-			// starts, so it resets startup consecutiveness — including a drain
-			// that ended in a dead-phase park or fleet trip, which still ran
-			// sessions. The fleet counter is untouched here; its reset lives in
-			// drainPhases (implement success only).
+			// CLA-562: any drain that spawned (err == nil) proves the harness starts, so it resets startup
+			// consecutiveness — including a drain that ended in a dead-phase park or fleet trip, which
+			// still ran sessions.
 			d.startupFails[d.cursor] = 0
 		}
-		// The run ends when every target has reached the budget in force for it
-		// (handled above, before the drain's outcome). A drain that stopped for
-		// the budget exhausted only THIS target: carry on with the siblings
-		// (CLA-480), because one project's ceiling must not take the daemon down.
+		// The run ends when every target has reached the budget in force for it (handled above, before
+		// the drain's outcome).
 		if stop {
 			if d.budgetStoppedAt(d.cursor) {
 				d.clearBudgetStopped(d.cursor)
-				// markBudgetExhausted has already named the account and its
-				// projects; this line only says the drain is unwinding rather than
-				// ending the daemon.
+				// markBudgetExhausted has already named the account and its projects; this line only says the
+				// drain is unwinding rather than ending the daemon.
 				log.Printf("%sbudget exhausted mid-drain — continuing with the projects that still have headroom", d.prefix(d.cursor))
 			} else {
 				return nil
@@ -256,18 +192,6 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		}
 
 		// CLA-564: every task boundary is a stop boundary, not just idle waits.
-		// The cycle top reads these before the next poll, and this repeats the
-		// read after the drain has fully unwound so the stop lands here —
-		// before the next poll's side effects and the next spawn — rather than
-		// depending on a single read a future fast path could bypass. A
-		// file-exists read, never a wait, so the wired "loop straight back"
-		// path below stays fast. HALT stops without being consumed (the
-		// operator deletes it to resume); STOP is consumed on stop so a
-		// restart is not stillborn.
-		//
-		// A cancelled context outranks both markers here exactly as at the
-		// cycle top: falling through lets the top report the cancel, and the
-		// exit sweep clears any pending STOP (CLA-491).
 		if runCtx.Err() == nil {
 			if present, msg := d.readMarker("HALT"); present {
 				log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
@@ -280,13 +204,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			}
 		}
 
-		// Blind mode has no counts to gate on, so it idles between sessions rather
-		// than spinning. Note this is a PER-TASK pause now: the default prompt asks
-		// for one task, so a blind run alternates task / idle / task, where the old
-		// drain default spent one idle on the whole queue. An operator tuning
-		// `idle_poll_interval` on a blind run is setting the gap between tasks.
-		// In wired mode, loop straight back — the next cheap poll decides whether
-		// more work appeared.
+		// Blind mode has no counts to gate on, so it idles between sessions rather than spinning.
 		if d.blind {
 			log.Printf("idle — re-checking in %s", idle)
 			if d.waitOrStop(runCtx, idle) {
@@ -296,17 +214,8 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	}
 }
 
-// sweepPendingStop is Run's exit sweep (CLA-491): it removes a STOP marker the
-// run never consumed, and logs the reason the run ended.
-//
-// A pending marker at exit means the operator dropped a soft stop against a LIVE
-// daemon that then exited through a path with no STOP read (a non-retryable
-// phase failure, a budget or zero-spend trip inside the drain, HALT beside it,
-// a signal). The marker's intent is satisfied by ANY exit: the daemon is down
-// either way, but leaving it would make the next start read a ghost and stop
-// itself before doing anything. runErr carries how this run ended: an error
-// return names it in the closing line (and so does every graceful path's own
-// log line above), so the daemon log always says why.
+// sweepPendingStop is Run's exit sweep: it removes a STOP marker the run never consumed, and logs
+// the reason the run ended.
 func (d *Driver) sweepPendingStop(runErr error) {
 	if d.state == nil {
 		return
@@ -326,22 +235,18 @@ func (d *Driver) sweepPendingStop(runErr error) {
 	log.Printf("run ended (%s) without consuming the STOP marker - removed it so the next start is not stopped by it", why)
 }
 
-// pickTarget polls every target's queue and chooses the one to drain next:
-// round-robin over the targets with spawnable work, or over those not backed off
-// when polling is blind. runContinue means nothing is spawnable and the run waited;
-// runStop means the run ends, with err as its error.
+// pickTarget polls every target's queue and chooses the one to drain next: round-robin over the
+// targets with spawnable work, or over those not backed off when polling is blind.
 func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target, runNext, error) {
 	var target Target
-	// Read once per pass, so one boundary landing mid-pass cannot give a target a
-	// different answer from its siblings.
+	// Read once per pass, so one boundary landing mid-pass cannot give a target a different answer
+	// from its siblings.
 	sched := d.scheduledPause()
 	if !d.blind {
 		candidates := make([]bool, len(d.targets))
 		anyCandidate := false
-		// The local BEACON takes no target, so this pass writes it ONCE, from
-		// the state that best speaks for the daemon (CLA-908). Writing it per
-		// target would let whichever project is polled last decide what
-		// `supervise` says about every project on the daemon.
+		// The local BEACON takes no target, so this pass writes it ONCE, from the state that best speaks
+		// for the daemon.
 		localState := fleet.State{Kind: fleet.StateIdle}
 		reported := false
 		for i := range d.targets {
@@ -352,51 +257,30 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 				log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
 				d.blind = true
 			case errors.Is(err, backlog.ErrUnauthorized):
-				// A 401/403 means CLANKERBAR_API_KEY is bad — and the harness sessions
-				// we'd spawn carry the SAME key, so blind-draining or idle-retrying just
-				// burns dead work against a credential that won't self-heal. Hard-stop
-				// LOUDLY with a non-nil error (non-zero exit — distinct from the graceful
-				// nil stop STOP/budget return) so the operator fixes the key (CLA-132).
+				// A 401/403 means CLANKERBAR_API_KEY is bad — and the harness sessions we'd spawn carry the
+				// SAME key, so blind-draining or idle-retrying just burns dead work against a credential that
+				// won't self-heal.
 				log.Printf("%sbacklog auth failed (401/403) — check CLANKERBAR_API_KEY; stopping", d.prefix(i))
 				return target, runStop, fmt.Errorf("backlog auth failed (401/403) — check CLANKERBAR_API_KEY: %w", err)
 			case errors.Is(err, backlog.ErrProjectRequired):
-				// A 400 project_required means the poll hit the LEGACY slug-less summary
-				// route with an ACCOUNT-scoped key, which that route cannot bind to a
-				// project. The remedy is a project selector, NOT abandoning the account
-				// key (decision 2026-07-29): give the loop a slug to name in the path —
-				// a `projects` list in the config, or an .mcp.json whose clankerbar URL
-				// is /mcp/<slug> — or, for CI-style setups only, a project-scoped key.
-				// Still a hard stop: the mismatch won't self-heal, and idle-retrying or
-				// blind-draining would just burn doomed sessions (CLA-133/CLA-142).
+				// A 400 project_required means the poll hit the LEGACY slug-less summary route with an
+				// ACCOUNT-scoped key, which that route cannot bind to a project.
 				log.Printf("%sbacklog poll: the summary route needs a project selector — add a `projects` list to the config, or point the loop at an .mcp.json naming /mcp/<slug>; stopping", d.prefix(i))
 				return target, runStop, fmt.Errorf("backlog poll needs a project selector (configure `projects` or an /mcp/<slug> .mcp.json; a project-scoped key also works for CI): %w", err)
 			case err != nil:
 				log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 			default:
-				// The stored execution-config boundary (CLA-410): a moved
-				// runConfigVersion — including the first poll, which is
-				// "start of run" — refetches and re-overlays BEFORE the
-				// spawn gate reads anything, so the drain that follows this
-				// poll runs on the current document. Mid-session is
-				// unreachable by construction: polls happen only here.
+				// The stored execution-config boundary: a moved runConfigVersion — including the first poll,
+				// which is "start of run" — refetches and re-overlays BEFORE the spawn gate reads anything,
+				// so the drain that follows this poll runs on the current document.
 				d.checkRunConfigVersion(runCtx, i, &d.targets[i], sum.RunConfigVersion)
-				// stale_claimable is reported beside claimable, not folded into it: an
-				// operator watching the console has to be able to tell "spawning
-				// because there is fresh work" from "spawning to recover an abandoned
-				// branch", and before CLA-274 those were indistinguishable — the
-				// second did not happen at all, and now that it does it must not look
-				// like the first.
+				// stale_claimable is reported beside claimable, not folded into it: an operator watching the
+				// console has to be able to tell "spawning because there is fresh work" from "spawning to
+				// recover an abandoned branch", and before CLA-274 those were indistinguishable — the second
+				// did not happen at all, and now that it does it must not look like the first.
 				log.Printf("%squeue: ready=%d claimable=%d stale_claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
 					d.prefix(i), sum.Ready, sum.Claimable, sum.StaleClaimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
-				// Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
-				// a run from the web console, PER PROJECT. Honour it BEFORE the spawn
-				// gate so a paused project never gets a new session even when it has
-				// work to spawn for — including a recovery session for abandoned work,
-				// which a pause outranks like any other. Other projects keep draining.
-				// Distinct from
-				// STOP (which exits the instance) and from an empty queue. A pause
-				// landing mid-drain is only seen here, between iterations, so it never
-				// kills an in-flight session (exactly like STOP).
+				// Console pause: the operator can pause a run from the web console, PER PROJECT.
 				if sum.Paused {
 					if !d.paused[i] {
 						d.paused[i] = true
@@ -407,30 +291,23 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 						d.paused[i] = false
 						log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 					}
-					// A poll taken while the loop has stopped spawning cannot tell "our
-					// last drain settled nothing" from "nothing happened because we
-					// stopped", so the verdict waits until the loop is live again. A
-					// budget-exhausted target is one of those stops (CLA-480): judging
-					// its poll would charge the drain that reached the ceiling to the
-					// quiet accumulator and log a back-off for a project that will
-					// never spawn again this run.
+					// A poll taken while the loop has stopped spawning cannot tell "our last drain settled
+					// nothing" from "nothing happened because we stopped", so the verdict waits until the loop is
+					// live again.
 					if !sched && !d.exhaustedAt(i) {
 						d.judgeProgress(i, sum)
 					}
-					// CLA-396: a target the fleet counter paused stays
-					// paused until the operator answers the raised question
-					// — the open-question count falls back to what it was at
-					// the raise (the same "something was resolved" signal
-					// judgeProgress uses for the quiet back-off).
+					// CLA-396: a target the fleet counter paused stays paused until the operator answers the
+					// raised question — the open-question count falls back to what it was at the raise (the same
+					// "something was resolved" signal judgeProgress uses for the quiet back-off).
 					if d.fleetPaused[i] && sum.OpenQuestions <= d.fleetOpenQ[i] {
 						d.fleetPaused[i] = false
 						d.fleetRaised[i] = false
 						log.Printf("%sfleet pause cleared — the operator answered the dead-phase question; resuming", d.prefix(i))
 					}
-					// CLA-562: the same resume signal for the startup-failure
-					// pause - answering resumes, and the next startup failure
-					// re-arms (the counter stays at the bound, so the next
-					// startup failure trips again and raises fresh).
+					// CLA-562: the same resume signal for the startup-failure pause - answering resumes, and the
+					// next startup failure re-arms (the counter stays at the bound, so the next startup failure
+					// trips again and raises fresh).
 					if d.startupPaused[i] && sum.OpenQuestions <= d.startupOpenQ[i] {
 						d.startupPaused[i] = false
 						d.startupRaised[i] = false
@@ -442,13 +319,7 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 					}
 				}
 			}
-			// CLA-466: the presence beacon rides THIS poll — no new cadence. It
-			// fires AFTER the switch, whose default arm writes the pause flags
-			// fleetState reads (CLA-483); every poll beacons bar the two hard-stop
-			// arms, which get their `stopping` from fleetShutdown. A session blocks
-			// the poll, so the in-session renewal tick carries the same lap (CLA-771).
-			// The plane gets one report per target; the local file is written once
-			// after the loop (see localState above).
+			// CLA-466: the presence beacon rides THIS poll — no new cadence.
 			st := d.fleetState(i)
 			d.sendBeacon(i, t, st)
 			localState = pollBeaconState(localState, st)
@@ -478,20 +349,12 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 		}
 	}
 	if d.blind {
-		// An active window chooses no target at all, before the rotation below
-		// can reach for one.
+		// An active window chooses no target at all, before the rotation below can reach for one.
 		if sched {
 			return target, d.idleThroughPause(runCtx, idle), nil
 		}
-		// Blind mode has no counts to route on - rotate across targets so every
-		// queue still gets sessions. A target sitting out a harness failure
-		// (CLA-507) is skipped here exactly as the wired gate skips it; the only
-		// way skipUntil can be set in blind mode is that failure path, since
-		// judgeProgress never runs without polls. Walking a full lap without
-		// finding a drivable target means nothing is left, and that exit is the
-		// honest one. The lap reads from the PRE-pass cursor: mutating d.cursor
-		// per step would make later steps orbit the mutated value instead of
-		// walking the ring.
+		// Blind mode has no counts to route on - rotate across targets so every queue still gets
+		// sessions.
 		found := false
 		orig := d.cursor
 		for i := 1; i <= len(d.targets); i++ {
@@ -508,9 +371,8 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 		target = d.targets[d.cursor]
 	}
 
-	// There is work (or we're blind) — spend a session (or a phase sequence of
-	// them, one task either way), retrying transient blips with backoff (a
-	// fresh session reclaims any half-done task).
+	// There is work (or we're blind) — spend a session (or a phase sequence of them, one task either
+	// way), retrying transient blips with backoff (a fresh session reclaims any half-done task).
 	return target, runFall, nil
 }
 
@@ -523,8 +385,8 @@ const (
 	runStop                    // end the run
 )
 
-// checkMarkers reads the operator's control markers at the iteration boundary:
-// HALT, STOP, RESTART and RESTART_NOW end the run (true), RELOAD re-reads the config.
+// checkMarkers reads the operator's control markers at the iteration boundary: HALT, STOP, RESTART
+// and RESTART_NOW end the run (true), RELOAD re-reads the config.
 func (d *Driver) checkMarkers() bool {
 	if present, msg := d.readMarker("HALT"); present {
 		log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
@@ -535,14 +397,8 @@ func (d *Driver) checkMarkers() bool {
 		log.Print("STOP requested — stopping")
 		return true
 	}
-	// The restart/reload markers (CLA-461), honoured exactly where STOP is: the
-	// ITERATION boundary and, for STOP and RESTART, a verified phase seam
-	// (CLA-879). Reaching this point means the previous drain has fully unwound
-	// and handed its claim back, so a graceful restart holds no claim across the
-	// boundary by construction (resume is the plane's job anyway). A RESTART_NOW
-	// consumed here found no session in flight and acts as a plain restart; when
-	// one IS in flight the watcher in watchRestartNow has already cancelled the
-	// drain and this block is never reached.
+	// The restart/reload markers, honoured exactly where STOP is: the ITERATION boundary and, for STOP
+	// and RESTART, a verified phase seam.
 	if present, msg := d.readMarker(MarkerRestart); present {
 		_ = d.state.Remove(MarkerRestart)
 		if msg != "" {
@@ -565,9 +421,8 @@ func (d *Driver) checkMarkers() bool {
 		d.restartRequested.Store(true)
 		return true
 	}
-	// Locked against a panel member's wait-side RELOAD (CLA-697 review finding
-	// 1.review-1.2): both consume the same marker, and the read-then-remove is
-	// not atomic — the lock is what makes the reload happen once, on one
+	// Locked against a panel member's wait-side RELOAD: both consume the same marker, and the
+	// read-then-remove is not atomic — the lock is what makes the reload happen once, on one
 	// goroutine, whatever else is parked in waitOrStop.
 	d.controlMu.Lock()
 	if present, _ := d.readMarker(MarkerReload); present {

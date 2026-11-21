@@ -15,19 +15,11 @@ import (
 
 // --- run-config in force (CLA-410) -------------------------------------------
 
-// checkRunConfigs reports, per target, WHICH execution config the loop will run
-// under — the local file, or a stored plane document overlaid on it — plus any
-// machine-fit warnings about the STORED dials. The plane validates shape; only
-// this machine can see whether a dial it ratified can actually fire (a turn cap
-// under opencode, a cost ceiling on a harness that never reports cost), which is
-// the validation split the design memo draws.
-//
-// Plane trouble never FAILs: an unreadable stored document leaves the loop
-// running its previous config (the same posture applyReload takes), so doctor
-// says WARN and keeps `doctor && run` usable. A stored step this machine cannot
-// spawn is NOT plane trouble — it is ratified policy that would silently not
-// run here — so that one deliberately FAILs, and `doctor && run` refuses to
-// start until it is fixed.
+// checkRunConfigs reports, per target, WHICH execution config the loop will run under — the local
+// file, or a stored plane document overlaid on it — plus any machine-fit warnings about the
+// STORED dials. The plane validates shape; only this machine can see whether a dial it ratified can
+// actually fire (a turn cap under opencode, a cost ceiling on a harness that never reports cost),
+// which is the validation split the design memo draws.
 func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	type rcTarget struct {
 		name string // "" for the unnamed single target
@@ -55,17 +47,16 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 		}
 		newRCfg := e.newRCfgAPI
 		if newRCfg == nil {
-			// An env literal that predates the seam (every existing test) still
-			// gets production wiring, not a nil call.
+			// An env literal that predates the seam (every existing test) still gets production wiring, not
+			// a nil call.
 			newRCfg = plane.NewRunConfigAPI
 		}
 		rc := newRCfg(t.url, e.apiKey)
 		st, err := rc.RunConfig(ctx)
 		switch {
 		case errors.Is(err, plane.ErrNotWired):
-			// No endpoint or no key: nothing to compare against, and the backlog
-			// wiring check already reports that gap. Silence here is not hiding
-			// a finding; it is declining to duplicate one.
+			// No endpoint or no key: nothing to compare against, and the backlog wiring check already
+			// reports that gap.
 			continue
 		case errors.Is(err, plane.ErrNoConfig):
 			checks = append(checks, check{
@@ -114,13 +105,10 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 			continue
 		}
 		if err := eff.Validate(); err != nil {
-			// A stored STEP this machine cannot spawn is the one refusal that
-			// earns FAIL: the document is ratified policy that silently will not
-			// run here, and the operator has to know before an unattended drain
-			// quietly falls back to local rules instead (CLA-598). That FAIL is
-			// the point — `doctor && run` refuses to start on such a document.
-			// Every OTHER refusal stays WARN, because plane trouble must not make
-			// `doctor && run` unusable (applyRunConfig's own posture).
+			// A stored STEP this machine cannot spawn is the one refusal that earns FAIL: the document is
+			// ratified policy that silently will not run here, and the operator has to know before an
+			// unattended drain quietly falls back to local rules instead. Every OTHER refusal stays WARN,
+			// because plane trouble must not make `doctor && run` unusable (applyRunConfig's own posture).
 			var she *config.StepHarnessError
 			if errors.As(err, &she) {
 				where := ""
@@ -144,9 +132,7 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 		if st.Pending {
 			c.detail += "; a proposed change awaits ratification"
 		}
-		// Machine-fit notes on the STORED dials: what shape-validates but cannot
-		// fire here. Each names the dial as stored, so the operator edits the
-		// document rather than hunting their local file for a line they have.
+		// Machine-fit notes on the STORED dials: what shape-validates but cannot fire here.
 		var inert []string
 		if doc.MaxTurns > 0 {
 			var blind []string

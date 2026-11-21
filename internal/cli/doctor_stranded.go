@@ -11,26 +11,11 @@ import (
 
 // --- 7. stranded commits ----------------------------------------------------
 
-// checkStranded reports commits that exist only on this machine: reachable from
-// a local branch or a worktree HEAD (including detached ones), and from no
-// remote-tracking ref.
-//
-// The failure this exists for is silent and irreversible, not loud and
-// expensive: on 2026-08-28 three commits were found that existed in exactly one
-// place on earth — local `main` in one checkout, on no remote branch and no
-// other local branch. They had been committed on a permanent branch the
-// workflow forbids (so they were unpushable) and in a worktree under
-// /private/tmp, which macOS sweeps; when the tree went, the only surviving
-// pointer was a local ref nobody looks at. The causes vary — a swept temp dir,
-// an abandoned worktree, a stale checkout, an iteration that died mid-flight —
-// and they all have one signature: commits reachable from a local ref and from
-// no remote ref.
-//
-// This check is deliberately inert: it reports and recommends, and never
-// deletes, moves, pushes or rebases. A clean worktree is not evidence of
-// abandonment, and a live holder may be mid-task, so acting on someone else's
-// tree is dangerous — a report that surfaces the work and does nothing is safe
-// precisely because it does nothing.
+// checkStranded reports commits that exist only on this machine: reachable from a local branch or a
+// worktree HEAD (including detached ones), and from no remote-tracking ref. They had been committed
+// on a permanent branch the workflow forbids (so they were unpushable) and in a worktree under
+// /private/tmp, which macOS sweeps; when the tree went, the only surviving pointer was a local ref
+// nobody looks at.
 func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	c := check{name: "stranded", status: pass}
 
@@ -40,20 +25,17 @@ func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 		return c
 	}
 
-	// One check for every repo, with the findings carrying the repo path when
-	// there is more than one: the report must summarise, not dump — the CLI repo
-	// alone has 27 worktrees, and a per-tip line for every clean one is exactly
-	// the noise an operator learns to skim past.
+	// One check for every repo, with the findings carrying the repo path when there is more than one:
+	// the report must summarise, not dump — the CLI repo alone has 27 worktrees, and a per-tip line
+	// for every clean one is exactly the noise an operator learns to skim past.
 	multi := len(repos) > 1
 	var lines []string
 	withFindings, unchecked := 0, 0
 	for _, repo := range repos {
 		report, found := strandedFindings(ctx, e.gitRun, repo)
-		// A repo is counted as unchecked when none of its lines is a REAL
-		// finding — read failure, or every per-tip comparison failed: its only
-		// lines are errors, and the summary sentence must not read it as work
-		// that exists only on this machine. A repo with findings counts as one
-		// that holds stranded commits even when a line beside them is an error.
+		// A repo is counted as unchecked when none of its lines is a REAL finding — read failure, or
+		// every per-tip comparison failed: its only lines are errors, and the summary sentence must not
+		// read it as work that exists only on this machine.
 		if len(report) > 0 && !found {
 			unchecked++
 		}
@@ -61,11 +43,8 @@ func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 			withFindings++
 		}
 		for _, f := range report {
-			// Error lines name the repo even when it is the only one in scope:
-			// the remedy points at "the repo named above", and a bare "could
-			// not enumerate" line names nothing. Finding lines stay bare — the
-			// ref or worktree path is the handle a human rescues by — and take
-			// the repo prefix only when more than one repo is in scope.
+			// Error lines name the repo even when it is the only one in scope: the remedy points at "the
+			// repo named above", and a bare "could not enumerate" line names nothing.
 			if multi || f.err {
 				f.text = repo + ": " + f.text
 			}
@@ -97,17 +76,9 @@ func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	return c
 }
 
-// strandedRepos lists the repositories the stranded check reports on: every
-// checkout the config resolves to for each project — the declared repos
-// (CLA-437), and the checkouts under the project's workdir.
-//
-// The workdir scan is scoped to the project's own repos when a slug is
-// configured: a multi-repo parent holds checkouts that belong to other
-// projects, and warning about every one of them is how a WARN line becomes
-// something an operator skims. The project's repos are taken to be the ones
-// named after its slug — the same deliberate under-reporting direction as
-// detectToolchains: a missed report is a one-off, a wall of irrelevant
-// warnings buries the one that mattered.
+// strandedRepos lists the repositories the stranded check reports on: every checkout the config
+// resolves to for each project — the declared repos, and the checkouts under the project's
+// workdir.
 func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []string {
 	type target struct {
 		dir     string
@@ -129,13 +100,8 @@ func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []strin
 		}
 	}
 
-	// delivery.Repos returns working-tree dirs deduplicated by repository, so
-	// linked worktrees never double-report. The declared checkouts can collide
-	// with the scan the other way round — a declared path that is a WORKTREE of
-	// a repo the scan also found: two paths, one repository. Dedupe the
-	// combined list by the shared git directory, the same identity
-	// candidateRepos uses, so a repository is checked once no matter how many
-	// of its trees the config names.
+	// delivery.Repos returns working-tree dirs deduplicated by repository, so linked worktrees never
+	// double-report.
 	seen := map[string]bool{}
 	var out []string
 	add := func(dir string) {
@@ -144,9 +110,8 @@ func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []strin
 		}
 		key := repoCommonDir(ctx, e.gitRun, dir)
 		if key == "" {
-			// The repo could not be read at all: keep it on its path — the
-			// check's error line will say why — rather than silently dropping
-			// it under a key we cannot know.
+			// The repo could not be read at all: keep it on its path — the check's error line will say why
+			// — rather than silently dropping it under a key we cannot know.
 			key = resolvePath(dir)
 		}
 		if !seen[key] {
@@ -159,8 +124,8 @@ func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []strin
 		if dir == "" {
 			dir = "."
 		}
-		// Declared repos first: an explicit `repos` path is the project's repo
-		// by declaration, even when the checkout lives outside the workdir.
+		// Declared repos first: an explicit `repos` path is the project's repo by declaration, even when
+		// the checkout lives outside the workdir.
 		for _, checkout := range config.DeclaredCheckouts(t.repos, t.primary, dir) {
 			add(checkout)
 		}
@@ -174,9 +139,9 @@ func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []strin
 	return out
 }
 
-// repoHasSlug reports whether repo is one of the project's own checkouts: the
-// workdir itself (whatever its name — the single-repo case, where the workdir
-// IS the checkout), or a checkout whose directory name starts with the slug.
+// repoHasSlug reports whether repo is one of the project's own checkouts: the workdir itself
+// (whatever its name — the single-repo case, where the workdir IS the checkout), or a checkout
+// whose directory name starts with the slug.
 func repoHasSlug(repo, workdir, slug string) bool {
 	if resolvePath(repo) == resolvePath(workdir) {
 		return true
@@ -184,11 +149,8 @@ func repoHasSlug(repo, workdir, slug string) bool {
 	return strings.HasPrefix(filepath.Base(repo), slug)
 }
 
-// repoCommonDir is the shared git directory of a checkout — the identity a
-// repository keeps across all its working trees. The main checkout reports
-// ".git" relative to itself, a linked worktree reports the common dir as an
-// absolute path; both are normalised to the same resolved path, so two trees
-// of one repo compare equal. Empty when the repo cannot be read.
+// repoCommonDir is the shared git directory of a checkout — the identity a repository keeps
+// across all its working trees. Empty when the repo cannot be read.
 func repoCommonDir(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), dir string) string {
 	out, err := gitRun(ctx, dir, "rev-parse", "--git-common-dir")
 	if err != nil || out == "" {
@@ -200,26 +162,19 @@ func repoCommonDir(ctx context.Context, gitRun func(ctx context.Context, dir str
 	return resolvePath(out)
 }
 
-// strandedLine is one report line for a repo: a finding naming a tip that
-// reaches stranded commits, or an error line naming a git read that failed.
-// err lines are prefixed with the repo path by the caller even in single-repo
-// mode, so the repo the remedy points at ("run the failing git command by hand
-// in the repo named above") is actually named; finding lines stay bare, the
-// ref or worktree path being the handle a human rescues by.
+// strandedLine is one report line for a repo: a finding naming a tip that reaches stranded commits,
+// or an error line naming a git read that failed.
 type strandedLine struct {
 	text string
 	err  bool
 }
 
-// strandedFindings returns the lines to report for one repository — a finding
-// per tip that reaches a commit no remote-tracking ref reaches, and an error
-// line per git read that failed — and whether any line is a REAL finding
-// (commits established to exist only on this machine).
-//
-// A finding names the ref (a branch) or the worktree path (a detached HEAD —
-// the only handle a detached commit has), how many commits are stranded, and
-// the newest one's subject and date: the three facts a human needs to tell live
-// work from debris at a glance.
+// strandedFindings returns the lines to report for one repository — a finding per tip that
+// reaches a commit no remote-tracking ref reaches, and an error line per git read that failed —
+// and whether any line is a REAL finding (commits established to exist only on this machine). A
+// finding names the ref (a branch) or the worktree path (a detached HEAD — the only handle a
+// detached commit has), how many commits are stranded, and the newest one's subject and date: the
+// three facts a human needs to tell live work from debris at a glance.
 func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), repo string) ([]strandedLine, bool) {
 	branches, err := gitRun(ctx, repo, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads")
 	if err != nil {
@@ -230,9 +185,8 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 		return []strandedLine{{text: "could not enumerate the worktrees: " + err.Error(), err: true}}, false
 	}
 
-	// Tips, deduplicated by sha with the branch name winning: a detached HEAD
-	// that happens to sit on a branch tip is the same commits, and the branch is
-	// the stable handle a human rescues by.
+	// Tips, deduplicated by sha with the branch name winning: a detached HEAD that happens to sit on a
+	// branch tip is the same commits, and the branch is the stable handle a human rescues by.
 	names := map[string]string{}
 	var shas []string
 	add := func(sha, name string) {
@@ -262,9 +216,8 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 		return []strandedLine{{text: "could not read the remote-tracking refs: " + err.Error(), err: true}}, false
 	}
 	if remotes == "" {
-		// No remote-tracking refs at all: every local commit qualifies, and
-		// per-tip lines would dump the whole history. One finding names the
-		// state instead — the whole repository is on no remote.
+		// No remote-tracking refs at all: every local commit qualifies, and per-tip lines would dump the
+		// whole history.
 		all, err := gitRun(ctx, repo, strandedRevListArgs(shas)...)
 		if err != nil {
 			return []strandedLine{{text: "could not enumerate the local commits: " + err.Error(), err: true}}, false
@@ -293,11 +246,11 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 		if stranded == "" {
 			continue
 		}
-		// The rev-list output above IS the finding — commits established to be
-		// on no remote — even when the newest one's subject cannot be read.
+		// The rev-list output above IS the finding — commits established to be on no remote — even
+		// when the newest one's subject cannot be read.
 		found = true
-		// rev-list prints newest first, one sha per line; the runner trimmed the
-		// trailing newline, so a non-empty list has count = newlines + 1.
+		// rev-list prints newest first, one sha per line; the runner trimmed the trailing newline, so a
+		// non-empty list has count = newlines + 1.
 		n := strings.Count(stranded, "\n") + 1
 		subject, date, err := newestCommit(ctx, gitRun, repo, firstLine(stranded))
 		if err != nil {
@@ -311,9 +264,9 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 	return lines, found
 }
 
-// strandedRevListArgs builds `rev-list <tips...> --not --remotes`: every commit
-// reachable from a tip and from no remote-tracking ref. Built as one slice so
-// the two call sites cannot drift apart on the arg order.
+// strandedRevListArgs builds `rev-list <tips...> --not --remotes`: every commit reachable from a
+// tip and from no remote-tracking ref. Built as one slice so the two call sites cannot drift apart
+// on the arg order.
 func strandedRevListArgs(shas []string) []string {
 	out := make([]string, 0, len(shas)+3)
 	out = append(out, "rev-list")
@@ -322,8 +275,8 @@ func strandedRevListArgs(shas []string) []string {
 	return out
 }
 
-// newestCommit renders a commit's subject and short date — the two facts the
-// stranded report promises per finding.
+// newestCommit renders a commit's subject and short date — the two facts the stranded report
+// promises per finding.
 func newestCommit(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), repo, sha string) (subject, date string, err error) {
 	out, err := gitRun(ctx, repo, "show", "-s", "--format=%s%n%ad", "--date=short", sha)
 	if err != nil {
@@ -333,20 +286,17 @@ func newestCommit(ctx context.Context, gitRun func(ctx context.Context, dir stri
 	return subject, date, nil
 }
 
-// strandedWorktree is one entry of `git worktree list --porcelain`, kept only
-// for the entries that matter to the stranded check: detached heads.
+// strandedWorktree is one entry of `git worktree list --porcelain`, kept only for the entries that
+// matter to the stranded check: detached heads.
 type strandedWorktree struct {
 	path     string
 	head     string
 	detached bool
 }
 
-// parseStrandedWorktrees reads `git worktree list --porcelain`: blank-line-
-// separated blocks, each led by `worktree <path>` with `HEAD <sha>` and, when a
-// branch is checked out, `branch refs/heads/<name>`. A `detached` block has no
-// branch line and is exactly the tip no branch names. Bare blocks (no working
-// tree) are dropped: their HEAD is a branch, so the branch enumeration already
-// covers it.
+// parseStrandedWorktrees reads `git worktree list --porcelain`: blank-line- separated blocks, each
+// led by `worktree <path>` with `HEAD <sha>` and, when a branch is checked out, `branch
+// refs/heads/<name>`.
 func parseStrandedWorktrees(listing string) []strandedWorktree {
 	var out []strandedWorktree
 	var cur strandedWorktree

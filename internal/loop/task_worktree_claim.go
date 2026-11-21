@@ -1,9 +1,8 @@
 package loop
 
-// task_worktree_claim.go — the READ-ONLY pre-claim verdict on a task's existing
-// worktree, so a deterministic local refusal is found BEFORE the claim: a claim
-// that cannot be honoured costs a reclaim, and two consecutive ones park the
-// task (CLA-847).
+// task_worktree_claim.go — the READ-ONLY pre-claim verdict on a task's existing worktree, so a
+// deterministic local refusal is found BEFORE the claim: a claim that cannot be honoured costs a
+// reclaim, and two consecutive ones park the task.
 
 import (
 	"context"
@@ -12,21 +11,9 @@ import (
 	"strings"
 )
 
-// claimWorktreeRefusal is the pre-claim, READ-ONLY answer for one task: the
-// deterministic reason the task's existing worktree cannot be prepared for a
-// claim, or "" when taking the claim is worth it. It moves, fetches-to-reset and
-// prunes nothing, so a refusal here happens BEFORE the claim and costs no
-// reclaim — the park that two refused claims produce is what this exists to
-// prevent.
-//
-// Only what can be proven is refused. Everything judged against origin is
-// decided after one fetch; a fresh tree at a PR base the request does not carry
-// is deferred to the post-claim prep, which resolves that base itself. A check
-// that cannot run is not a refusal: the prep repeats the same decision with the
-// same facts, and a transient failure must not starve the task.
-//
-// The origin facts it fetched are returned so the post-claim prep can reuse them
-// instead of paying a second round-trip.
+// claimWorktreeRefusal is the pre-claim, READ-ONLY answer for one task: the deterministic reason
+// the task's existing worktree cannot be prepared for a claim, or "" when taking the claim is worth
+// it. Only what can be proven is refused.
 func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip string) (string, originBranchFacts, error) {
 	id := strings.TrimSpace(req.TaskID)
 	if strings.TrimSpace(req.Checkout) == "" || strings.TrimSpace(req.Branch) == "" || len(id) < 8 || !isHex(id[:8]) {
@@ -43,8 +30,8 @@ func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip stri
 	dir := taskWorktreeDir(req, main)
 	wt, found := taskWorktreeExisting(registered, dir, req.Branch)
 	if !found {
-		// A new tree is cut from origin, so its deterministic refusals are
-		// origin facts too: proving them here keeps them off the reclaim.
+		// A new tree is cut from origin, so its deterministic refusals are origin facts too: proving them
+		// here keeps them off the reclaim.
 		return claimWorktreeCreateRefusal(ctx, req, dir, doneTip)
 	}
 	switch {
@@ -68,8 +55,8 @@ func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip stri
 	if err != nil {
 		return "", originBranchFacts{}, err
 	}
-	// Untracked files need origin to prove they are clearable, and a resumed or
-	// close-out tree is synced against origin by the prep.
+	// Untracked files need origin to prove they are clearable, and a resumed or close-out tree is
+	// synced against origin by the prep.
 	var facts originBranchFacts
 	if len(untracked) > 0 || req.Resume || req.CloseOut {
 		if _, err := taskWorktreeGit(ctx, req.Checkout, "fetch", "origin", "--prune"); err != nil {
@@ -84,8 +71,8 @@ func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip stri
 	}
 	if len(untracked) > 0 {
 		if !onOrigin {
-			// A fresh tree at the PR base may be safe to clear; the post-claim
-			// prep resolves that base, so defer rather than guess.
+			// A fresh tree at the PR base may be safe to clear; the post-claim prep resolves that base, so
+			// defer rather than guess.
 			return "", facts, nil
 		}
 		ref, err := taskWorktreeClearedRef(ctx, req, wt.path)
@@ -114,8 +101,8 @@ func claimWorktreeRefusal(ctx context.Context, req worktreeRequest, doneTip stri
 	return "", facts, nil
 }
 
-// taskWorktreeExisting finds the tree a prep would reuse: the one at the
-// deterministic path, else one already checked out on the branch elsewhere.
+// taskWorktreeExisting finds the tree a prep would reuse: the one at the deterministic path, else
+// one already checked out on the branch elsewhere.
 func taskWorktreeExisting(list []registeredWorktree, dir, branch string) (registeredWorktree, bool) {
 	for _, wt := range list {
 		if taskWorktreeSamePath(wt.path, dir) {
@@ -125,10 +112,8 @@ func taskWorktreeExisting(list []registeredWorktree, dir, branch string) (regist
 	return taskWorktreeOnBranch(list, branch)
 }
 
-// claimWorktreeCreateRefusal proves the CREATE path's deterministic refusals
-// before the claim: each one fails identically inside prepareTaskWorktree, so
-// finding it here costs no reclaim. A check whose facts this request does not
-// carry is deferred — the prep repeats the decision after the claim.
+// claimWorktreeCreateRefusal proves the CREATE path's deterministic refusals before the claim: each
+// one fails identically inside prepareTaskWorktree, so finding it here costs no reclaim.
 func claimWorktreeCreateRefusal(ctx context.Context, req worktreeRequest, dir, doneTip string) (string, originBranchFacts, error) {
 	if _, err := os.Stat(dir); err == nil {
 		return fmt.Sprintf("%s already exists but is not a worktree of %s — refusing to reuse it", dir, req.Checkout), originBranchFacts{}, nil
@@ -136,8 +121,8 @@ func claimWorktreeCreateRefusal(ctx context.Context, req worktreeRequest, dir, d
 		return "", originBranchFacts{}, err
 	}
 	if !req.Resume && !req.CloseOut && strings.TrimSpace(req.PRBase) == "" {
-		// The caller resolved no base, so a missing origin/<base> cannot be
-		// proven here; the prep resolves one after the claim.
+		// The caller resolved no base, so a missing origin/<base> cannot be proven here; the prep
+		// resolves one after the claim.
 		return "", originBranchFacts{}, nil
 	}
 	if _, err := taskWorktreeGit(ctx, req.Checkout, "fetch", "origin", "--prune"); err != nil {
@@ -145,8 +130,7 @@ func claimWorktreeCreateRefusal(ctx context.Context, req worktreeRequest, dir, d
 	}
 	facts := readOriginBranchFetched(ctx, req.Checkout, req.Branch, doneTip)
 	if req.Resume || req.CloseOut {
-		// taskWorktreeAddExisting needs the branch on origin and only
-		// fast-forwards a local one.
+		// taskWorktreeAddExisting needs the branch on origin and only fast-forwards a local one.
 		remote := "origin/" + req.Branch
 		if !taskWorktreeCommitishExists(ctx, req.Checkout, remote) {
 			return fmt.Sprintf("the branch %s is not on origin", req.Branch), facts, nil
@@ -154,8 +138,8 @@ func claimWorktreeCreateRefusal(ctx context.Context, req worktreeRequest, dir, d
 		reason, err := claimWorktreeLocalBranchRefusal(ctx, req.Checkout, req.Branch, remote)
 		return reason, facts, err
 	}
-	// taskWorktreeAddNew cuts from the PR base and reuses a local branch only
-	// when it holds nothing that base lacks.
+	// taskWorktreeAddNew cuts from the PR base and reuses a local branch only when it holds nothing
+	// that base lacks.
 	base := "origin/" + req.PRBase
 	if !taskWorktreeCommitishExists(ctx, req.Checkout, base) {
 		return fmt.Sprintf("the PR base %s is not on origin", req.PRBase), facts, nil
@@ -164,9 +148,8 @@ func claimWorktreeCreateRefusal(ctx context.Context, req worktreeRequest, dir, d
 	return reason, facts, err
 }
 
-// claimWorktreeLocalBranchRefusal names a local branch the create path would
-// refuse to reset: one holding commits the branch would be cut from does not
-// have. A missing local branch is not a refusal.
+// claimWorktreeLocalBranchRefusal names a local branch the create path would refuse to reset: one
+// holding commits the branch would be cut from does not have.
 func claimWorktreeLocalBranchRefusal(ctx context.Context, checkout, branch, against string) (string, error) {
 	if !taskWorktreeCommitishExists(ctx, checkout, "refs/heads/"+branch) {
 		return "", nil

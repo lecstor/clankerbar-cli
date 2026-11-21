@@ -13,13 +13,10 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// A runner-claimed session makes NO plane writes: it ends its final message with
-// a done report and the runner turns that report into the task's records here.
-// See docs/runner-owned-mechanics.md ("B8 design") for what each phase writes.
+// A runner-claimed session makes NO plane writes: it ends its final message with a done report and
+// the runner turns that report into the task's records here.
 
-// reportKind is which done report a phase expects. It is decided from the runner
-// brief the phase runs, so a phase whose session still owns its writes (a
-// close-out, a panel member, a custom prompt) reports nothing at all.
+// reportKind is which done report a phase expects.
 type reportKind int
 
 const (
@@ -31,12 +28,9 @@ const (
 	reportVerify
 )
 
-// reportKindFor decides the kind from the CAPTURED phase's prompt, never the
-// live one: a handoff respawn replaces ph.Prompt with the predecessor's
-// successor text, and the successor still owes the same report its phase does.
-// The checkpoint variant is resolved first, exactly as invocationFor does, so a
-// branchless or unverified phase - which still runs a shipped brief that writes
-// its own records - expects no report.
+// reportKindFor decides the kind from the CAPTURED phase's prompt, never the live one: a handoff
+// respawn replaces ph.Prompt with the predecessor's successor text, and the successor still owes
+// the same report its phase does.
 func reportKindFor(phases []config.Phase, phaseIdx int, rb *runnerBriefing, panelMember bool, prev *harness.Result) reportKind {
 	if phaseIdx < 0 || phaseIdx >= len(phases) {
 		return reportNone
@@ -44,9 +38,9 @@ func reportKindFor(phases []config.Phase, phaseIdx int, rb *runnerBriefing, pane
 	return reportKindOf(resolvedRunnerBrief(phases[phaseIdx].Prompt, rb, panelMember, prev))
 }
 
-// resolvedRunnerBrief is the brief invocationFor gives a phase: the checkpoint
-// variant of its captured prompt, then the runner swap, both only for a resumed
-// (held) claim, exactly as invocationFor applies them.
+// resolvedRunnerBrief is the brief invocationFor gives a phase: the checkpoint variant of its
+// captured prompt, then the runner swap, both only for a resumed (held) claim, exactly as
+// invocationFor applies them.
 func resolvedRunnerBrief(captured string, rb *runnerBriefing, panelMember bool, prev *harness.Result) string {
 	if rb == nil || panelMember || prev == nil || !prev.Claim.Held() {
 		return ""
@@ -71,20 +65,15 @@ func reportKindOf(brief string) reportKind {
 	return reportNone
 }
 
-// doneAttribution resolves who a done report is attributed to: this phase's
-// harness and model, the implementer's for a phase that judges its work, and the
-// reviewer role a review record is filed under. It is the SAME resolution
-// invocationFor fills the attribution placeholders with, so the record the
-// runner writes names exactly what the session's brief did.
+// doneAttribution resolves who a done report is attributed to: this phase's harness and model, the
+// implementer's for a phase that judges its work, and the reviewer role a review record is filed
+// under.
 func (d *Driver) doneAttribution(t Target, ph config.Phase, phases []config.Phase, phaseIdx int, inv harness.Invocation) (config.Attribution, string) {
 	tc := d.targetCfg(t)
 	attr := config.Attribution{Harness: tc.HarnessFor(ph), Model: inv.Model}
 	prevIdx := phaseIdx - 1
-	// CLA-639: inside a review panel every member's predecessor is the member
-	// before it, but the review briefs name {{prevHarness}}/{{prevModel}} as the
-	// IMPLEMENTER whose work is being judged. Walk back past the panel to the
-	// last non-review phase, so member 2 does not accuse member 1 of having
-	// implemented the branch.
+	// CLA-639: inside a review panel every member's predecessor is the member before it, but the
+	// review briefs name {{prevHarness}}/{{prevModel}} as the IMPLEMENTER whose work is being judged.
 	for prevIdx >= 0 && config.ReviewShaped(phases[prevIdx].Prompt) && phases[prevIdx].IsPanelMember() {
 		prevIdx--
 	}
@@ -95,24 +84,18 @@ func (d *Driver) doneAttribution(t Target, ph config.Phase, phases []config.Phas
 	return attr, reviewerRoleFor(phases, phaseIdx)
 }
 
-// applyDoneReport turns the session's done report into the task's records. It
-// runs after the handoff classification — a session that handed off owes its
-// successor's report, not its own — and before the evidence gate, because that
-// gate judges what this has just written.
+// applyDoneReport turns the session's done report into the task's records.
 func (r *phaseRun) applyDoneReport(ctx context.Context, at *phaseAttempt) {
 	if r.kind == reportNone || at.runLost != nil {
 		return
 	}
-	// The implement branch is a fact about origin, not part of the report: it is
-	// recorded on every trusted end, so a handoff the driver later refuses, or a
-	// session that died after pushing, still leaves the WIP a takeover resumes
-	// instead of releasing the task to ready over pushed work.
+	// The implement branch is a fact about origin, not part of the report: it is recorded on every
+	// trusted end, so a handoff the driver later refuses, or a session that died after pushing, still
+	// leaves the WIP a takeover resumes instead of releasing the task to ready over pushed work.
 	if r.kind == reportImplement && at.res.Untrusted == "" && at.res.Claim.Held() {
 		r.recordDoneBranch(ctx, at)
 	}
-	// Only a handoff the driver will honour defers the report to its successor. A
-	// refused or cleared one (every verify round clears it) has no successor, so
-	// a report the session also wrote is the phase's only record.
+	// Only a handoff the driver will honour defers the report to its successor.
 	if at.handoff != "" {
 		return
 	}
@@ -160,15 +143,15 @@ func (r *phaseRun) applyDoneReport(ctx context.Context, at *phaseAttempt) {
 	}
 }
 
-// applyImplementReport writes an implement phase's delivery: the branch the
-// session pushed, then the outcome section its report becomes.
+// applyImplementReport writes an implement phase's delivery: the branch the session pushed, then
+// the outcome section its report becomes.
 func (r *phaseRun) applyImplementReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
 	st, ok := r.doneTask(ctx, at, "for the implement phase's done report")
 	if !ok {
 		return
 	}
-	// A park replaces settle_task: the session re-read the task, found its work
-	// superseded, and the park's reason is the whole record.
+	// A park replaces settle_task: the session re-read the task, found its work superseded, and the
+	// park's reason is the whole record.
 	if park := strings.TrimSpace(rep.Park); park != "" {
 		r.parkReported(ctx, at, st, park)
 		return
@@ -188,9 +171,9 @@ func (r *phaseRun) applyImplementReport(ctx context.Context, w plane.ReportWrite
 		labelOf(r.t), r.drainNum, r.phaseLabel(), claimLabel(at.res.Claim))
 }
 
-// applyReviewReport writes a review phase's record: the legacy `## Review` block
-// ONTO the outcome first, then the durable record. The order is load-bearing —
-// the plane refuses the run's outcome write once its review record is sealed.
+// applyReviewReport writes a review phase's record: the legacy `## Review` block ONTO the outcome
+// first, then the durable record. The order is load-bearing — the plane refuses the run's outcome
+// write once its review record is sealed.
 func (r *phaseRun) applyReviewReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
 	tip := r.checkpointTip()
 	if err := r.checkReviewRecord(rep); err != nil {
@@ -201,8 +184,8 @@ func (r *phaseRun) applyReviewReport(ctx context.Context, w plane.ReportWriter, 
 	if !ok {
 		return
 	}
-	// Idempotent on the plane's own terms: a record this run already wrote under
-	// this role at this tip IS the record, so a retried attempt writes nothing.
+	// Idempotent on the plane's own terms: a record this run already wrote under this role at this tip
+	// IS the record, so a retried attempt writes nothing.
 	if rec, matched := matchingReviewRecord(st.Reviews, at.role, at.res.Claim.RunID, tip, r.requireReviewTip()); matched {
 		log.Printf("%siteration %d: the %s phase: the task already carries this run's %s record (round %d) — nothing to write",
 			labelOf(r.t), r.drainNum, r.phaseLabel(), at.role, rec.Round)
@@ -241,8 +224,7 @@ func (r *phaseRun) applyReviewReport(ctx context.Context, w plane.ReportWriter, 
 	}
 }
 
-// applyFixReport writes a fix phase's finding answers, then the outcome section
-// its report becomes. It is the fix that a verification round follows.
+// applyFixReport writes a fix phase's finding answers, then the outcome section its report becomes.
 func (r *phaseRun) applyFixReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
 	if r.fixParked(ctx, at, rep) {
 		return
@@ -271,8 +253,8 @@ func (r *phaseRun) applyFixReport(ctx context.Context, w plane.ReportWriter, at 
 		labelOf(r.t), r.drainNum, r.phaseLabel(), claimLabel(at.res.Claim))
 }
 
-// applyFixLastReport is the LAST fix: the same finding answers, then the
-// hand-over the session used to make itself.
+// applyFixLastReport is the LAST fix: the same finding answers, then the hand-over the session used
+// to make itself.
 func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
 	if r.fixParked(ctx, at, rep) {
 		return
@@ -289,15 +271,15 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 	if !ok {
 		return
 	}
-	// The hand-over names a branch the next clanker can actually fetch, so origin
-	// must have it before the task leaves this run's hands.
+	// The hand-over names a branch the next clanker can actually fetch, so origin must have it before
+	// the task leaves this run's hands.
 	branch := r.doneBranch(at)
 	if onOrigin, why := r.branchOnOrigin(ctx, at, branch); !onOrigin {
 		r.noteReportProblem("the task branch %q is not verified on the origin remote (%s), so the task was not handed over", branch, why)
 		return
 	}
-	// A takeover start may have the branch on origin but not on the task, and
-	// the reviewer reads an empty branch field as a failed hand-off.
+	// A takeover start may have the branch on origin but not on the task, and the reviewer reads an
+	// empty branch field as a failed hand-off.
 	if !r.recordVerifiedBranch(ctx, at, branch) {
 		return
 	}
@@ -307,8 +289,8 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 		Touches:      riskTouches(rep),
 	}
 	if err := w.SubmitForReview(ctx, at.res.Claim.TaskID, at.res.Claim.RunID, sub); err != nil {
-		// Not folded, not stopped: the claim stays live and the ordinary handback
-		// gives the task back with its branch recorded.
+		// Not folded, not stopped: the claim stays live and the ordinary handback gives the task back
+		// with its branch recorded.
 		r.noteReportWrite("handing the task over for review", err)
 		return
 	}
@@ -317,9 +299,8 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 		labelOf(r.t), r.drainNum, r.phaseLabel(), claimLabel(at.res.Claim))
 }
 
-// applyVerifyReport writes a verification round's record: the finding answers,
-// the review block, then the durable record scoped to the fix delta. The record
-// is kept for the hand-over judgeVerifyRound performs once the round is closed.
+// applyVerifyReport writes a verification round's record: the finding answers, the review block,
+// then the durable record scoped to the fix delta.
 func (r *phaseRun) applyVerifyReport(ctx context.Context, w plane.ReportWriter, at *phaseAttempt, rep config.DoneReport) {
 	if err := r.checkReviewRecord(rep); err != nil {
 		r.noteReportProblem("its done report is not a valid verification record: %v", err)
@@ -350,8 +331,8 @@ func (r *phaseRun) applyVerifyReport(ctx context.Context, w plane.ReportWriter, 
 		ScopeKind:   "fix-delta",
 		Findings:    doneFindings(rep, at.attr.Model),
 	}
-	// What this round verified is the delta on top of the newest record the
-	// plane has already released; with none to name, the scope is the kind alone.
+	// What this round verified is the delta on top of the newest record the plane has already
+	// released; with none to name, the scope is the kind alone.
 	if base := newestReleasedReviewTip(st.Reviews); base != "" {
 		rec.ScopeBase = base
 		rec.ScopeRange = base + ".." + rep.ReviewedTip
@@ -365,15 +346,15 @@ func (r *phaseRun) applyVerifyReport(ctx context.Context, w plane.ReportWriter, 
 		labelOf(r.t), r.drainNum, r.phaseLabel(), at.role, rep.Verdict, claimLabel(at.res.Claim))
 }
 
-// handOverVerifiedRound is the verify phase's terminal step, which a runner
-// brief forbids its session to take: once the round is closed with no open MUST
-// and the task was left in_progress, the runner hands the task to review.
+// handOverVerifiedRound is the verify phase's terminal step, which a runner brief forbids its
+// session to take: once the round is closed with no open MUST and the task was left in_progress,
+// the runner hands the task to review.
 func (r *phaseRun) handOverVerifiedRound(ctx context.Context, at *phaseAttempt, st plane.TaskState) {
 	if r.kind != reportVerify || r.end.doneReport == nil {
 		return
 	}
-	// openMustIDs, not the plane's openMustIds: the plane's list includes void
-	// records, whose MUSTs are not work left to do.
+	// openMustIDs, not the plane's openMustIds: the plane's list includes void records, whose MUSTs
+	// are not work left to do.
 	if len(openMustIDs(st.Reviews)) != 0 || st.Status != "in_progress" {
 		return
 	}
@@ -383,9 +364,7 @@ func (r *phaseRun) handOverVerifiedRound(ctx context.Context, at *phaseAttempt, 
 	}
 	rep := *r.end.doneReport
 	sub := plane.Submission{RiskDeclared: rep.RiskDeclared(), Touches: riskTouches(rep)}
-	// The plane's in_review guard reads **Tests** from the stored outcome. The fix
-	// phase normally wrote it, but a verify-start run may inherit an outcome
-	// without one; the round is closed by now, so an outcome write is legal.
+	// The plane's in_review guard reads **Tests** from the stored outcome.
 	if !config.HasTestsSection(st.Outcome) {
 		sub.Outcome = config.AppendOutcome(st.Outcome, config.RenderTestsSection(rep.Tests))
 	}
@@ -399,9 +378,9 @@ func (r *phaseRun) handOverVerifiedRound(ctx context.Context, at *phaseAttempt, 
 		labelOf(r.t), r.drainNum, r.phaseLabel(), claimLabel(at.res.Claim))
 }
 
-// parkReported parks the task on the session's own reason, appended to the
-// outcome it found so the operator reads both. A successful park settles the
-// claim exactly as the session's settle_task would have.
+// parkReported parks the task on the session's own reason, appended to the outcome it found so the
+// operator reads both. A successful park settles the claim exactly as the session's settle_task
+// would have.
 func (r *phaseRun) parkReported(ctx context.Context, at *phaseAttempt, st plane.TaskState, park string) {
 	parker, ok := r.t.Releaser.(plane.ParkAPI)
 	if !ok {
@@ -418,9 +397,9 @@ func (r *phaseRun) parkReported(ctx context.Context, at *phaseAttempt, st plane.
 		labelOf(r.t), r.drainNum, r.phaseLabel(), park)
 }
 
-// fixParked handles a fix report's park before any write: the session found the
-// review record missing or stale and changed nothing, so answering findings or
-// writing a Fixes section would report a fix that never happened.
+// fixParked handles a fix report's park before any write: the session found the review record
+// missing or stale and changed nothing, so answering findings or writing a Fixes section would
+// report a fix that never happened.
 func (r *phaseRun) fixParked(ctx context.Context, at *phaseAttempt, rep config.DoneReport) bool {
 	park := strings.TrimSpace(rep.Park)
 	if park == "" {
@@ -432,9 +411,8 @@ func (r *phaseRun) fixParked(ctx context.Context, at *phaseAttempt, rep config.D
 	return true
 }
 
-// recordDoneBranch records the task's branch when the session did not, so a
-// phase that pushed work but wrote nothing still leaves the hand-off a takeover
-// needs. It reports whether the caller may carry on to its remaining writes.
+// recordDoneBranch records the task's branch when the session did not, so a phase that pushed work
+// but wrote nothing still leaves the hand-off a takeover needs.
 func (r *phaseRun) recordDoneBranch(ctx context.Context, at *phaseAttempt) bool {
 	if len(recordedBranches(at.res)) > 0 {
 		return true
@@ -453,8 +431,8 @@ func (r *phaseRun) recordDoneBranch(ctx context.Context, at *phaseAttempt) bool 
 	return r.recordVerifiedBranch(ctx, at, branch)
 }
 
-// recordVerifiedBranch writes a branch the caller has already verified on
-// origin and folds it onto the claim, as salvage does.
+// recordVerifiedBranch writes a branch the caller has already verified on origin and folds it onto
+// the claim, as salvage does.
 func (r *phaseRun) recordVerifiedBranch(ctx context.Context, at *phaseAttempt, branch string) bool {
 	if len(recordedBranches(at.res)) > 0 {
 		return true
@@ -477,8 +455,8 @@ func (r *phaseRun) recordVerifiedBranch(ctx context.Context, at *phaseAttempt, b
 	return true
 }
 
-// branchOnOrigin runs the same delivery check the phase evidence gate runs: a
-// branch may only be recorded, or handed over, when origin really has it.
+// branchOnOrigin runs the same delivery check the phase evidence gate runs: a branch may only be
+// recorded, or handed over, when origin really has it.
 func (r *phaseRun) branchOnOrigin(ctx context.Context, at *phaseAttempt, branch string) (bool, string) {
 	if branch == "" {
 		return false, "the task names no branch"
@@ -502,8 +480,8 @@ func (r *phaseRun) branchOnOrigin(ctx context.Context, at *phaseAttempt, branch 
 	return false, "the check returned no branch-push result"
 }
 
-// doneTask reads the task a report's writes are appended to. A failed read is a
-// reportProblem, not a retry: the phase's evidence gate fails closed on its own.
+// doneTask reads the task a report's writes are appended to. A failed read is a reportProblem, not
+// a retry: the phase's evidence gate fails closed on its own.
 func (r *phaseRun) doneTask(ctx context.Context, at *phaseAttempt, purpose string) (plane.TaskState, bool) {
 	st, ok := r.d.readTaskStateRetry(ctx, r.t, at.res.Claim.TaskID, purpose)
 	if !ok {
@@ -512,9 +490,9 @@ func (r *phaseRun) doneTask(ctx context.Context, at *phaseAttempt, purpose strin
 	return st, ok
 }
 
-// doneBranch is the task branch as this session was told it: the verified
-// hand-off, else the runner's own name for a fresh claim (the same rule the
-// context block follows), else whatever the claim itself carries.
+// doneBranch is the task branch as this session was told it: the verified hand-off, else the
+// runner's own name for a fresh claim (the same rule the context block follows), else whatever the
+// claim itself carries.
 func (r *phaseRun) doneBranch(at *phaseAttempt) string {
 	if r.prev != nil {
 		if b := verifiedBranch(r.prev); b != "" {
@@ -527,8 +505,8 @@ func (r *phaseRun) doneBranch(at *phaseAttempt) string {
 	return at.res.Claim.Branch
 }
 
-// checkpointTip is the origin tip the brief handed this session as the revision
-// to review, "" when the driver verified none.
+// checkpointTip is the origin tip the brief handed this session as the revision to review, "" when
+// the driver verified none.
 func (r *phaseRun) checkpointTip() string {
 	if r.prev == nil {
 		return ""
@@ -536,18 +514,16 @@ func (r *phaseRun) checkpointTip() string {
 	return r.prev.CheckpointTip
 }
 
-// requireReviewTip is matchingReviewRecord's tip rule for the idempotency check:
-// with no verified tip, an unverified checkpoint still demands a record that
-// names its own.
+// requireReviewTip is matchingReviewRecord's tip rule for the idempotency check: with no verified
+// tip, an unverified checkpoint still demands a record that names its own.
 func (r *phaseRun) requireReviewTip() bool {
 	return r.checkpointTip() == "" && r.prev != nil && r.prev.CheckpointUnverified
 }
 
 func (r *phaseRun) phaseLabel() string { return r.ph.Label(r.phaseIdx) }
 
-// noteReportProblem records why a done report became no records, and says so:
-// "the phase recorded nothing" reads very differently when the session's own
-// report was missing or invalid.
+// noteReportProblem records why a done report became no records, and says so: "the phase recorded
+// nothing" reads very differently when the session's own report was missing or invalid.
 func (r *phaseRun) noteReportProblem(format string, args ...any) {
 	problem := fmt.Sprintf(format, args...)
 	log.Printf("%siteration %d: the %s phase: %s", labelOf(r.t), r.drainNum, r.phaseLabel(), problem)
@@ -558,8 +534,8 @@ func (r *phaseRun) noteReportWrite(what string, err error) {
 	r.noteReportProblem("%s failed (%v) — the rest of this phase's records were not written", what, err)
 }
 
-// withReportProblem adds the done-report problem to a gate's reason, so the
-// operator can tell "the session wrote nothing" from "the record did not land".
+// withReportProblem adds the done-report problem to a gate's reason, so the operator can tell "the
+// session wrote nothing" from "the record did not land".
 func (r *phaseRun) withReportProblem(why string) string {
 	if r.end.reportProblem == "" {
 		return why
@@ -567,9 +543,8 @@ func (r *phaseRun) withReportProblem(why string) string {
 	return why + "; the session's done report: " + r.end.reportProblem
 }
 
-// newestReleasedReviewTip is the reviewed tip of the newest record the plane has
-// released: the base a verification round's scope names. Sealed and void records
-// speak for nothing.
+// newestReleasedReviewTip is the reviewed tip of the newest record the plane has released: the base
+// a verification round's scope names.
 func newestReleasedReviewTip(records []plane.ReviewRecordState) string {
 	base, round := "", 0
 	for _, rec := range records {

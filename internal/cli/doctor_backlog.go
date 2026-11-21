@@ -19,10 +19,9 @@ import (
 
 // --- 4. backlog wiring -------------------------------------------------------
 
-// checkBacklog verifies the driver's cheap control-plane read. A multi-project
-// instance gets ONE CHECK PER PROJECT: each has its own slug-ful route and its
-// own .mcp.json, so one of them can be wired wrong while the others are fine —
-// and a single aggregate line would hide exactly that.
+// checkBacklog verifies the driver's cheap control-plane read. A multi-project instance gets ONE
+// CHECK PER PROJECT: each has its own slug-ful route and its own .mcp.json, so one of them can be
+// wired wrong while the others are fine — and a single aggregate line would hide exactly that.
 func checkBacklog(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	if len(cfg.Projects) == 0 {
 		return []check{backlogCheck(ctx, "backlog", cfg.BacklogSummaryURL(), e)}
@@ -34,15 +33,10 @@ func checkBacklog(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	return out
 }
 
-// checkFleets reports whether fleet activity reporting (CLA-466) is wired and
-// its endpoint reachable — the same PASS/WARN table shape as the MCP wiring
-// checks (the CLA-448 precedent). One check per project, like backlog's.
-//
-// Every outcome is PASS or WARN, never FAIL: reporting is telemetry, so an
-// outage or a gap degrades console visibility while the loop runs exactly as
-// before. A rejected key already FAILs in the backlog check above it, where it
-// actually stops the run; saying it twice here at FAIL strength would make
-// doctor exit non-zero over a condition that costs nothing but a picture.
+// checkFleets reports whether fleet activity reporting is wired and its endpoint reachable — the
+// same PASS/WARN table shape as the MCP wiring checks. Every outcome is PASS or WARN, never FAIL:
+// reporting is telemetry, so an outage or a gap degrades console visibility while the loop runs
+// exactly as before.
 func checkFleets(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	if len(cfg.Projects) == 0 {
 		return []check{fleetCheck(ctx, "fleet", cfg.FleetReportURL(), e)}
@@ -57,8 +51,7 @@ func checkFleets(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
 	c := check{name: name}
 
-	// Not-wired cases first: no key, no derivable slug-ful report URL. Both are
-	// the "reporting off, loop fine" shape.
+	// Not-wired cases first: no key, no derivable slug-ful report URL.
 	if e.apiKey == "" {
 		c.status = warn
 		c.detail = "fleet activity reporting is off: no creds — CLANKERBAR_API_KEY is unset"
@@ -72,10 +65,8 @@ func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
 		return c
 	}
 
-	// The probe POSTs an EMPTY body: auth is checked before body validation, so a
-	// 400 proves reachable + routed + key accepted without writing anything. A
-	// real beacon would upsert this machine's presence row with doctor's own
-	// state, fighting whatever a live daemon on the same host reports.
+	// The probe POSTs an EMPTY body: auth is checked before body validation, so a 400 proves reachable
+	// + routed + key accepted without writing anything.
 	err := e.fleetProbe(ctx, endpoint, e.apiKey)
 	switch {
 	case err == nil:
@@ -109,9 +100,9 @@ func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
 	return c
 }
 
-// timedOut reports whether err is a timeout, however the HTTP client chose to
-// express it: a context deadline or the Client.Timeout wrapper (a net.Error
-// with Timeout set), which are not the same error chain.
+// timedOut reports whether err is a timeout, however the HTTP client chose to express it: a context
+// deadline or the Client.Timeout wrapper (a net.Error with Timeout set), which are not the same
+// error chain.
 func timedOut(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -122,27 +113,15 @@ func timedOut(err error) bool {
 
 // --- fleet identity -----------------------------------------------------------
 
-// checkInstanceIdentity warns when two config files in THIS config's directory
-// would resolve to the same Fleet-page instance identity (CLA-501).
-//
-// The collision is invisible from inside one daemon  -  every daemon believes its
-// own name is fine  -  so the check has to look sideways at its siblings: each
-// top-level *.json in the config's directory is read for instance_name and
-// resolved through the SAME function the loop beacons under
-// (config.ResolveInstanceName), and any identity claimed by two or more files
-// warns. Files that do not parse as JSON are skipped: a file the loader cannot
-// read cannot start a daemon, so it cannot beacon anything to collide with.
-//
-// Since CLA-501 the default identity embeds the config basename, so distinct
-// filenames cannot collide; what remains is two siblings declaring the same
-// explicit instance_name (or a truncation-induced prefix clash)  -  exactly the
-// silent overwrite this check exists to catch before an overnight run.
+// checkInstanceIdentity warns when two config files in THIS config's directory would resolve to the
+// same Fleet-page instance identity. Files that do not parse as JSON are skipped: a file the loader
+// cannot read cannot start a daemon, so it cannot beacon anything to collide with.
 func checkInstanceIdentity(cfg *config.Config) check {
 	c := check{name: "instance identity"}
 	host, err := os.Hostname()
 	if err != nil {
-		// The loop logs the same failure and beacons a blank host half; here a
-		// blank simply resolves against basenames alone.
+		// The loop logs the same failure and beacons a blank host half; here a blank simply resolves
+		// against basenames alone.
 		host = ""
 	}
 	resolved := cfg.ResolvedInstanceName(host)
@@ -199,9 +178,9 @@ func checkInstanceIdentity(cfg *config.Config) check {
 func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) check {
 	c := check{name: name}
 
-	// The four not-wired cases are kept distinct on purpose. "Blind" (no creds, no
-	// endpoint, unreachable) still makes progress, so it WARNs; a rejected key or a
-	// key/route mismatch will never self-heal and burns doomed sessions, so it FAILs.
+	// The four not-wired cases are kept distinct on purpose. "Blind" (no creds, no endpoint,
+	// unreachable) still makes progress, so it WARNs; a rejected key or a key/route mismatch will
+	// never self-heal and burns doomed sessions, so it FAILs.
 	if e.apiKey == "" {
 		c.status = warn
 		c.detail = "loop would run blind: no creds — CLANKERBAR_API_KEY is unset"
@@ -220,28 +199,20 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 	case err == nil:
 		c.status = pass
 		c.detail = fmt.Sprintf("%s — %d claimable, %d open question(s)", summaryURL, sum.Claimable, sum.OpenQuestions)
-		// Named only when there is some, and named separately from `claimable`. The
-		// warning below already reads through Spawnable() and so goes quiet on its
-		// own, but a PASS reading "0 claimable" in front of an operator whose loop is
-		// about to start spawning is the same drift one line earlier: they would read
-		// it as an idle night (CLA-274).
+		// Named only when there is some, and named separately from `claimable`.
 		if sum.StaleClaimable > 0 {
 			c.detail += fmt.Sprintf(", %d abandoned to recover", sum.StaleClaimable)
 		}
-		// A paused queue is the most certain no-op there is: the driver polls all
-		// night and spawns nothing. That is precisely the "the window produced
-		// nothing and I did not know" class doctor exists for, so it WARNs rather
-		// than decorating a PASS with a footnote the operator skims past.
+		// A paused queue is the most certain no-op there is: the driver polls all night and spawns
+		// nothing.
 		if sum.Paused {
 			c.status = warn
 			c.detail += " — paused from the console; the loop will not spawn sessions"
 			c.remedy = "resume the loop at clankerbar.com, or expect an idle run"
 			return c
 		}
-		// Nothing claimable is not itself a problem — the loop idle-polls for free
-		// rather than spawning. It IS worth saying out loud when the operator holds
-		// the only key, because "no work" and "work you have not unblocked" look
-		// identical in the counts and read as a healthy queue.
+		// Nothing claimable is not itself a problem — the loop idle-polls for free rather than
+		// spawning.
 		if !sum.Spawnable() && sum.OpenQuestions > 0 {
 			c.status = warn
 			c.detail += " — nothing to claim; the loop will idle without spawning"
@@ -252,8 +223,8 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 		c.detail = "key rejected (401/403) by " + summaryURL
 		c.remedy = "CLANKERBAR_API_KEY is revoked, wrong or malformed — mint a fresh key; the harness sessions carry this same key"
 	case errors.Is(err, backlog.ErrProjectRequired):
-		// The remedy follows the 2026-07-29 decision: the loop runs on the ACCOUNT
-		// key, so the fix is a project SELECTOR, not a different key.
+		// The remedy follows the 2026-07-29 decision: the loop runs on the ACCOUNT key, so the fix is a
+		// project SELECTOR, not a different key.
 		c.status = fail
 		c.detail = "key/route mismatch: 400 project_required from the slug-less route"
 		c.remedy = "declare the project slug(s) so the driver polls /api/projects/<slug>/backlog-summary (a project-scoped key also works, CI-style)"

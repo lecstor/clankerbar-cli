@@ -13,14 +13,10 @@ import (
 
 // --- 13. delivery PR gate ----------------------------------------------------
 
-// prGateProbeWorkdirs lists the directories whose repositories the delivery
-// gate judges, so the preflight exercises the SAME ones. For every configured
-// project that is its effective workdir (its own, falling back to the
-// top-level one — see projectWorkDir) plus the checkouts its repos map
-// declares, because a session starts in a resolved checkout rather than in the
-// project root. A config with no projects probes the top-level workdir and its
-// declared checkouts. Paths are deduplicated so a project inheriting the
-// top-level workdir, or a checkout that is also inside it, is probed once.
+// prGateProbeWorkdirs lists the directories whose repositories the delivery gate judges, so the
+// preflight exercises the SAME ones. For every configured project that is its effective workdir
+// (its own, falling back to the top-level one — see projectWorkDir) plus the checkouts its repos
+// map declares, because a session starts in a resolved checkout rather than in the project root.
 func prGateProbeWorkdirs(cfg *config.Config) []string {
 	var dirs []string
 	seen := map[string]bool{}
@@ -53,34 +49,13 @@ func prGateProbeWorkdirs(cfg *config.Config) []string {
 	return dirs
 }
 
-// checkPRGate reports CLA-310's delivery gate and its prerequisites: the
-// driver's verifier reaches GitHub through the `gh` CLI, a delivery whose PR is
-// CONFLICTING or carries NO checks is refused when it runs, and — since CLA-776
-// — gh's `--json` output must actually be parseable, because the shipped
-// GH_FORCE_TTY=0 made gh colour it and every real delivery's PR went unjudged
-// for two months.
-//
-// A missing `gh` is a WARN, not a FAIL — the check degrades to an explicit
-// refusal-to-verify and the run carries on, which is the package's fail-open
-// discipline — but the operator should see the gate's prerequisite BEFORE the
-// first delivery goes out unchecked. The probe's own outcomes are classified by
-// what they say about the GATE:
-//
-//   - output that does not parse is a FAIL: gh ran, and every delivery's PR is
-//     unjudgeable now. It is the one fault an operator must fix before a run.
-//   - gh cannot reach GitHub (auth, network) is a WARN: the prerequisite is
-//     unavailable, not the gate broken, and the delivery path degrades the same
-//     way it always did.
-//   - there is no pull request to read is a WARN too: the probe did not exercise
-//     the parse path, so the check has not validated the thing it exists to
-//     validate. Leaving it PASS (with an easily-missed INFO line) would let a
-//     pr_gate PASS imply the parse path was tested — the blind spot that let
-//     the CLA-776 fault pass doctor for two months.
-//
-// The probe searches every configured project's effective workdir plus its
-// declared checkouts (prGateProbeWorkdirs), because that is what the delivery
-// gate judges: probing only cfg.WorkDir missed a project whose checkout lives
-// elsewhere and reported its PR untested.
+// checkPRGate reports CLA-310's delivery gate and its prerequisites: the driver's verifier reaches
+// GitHub through the `gh` CLI, a delivery whose PR is CONFLICTING or carries NO checks is refused
+// when it runs, and — since CLA-776 — gh's `--json` output must actually be parseable, because
+// the shipped GH_FORCE_TTY=0 made gh colour it and every real delivery's PR went unjudged for two
+// months. A missing `gh` is a WARN, not a FAIL — the check degrades to an explicit
+// refusal-to-verify and the run carries on, which is the package's fail-open discipline — but the
+// operator should see the gate's prerequisite BEFORE the first delivery goes out unchecked.
 func checkPRGate(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	c := check{name: "pr_gate", status: pass}
 	path, err := e.lookPath("gh")
@@ -92,9 +67,8 @@ func checkPRGate(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	}
 	c.detail = path + " present; a delivery's PR must be MERGEABLE with a passing check rollup"
 
-	// Probe a REAL `gh pr view --json` (CLA-776). Before this, doctor checked
-	// only that gh existed; a gh whose output is coloured passed doctor every
-	// time while the delivery gate parsed nothing.
+	// Probe a REAL `gh pr view --json`. Before this, doctor checked only that gh existed; a gh whose
+	// output is coloured passed doctor every time while the delivery gate parsed nothing.
 	if e.probePRGate != nil {
 		probe, perr := e.probePRGate(ctx, path, prGateProbeWorkdirs(cfg))
 		switch {
@@ -131,8 +105,8 @@ func checkPRGate(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 		}
 		return c
 	}
-	// Per project, because the opt-out is per project: one line each, so a
-	// loose project is visible without grepping the config.
+	// Per project, because the opt-out is per project: one line each, so a loose project is visible
+	// without grepping the config.
 	for _, p := range cfg.Projects {
 		state := "REFUSED"
 		if cfg.AllowUncheckedPRFor(p.Slug) {

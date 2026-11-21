@@ -14,103 +14,67 @@ import (
 
 func init() { Register(copilot{}) }
 
-// copilot drives GitHub Copilot CLI (`copilot -p`) headlessly. Everything below
-// is recorded against GitHub Copilot CLI 1.0.112 (the GA line; see
-// docs/copilot-cli.md for the flags and event shapes this adapter relies on):
-//
-//   - `-p/--prompt` runs one non-interactive session and exits. `--output-format
-//     json` turns stdout into a JSONL event stream (one object per line); the
-//     final answer rides an `assistant.message` event and the session's usage a
-//     `session.usage_checkpoint`.
-//   - In `-p` mode a tool permission request that would prompt is DENIED, so the
-//     posture is fail-closed before any rule is added; `--allow-tool` /
-//     `--deny-tool` are what open the working set the driver needs. Deny rules
-//     win over every allow, including --allow-all.
-//   - `--additional-mcp-config @<file>` registers the operator's `mcpServers`
-//     file for one session, which is why this adapter reads `mcp_config_path` in
-//     Claude's schema: the shapes are the same object.
-//   - COPILOT_HOME is the config/state dir (the CLAUDE_CONFIG_DIR / CODEX_HOME
-//     analogue); auth lives in the OS keychain or an env token, so a pinned home
-//     is not a pinned login.
-//   - `--usage-output-file` also exists and reports AI credits; the JSONL
-//     checkpoint carries the same figures, so no temp file is written.
-//
-// Billing is METERED since 2026-06-01: a monthly AI-credit allowance, then
-// per-token overage. There is no rolling window to wait out, so the credit/
-// allowance exhaustion this adapter recognises is a Limit.Stop; the budget
-// breaker is the control. The CLI's session/weekly/model RATE limits are short
-// rolling windows and are retried as transient instead.
+// copilot drives GitHub Copilot CLI (`copilot -p`) headlessly. - In `-p` mode a tool permission
+// request that would prompt is DENIED, so the posture is fail-closed before any rule is added;
+// `--allow-tool` / `--deny-tool` are what open the working set the driver needs.
 type copilot struct{}
 
 func (copilot) Name() string { return "copilot" }
 
-// copilot reads mcp_config_path in Claude's `mcpServers` schema, handed over
-// with --additional-mcp-config rather than auto-discovered. A workspace
-// .mcp.json is only auto-loaded once the folder is trusted, and this adapter
-// never trusts a folder (that would also approve its skills, plugins and hooks);
-// passing the file explicitly is what gives every session its clankerbar tools.
+// copilot reads mcp_config_path in Claude's `mcpServers` schema, handed over with
+// --additional-mcp-config rather than auto-discovered. A workspace .mcp.json is only auto-loaded
+// once the folder is trusted, and this adapter never trusts a folder (that would also approve its
+// skills, plugins and hooks); passing the file explicitly is what gives every session its
+// clankerbar tools.
 func (copilot) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfigClaudeJSON} }
 
-// copilotArgs maps an Invocation to the CLI dialect. Split out so the argument
-// shape - and the fail-closed permission posture below - is unit-testable
-// without executing anything.
+// copilotArgs maps an Invocation to the CLI dialect. Split out so the argument shape - and the
+// fail-closed permission posture below - is unit-testable without executing anything.
 func copilotArgs(in Invocation) []string {
 	args := []string{"--output-format", "json", "--no-ask-user", "--no-auto-update", "--no-color",
-		// The built-in GitHub MCP server is not in this adapter's allow policy,
-		// so in -p mode every one of its tools would be offered to the model and
-		// then denied. Drop it: a session's MCP servers are the operator's
-		// mcp_config_path, and nothing else.
+		// The built-in GitHub MCP server is not in this adapter's allow policy, so in -p mode every one
+		// of its tools would be offered to the model and then denied.
 		"--disable-builtin-mcps",
 	}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}
 	if in.MCPConfigPath != "" {
-		// `@path` is the documented file form. An absolute path is what
-		// config.ResolveMCPConfig hands over; a relative one resolves against
-		// the session working directory, which cmd.Dir pins.
+		// `@path` is the documented file form. An absolute path is what config.ResolveMCPConfig hands
+		// over; a relative one resolves against the session working directory, which cmd.Dir pins.
 		args = append(args, "--additional-mcp-config", "@"+in.MCPConfigPath)
 	}
 	for _, dir := range in.ExtraDirs {
-		// Repeatable, one directory per flag: the CLI documents --add-dir as a
-		// single-directory flag, and path verification (not the permission
-		// rules) is what keeps file access to the workdir and these roots.
+		// Repeatable, one directory per flag: the CLI documents --add-dir as a single-directory flag, and
+		// path verification (not the permission rules) is what keeps file access to the workdir and these
+		// roots.
 		args = append(args, "--add-dir", dir)
 	}
 	if in.Probe {
-		// A probe is read-only by construction: no write and no shell grant,
-		// plus explicit denies, because read-only shell commands normally run
-		// without asking and a probe must do neither. Its one grant is the
-		// cheap clankerbar read, so a probe also proves the MCP wiring.
+		// A probe is read-only by construction: no write and no shell grant, plus explicit denies,
+		// because read-only shell commands normally run without asking and a probe must do neither.
 		args = append(args, "--deny-tool", "write", "--deny-tool", "shell")
 		if in.MCPConfigPath != "" {
 			args = append(args, "--allow-tool", "clankerbar(get_backlog_summary)")
 		}
 		return append(args, "-p", copilotPrompt(in))
 	}
-	// The working set. Path-scoped kind(...) rules are optional-argument forms,
-	// and a bare kind means "every request of this kind": the file boundary is
-	// the CLI's own path verification (workdir + temp + --add-dir), which in -p
-	// mode cannot prompt and so fails closed. `clankerbar` is the MCP server
-	// name; a server the operator adds under another name stays unapproved.
+	// The working set. Path-scoped kind(...) rules are optional-argument forms, and a bare kind means
+	// "every request of this kind": the file boundary is the CLI's own path verification (workdir +
+	// temp + --add-dir), which in -p mode cannot prompt and so fails closed.
 	for _, rule := range []string{"read", "write", "shell", "clankerbar"} {
 		args = append(args, "--allow-tool", rule)
 	}
-	// The prompt is the VALUE of -p, never a positional: a prompt that begins
-	// with "-" cannot be read as a flag, and there is no subcommand position it
-	// could be mistaken for.
+	// The prompt is the VALUE of -p, never a positional: a prompt that begins with "-" cannot be read
+	// as a flag, and there is no subcommand position it could be mistaken for.
 	return append(args, "-p", in.Prompt)
 }
 
-// env builds the child environment, with the same PWD pin as every other
-// adapter (CLA-441) and COPILOT_HOME as the config-dir override.
+// env builds the child environment, with the same PWD pin as every other adapter and COPILOT_HOME
+// as the config-dir override.
 func (c copilot) env(in Invocation) []string {
 	env := append(pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir), in.Env...)
-	// The ambient approval shortcuts are pinned OFF, and REPLACED rather than
-	// appended. COPILOT_ALLOW_ALL=true approves every tool AND trusts the folder,
-	// which loads its skills, plugins, MCP servers and hooks; the assisted judge
-	// is probabilistic and not a boundary. The posture is the closed --allow-tool
-	// set, not whatever the operator's shell exports.
+	// The ambient approval shortcuts are pinned OFF, and REPLACED rather than appended.
 	env = overrideEnv(env, "COPILOT_ALLOW_ALL=false", "COPILOT_ASSISTED_APPROVAL=false")
 	if in.ConfigDir != "" {
 		env = overrideEnv(env, "COPILOT_HOME="+in.ConfigDir)
@@ -118,9 +82,9 @@ func (c copilot) env(in Invocation) []string {
 	return env
 }
 
-// overrideEnv drops every existing entry for the keys in kv and appends kv, so
-// the pinned value is the ONLY one and nothing depends on how a duplicate is
-// resolved (os/exec keeps the last today; getenv keeps the first).
+// overrideEnv drops every existing entry for the keys in kv and appends kv, so the pinned value is
+// the ONLY one and nothing depends on how a duplicate is resolved (os/exec keeps the last today;
+// getenv keeps the first).
 func overrideEnv(env []string, kv ...string) []string {
 	drop := make(map[string]struct{}, len(kv))
 	for _, e := range kv {
@@ -142,9 +106,8 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if err := refuseTurns("copilot", in); err != nil {
 		return Result{}, err
 	}
-	// The wall-clock cap, on the exec context: Copilot has no turn flag, so
-	// elapsed time is the only phase backstop this adapter can offer. Never on a
-	// probe (a one-word liveness check is not a phase doing work).
+	// The wall-clock cap, on the exec context: Copilot has no turn flag, so elapsed time is the only
+	// phase backstop this adapter can offer.
 	sctx := ctx
 	cancel := context.CancelFunc(func() {})
 	if in.MaxSessionWallClock > 0 && !in.Probe {
@@ -161,10 +124,8 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = c.env(in)
-	// A cap that can hang is not a cap: os/exec waits for every writer of its
-	// own pipe, and a bash-tool grandchild (or an MCP server) inheriting stdout
-	// survives a direct-child kill. WaitDelay force-closes the pipes so Invoke
-	// returns; the process-group Cancel below kills the descendants we can reach.
+	// A cap that can hang is not a cap: os/exec waits for every writer of its own pipe, and a
+	// bash-tool grandchild (or an MCP server) inheriting stdout survives a direct-child kill.
 	if _, hasDeadline := sctx.Deadline(); hasDeadline {
 		cmd.WaitDelay = 5 * time.Second
 	}
@@ -179,16 +140,15 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	}
 	tee := console
 	if in.Probe {
-		// Nothing is watching a probe; io.Discard rather than nil because the
-		// shared claim observer writes diagnostics to this writer, and a nil
-		// io.Writer panics.
+		// Nothing is watching a probe; io.Discard rather than nil because the shared claim observer
+		// writes diagnostics to this writer, and a nil io.Writer panics.
 		console, tee = io.Discard, nil
 	}
 
 	res := newSessionResult(in)
-	// Close the sink this Result may have built. copilot does not emit events in
-	// v1 (EmitsEvents false), but the guard must not depend on that stay true: an
-	// unclosed emitter leaks its sender goroutine.
+	// Close the sink this Result may have built. copilot does not emit events in v1 (EmitsEvents
+	// false), but the guard must not depend on that stay true: an unclosed emitter leaks its sender
+	// goroutine.
 	defer res.closeEvents()
 	var p copilotParse
 	captured := newCapture(func(line []byte) { p.line(line, &res, console) })
@@ -198,10 +158,8 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	captured.finishInto(&res, "copilot")
 	p.finish(&res)
 
-	// Our own deadline, not the caller's: a run-wide cancellation must not be
-	// reported as the phase reaching its backstop. runErr conjunct because the
-	// deadline is read after Run returned - a session that exited a hair before
-	// it is not capped.
+	// Our own deadline, not the caller's: a run-wide cancellation must not be reported as the phase
+	// reaching its backstop.
 	timedOut := runErr != nil && sctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 	if timedOut {
 		res.markWallClockCapped()
@@ -214,9 +172,7 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
 	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut {
-		// The session exited on its own and a grandchild held the pipe open past
-		// WaitDelay. Every event it emitted was consumed live, so this is a clean
-		// end (the same arm opencode has, CLA-414).
+		// The session exited on its own and a grandchild held the pipe open past WaitDelay.
 	} else if runErr != nil && timedOut {
 		res.ExitCode = -1
 	} else if runErr != nil {
@@ -225,9 +181,9 @@ func (c copilot) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	return res, nil
 }
 
-// copilotEvent is one line of `copilot --output-format json`. One flat struct
-// covers every event type: the envelope is {type, data, id, timestamp} and any
-// field a given type does not carry is simply absent.
+// copilotEvent is one line of `copilot --output-format json`. One flat struct covers every event
+// type: the envelope is {type, data, id, timestamp} and any field a given type does not carry is
+// simply absent.
 type copilotEvent struct {
 	Type string           `json:"type"`
 	Data copilotEventData `json:"data"`
@@ -276,12 +232,9 @@ type copilotToolResult struct {
 	Content string `json:"content"`
 }
 
-// copilotAccounting is the session's cumulative usage snapshot.
-// `tokenDetails` is already disjoint - its input excludes cache reads and writes
-// (a real session reported input 15811 + cache_read 29824 against model
-// usage.inputTokens 45635) - so the four buckets are copied unchanged. The
-// modelMetrics fallback is INCLUSIVE of the cache buckets and is normalised in
-// noteUsage.
+// copilotAccounting is the session's cumulative usage snapshot. `tokenDetails` is already disjoint
+// - its input excludes cache reads and writes (a real session reported input 15811 + cache_read
+// 29824 against model usage.inputTokens 45635) - so the four buckets are copied unchanged.
 type copilotAccounting struct {
 	TotalNanoAiu int64          `json:"totalNanoAiu"`
 	TokenDetails *copilotTokens `json:"tokenDetails"`
@@ -303,9 +256,8 @@ type copilotTokens struct {
 	CacheWrite struct{ TokenCount int } `json:"cache_write"`
 }
 
-// copilotParse accumulates the session's final message, usage and clankerbar
-// observation as the stream arrives. Live rather than a walk over saved output,
-// so trimming the retained text cannot cost the budget a token (CLA-262).
+// copilotParse accumulates the session's final message, usage and clankerbar observation as the
+// stream arrives.
 type copilotParse struct {
 	lastText  string
 	finalText string
@@ -365,11 +317,9 @@ func (p *copilotParse) line(line []byte, res *Result, console io.Writer) {
 	}
 }
 
-// noteUsage keeps the LAST checkpoint, never a sum: the CLI's counters are
-// cumulative session totals (a real session's two model calls both appear in one
-// final snapshot), so summing would double-count. A checkpoint that carries no
-// accounting snapshot still counts as a REPORT of zero - UsageReported answers
-// "did the CLI report?", not "was the report large?".
+// noteUsage keeps the LAST checkpoint, never a sum: the CLI's counters are cumulative session
+// totals (a real session's two model calls both appear in one final snapshot), so summing would
+// double-count.
 func (p *copilotParse) noteUsage(d copilotEventData) {
 	p.sawUsage = true
 	if d.TotalNanoAiu != 0 {
@@ -383,8 +333,8 @@ func (p *copilotParse) noteUsage(d copilotEventData) {
 	if a.TotalNanoAiu != 0 {
 		p.nanoAiu = a.TotalNanoAiu
 	}
-	// Only recompute when the snapshot carries modelMetrics: a later checkpoint
-	// without them must not erase the figure an earlier one reported.
+	// Only recompute when the snapshot carries modelMetrics: a later checkpoint without them must not
+	// erase the figure an earlier one reported.
 	if len(a.ModelMetrics) > 0 {
 		p.reason = 0
 		for _, m := range a.ModelMetrics {
@@ -401,9 +351,8 @@ func (p *copilotParse) noteUsage(d copilotEventData) {
 		}
 		return
 	}
-	// Older/partial snapshots carry only modelMetrics, whose inputTokens is the
-	// INCLUSIVE figure (fresh + cache). Subtract the cache buckets so the four
-	// buckets stay disjoint, as codex's are mapped.
+	// Older/partial snapshots carry only modelMetrics, whose inputTokens is the INCLUSIVE figure
+	// (fresh + cache).
 	var in, out, cr, cw int
 	for _, m := range a.ModelMetrics {
 		in += m.Usage.InputTokens
@@ -419,11 +368,8 @@ func (p *copilotParse) noteUsage(d copilotEventData) {
 	}
 }
 
-// noteRequest feeds one tool REQUEST to the shared observer under the canonical
-// clankerbar name, so claim/settle/delivery observation is the same code path
-// claude and opencode use. Copilot names an MCP tool `clankerbar-<tool>` and
-// reports its server and tool separately; `mcp__clankerbar__<tool>` is the
-// namespace the shared observer keys on.
+// noteRequest feeds one tool REQUEST to the shared observer under the canonical clankerbar name, so
+// claim/settle/delivery observation is the same code path claude and opencode use.
 func (p *copilotParse) noteRequest(id, name string, args json.RawMessage, mcpServer, mcpTool string, res *Result) {
 	if id == "" {
 		return
@@ -445,22 +391,21 @@ func (p *copilotParse) noteRequest(id, name string, args json.RawMessage, mcpSer
 	noteToolUse(canonical, id, args, res)
 }
 
-// noteResult resolves the request's meaning on its result. A missing `success`
-// with no error is read as success: the field is documented on failures, and
-// treating an absent flag as failure would drop every claim the plane accepted.
+// noteResult resolves the request's meaning on its result. A missing `success` with no error is
+// read as success: the field is documented on failures, and treating an absent flag as failure
+// would drop every claim the plane accepted.
 func (p *copilotParse) noteResult(d copilotEventData, res *Result, console io.Writer) {
 	if d.ToolCallID == "" {
 		return
 	}
-	// A start event normally armed this already; if it did not, nothing about
-	// this call is known and there is no claim to settle.
+	// A start event normally armed this already; if it did not, nothing about this call is known and
+	// there is no claim to settle.
 	if _, known := p.toolNames[d.ToolCallID]; !known {
 		return
 	}
 	delete(p.toolNames, d.ToolCallID)
-	// `error` is documented on failures; a success event that carries the JSON
-	// empty string (or null) is still a success, and treating it as an error
-	// would drop a valid claim/settle.
+	// `error` is documented on failures; a success event that carries the JSON empty string (or null)
+	// is still a success, and treating it as an error would drop a valid claim/settle.
 	isError := (d.Success != nil && !*d.Success) || copilotErrorPayload(d.Error)
 	var content json.RawMessage
 	if d.Result != nil && d.Result.Content != "" {
@@ -476,8 +421,8 @@ func (p *copilotParse) raw(res *Result) map[string]any {
 	return res.Raw
 }
 
-// finish writes what the stream added up to onto res, PRESERVING the claim and
-// reports the shared observer recorded while it ran.
+// finish writes what the stream added up to onto res, PRESERVING the claim and reports the shared
+// observer recorded while it ran.
 func (p *copilotParse) finish(res *Result) {
 	if p.finalText != "" {
 		res.FinalMessage = p.finalText
@@ -499,20 +444,16 @@ func (p *copilotParse) finish(res *Result) {
 	raw["reasoning_tokens"] = p.reason
 }
 
-// copilotErrorPayload reports whether an `error` JSON field carries a real
-// error: absent/null and the empty string are not failures.
+// copilotErrorPayload reports whether an `error` JSON field carries a real error: absent/null and
+// the empty string are not failures.
 func copilotErrorPayload(raw json.RawMessage) bool {
 	s := string(raw)
 	return len(raw) > 0 && s != "null" && s != `""`
 }
 
-// copilotErrorText collects the CLI's OWN diagnostic text: all of stderr, the
-// stdout lines that are not events, and the CLI's session-level error events. The
-// agent's narration (assistant.message content) and any tool output are
-// EXCLUDED: a backlog task body quoting "Plan: 100% used" must not stop the run
-// on a limit that never happened (the CLA-258 class). warnings are excluded too,
-// deliberately - the CLI's 75%-used quota notice is a warning, and it is not a
-// limit.
+// copilotErrorText collects the CLI's OWN diagnostic text: all of stderr, the stdout lines that are
+// not events, and the CLI's session-level error events. warnings are excluded too, deliberately -
+// the CLI's 75%-used quota notice is a warning, and it is not a limit.
 func copilotErrorText(res Result) string {
 	return res.scan(scanErrorText, func() string { return buildCopilotErrorText(res) })
 }
@@ -534,10 +475,9 @@ func buildCopilotErrorText(res Result) string {
 		if json.Unmarshal([]byte(line), &ev) != nil {
 			continue
 		}
-		// Only the CLI's own session-level failures. A tool.* event can carry an
-		// error too, but that text is the tool's output - a failed shell command
-		// echoes whatever it was run against - and reading it here would reopen
-		// exactly the injection the narration exclusion closes.
+		// Only the CLI's own session-level failures. A tool.* event can carry an error too, but that text
+		// is the tool's output - a failed shell command echoes whatever it was run against - and reading
+		// it here would reopen exactly the injection the narration exclusion closes.
 		if !strings.Contains(ev.Type, "error") || strings.HasPrefix(ev.Type, "tool.") {
 			continue
 		}
@@ -555,17 +495,10 @@ func buildCopilotErrorText(res Result) string {
 	return b.String()
 }
 
-// copilotLimitRe recognises the CLI's documented credit/allowance exhaustion
-// statements (`copilot help billing`, `copilot help limits`): the plan's monthly
-// credit allowance running out and the session AI-credit cap.
-//
-// Deliberately NOT the bare word "usage limit" or "quota": the CLI's warning at
-// 75% of a weekly allowance contains both and is not a limit.
-//
-// Deliberately NOT the session/weekly/model RATE limits either: those are short
-// rolling windows the CLI states a reset for, the same provider blip that
-// arrives as a bare 429 - IsTransient retries them, and a Stop there would end
-// a whole run on a wait it could have taken.
+// copilotLimitRe recognises the CLI's documented credit/allowance exhaustion statements (`copilot
+// help billing`, `copilot help limits`): the plan's monthly credit allowance running out and the
+// session AI-credit cap. Deliberately NOT the bare word "usage limit" or "quota": the CLI's warning
+// at 75% of a weekly allowance contains both and is not a limit.
 var copilotLimitRe = regexp.MustCompile(`(?i)` +
 	`plan:\s*100%\s*used` +
 	`|(?:out of|insufficient|no) (?:ai )?credits(?: left| remaining)?` +
@@ -580,16 +513,15 @@ func (copilot) DetectLimit(res Result) Limit {
 	if !copilotLimitRe.MatchString(text) {
 		return Limit{}
 	}
-	// Metered billing (GitHub moved Copilot to per-token AI-credit billing on
-	// 2026-06-01): the allowance refills monthly and overage is paid, so there is
-	// no rolling window the supervised wait could poll for. Stop cleanly and let
-	// the operator top up / resume, which is docs/limit-stop.md's flow.
+	// Metered billing (GitHub moved Copilot to per-token AI-credit billing on 2026-06-01): the
+	// allowance refills monthly and overage is paid, so there is no rolling window the supervised wait
+	// could poll for.
 	return Limit{Limited: true, Stop: true, Reason: "budget_exhausted", Window: "monthly"}
 }
 
-// copilotTransientRe: API-level rate limits (429/too many requests) and server/
-// network blips are retryable. The subscription/credit cap (DetectLimit) is not,
-// and DetectLimit is consulted first by the driver.
+// copilotTransientRe: API-level rate limits (429/too many requests) and server/ network blips are
+// retryable. The subscription/credit cap (DetectLimit) is not, and DetectLimit is consulted first
+// by the driver.
 var copilotTransientRe = regexp.MustCompile(`(?i)` +
 	`\b(?:status|code|http)[ :=]*(408|429|5\d\d)\b` +
 	`|\b429\b|too many requests|rate limit` +
@@ -598,8 +530,7 @@ var copilotTransientRe = regexp.MustCompile(`(?i)` +
 	`|fetch failed|timed out|temporarily unavailable|try again later`)
 
 func (c copilot) IsTransient(res Result) bool {
-	// A recognised credit/allowance stop is never a blip to retry, whatever
-	// else the text says.
+	// A recognised credit/allowance stop is never a blip to retry, whatever else the text says.
 	if c.DetectLimit(res).Limited {
 		return false
 	}
@@ -609,12 +540,11 @@ func (c copilot) IsTransient(res Result) bool {
 // Never a guess: pattern-driven throughout, so an unrecognised exit is a stop.
 func (copilot) IsUnclassifiedTransient(Result) bool { return false }
 
-// No turn cap: Copilot takes no turn flag, so Invocation.MaxTurns never reaches
-// it. The wall-clock cap below is the phase backstop instead.
+// No turn cap: Copilot takes no turn flag, so Invocation.MaxTurns never reaches it.
 func (copilot) TurnCapped(Result) bool { return false }
 
-// No mid-stream token ceiling: nothing here kills the process on cumulative
-// usage, so no exit can be attributed to one.
+// No mid-stream token ceiling: nothing here kills the process on cumulative usage, so no exit can
+// be attributed to one.
 func (copilot) TokenCeilingHit(Result) bool { return false }
 
 func (copilot) WallClockCapped(res Result) bool {
@@ -625,20 +555,14 @@ func (copilot) WallClockCapped(res Result) bool {
 	return r == wallClockReason
 }
 
-// No zero-usage-unknown signature: it is opencode's step_finish shape, and
-// copilot's checkpoint reports the session total rather than per-step figures.
+// No zero-usage-unknown signature: it is opencode's step_finish shape, and copilot's checkpoint
+// reports the session total rather than per-step figures.
 func (copilot) ZeroUsageUnknown(Result) bool { return false }
 
-// copilot observes the session's clankerbar tool calls through the shared
-// observer (noteToolUse/noteToolResult), so Result.Claim, Reports, Settled and
-// ClankerbarCalls are all populated and a phased config is allowed.
-//
-// ReportsCost is false for a harder reason than "not implemented": Copilot
-// reports AI CREDITS (and premium requests), never money. One credit's dollar
-// value depends on the plan and on whether the call is inside the included
-// allowance, so mapping it to CostUSD would invent a price. `budget.max_cost_usd`
-// is therefore inert under copilot, and `budget.max_tokens` - fed by the
-// checkpoint's token counts - is the breaker; doctor says so (CLA-288).
+// copilot observes the session's clankerbar tool calls through the shared observer
+// (noteToolUse/noteToolResult), so Result.Claim, Reports, Settled and ClankerbarCalls are all
+// populated and a phased config is allowed. ReportsCost is false for a harder reason than "not
+// implemented": Copilot reports AI CREDITS (and premium requests), never money.
 func (copilot) Capabilities() Capabilities {
 	return Capabilities{
 		TracksClaims:            true,
@@ -659,16 +583,12 @@ func (c copilot) Probe(ctx context.Context, in Invocation) (ProbeResult, error) 
 }
 
 func (copilot) ReadUsage(context.Context, Invocation) (Usage, error) {
-	// /usage is TUI-only; the JSONL checkpoint reports this session, not the
-	// account's window.
+	// /usage is TUI-only; the JSONL checkpoint reports this session, not the account's window.
 	return Usage{}, ErrUsageUnsupported
 }
 
-// copilotPrompt is the probe's prompt, kept beside the args builder so the
-// read-only shape is asserted through the same path production uses. A probe
-// with an MCP config asks for the cheap clankerbar read: it proves the custom
-// server really connected in a headless run, which is the one part of the wiring
-// no unit test can.
+// copilotPrompt is the probe's prompt, kept beside the args builder so the read-only shape is
+// asserted through the same path production uses.
 func copilotPrompt(in Invocation) string {
 	if in.Probe {
 		if in.MCPConfigPath != "" {

@@ -1,20 +1,13 @@
 package config
 
-// prompts_maps.go — the maps-session review method's turn prompts (CLA-864,
-// CLA-869). This is not a brief of its own: the phase's review brief stays the
-// first turn's substance (runner context, read-only rules, the bar, the done
-// report), and the section below is APPENDED to it. The later turns are
-// deliberately lean — they rely on the first turn's transcript, which the same
-// session still holds.
+// prompts_maps.go — the maps-session review method's turn prompts.
 
 import (
 	"fmt"
 	"strings"
 )
 
-// mapsSessionChecklist is the review checklist the notes turns work through. It
-// is the adversarial gate's categories stated as checks a per-item note can
-// answer, since a note is written about one item at a time.
+// mapsSessionChecklist is the review checklist the notes turns work through.
 const mapsSessionChecklist = "## Checklist\n" +
 	"- Correctness: wrong logic, an inverted condition, off-by-one, a missing case, a path that skips a step its " +
 	"siblings perform; async/concurrency; nil/null; swallowed errors; values wrong for some inputs, including on " +
@@ -33,14 +26,10 @@ const mapsSessionChecklist = "## Checklist\n" +
 	"if the change regressed; an assertion that no longer matches the code.\n" +
 	"- Documentation: docs, comments, READMEs or examples the change made wrong."
 
-// MapsSessionFirstTurn is the section appended to the phase's review brief for
-// the first notes turn: what the maps are, how to read an M and an F item, the
-// checklist, and chunk 1 of the items. hunksEmbedded says each M item carries
-// its hunk, so the instructions send the model to the tools only for context.
-//
-// base is the commit the per-file diff starts from (the runner's merge-base),
-// filled in literally: this text is appended after the driver's placeholder
-// substitution, so a placeholder here would reach the session unsubstituted.
+// MapsSessionFirstTurn is the section appended to the phase's review brief for the first notes
+// turn: what the maps are, how to read an M and an F item, the checklist, and chunk 1 of the items.
+// hunksEmbedded says each M item carries its hunk, so the instructions send the model to the tools
+// only for context.
 func MapsSessionFirstTurn(base string, chunk, chunks int, items string, hunksEmbedded bool) string {
 	var b strings.Builder
 	b.WriteString("## How this review works\n")
@@ -66,8 +55,8 @@ func MapsSessionFirstTurn(base string, chunk, chunks int, items string, hunksEmb
 		"against required; sync against async (missing await, unhandled promise, a goroutine or error that is " +
 		"dropped); return values the caller ignores or assumes non-null; renamed or removed exports still " +
 		"referenced. Follow a use one level further when the value is passed on.\n\n")
-	// The embedded hunks replace the diff reads; saying otherwise in the next
-	// breath would send a step-heavy model straight back to them.
+	// The embedded hunks replace the diff reads; saying otherwise in the next breath would send a
+	// step-heavy model straight back to them.
 	diffHint := "Use `git diff %s..HEAD -- <path>` for the diff of a file"
 	if hunksEmbedded {
 		diffHint = "Use `git diff %s..HEAD -- <path>` only for a file whose hunk was truncated or that is listed without one"
@@ -84,9 +73,8 @@ func MapsSessionFirstTurn(base string, chunk, chunks int, items string, hunksEmb
 	return b.String()
 }
 
-// MapsSessionNotesTurn is one follow-up notes turn: the next chunk, with a
-// reminder that the instructions still stand and the report still does not
-// belong in this turn.
+// MapsSessionNotesTurn is one follow-up notes turn: the next chunk, with a reminder that the
+// instructions still stand and the report still does not belong in this turn.
 func MapsSessionNotesTurn(chunk, chunks int, items string) string {
 	return mapsSessionChunkHeading(chunk, chunks) + "\n" +
 		"Same instructions as before: read each item and its context, apply the checklist, and note everything " +
@@ -95,10 +83,9 @@ func MapsSessionNotesTurn(chunk, chunks int, items string) string {
 		"Do NOT write a done report in this turn."
 }
 
-// The two endings a findings turn can have, chosen by the phase's own brief: a
-// runner-claimed review ends with a done report the runner turns into records,
-// and a panel member (or any phase writing its own record) ends by writing that
-// record itself.
+// The two endings a findings turn can have, chosen by the phase's own brief: a runner-claimed
+// review ends with a done report the runner turns into records, and a panel member (or any phase
+// writing its own record) ends by writing that record itself.
 const (
 	MapsSessionDoneReportEnding = "Then end with the done report exactly as the review brief specifies " +
 		"(verdict, reviewedTip, findings, omitted, notes)."
@@ -106,10 +93,7 @@ const (
 		"(verdict, reviewedTip, findings, omitted, notes)."
 )
 
-// The severity bars a findings turn can grade against. A phase review has a
-// task with a done-when bar; `clankerbar review run` does not, so its sentence
-// drops the clause that would name an input the standalone brief says does not
-// exist. Callers pass one of these to MapsSessionFindingsTurn.
+// The severity bars a findings turn can grade against.
 const (
 	MapsSessionSeverityTask = "Severity: MUST only for what violates the task's done-when bar, the repo's gates, " +
 		"or correctness/safety; SHOULD for a real problem that does not block; NIT for small issues. "
@@ -117,10 +101,10 @@ const (
 		"SHOULD for a real problem that does not block; NIT for small issues. "
 )
 
-// MapsSessionFindingsTurn is the final turn: confirm every doubtful note against
-// the code, look across the notes for problems no single item showed, and end
-// with the record the phase's brief specifies. severity is the bar this review
-// grades MUST against (MapsSessionSeverityTask or MapsSessionSeverityTaskless).
+// MapsSessionFindingsTurn is the final turn: confirm every doubtful note against the code, look
+// across the notes for problems no single item showed, and end with the record the phase's brief
+// specifies. severity is the bar this review grades MUST against (MapsSessionSeverityTask or
+// MapsSessionSeverityTaskless).
 func MapsSessionFindingsTurn(severity, ending string) string {
 	return "You have been through every item. Now turn your notes into findings.\n" +
 		"1. Go through all your notes from every chunk. For each note that names a problem or a doubt, confirm it " +
@@ -144,7 +128,7 @@ func mapsSessionChunkHeading(chunk, chunks int) string {
 	return fmt.Sprintf("## Chunk %d of %d", chunk, chunks)
 }
 
-// mapsSessionNotesRule closes every notes turn: notes are notes, and the report
-// is the findings turn's alone.
+// mapsSessionNotesRule closes every notes turn: notes are notes, and the report is the findings
+// turn's alone.
 const mapsSessionNotesRule = "Reply with one note per item in this chunk, in order, each starting with its id " +
 	"(`M3: ...`). Do NOT write a done report in this turn."
