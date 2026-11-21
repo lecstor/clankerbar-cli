@@ -1436,8 +1436,10 @@ repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), **deploy_lag** (how far the deployed build lags the
 project's integration branch), **pr_gate** (gh is on PATH *and* a real
 `gh pr view --json` parses — decorated output is a FAIL, an unreachable GitHub a
-WARN, and "no PR to read" says the probe was not exercised), and **budget**
-(ceilings parse and are sane).
+WARN, and "no PR to read" says the probe was not exercised), **delivery** (per
+project: git is on PATH, a non-bare repository is found under the workdir, and
+it has a remote the delivery check can read — a WARN, never a FAIL), and
+**budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
@@ -1462,6 +1464,16 @@ clone. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
 is discoverable without nagging anyone who opted out; in a mixed multi-project
 config the unmonitored projects still get their own quiet PASS rather than
 disappearing from doctor's output.
+
+`delivery` answers whether the CLA-253 delivery check will be able to verify
+anything from a project's workdir: git on PATH, at least one non-bare
+repository at or below it (or in one of the project's declared checkouts,
+where a session actually starts), and a remote that repository's claims can be
+judged against. It names every repository it found and the remote it will read.
+It never FAILs — a verifier that resolves nothing degrades to "could not
+verify" and the run still drains a backlog — but that silent degradation is
+exactly what an operator should learn before the night, not after it. It sits
+beside `stranded`: the same repositories, a different question.
 
 The `toolchains` audit reads every settings file Claude merges — the `--settings`
 policy, the config dir's `settings.json`/`settings.local.json`, and each session

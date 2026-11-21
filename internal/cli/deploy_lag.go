@@ -208,25 +208,16 @@ func deployCredEnv(ctx context.Context, repo string) []string {
 // the same gh dependency doctor's PR-gate check already rides.
 const deployGhBin = "gh"
 
-// deployRemoteOf picks which remote to judge against: origin when the repo
-// has it, else its only remote, else origin. The same rule
-// delivery.resolveRemote applies, kept in step because a rescue and this check
-// must not disagree about which remote names the integration branch.
+// deployRemoteOf picks which remote to judge against, keeping origin when none
+// can be read. Shared with the delivery verifier through delivery.ProbeRemote so
+// this check, a rescue and the verifier cannot disagree about which remote names
+// the integration branch.
 func deployRemoteOf(ctx context.Context, run gitRunner, repo string) string {
-	out, err := run(ctx, repo, "remote")
-	if err != nil || out == "" {
+	remote, err := delivery.ProbeRemote(ctx, run, repo, "origin")
+	if err != nil {
 		return "origin"
 	}
-	names := strings.Fields(out)
-	for _, n := range names {
-		if n == "origin" {
-			return "origin"
-		}
-	}
-	if len(names) == 1 {
-		return names[0]
-	}
-	return "origin"
+	return remote
 }
 
 // deployLsRemoteHead returns the SHA a remote branch points at, or "" when the
