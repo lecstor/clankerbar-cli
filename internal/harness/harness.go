@@ -265,6 +265,17 @@ type Capabilities struct {
 	// adapter with session continuation today.
 	RunsTurnSequences bool
 
+	// HonoursNoBacklogMCP reports whether this adapter implements
+	// Invocation.NoBacklogMCP: it switches off every backlog MCP server the
+	// harness would otherwise load from its own config layers, so the session is
+	// offered no backlog tools and nothing waits for a connection. False means
+	// the flag is inert for this harness — the session gets whatever MCP servers
+	// its config declares — so a caller that must keep the backlog unreachable
+	// (`clankerbar review run`) refuses the harness rather than promise a
+	// guarantee the adapter cannot keep. opencode is the adapter that implements
+	// it today.
+	HonoursNoBacklogMCP bool
+
 	// EmitsEvents reports whether this adapter normalizes its structured tool
 	// events into the agent event channel (CLA-603, transcript tier CLA-887)
 	// — the activity tier always, and the transcript tier while its dial is on.
@@ -449,6 +460,19 @@ type Invocation struct {
 	// re-emit, and the later turns of a multi-turn sequence, which would
 	// otherwise stop after the first one with "claim_not_held".
 	AllowUnclaimed bool
+
+	// NoBacklogMCP forbids this session the backlog: the adapter switches off
+	// every clankerbar MCP server opencode would otherwise load from its config
+	// layers, so the session is offered no backlog tools and nothing waits for a
+	// connection. It is NOT AllowUnclaimed's opposite face: a caller can be
+	// unclaimed and still want the tools, and it exists as its own field because
+	// the review that must not touch the backlog says so explicitly.
+	//
+	// Only opencode honours it today (see disableBacklogMCPServers and
+	// Capabilities.HonoursNoBacklogMCP); a caller must not read "ignored by this
+	// adapter" as "the backlog is unreachable". clankerbar review run is the
+	// caller, and it refuses a harness whose adapter does not honour the field.
+	NoBacklogMCP bool
 
 	// OnClaim, when non-nil, is called by the adapter's parser the moment it
 	// observes the session's clankerbar claim state change: a claim_task whose

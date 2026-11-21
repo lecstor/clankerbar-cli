@@ -142,6 +142,13 @@ func RunReview(ctx context.Context, opts ReviewRunOptions) (*ReviewRunReport, er
 	if method == config.ReviewMethodMapsSession && !adapter.Capabilities().RunsTurnSequences {
 		return nil, fmt.Errorf("--method maps-session runs its notes and findings turns in one session, and harness %q cannot continue a session: use a harness that can, or the single-pass method", opts.Harness)
 	}
+	// The command's contract is that the review cannot touch the operator's
+	// backlog. Only an adapter that implements the switch can keep that promise;
+	// running one that ignores it would pass the operator's MCP servers to the
+	// session instead.
+	if !adapter.Capabilities().HonoursNoBacklogMCP {
+		return nil, fmt.Errorf("harness %q does not implement the no-backlog MCP switch, so review run cannot keep the session out of the operator's backlog: use a harness that does", opts.Harness)
+	}
 	invoke := opts.invoke
 	if invoke == nil {
 		invoke = adapter.Invoke
@@ -232,9 +239,11 @@ func reviewRunSession(ctx context.Context, opts ReviewRunOptions, cfg *config.Co
 // reviewRunInvocation composes the session: the taskless brief, the maps
 // section when the method asks for it, and the harness/session fields the
 // phase driver would resolve from config. It deliberately leaves MCPConfigPath
-// empty: this command has no plane identity to hand a session, and a session
-// that tried a clankerbar call would be talking to the operator's backlog in a
-// review that must not touch it.
+// empty and sets NoBacklogMCP: this command has no plane identity to hand a
+// session, and a session that tried a clankerbar call would be talking to the
+// operator's backlog in a review that must not touch it. NoBacklogMCP is what
+// makes that true even when the reviewed checkout checks in an opencode.json
+// declaring a clankerbar server (CLA-927).
 func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, base, head string) (harness.Invocation, reviewRunStage, error) {
 	stage := reviewRunStage{models: map[string]string{}}
 	env, err := cfg.SessionEnv(opts.Harness, "")
@@ -268,6 +277,7 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 		MaxToolCallDuration:     toolCall,
 		MaxSessionWallClock:     cfg.MaxSessionWallClock.Duration(),
 		AllowUnclaimed:          true,
+		NoBacklogMCP:            true,
 		CheckReport:             func(final string) error { _, err := reviewRunParseDone(final, head); return err },
 	}
 	stage.models["review"] = inv.Model

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -702,9 +703,15 @@ func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
 // over even when config resolved none (CLA-318). An explicit in.Env value still
 // applies, since it is appended later.
 func withoutAmbientOpencodeConfig(env []string) []string {
+	return withoutEnvKey(env, "OPENCODE_CONFIG")
+}
+
+// withoutEnvKey drops every assignment of one variable.
+func withoutEnvKey(env []string, key string) []string {
+	prefix := key + "="
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "OPENCODE_CONFIG=") {
+		if strings.HasPrefix(kv, prefix) {
 			continue
 		}
 		out = append(out, kv)
@@ -759,7 +766,8 @@ func (opencode) env(in Invocation) ([]string, error) {
 	// file did not; and environment plus argv is capped around 1 MB on macOS, so
 	// an enormous config would fail the spawn with E2BIG rather than merely being
 	// ignored.
-	content, err := opencodeSessionConfig(in)
+	//
+	content, err := opencodeSessionConfigWithEnv(in, env)
 	if err != nil {
 		// FAIL CLOSED. The alternative - spawn without the content layer - is a
 		// session with no permission policy at all on 2.x, claiming from whichever
@@ -775,9 +783,19 @@ func (opencode) env(in Invocation) ([]string, error) {
 	return env, nil
 }
 
-// opencodeSessionConfig builds the document pinned as OPENCODE_CONFIG_CONTENT:
-// the mcp config file's own keys, with every MCP server moved out of Code Mode
-// and the fail-closed permission policy under `permission`.
+// opencodeSessionConfig is opencodeSessionConfigWithEnv with no environment: the
+// path doctor and the unit tests use, and never a NoBacklogMCP session.
+func opencodeSessionConfig(in Invocation) ([]byte, error) {
+	return opencodeSessionConfigWithEnv(in, nil)
+}
+
+// opencodeSessionConfigWithEnv builds the document pinned as
+// OPENCODE_CONFIG_CONTENT: the mcp config file's own keys, with every MCP server
+// moved out of Code Mode and the fail-closed permission policy under
+// `permission`.
+//
+// env is the environment built so far (before the content layer is appended), so
+// the NoBacklogMCP switch can resolve the same ambient layers opencode will load.
 //
 // The file is parsed as strict JSON, the same rule config applies to every file
 // the driver names (readMCPFile): those feed fail-closed gates, and a lenient
@@ -791,7 +809,24 @@ func (opencode) env(in Invocation) ([]string, error) {
 // insertion order, so a key the file declares sorts ahead of this policy's `*`
 // catch-all. doctor WARNs on a named file carrying one (and config refuses one
 // in a DISCOVERED file, checkDiscoveredMCPConfig).
-func opencodeSessionConfig(in Invocation) ([]byte, error) {
+func opencodeSessionConfigWithEnv(in Invocation, env []string) ([]byte, error) {
+	if in.NoBacklogMCP {
+		// A declared OPENCODE_CONFIG_CONTENT replaces this document wholesale
+		// (exec takes the last of a duplicate key), and with it the backlog
+		// switch. Fail closed rather than hand a standalone review the tools it
+		// exists to avoid.
+		for _, kv := range in.Env {
+			if strings.HasPrefix(kv, "OPENCODE_CONFIG_CONTENT=") {
+				return nil, errors.New("a no-backlog session cannot run with a declared OPENCODE_CONFIG_CONTENT: it replaces the adapter's content layer, and with it the switch that keeps the backlog MCP server off")
+			}
+		}
+		// The switch resolves the layers against the environment opencode will
+		// SEE, so a caller-declared OPENCODE_CONFIG_DIR or OPENCODE_CONFIG (which
+		// exec lets win) cannot name a layer the resolver never read. An
+		// INHERITED content layer is dropped: this call is about to write the
+		// one that replaces it.
+		env = append(withoutEnvKey(env, "OPENCODE_CONFIG_CONTENT"), in.Env...)
+	}
 	doc := map[string]any{}
 	if in.MCPConfigPath != "" {
 		data, err := os.ReadFile(in.MCPConfigPath)
@@ -806,8 +841,26 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 		if doc == nil {
 			doc = map[string]any{}
 		}
+	}
+	// CLA-927: a standalone session that must not reach a backlog gets every
+	// clankerbar server opencode would load switched off in THIS layer, which
+	// opencode merges last. Without it a checkout's checked-in opencode.json
+	// hands the review the operator's backlog tools (with a key in env) or fails
+	// the preflight with needs_auth (without one).
+	if in.NoBacklogMCP {
+		decls, err := opencodeBacklogMCPDeclarations(in, env, true)
+		if err != nil {
+			return nil, err
+		}
+		disableBacklogMCPServers(doc, decls)
+	}
+	if raw, ok := doc["mcp"]; ok && raw != nil {
+		source := "backlog MCP disable"
+		if in.MCPConfigPath != "" {
+			source = "mcp config " + in.MCPConfigPath
+		}
 		if err := opencodeMCPOutOfCodeMode(doc); err != nil {
-			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
+			return nil, fmt.Errorf("%s: %w", source, err)
 		}
 	}
 	policy := opencodePermissionPolicy(in.Probe, in.WorkDir, in.ExtraDirs)
@@ -1775,7 +1828,7 @@ func (opencode) Capabilities() Capabilities {
 	// and that server's session API steers a message into the live run
 	// (opencode_inbox.go). A session with no such server has no delivery target
 	// and simply receives nothing.
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, HonoursNoBacklogMCP: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {
