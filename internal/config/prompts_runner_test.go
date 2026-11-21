@@ -69,6 +69,11 @@ func TestRunnerBriefsEndWithADoneReportAndNoWrites(t *testing.T) {
 		if !strings.Contains(tc.brief, DoneMarker) {
 			t.Errorf("the %s brief never names the done marker %q", tc.name, DoneMarker)
 		}
+		// CLA-948: a model copies an inline-code span verbatim, so the brief
+		// must never show the marker in one.
+		if strings.Contains(tc.brief, "`"+DoneMarker) || strings.Contains(tc.brief, DoneMarker+"`") {
+			t.Errorf("the %s brief shows the done marker in backticks", tc.name)
+		}
 		if !strings.Contains(tc.brief, runnerNoWrites) {
 			t.Errorf("the %s brief does not carry the runner's write ban", tc.name)
 		}

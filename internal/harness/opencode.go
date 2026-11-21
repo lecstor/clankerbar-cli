@@ -1318,6 +1318,9 @@ func (opencode) DetectLimit(res Result) Limit {
 	if window, planLimit := opencodeWindowLimit(facts, text); planLimit {
 		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: window}
 	}
+	if opencodeSubscriptionLimit(facts, text) {
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit"}
+	}
 	// A rolling subscription quota is a LIMIT the loop waits out, so Stop stays
 	// false. ResetAt is the provider's own stated instant when present.
 	if opencodeRollingQuotaRe.MatchString(text) {

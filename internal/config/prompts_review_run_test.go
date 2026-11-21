@@ -39,6 +39,10 @@ func TestReviewRunBriefCarriesTheChangeAndNoTask(t *testing.T) {
 			t.Errorf("the brief does not carry %q:\n%s", want, brief)
 		}
 	}
+	// CLA-948: a model copies an inline-code span verbatim.
+	if strings.Contains(brief, "`"+DoneMarker) || strings.Contains(brief, DoneMarker+"`") {
+		t.Errorf("the brief shows the done marker in backticks:\n%s", brief)
+	}
 	if strings.Contains(brief, "{{") {
 		t.Errorf("the brief carries a placeholders the command cannot substitute:\n%s", brief)
 	}

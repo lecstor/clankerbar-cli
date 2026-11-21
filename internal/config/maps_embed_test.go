@@ -168,6 +168,25 @@ func TestEmbedMapsSessionHunks_DoneMarkerEscaped(t *testing.T) {
 	}
 }
 
+// TestEmbedMapsSessionHunks_BacktickedDoneMarkerEscaped (CLA-948): the parser
+// also reads a backticked marker line as the marker, so a hunk line in that
+// form must be escaped too.
+func TestEmbedMapsSessionHunks_BacktickedDoneMarkerEscaped(t *testing.T) {
+	ticked := "`" + DoneMarker + "`"
+	hunk := "@@ -1,2 +1,2 @@\n context\n+" + ticked
+	items := []string{"M1. src/a.ts:1-2"}
+	out, _ := EmbedMapsSessionHunks(items, []MapsSessionHunk{{Path: "src/a.ts", Text: hunk}}, "abc1234",
+		&EmbedHunksOptions{Enabled: true})
+	for _, line := range strings.Split(embedBody(t, out[0]), "\n") {
+		if isDoneMarkerLine(strings.TrimLeft(line, "+- ")) {
+			t.Errorf("an embedded hunk line still reads as the done marker: %q", line)
+		}
+	}
+	if !strings.Contains(out[0], "\n+\\"+ticked) {
+		t.Errorf("the backticked done-marker line was not escaped:\n%s", out[0])
+	}
+}
+
 // TestEmbedMapsSessionHunks_EdgeCases covers empty hunks, UTF-8 truncation and
 // the missing-base placeholder.
 func TestEmbedMapsSessionHunks_EdgeCases(t *testing.T) {
