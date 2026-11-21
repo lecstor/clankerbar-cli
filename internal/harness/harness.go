@@ -457,7 +457,7 @@ type Invocation struct {
 	// unclaimed and still want the tools, and it exists as its own field because
 	// the review that must not touch the backlog says so explicitly.
 	//
-	// Only opencode honours it today (see opencodeBacklogMCPDisables); a caller
+	// Only opencode honours it today (see disableBacklogMCPServers); a caller
 	// must not read "ignored by this adapter" as "the backlog is unreachable".
 	// clankerbar review run is the caller.
 	NoBacklogMCP bool
