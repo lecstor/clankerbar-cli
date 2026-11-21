@@ -1945,7 +1945,12 @@ func TestFleetShutdownIsBoundedByOneBudgetAcrossTargets(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
+	var mu sync.Mutex
+	posts := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		posts++
+		mu.Unlock()
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -1959,8 +1964,9 @@ func TestFleetShutdownIsBoundedByOneBudgetAcrossTargets(t *testing.T) {
 		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
 	})
 	openTestStateDir(t, d)
-	d.shutdownBudget = 100 * time.Millisecond
+	d.shutdownBudget = 200 * time.Millisecond
 
+	start := time.Now()
 	done := make(chan struct{})
 	go func() {
 		d.fleetShutdown()
@@ -1970,6 +1976,19 @@ func TestFleetShutdownIsBoundedByOneBudgetAcrossTargets(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatalf("fleetShutdown had not returned 1s into a hanging plane with 3 targets (budget %s) — total shutdown must be one budget, not one per target", d.shutdownBudget)
+	}
+	if elapsed := time.Since(start); elapsed > d.shutdownBudget+500*time.Millisecond {
+		t.Errorf("fleetShutdown took %s with a %s budget — total shutdown must be one budget, not one per target", elapsed, d.shutdownBudget)
+	}
+
+	// Every target must have REACHED the plane while the others were still
+	// waiting: a serial loop sharing the already-expired ctx posts only the
+	// first target's beacon, because the rest see the deadline before sending.
+	mu.Lock()
+	got := posts
+	mu.Unlock()
+	if got != 3 {
+		t.Errorf("the plane received %d stopping beacon(s), want one per target (3) — the targets were not closed concurrently under a shared deadline", got)
 	}
 }
 
@@ -1996,14 +2015,16 @@ func TestFleetShutdownAbandonsAReporterThatIgnoresTheDeadline(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("fleetShutdown never returned against a Reporter that ignores its context (budget %s)", d.shutdownBudget)
 	}
+	// Bounded waits: the spawned Close goroutines may not have been scheduled
+	// the instant fleetShutdown abandoned the wait.
 	select {
 	case <-a.entered:
-	default:
+	case <-time.After(100 * time.Millisecond):
 		t.Error("target 0's Close was never entered")
 	}
 	select {
 	case <-b.entered:
-	default:
+	case <-time.After(100 * time.Millisecond):
 		t.Error("target 1's Close was never entered")
 	}
 }

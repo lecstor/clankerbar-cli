@@ -639,11 +639,46 @@ func neverAnswers(t *testing.T) string {
 	return srv.URL
 }
 
+// shrinkCloseBudget lowers the enforced cap for one test, so a cap test costs
+// milliseconds instead of the production five seconds.
+func shrinkCloseBudget(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := closeBudget
+	closeBudget = d
+	t.Cleanup(func() { closeBudget = old })
+}
+
 // The stopping beacon is the last POST a shutdown makes; it must not outlive the
 // deadline the caller gave. Deriving it from context.Background meant a hanging
-// plane held Ctrl-C for a full reportTimeout per target.
+// plane held Ctrl-C for a full reportTimeout per target. One queued report is
+// enough to spend the deadline, which also pins the deliberate skip: once the
+// deadline has passed no stopping beacon leaves.
 func TestCloseStoppingBeaconIsBoundedByTheDeadline(t *testing.T) {
-	rep := New(neverAnswers(t), "k")
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	var mu sync.Mutex
+	var states []string
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var rep Report
+		_ = json.Unmarshal(body, &rep)
+		mu.Lock()
+		states = append(states, rep.State.Kind)
+		mu.Unlock()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+
+	logs := captureLog(t)
+	rep := New(srv.URL, "k").(*httpReporter)
+	// Queue without starting the pump: this test is about Close's own sends,
+	// and this one spends the whole deadline.
+	rep.queue <- Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -651,6 +686,43 @@ func TestCloseStoppingBeaconIsBoundedByTheDeadline(t *testing.T) {
 	rep.Close(ctx, Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("Close took %s with a 100ms deadline — the stopping POST ran its own %s timeout", elapsed, reportTimeout)
+	}
+	mu.Lock()
+	got := append([]string(nil), states...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != StateIdle {
+		t.Errorf("plane received states %v; want only the queued idle report — a stopping beacon sent past the deadline would mark the replacement as stopping", got)
+	}
+	if out := logs.String(); !strings.Contains(out, "deadline reached before the stopping beacon") {
+		t.Errorf("the post-deadline beacon skip was not the branch taken:\n%s", out)
+	}
+}
+
+// A direct Close with an unbounded context still gets the ceiling: without the
+// cap, a hanging plane spends reportTimeout on the flush and another on the
+// beacon.
+func TestCloseCapsAnUnboundedCallerAtTheBudget(t *testing.T) {
+	shrinkCloseBudget(t, 50*time.Millisecond)
+	rep := New(neverAnswers(t), "k")
+
+	start := time.Now()
+	rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("Close took %s with an unbounded context and a %s cap — an unbounded caller must still be capped", elapsed, 50*time.Millisecond)
+	}
+}
+
+// Shutdown's abandon backstop needs a deadline to fire. An unbounded caller is
+// given closeBudget, so a reporter that ignores its context cannot hold exit.
+func TestShutdownCapsAnUnboundedCallerAtTheBudget(t *testing.T) {
+	shrinkCloseBudget(t, 50*time.Millisecond)
+	g := newGatedReporter()
+	t.Cleanup(g.unblock)
+
+	start := time.Now()
+	Shutdown(context.Background(), []ShutdownBeacon{{Reporter: g}})
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("Shutdown took %s with an unbounded context and a %s cap — a reporter that ignores its context held the wait", elapsed, 50*time.Millisecond)
 	}
 }
 

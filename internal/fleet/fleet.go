@@ -308,9 +308,16 @@ type ShutdownBeacon struct {
 // goodbye on a hanging plane, and the operator's Ctrl-C waits for this.
 //
 // The deadline is the guarantee for the reporters this package builds — each
-// Close returns by it. The abandon below is a backstop for one that does not:
-// a reporter must never be able to hold process exit past the budget.
+// Close returns by it. A ctx carrying no deadline is capped at closeBudget, so
+// the bound holds for a direct caller too. The abandon below is a backstop for
+// a reporter that does not honour it: one must never be able to hold process
+// exit past the budget.
 func Shutdown(ctx context.Context, beacons []ShutdownBeacon) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, closeBudget)
+		defer cancel()
+	}
 	var wg sync.WaitGroup
 	for _, b := range beacons {
 		if b.Reporter == nil {
@@ -374,6 +381,10 @@ const reportTimeout = 5 * time.Second
 // presence row of the daemon that replaced this one.
 const CloseBudget = 5 * time.Second
 
+// closeBudget is the value Close and Shutdown enforce. A var so a test can
+// shrink it and pin the cap without waiting out the production five seconds.
+var closeBudget = CloseBudget
+
 // queueCap is how many reports may sit unread while the pump works through a
 // slow endpoint. Generous next to the production cadence (one per idle poll);
 // anything beyond this during an outage is dropped by design.
@@ -420,8 +431,8 @@ type httpReporter struct {
 	// done is closed by Close; the pump's select on queue-vs-done then parks
 	// it for good. postMu serialises every POST so that after Close takes the
 	// lock nothing can land after the `stopping` beacon. closed makes Send a
-	// no-op once Close has run, guards Close's own idempotence, and stops the
-	// pump from starting a POST after the goodbye has begun.
+	// no-op once Close has run, guards Close's own idempotence, and guarantees
+	// the pump starts no POST after Close returns.
 	done       chan struct{}
 	postMu     *ctxMutex
 	closed     atomic.Bool
@@ -463,7 +474,7 @@ func (r *httpReporter) Close(ctx context.Context, rep Report) {
 
 	// A caller passing an unbounded context (a direct Close outside Shutdown)
 	// still gets the ceiling; a caller sharing a tighter deadline keeps it.
-	ctx, cancel := context.WithTimeout(ctx, CloseBudget)
+	ctx, cancel := context.WithTimeout(ctx, closeBudget)
 	defer cancel()
 
 	if !r.postMu.LockContext(ctx) {
@@ -523,9 +534,10 @@ func (r *httpReporter) pump() {
 	for {
 		r.postMu.Lock()
 		// Close may be waiting for this lock with a deadline. Checking closed
-		// under it means that once the goodbye has begun the pump starts no
-		// further POST — without this it could pick a queued report out of the
-		// still-ready select and land it after Close returned.
+		// under it gives the invariant that matters: no POST starts after Close
+		// returns. A report already selected when Close sets closed may still
+		// land while Close waits for the lock — bounded by reportTimeout, and
+		// inside the accepted "pump POST started before Close" tradeoff.
 		if r.closed.Load() {
 			r.postMu.Unlock()
 			return

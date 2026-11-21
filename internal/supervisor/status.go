@@ -92,8 +92,13 @@ type StatusReport struct {
 
 // StatusReporter sends supervisor status reports. Both methods are fail-soft by
 // contract: neither blocks meaningfully, neither returns an error, and neither
-// may be load-bearing for supervision. The shape mirrors fleet.Reporter, whose
-// reasoning applies unchanged.
+// may be load-bearing for supervision.
+//
+// It keeps the pre-CLA-484 shape on purpose. Unlike the fleet's reporter — one
+// per project, all closed together at daemon exit — the supervisor holds a
+// SINGLE reporter, so one bounded goodbye is the whole shutdown cost and there
+// is no per-target fleet for a shared deadline to bound. Close therefore waits
+// uncancellably for an in-flight POST and flushes under statusCloseBudget.
 type StatusReporter interface {
 	// Send enqueues one report and returns at once. Under an unresponsive
 	// endpoint the queue fills and the report is dropped rather than awaited.
@@ -145,8 +150,9 @@ func newStatusReporter(endpoint, apiKey string) StatusReporter {
 const statusReportTimeout = 5 * time.Second
 
 // statusCloseBudget bounds how long Close may spend delivering what is still
-// queued before its own report. One report's worth of patience, exactly as
-// fleet.CloseBudget.
+// queued before its own report. One report's worth of patience; unlike
+// fleet.CloseBudget it is not a deadline shared across targets, because there is
+// only ever one supervisor status reporter.
 const statusCloseBudget = 5 * time.Second
 
 // statusQueueCap is how many reports may sit unread while the pump works through
