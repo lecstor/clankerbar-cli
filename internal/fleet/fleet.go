@@ -330,6 +330,13 @@ func Shutdown(ctx context.Context, beacons []ShutdownBeacon) {
 	select {
 	case <-done:
 	case <-ctx.Done():
+		// The last Close may have returned at the same instant the deadline
+		// fired; report an abandoned wait only if one is still running.
+		select {
+		case <-done:
+			return
+		default:
+		}
 		log.Printf("fleet: shutdown deadline reached with a stopping beacon still unsent")
 	}
 }
@@ -375,7 +382,8 @@ const queueCap = 16
 // ctxMutex is a mutex whose acquisition can be abandoned at a deadline.
 // sync.Mutex cannot be: Close must not spend the entire shutdown budget waiting
 // out a pump POST that started before the budget did, or the bound it promises
-// is a fiction.
+// is a fiction. Construct with newCtxMutex: the zero value's nil token blocks
+// forever.
 type ctxMutex struct{ token chan struct{} }
 
 func newCtxMutex() *ctxMutex {

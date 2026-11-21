@@ -1968,8 +1968,8 @@ func TestFleetShutdownIsBoundedByOneBudgetAcrossTargets(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("fleetShutdown had not returned 2s into a hanging plane with 3 targets (budget %s) — total shutdown must be one budget, not one per target", d.shutdownBudget)
+	case <-time.After(time.Second):
+		t.Fatalf("fleetShutdown had not returned 1s into a hanging plane with 3 targets (budget %s) — total shutdown must be one budget, not one per target", d.shutdownBudget)
 	}
 }
 
@@ -1993,7 +1993,7 @@ func TestFleetShutdownAbandonsAReporterThatIgnoresTheDeadline(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatalf("fleetShutdown never returned against a Reporter that ignores its context (budget %s)", d.shutdownBudget)
 	}
 	select {
