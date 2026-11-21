@@ -33,7 +33,7 @@ func TestNewWithoutCredsIsNotWired(t *testing.T) {
 		}
 		// Both methods must be safe to call: reporting is never load-bearing.
 		r.Send(Report{Identity: Identity{Instance: "x"}})
-		r.Close(Report{})
+		r.Close(context.Background(), Report{})
 	}
 }
 
@@ -516,7 +516,7 @@ func TestCloseLandsBeforeItReturns(t *testing.T) {
 
 	rep := New(srv.URL, "k")
 	rep.Send(Report{Identity: Identity{Instance: "x"}}) // occupy the pump briefly
-	rep.Close(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
 	select {
 	case <-arrived:
 	default:
@@ -575,7 +575,7 @@ func TestCloseEndsTheReporterWithStoppingLast(t *testing.T) {
 		Iterations: []Iteration{{TaskID: "t-1", TaskRef: "CLA-1", Outcome: OutcomeReleased, DurationSeconds: 1, Tokens: 3}}})
 	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // r5
 	close(release)
-	rep.Close(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -605,7 +605,7 @@ func TestSendAfterCloseIsInert(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	rep := New(srv.URL, "k")
-	rep.Close(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
 	select {
 	case <-arrived:
 	default:

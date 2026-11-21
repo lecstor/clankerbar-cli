@@ -146,7 +146,7 @@ const statusReportTimeout = 5 * time.Second
 
 // statusCloseBudget bounds how long Close may spend delivering what is still
 // queued before its own report. One report's worth of patience, exactly as
-// fleet.closeFlushBudget.
+// fleet.CloseBudget.
 const statusCloseBudget = 5 * time.Second
 
 // statusQueueCap is how many reports may sit unread while the pump works through

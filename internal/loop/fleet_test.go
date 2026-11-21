@@ -50,7 +50,7 @@ func (f *fakeFleet) Send(r fleet.Report) {
 	f.sent = append(f.sent, r)
 }
 
-func (f *fakeFleet) Close(r fleet.Report) {
+func (f *fakeFleet) Close(_ context.Context, r fleet.Report) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = append(f.closed, r)
