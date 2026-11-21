@@ -397,28 +397,28 @@ func opencodeEffectiveMCPServers(in Invocation, env []string) ([]string, error) 
 // no-backlog switch asks what opencode will END UP loading, so it must read every
 // layer, the named file included.
 //
-// A name declared by several layers keeps the union of their fields, later
-// layers winning key by key. That is deliberately more generous than opencode's
-// own merge for a PARTIAL entry (a `{"enabled": false}` does not switch a global
-// server off — see the conformance suite's mcpDisable test): the union is what
-// lets the switch write one full entry that does switch it off.
+// A name declared by several layers keeps the non-transport fields of all of
+// them, and the transport of the LAST layer that declares a complete one (type
+// plus url, or type plus command). That is deliberately more generous than
+// opencode's own merge for a PARTIAL entry (a `{"enabled": false}` does not
+// switch a global server off — see the conformance suite's mcpDisable test): the
+// carried-over transport is what lets the switch write one full entry that does
+// switch it off.
 func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool) (map[string]opencodeMCPDeclaration, error) {
 	decls := map[string]opencodeMCPDeclaration{}
-	if in.MCPConfigPath != "" {
-		// Strict JSON, the same rule config applies to every file the driver
-		// names; env() has already failed the spawn if this file is unreadable,
-		// so an error here is defensive, not a silent skip.
+	if in.MCPConfigPath != "" && !allLayers {
+		// The preflight asks what the NAMED file declares: it is pinned into the
+		// content layer and displaces ambient servers of the same name. Strict
+		// JSON, the same rule config applies to every file the driver names.
 		if err := readOpencodeMCPDocument(in.MCPConfigPath, true, decls); err != nil {
 			return nil, fmt.Errorf("%w: cannot establish opencode's effective config: mcp config %s: %v",
 				ErrMCPNotConnected, in.MCPConfigPath, err)
 		}
-		if !allLayers {
-			return decls, nil
-		}
+		return decls, nil
 	}
 
-	read := func(path, source string) error {
-		if err := readOpencodeMCPDocument(path, false, decls); err != nil {
+	read := func(path, source string, strict bool) error {
+		if err := readOpencodeMCPDocument(path, strict, decls); err != nil {
 			return fmt.Errorf("%w: cannot establish opencode's effective config: %s: %v", ErrMCPNotConnected, source, err)
 		}
 		return nil
@@ -432,14 +432,21 @@ func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool)
 	}
 	for _, name := range opencodeGlobalConfigNames {
 		path := filepath.Join(globalDir, name)
-		if err := read(path, "global config "+path); err != nil {
+		if err := read(path, "global config "+path, false); err != nil {
 			return nil, err
 		}
 	}
-	// 2. OPENCODE_CONFIG. Normally empty when no file is named, but an explicit
-	// caller value in in.Env is a layer opencode loads all the same.
+	// 2. OPENCODE_CONFIG, the layer opencode reads after the global dir. The
+	// adapter pins the named MCP config there (opencode.go), so it is read at
+	// this position rather than first; a caller-declared value in in.Env wins
+	// at exec, so it is read after it.
+	if in.MCPConfigPath != "" {
+		if err := read(in.MCPConfigPath, "mcp config "+in.MCPConfigPath, true); err != nil {
+			return nil, err
+		}
+	}
 	if path := envValue(env, "OPENCODE_CONFIG"); path != "" {
-		if err := read(path, "OPENCODE_CONFIG "+path); err != nil {
+		if err := read(path, "OPENCODE_CONFIG "+path, false); err != nil {
 			return nil, err
 		}
 	}
@@ -451,7 +458,7 @@ func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool)
 	}
 	for _, name := range opencodeProjectConfigNames {
 		path := filepath.Join(base, name)
-		if err := read(path, "project config "+path); err != nil {
+		if err := read(path, "project config "+path, false); err != nil {
 			return nil, err
 		}
 	}
@@ -580,10 +587,55 @@ func addOpencodeMCPServer(name string, entry map[string]any, out map[string]open
 	if decl.entry == nil {
 		decl.entry = map[string]any{}
 	}
+	// A layer with a COMPLETE transport replaces the transport keys as a unit:
+	// merging them key by key can pair a later `type` with an earlier `url` or
+	// `command`, and opencode's tolerance of such a hybrid entry is unverified.
+	// A partial entry (no complete transport) contributes only its other fields,
+	// so `{"disabled": true}` keeps the transport an EARLIER layer declared —
+	// which is exactly what lets the switch write a full disabled entry for a
+	// server the operator's global config defines and a checkout only tweaks.
+	if transport, ok := opencodeMCPCompleteTransport(entry); ok {
+		delete(decl.entry, "type")
+		delete(decl.entry, "url")
+		delete(decl.entry, "command")
+		delete(decl.entry, "args")
+		for key, value := range transport {
+			decl.entry[key] = value
+		}
+	}
 	for key, value := range entry {
-		decl.entry[key] = value
+		switch key {
+		case "type", "url", "command", "args":
+			// Transport keys arrive only through a complete transport above; a
+			// partial one must never combine with an earlier layer's dialect.
+		default:
+			decl.entry[key] = value
+		}
 	}
 	out[name] = decl
+}
+
+// opencodeMCPCompleteTransport extracts the transport a layer declares, if it
+// declares a whole one: a type plus a url, or a type plus a command. Partial
+// transports (a type alone, a url alone) are not returned: they cannot start a
+// server, and letting their keys join another layer's is how a hybrid entry is
+// made.
+func opencodeMCPCompleteTransport(entry map[string]any) (map[string]any, bool) {
+	kind, _ := entry["type"].(string)
+	if kind == "" {
+		return nil, false
+	}
+	if url, ok := entry["url"].(string); ok && url != "" {
+		return map[string]any{"type": kind, "url": url}, true
+	}
+	if command, ok := entry["command"]; ok && command != nil {
+		transport := map[string]any{"type": kind, "command": command}
+		if args, ok := entry["args"]; ok && args != nil {
+			transport["args"] = args
+		}
+		return transport, true
+	}
+	return nil, false
 }
 
 // opencodeMCPEntryShaped reports whether a value carries any field an MCP entry
@@ -616,10 +668,14 @@ func opencodeMCPEntryShaped(entry map[string]any) bool {
 // The switch is a FULL entry, not the partial `{"disabled": true}` shape: verified
 // on 2.0.32, a partial entry in a later layer leaves the earlier server running
 // (see the conformance suite's mcpDisable and doctor's opencode_mcp_disables).
-// Only the transport keys are copied — type and url/command/args — so a
-// credential in `headers` or `environment` is not moved out of the operator's
-// config file and into the child's environment, where a process listing reaches
-// it. A disabled server never dials, so it needs none of them.
+// Only the transport key the type needs is copied — `url` for a remote server,
+// `command` (without `args`, which a disabled local server never runs) for a
+// local one — so a credential in `headers` or `environment` is not moved out of
+// the operator's config file and into the child's environment, where a process
+// listing reaches it. A URL that embeds a token in its query string IS copied:
+// it is already in the operator's config file, and the switch cannot strip it
+// without changing which server the entry names. A disabled server never dials,
+// so it needs none of the credentials.
 //
 // The entry is written in the 2.x container shape and any same-named direct entry
 // in doc is dropped: opencode applies the later layer's container entry over an
@@ -677,23 +733,28 @@ func disableBacklogMCPServers(doc map[string]any, decls map[string]opencodeMCPDe
 }
 
 // backlogMCPTransportEntry is the minimal full entry for one declaration: the
-// fields opencode needs to know what the server WOULD be, with none that carry a
-// credential. nil when the declaration has no transport at all.
+// one transport key opencode needs to know what the server WOULD be, with none
+// that carry a credential and never both dialects. nil when the declaration has
+// no transport at all.
 func backlogMCPTransportEntry(fields map[string]any) map[string]any {
 	kind, _ := fields["type"].(string)
 	if kind == "" {
 		return nil
 	}
-	entry := map[string]any{"type": kind}
-	for _, key := range []string{"url", "command", "args"} {
-		if value, ok := fields[key]; ok && value != nil {
-			entry[key] = value
+	switch kind {
+	case "remote", "http", "https", "sse":
+		url, _ := fields["url"].(string)
+		if url == "" {
+			return nil
 		}
+		return map[string]any{"type": kind, "url": url}
+	default:
+		command, ok := fields["command"]
+		if !ok || command == nil {
+			return nil
+		}
+		return map[string]any{"type": kind, "command": command}
 	}
-	if entry["url"] == nil && entry["command"] == nil {
-		return nil
-	}
-	return entry
 }
 
 // opencodeGlobalConfigDir resolves the ONE global config directory opencode

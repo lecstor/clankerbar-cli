@@ -133,14 +133,135 @@ func TestOpencodeNoBacklogMCPDisablesEveryAmbientClankerbarServer(t *testing.T) 
 			if got := doc.MCP.Servers["clankerbar"]["url"]; got != "https://clankerbar.com/mcp/makespdf" {
 				t.Errorf("the project server's url = %v, want the declared one", got)
 			}
-			if _, ok := doc.MCP.Servers["other"]; ok {
-				t.Errorf("an unrelated MCP server was switched off: %v", doc.MCP.Servers["other"])
-			}
 			if doc.MCP.Servers["clankerbar"]["codemode"] != false {
 				t.Errorf("the disabled entry was left in Code Mode: %v", doc.MCP.Servers["clankerbar"])
 			}
+			// The content doc is built from nothing here (no named MCP config), so
+			// the switch is its only writer: assert the exact key set it produced.
+			want := map[string]bool{"clankerbar": true, "cb": true}
+			if len(doc.MCP.Servers) != len(want) {
+				t.Errorf("mcp.servers has %d entries, want exactly %v: %v", len(doc.MCP.Servers), want, doc.MCP.Servers)
+			}
+			for name := range doc.MCP.Servers {
+				if !want[name] {
+					t.Errorf("an unrelated MCP server was switched off: %v", name)
+				}
+			}
 		})
 	}
+}
+
+// The same clankerbar name declared by TWO layers: a full transport in the
+// global config, and a checkout that only tweaks it. opencode leaves a server
+// running under a later partial entry, so the switch must carry the global
+// transport forward into one full disabled entry; without the field merge it
+// would write no disable at all and the operator's server would stay reachable.
+func TestOpencodeNoBacklogMCPMergesATwoLayerDeclaration(t *testing.T) {
+	globalDir := t.TempDir()
+	writeAt(t, filepath.Join(globalDir, "opencode.json"),
+		`{"mcp":{"servers":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/global","headers":{"Authorization":"Bearer {env:CLANKERBAR_API_KEY}"}}}}}`)
+	work := t.TempDir()
+	writeAt(t, filepath.Join(work, "opencode.json"),
+		`{"mcp":{"servers":{"clankerbar":{"disabled":true}}}}`)
+
+	servers := noBacklogContentServers(t, Invocation{WorkDir: work, ConfigDir: globalDir, NoBacklogMCP: true})
+	entry := servers["clankerbar"]
+	if entry == nil {
+		t.Fatalf("the two-layer clankerbar declaration was not switched off: %v", servers)
+	}
+	if entry["disabled"] != true {
+		t.Errorf("clankerbar was not switched off: %v", entry)
+	}
+	if entry["type"] != "remote" || entry["url"] != "https://clankerbar.com/mcp/global" {
+		t.Errorf("clankerbar = %v, want the global layer's transport carried forward", entry)
+	}
+	if _, ok := entry["headers"]; ok {
+		t.Errorf("clankerbar carried its credential headers into the child's environment: %v", entry)
+	}
+}
+
+// Two layers can disagree about the dialect. The switch must emit ONE transport,
+// the last complete declaration's: unioning transport keys would pair a later
+// `type` with an earlier `url`/`command`, and a hybrid entry's acceptance by
+// opencode is unverified.
+func TestOpencodeNoBacklogMCPPicksOneTransportDialect(t *testing.T) {
+	for _, tc := range []struct {
+		name, global, project, wantType, wantURL, wantCommand string
+	}{
+		{
+			name:        "remote over local",
+			global:      `{"mcp":{"servers":{"clankerbar":{"type":"local","command":["some-mcp","--serve"]}}}}`,
+			project:     `{"mcp":{"servers":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/makespdf"}}}}`,
+			wantType:    "remote",
+			wantURL:     "https://clankerbar.com/mcp/makespdf",
+			wantCommand: "",
+		},
+		{
+			name:        "local over remote",
+			global:      `{"mcp":{"servers":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/global"}}}}`,
+			project:     `{"mcp":{"servers":{"clankerbar":{"type":"local","command":["some-mcp"]}}}}`,
+			wantType:    "local",
+			wantCommand: "some-mcp",
+			wantURL:     "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			globalDir := t.TempDir()
+			writeAt(t, filepath.Join(globalDir, "opencode.json"), tc.global)
+			work := t.TempDir()
+			writeAt(t, filepath.Join(work, "opencode.json"), tc.project)
+
+			entry := noBacklogContentServers(t, Invocation{WorkDir: work, ConfigDir: globalDir, NoBacklogMCP: true})["clankerbar"]
+			if entry == nil {
+				t.Fatal("the clankerbar declaration was not switched off")
+			}
+			if entry["type"] != tc.wantType {
+				t.Errorf("type = %v, want %q: %v", entry["type"], tc.wantType, entry)
+			}
+			if tc.wantURL != "" && entry["url"] != tc.wantURL {
+				t.Errorf("url = %v, want %q: %v", entry["url"], tc.wantURL, entry)
+			}
+			if tc.wantURL == "" {
+				if _, ok := entry["url"]; ok {
+					t.Errorf("the entry kept the losing dialect's url: %v", entry)
+				}
+			}
+			if tc.wantCommand != "" {
+				command, _ := entry["command"].([]any)
+				if len(command) == 0 || command[0] != tc.wantCommand {
+					t.Errorf("command = %v, want [%q]: %v", entry["command"], tc.wantCommand, entry)
+				}
+			}
+			if tc.wantCommand == "" {
+				if _, ok := entry["command"]; ok {
+					t.Errorf("the entry kept the losing dialect's command: %v", entry)
+				}
+			}
+			if _, ok := entry["args"]; ok {
+				t.Errorf("a disabled local entry copied args it will never run: %v", entry)
+			}
+		})
+	}
+}
+
+// noBacklogContentServers runs the adapter's env builder for a no-backlog
+// invocation and returns the mcp.servers the content layer carries.
+func noBacklogContentServers(t *testing.T, in Invocation) map[string]map[string]any {
+	t.Helper()
+	env, err := opencode{}.env(in)
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	var doc struct {
+		MCP struct {
+			Servers map[string]map[string]any `json:"servers"`
+		} `json:"mcp"`
+	}
+	content := lastValue(env, "OPENCODE_CONFIG_CONTENT")
+	if err := json.Unmarshal([]byte(content), &doc); err != nil {
+		t.Fatalf("content is not JSON: %v\n%s", err, content)
+	}
+	return doc.MCP.Servers
 }
 
 // The switch normalises every declaration into the 2.x container, drops the

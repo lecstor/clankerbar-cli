@@ -859,7 +859,17 @@ func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
 	iso := isolate(t)
-	cfg := writeJSON(t, fakeConfigDoc(srv.URL))
+	// The provider config is the GLOBAL layer, and the invocation below names no
+	// MCP config at all: that is review run's real shape. A named file would have
+	// made the preflight read only itself, which is not the path the incident
+	// took (and would not have waited for the checkout's server either).
+	global, err := json.Marshal(fakeConfigDoc(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(iso.cfgDir, "opencode.json"), global, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// run starts a session over a checkout that itself declares the fake
 	// clankerbar server, and reports the server's start marker and the tool names
@@ -868,8 +878,9 @@ func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
 		t.Helper()
 		mcpDir := t.TempDir()
 		work := t.TempDir()
+		marker := filepath.Join(t.TempDir(), "starts")
 		project, err := json.Marshal(map[string]any{
-			"mcp": map[string]any{"servers": map[string]any{"clankerbar": fakeMCPEntry(t, mcpDir)}},
+			"mcp": map[string]any{"servers": map[string]any{"clankerbar": fakeMCPStartMarkerEntry(t, mcpDir, marker)}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -877,7 +888,7 @@ func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(work, "opencode.json"), project, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		in := iso.invocation(conformancePrompt, work, cfg)
+		in := iso.invocation(conformancePrompt, work, "")
 		in.NoBacklogMCP = noBacklog
 		before := len(fake.requests())
 		res := invokeConformance(t, in)
@@ -885,7 +896,7 @@ func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
 		for _, req := range fake.requests()[before:] {
 			tools = append(tools, req.Tools...)
 		}
-		_, err = os.Stat(filepath.Join(mcpDir, "starts"))
+		_, err = os.Stat(marker)
 		if res.ExitCode != 0 || strings.TrimSpace(res.FinalMessage) != "OK" {
 			t.Errorf("the session ended %s with final %q, want a clean OK", res.ExitString(), res.FinalMessage)
 		}
@@ -912,6 +923,39 @@ func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
 			t.Errorf("the no-backlog session was offered the backlog tool %q (tools: %v)", name, tools)
 		}
 	}
+}
+
+// fakeMCPStartMarkerEntry is a local MCP entry whose start marker does not
+// depend on the entry's environment. The no-backlog switch strips environment,
+// so a marker written only when CLANKERBAR_FAKE_MCP_DIR is set cannot tell a
+// switched-off server from one started without the variable: an entry emitted
+// without `disabled` would start, write nothing and offer no tools, and both
+// assertions would still pass. The command here is a wrapper that appends to
+// the marker first and then execs the fake server with the directory the entry
+// passed it, so a started entry always leaves evidence.
+func fakeMCPStartMarkerEntry(t *testing.T, dir, marker string) map[string]any {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "fake-mcp-start")
+	body := "#!/bin/sh\n" +
+		"printf 'start\\n' >> " + shellSingleQuote(marker) + "\n" +
+		`if [ "$#" -eq 0 ]; then exit 0; fi` + "\n" +
+		fakeMCPDirEnv + "=$1 exec " + shellSingleQuote(self) + "\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{
+		"type":    "local",
+		"command": []string{script, dir},
+	}
+}
+
+// shellSingleQuote quotes s for /bin/sh.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // Switching off a server the global config declares takes a FULL entry in the

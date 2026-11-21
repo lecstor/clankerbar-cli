@@ -1828,7 +1828,7 @@ func (opencode) Capabilities() Capabilities {
 	// and that server's session API steers a message into the live run
 	// (opencode_inbox.go). A session with no such server has no delivery target
 	// and simply receives nothing.
-	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true, RunsTurnSequences: true, HonoursNoBacklogMCP: true, EmitsEvents: true, DeliversMessages: true, ResumesSessions: true}
 }
 
 func (o opencode) IsTransient(res Result) bool {

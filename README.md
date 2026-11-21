@@ -598,10 +598,11 @@ the driver's own review over one local change and prints the findings as JSON.
 It is the same review the `review` phase runs — the same brief substance, gate
 scope and MUST bar, the maps-session planner when asked for it, and the same
 done report read by the same validator — with the task removed: no claim, no
-plane record and no MCP config. A clankerbar MCP server the reviewed checkout
-checks in (or the global opencode config declares) is switched off in the
-adapter's own config layer, so the session cannot touch your backlog with or
-without `CLANKERBAR_API_KEY` in the environment. The
+plane record and no MCP config. On the opencode adapter, a clankerbar MCP
+server the reviewed checkout checks in (or the global opencode config declares)
+is switched off in the adapter's own config layer, so the session cannot touch
+your backlog with or without `CLANKERBAR_API_KEY` in the environment; a harness
+whose adapter does not implement that switch is refused. The
 reviewed repository is only read from: the session runs in a temporary detached
 worktree at `--head`, and that worktree is removed on success and on failure.
 

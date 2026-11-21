@@ -142,6 +142,13 @@ func RunReview(ctx context.Context, opts ReviewRunOptions) (*ReviewRunReport, er
 	if method == config.ReviewMethodMapsSession && !adapter.Capabilities().RunsTurnSequences {
 		return nil, fmt.Errorf("--method maps-session runs its notes and findings turns in one session, and harness %q cannot continue a session: use a harness that can, or the single-pass method", opts.Harness)
 	}
+	// The command's contract is that the review cannot touch the operator's
+	// backlog. Only an adapter that implements the switch can keep that promise;
+	// running one that ignores it would pass the operator's MCP servers to the
+	// session instead.
+	if !adapter.Capabilities().HonoursNoBacklogMCP {
+		return nil, fmt.Errorf("harness %q does not implement the no-backlog MCP switch, so review run cannot keep the session out of the operator's backlog: use a harness that does", opts.Harness)
+	}
 	invoke := opts.invoke
 	if invoke == nil {
 		invoke = adapter.Invoke
