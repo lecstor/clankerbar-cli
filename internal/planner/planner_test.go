@@ -131,7 +131,7 @@ func (f *fakeFleet) Send(r fleet.Report) {
 	f.sent = append(f.sent, r)
 }
 
-func (f *fakeFleet) Close(r fleet.Report) {
+func (f *fakeFleet) Close(_ context.Context, r fleet.Report) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = append(f.closed, r)
@@ -549,6 +549,27 @@ func TestBeaconsCarryThePlannerRole(t *testing.T) {
 	}
 	if len(f.fleet.closed) != 1 || f.fleet.closed[0].State.Kind != fleet.StateStopping {
 		t.Errorf("close beacons = %+v, want one stopping", f.fleet.closed)
+	}
+}
+
+// Every target gets its goodbye. A target skipped at shutdown leaves its
+// presence row silent until the plane's stale window, which reads as a crashed
+// instance rather than a planned stop.
+func TestCloseBeaconsReachesEveryTarget(t *testing.T) {
+	a, b := &fakeFleet{}, &fakeFleet{}
+	p := &Planner{targets: []Target{{Fleet: a}, {Fleet: b}}, instance: "x", host: "h"}
+	p.closeBeacons()
+
+	for i, f := range []*fakeFleet{a, b} {
+		f.mu.Lock()
+		got := append([]fleet.Report(nil), f.closed...)
+		f.mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("target %d got %d close beacon(s), want one", i, len(got))
+		}
+		if got[0].State.Kind != fleet.StateStopping {
+			t.Errorf("target %d close state = %q, want %q", i, got[0].State.Kind, fleet.StateStopping)
+		}
 	}
 }
 

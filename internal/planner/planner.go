@@ -517,17 +517,28 @@ func (p *Planner) identity(i int) fleet.Identity {
 	}
 }
 
-// closeBeacons sends each target's final `stopping` beacon synchronously, so the
-// console's silence after it means the instance is gone rather than stopped
-// talking.
+// closeBeacons sends each target's final `stopping` beacon, concurrently under
+// ONE deadline for the whole set, so the console's silence after it means the
+// instance is gone rather than stopped talking. The shared deadline matters for
+// the same reason as the drain loop's: a hanging plane must not cost the process
+// one report timeout per project.
 func (p *Planner) closeBeacons() {
+	ctx, cancel := context.WithTimeout(context.Background(), fleet.CloseBudget)
+	defer cancel()
+	beacons := make([]fleet.ShutdownBeacon, 0, len(p.targets))
 	for i := range p.targets {
-		t := p.targets[i]
-		if t.Fleet == nil {
+		if p.targets[i].Fleet == nil {
 			continue
 		}
-		t.Fleet.Close(fleet.Report{Identity: p.identity(i), State: fleet.State{Kind: fleet.StateStopping}})
+		beacons = append(beacons, fleet.ShutdownBeacon{
+			Reporter: p.targets[i].Fleet,
+			Report: fleet.Report{
+				Identity: p.identity(i),
+				State:    fleet.State{Kind: fleet.StateStopping},
+			},
+		})
 	}
+	fleet.Shutdown(ctx, beacons)
 }
 
 // labelOf is the log prefix a target's lines carry, empty for the unnamed

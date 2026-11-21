@@ -415,6 +415,13 @@ type Driver struct {
 	// limitBeaconInterval — no test should wait ten minutes to watch a tick.
 	leaseRenewalInterval time.Duration
 
+	// shutdownBudget bounds fleetShutdown's WHOLE goodbye — every target
+	// together, not each — because a hanging plane must not cost the run one
+	// report timeout per project while the operator waits on Ctrl-C. Zero means
+	// fleet.CloseBudget. A field for the same reason as waitGrace: a test pins
+	// the bound in milliseconds rather than sleeping the production budget.
+	shutdownBudget time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
