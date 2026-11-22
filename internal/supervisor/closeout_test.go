@@ -180,10 +180,12 @@ func (f *closeOutFixture) writeGH() {
 	f.ghBin = filepath.Join(f.ghDir, "gh")
 	script := fmt.Sprintf(`#!/bin/sh
 set -u
+prnum=%d
 dir=%q
 seed=%q
 base=%q
 head=%q
+headsha=%q
 case "$1 $2" in
 "pr list")
   # A test that drives TWO tasks in one repo gives each head branch its own list;
@@ -199,6 +201,19 @@ case "$1 $2" in
   ;;
 "pr view")
   sleep "$(cat "$dir/pr-view-delay" 2>/dev/null || echo 0)"
+  # The re-read after an ambiguous merge ("lost" mode) must see what GitHub
+  # would serve: the PR is MERGED, with the commit the fake merge pushed.
+  if [ -f "$dir/merged-sha" ]; then
+    sha=$(cat "$dir/merged-sha")
+    printf '{"number":%%s,"state":"MERGED","mergeCommit":{"oid":"%%s"},"baseRefName":"%%s","headRefName":"%%s","headRefOid":"%%s"}' "$prnum" "$sha" "$base" "$head" "$headsha"
+    exit 0
+  fi
+  # A test can make the POST-merge re-read fail, to pin what the close-out does
+  # when it cannot learn whether an errored merge landed.
+  if [ -f "$dir/pr-view-fail-after-merge" ] && [ -f "$dir/merge-args" ]; then
+    echo "gh: could not read the pull request" >&2
+    exit 1
+  fi
   f="$dir/prview-$3.json"
   [ -f "$f" ] || f="$dir/prview.json"
   cat "$f"
@@ -236,9 +251,16 @@ case "$1 $2" in
   fi
   git -C "$seed" fetch -q origin || exit 1
   git -C "$seed" checkout -q -f "$base" || exit 1
-  git -C "$seed" merge -q --no-ff "$got_head" -m "Merge pull request #%d" || exit 1
+  git -C "$seed" merge -q --no-ff "$got_head" -m "Merge pull request #$prnum" || exit 1
   git -C "$seed" push -q origin "$base" || exit 1
   sha=$(git -C "$seed" rev-parse HEAD)
+  if [ "$mode" = "lost" ]; then
+    # The merge LANDED but the response never reached the caller: the shape a
+    # client timeout, a connection reset or an edge 502 leaves behind.
+    printf '%%s\n' "$sha" > "$dir/merged-sha"
+    echo "the server closed the connection before answering" >&2
+    exit 1
+  fi
   if [ "$mode" = "bogus" ]; then
     sha=0123456789abcdef0123456789abcdef01234567
   fi
@@ -249,7 +271,7 @@ case "$1 $2" in
   exit 9
   ;;
 esac
-`, f.ghDir, f.seed, f.base, closeOutTestHead, closeOutTestPR)
+`, closeOutTestPR, f.ghDir, f.seed, f.base, closeOutTestHead, f.headOID)
 	if err := os.WriteFile(f.ghBin, []byte(script), 0o755); err != nil {
 		f.t.Fatalf("write fake gh: %v", err)
 	}
@@ -280,9 +302,12 @@ func (f *closeOutFixture) mergeArgs() string {
 	return strings.TrimSpace(string(b))
 }
 
-// writePR rewrites what `gh pr view` answers.
+// writePR rewrites what `gh pr view` answers. The PR is always OPEN: the
+// stand-downs this fixture drives are decided on the rollup and mergeability,
+// not on a closed PR, and the close-out's post-merge re-read has its own
+// MERGED answer (see writeGH).
 func (f *closeOutFixture) writePR(base, mergeable, state, rollup string) {
-	body := fmt.Sprintf(`{"number":%d,"url":"https://github.com/%s/pull/%d","mergeable":%q,"mergeStateStatus":%q,"statusCheckRollup":%s,"baseRefName":%q,"headRefName":%q,"headRefOid":%q}`,
+	body := fmt.Sprintf(`{"number":%d,"url":"https://github.com/%s/pull/%d","state":"OPEN","mergeable":%q,"mergeStateStatus":%q,"statusCheckRollup":%s,"baseRefName":%q,"headRefName":%q,"headRefOid":%q}`,
 		closeOutTestPR, closeOutTestRepo, closeOutTestPR, mergeable, state, rollup, base, closeOutTestHead, f.headOID)
 	if err := os.WriteFile(filepath.Join(f.ghDir, "prview.json"), []byte(body), 0o600); err != nil {
 		f.t.Fatalf("write prview: %v", err)
@@ -1037,6 +1062,70 @@ func TestCloseOutReleasesTheClaimAfterAMergeFailure(t *testing.T) {
 	}
 	if !strings.Contains(lines, "claim released") {
 		t.Errorf("the release was not reported:\n%s", lines)
+	}
+}
+
+// A merge request that errors may still have LANDED: GitHub can complete the
+// merge and lose the response to a timeout, a reset or an edge 502. The re-read
+// is what tells that apart from a refusal, and a PR that reads MERGED must be
+// finished from the commit it names - never released, because there is no open PR
+// left for the task to return to.
+func TestCloseOutFinishesAMergeWhoseResponseWasLost(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.setMergeMode("lost")
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if releases := f.releases(); releases != 0 {
+		t.Fatalf("release calls = %d after a merge whose response was lost: the PR is no longer OPEN, so the task would strand on approved: %v", releases, f.plane.planeCalls())
+	}
+	closed := f.callsFor("complete_task")
+	if len(closed) != 1 {
+		t.Fatalf("complete_task calls = %d, want 1 (the landed merge must be finished): %v", len(closed), f.plane.planeCalls())
+	}
+	merged := strings.TrimSpace(mustGit(t, f.remote, "rev-parse", "refs/heads/"+closeOutTestBase))
+	decl, ok := closed[0].args["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("the close carries no delivery block: %v", closed[0].args)
+	}
+	if got := decl["commit"]; got != merged {
+		t.Errorf("delivery.commit = %v, want the merge commit the remote carries (%s)", got, merged)
+	}
+	if got := decl["pr"]; got != fmt.Sprintf("#%d", closeOutTestPR) {
+		t.Errorf("delivery.pr = %v, want #%d", got, closeOutTestPR)
+	}
+	if !strings.Contains(lines, "reads MERGED") {
+		t.Errorf("the recovered merge was not reported:\n%s", lines)
+	}
+}
+
+// When the state of an errored merge cannot be re-read, the close-out cannot tell
+// a refusal from a landed merge. It must hold the claim: releasing on that
+// uncertainty is how a merged PR returns to approved with nothing to find.
+func TestCloseOutHoldsTheClaimWhenTheMergeStateCannotBeReread(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.setMergeMode("fail")
+	writeFile(t, filepath.Join(f.ghDir, "pr-view-fail-after-merge"), "")
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if releases := f.releases(); releases != 0 {
+		t.Fatalf("release calls = %d after a merge error whose PR state could not be read: the merge may have landed: %v", releases, f.plane.planeCalls())
+	}
+	if got := f.callsFor("complete_task"); len(got) != 0 {
+		t.Errorf("complete_task calls = %d with no merge commit to name: %v", len(got), f.plane.planeCalls())
+	}
+	if got := f.callsFor("record_progress"); len(got) != 0 {
+		t.Errorf("record_progress calls = %d with no merge commit to name: %v", len(got), f.plane.planeCalls())
+	}
+	for _, want := range []string{"could not be re-read", "LEFT HELD"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the stand-down does not say %q:\n%s", want, lines)
+		}
 	}
 }
 

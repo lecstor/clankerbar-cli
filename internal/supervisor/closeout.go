@@ -43,10 +43,12 @@ package supervisor
 //   - a refused claim (someone else holds it);
 //   - any failure after the claim: the claim is RELEASED, so the task returns to
 //     `approved` and the agent close-out can take it. A task is never left claimed
-//     by a run that has stopped. The one exception is a merge that LANDED but could
-//     not be finished: its close is retried on transient failures, the delivery is
-//     recorded if it still fails, and the claim is left to its lease — because a
-//     merged PR is no longer OPEN, so releasing would strand the task forever.
+//     by a run that has stopped. The exception is a merge that landed, or may have
+//     landed: an errored merge request is released only once a re-read shows its PR
+//     still OPEN. A landed merge's close is retried on transient failures, its
+//     delivery is recorded if it still fails, and the claim is left to its lease —
+//     because a merged PR is no longer OPEN, so releasing would strand the task
+//     forever.
 //
 // One log line per outcome, and each unchanged stand-down is said once rather than
 // on every poll: the supervisor's own log is a status surface, and a line repeated
@@ -445,9 +447,10 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 
 	// From here on the claim is ours, so every failure up to the merge has to
 	// hand it back: a task left claimed by a run that has stopped is a task nobody
-	// is working. AFTER a merge lands there is deliberately no release path (see
-	// settleMergedCloseOut): the PR is no longer OPEN, so releasing would strand
-	// the task on `approved` with nothing to find.
+	// is working. AFTER a merge lands — or after a merge request errors and cannot
+	// be shown NOT to have landed — there is deliberately no release path (see
+	// settleMergedCloseOut and settleMergeError): the PR is no longer OPEN, so
+	// releasing would strand the task on `approved` with nothing to find.
 	//
 	// The release attests checkGreen false because the MERGE is what failed: a
 	// green-but-unmergeable PR (branch protection, a base that moved) is bounded
@@ -470,7 +473,12 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	// landed after the judgement.
 	mergeSHA, err := verifier.MergePR(ctx, dir, task.Repo, state.Number, base, state.HeadOID)
 	if err != nil {
-		release("could not merge PR #%d into %s (%v)", state.Number, base, err)
+		// A failed merge request is ambiguous: GitHub can complete the merge and
+		// still answer with an error. Release only when a re-read proves the PR
+		// is still OPEN.
+		if d.settleMergeError(ctx, verifier, dir, client, label, key, task, runID, state, base, err) {
+			release("could not merge PR #%d into %s (%v)", state.Number, base, err)
+		}
 		return
 	}
 	check := d.verifyMerge(ctx, verifier, dir, base, mergeSHA)
@@ -554,6 +562,40 @@ func (d *Supervisor) recordMergedDelivery(client plane.CloseOutAPI, label, key, 
 	}
 	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR",
 		label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, recErr)
+}
+
+// settleMergeError decides what a failed MergePR means. The merge POST can land
+// at GitHub and still return an error — a timeout, a connection reset or an edge
+// 502 after GitHub completed the merge — so a release is only safe when a re-read
+// shows the PR still OPEN.
+//
+// A PR that reads MERGED is finished exactly as a verified merge would be, from
+// the merge commit the re-read names: its close is retried and its delivery
+// recorded, and the claim is left to its lease rather than released. Anything that
+// cannot be shown OPEN is held for the same reason: there is no open PR left for
+// either close-out path to find, so a release would strand the task on `approved`.
+//
+// It reports whether the claim may be released; only a PR re-read as OPEN proves
+// the merge did not land.
+func (d *Supervisor) settleMergeError(ctx context.Context, verifier *delivery.Verifier, dir string, client plane.CloseOutAPI, label, key string, task plane.CloseOutTask, runID string, state delivery.PRState, base string, mergeErr error) bool {
+	rctx, cancel := context.WithTimeout(ctx, closeOutCallTimeout)
+	defer cancel()
+	after, err := verifier.ReadPRMergeState(rctx, dir, task.Repo, state.Number)
+	if err != nil {
+		d.closeOutSay(key, "close-out: %s PR #%d could not be merged (%v), and its state could not be re-read to check whether the merge landed (%v) - the claim is LEFT HELD rather than risk returning a merged PR to approved", label, state.Number, mergeErr, err)
+		return false
+	}
+	if strings.EqualFold(after.State, "OPEN") {
+		return true
+	}
+	if strings.EqualFold(after.State, "MERGED") && after.MergeCommit != "" {
+		d.closeOutSay(key, "close-out: %s PR #%d's merge request failed (%v), but the PR reads MERGED as %s - finishing the close from that commit", label, state.Number, mergeErr, shortSHA(after.MergeCommit))
+		check := d.verifyMerge(ctx, verifier, dir, base, after.MergeCommit)
+		d.settleMergedCloseOut(client, label, key, task.ID, runID, state.Number, base, after.MergeCommit, check)
+		return false
+	}
+	d.closeOutSay(key, "close-out: %s PR #%d's merge request failed (%v), and the PR now reads %q with no merge commit to name (judged head %s) - the claim is LEFT HELD: releasing it would return a task with no open PR to approved", label, state.Number, mergeErr, after.State, shortSHA(state.HeadOID))
+	return false
 }
 
 // verifyMerge settles that the merge commit is an ancestor of base on origin. Two
