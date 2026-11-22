@@ -169,6 +169,32 @@ func TestReviewMapEmptyDiff(t *testing.T) {
 	}
 }
 
+// TestReviewMapFlowOverflowIsNotAnItem: the flow cap's "(N more changed
+// definitions not listed)" note is context for the reviewer, not a numbered
+// item, so items.flow counts only the numbered F items.
+func TestReviewMapFlowOverflowIsNotAnItem(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("sample.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 1\n}\n\nfunc Beta(x int) int {\n\treturn x + 2\n}\n")
+	base := r.commit("base")
+	r.write("sample.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 10\n}\n\nfunc Beta(x int) int {\n\treturn x + 20\n}\n")
+	head := r.commit("head")
+
+	report, err := ReviewMap(ReviewMapOptions{Repo: r.dir, Base: base, Head: head, FlowMax: 1})
+	if err != nil {
+		t.Fatalf("ReviewMap: %v", err)
+	}
+	if report.Items.Flow != 1 {
+		t.Errorf("items.flow = %d, want 1: the overflow note is not an item", report.Items.Flow)
+	}
+	var prompts strings.Builder
+	for _, turn := range report.Turns {
+		prompts.WriteString(turn.Prompt)
+	}
+	if !strings.Contains(prompts.String(), "not listed") {
+		t.Error("the prompts carry no overflow note, want the unnumbered note still in the reviewer's context")
+	}
+}
+
 // TestReviewMapChunkSizeSplitsTheItems: --chunk-size 2 over 5 items is three
 // notes turns, numbered 1/3, 2/3 and 3/3.
 func TestReviewMapChunkSizeSplitsTheItems(t *testing.T) {
