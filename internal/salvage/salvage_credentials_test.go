@@ -351,8 +351,12 @@ func TestSalvageRedactsTheScopedTokenFromAFailedPush(t *testing.T) {
 		t.Errorf("the detail should keep the redacted URL for diagnosis, got: %s", out.Detail)
 	}
 	// The retry reaches the same remote, so it is scoped the same way.
-	if pushes := credCallsNamed(credCalls(t, shims.gitLog), "push"); len(pushes) != 2 {
+	pushes := credCallsNamed(credCalls(t, shims.gitLog), "push")
+	if len(pushes) != 2 {
 		t.Errorf("%d push invocation(s) recorded, want 2 (the original and the HTTP/1.1 retry)", len(pushes))
+	}
+	for _, p := range pushes {
+		assertScoped(t, p)
 	}
 }
 

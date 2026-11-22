@@ -374,8 +374,8 @@ func (s *Salvager) delivered(ctx context.Context, wt worktree, remote string, re
 // nil is "run unscoped", byte-identical to the pre-CLA-970 behavior: a
 // non-github host, an ssh remote, an owner gh cannot serve a token for, or a
 // remote whose URL cannot be read. The URL read is local and consults no
-// credentials; the token probe is the only spawn, and it runs under the caller's
-// context, which the driver bounds with salvageTimeout.
+// credentials; the token probe is the only spawn, and it is bounded by
+// tokenProbeTimeout so it cannot spend the rescue's budget.
 func (s *Salvager) credEnv(ctx context.Context, dir, remote string) []string {
 	raw, err := s.run(ctx, dir, "remote", "get-url", remote)
 	if err != nil || raw == "" {
