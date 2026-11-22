@@ -1298,6 +1298,74 @@ func TestCloseOutRecordsTheDeliveryWhenTheCloseNeverSucceeds(t *testing.T) {
 	}
 }
 
+// A plane that just answered four 502s on the close will usually fail the
+// recovery write too, so the record gets the same bounded retry: the merge SHA
+// and PR must not be lost exactly when the plane is the thing failing.
+func TestCloseOutRetriesATransientDeliveryRecord(t *testing.T) {
+	oldBackoff := closeOutCompleteBackoff
+	closeOutCompleteBackoff = time.Millisecond
+	defer func() { closeOutCompleteBackoff = oldBackoff }()
+
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	var mu sync.Mutex
+	records := 0
+	f.plane.setStatusWhen(func(tool string, _ map[string]any) int {
+		switch tool {
+		case "complete_task":
+			return http.StatusServiceUnavailable
+		case "record_progress":
+			mu.Lock()
+			defer mu.Unlock()
+			records++
+			if records < 3 {
+				return http.StatusBadGateway
+			}
+		}
+		return 0
+	})
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := len(f.callsFor("record_progress")); got != 3 {
+		t.Fatalf("record_progress calls = %d, want 3 (two 502s, then the record): %v", got, f.plane.planeCalls())
+	}
+	if !strings.Contains(lines, "delivery RECORDED") {
+		t.Errorf("the recorded delivery was not reported:\n%s", lines)
+	}
+}
+
+// If even the recovery record is refused, that line is the only message a
+// successor gets: it must say the merge SHA could not be written down rather than
+// disappear with the record it meant to make.
+func TestCloseOutSaysWhenTheDeliveryCouldNotBeRecorded(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.plane.refuseWhen = func(tool string, _ map[string]any) string {
+		switch tool {
+		case "complete_task":
+			return "done refused: evidence_required"
+		case "record_progress":
+			return "progress refused: the task is done"
+		}
+		return ""
+	}
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if releases := f.releases(); releases != 0 {
+		t.Fatalf("release calls = %d after a merged PR whose close and record both failed: %v", releases, f.plane.planeCalls())
+	}
+	if got := len(f.callsFor("record_progress")); got != 1 {
+		t.Errorf("record_progress calls = %d, want 1 (a tool refusal is not retried): %v", got, f.plane.planeCalls())
+	}
+	if !strings.Contains(lines, "AND the delivery could not be recorded") {
+		t.Errorf("the failure line does not say the delivery could not be recorded:\n%s", lines)
+	}
+}
+
 func TestCloseOutNotWiredIsSilentOnThePlane(t *testing.T) {
 	f := newCloseOutFixture(t, false)
 	f.servePlane(t, "clanker")

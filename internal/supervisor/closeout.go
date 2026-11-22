@@ -519,23 +519,22 @@ func (d *Supervisor) settleMergedCloseOut(client plane.CloseOutAPI, label, key, 
 	d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s (merge commit is an ancestor of the remote tip) - task closed done", label, pr, shortSHA(mergeSHA), base)
 }
 
-// completeCloseOut closes the task done, retrying a TRANSIENT plane failure
-// (transport or 5xx) within one cleanup budget. A tool-level refusal is the
-// plane's answer and is returned at once: retrying it would only repeat it.
-func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, taskID, runID string, decl plane.CloseOutDelivery) error {
-	ctx, cancel := d.closeOutCleanupCtx()
-	defer cancel()
+// retryCloseOutCall runs one plane write, retrying a TRANSIENT plane failure
+// (transport or 5xx) within ctx. A tool-level refusal is the plane's considered
+// answer and is returned at once: retrying it would only repeat it. what names the
+// write for the retry line.
+func retryCloseOutCall(ctx context.Context, what string, fn func() error) error {
 	wait := closeOutCompleteBackoff
 	var err error
 	for attempt := 1; attempt <= closeOutCompleteAttempts; attempt++ {
-		if err = client.CompleteCloseOut(ctx, taskID, runID, decl); err == nil {
+		if err = fn(); err == nil {
 			return nil
 		}
 		if !plane.Transient(err) || attempt == closeOutCompleteAttempts {
 			return err
 		}
-		log.Printf("close-out: %s PR %s merged as %s, but closing the task failed transiently (attempt %d of %d: %v) - retrying",
-			label, decl.PR, decl.Commit, attempt, closeOutCompleteAttempts, err)
+		log.Printf("close-out: %s failed transiently (attempt %d of %d: %v) - retrying",
+			what, attempt, closeOutCompleteAttempts, err)
 		select {
 		case <-ctx.Done():
 			return err
@@ -546,21 +545,40 @@ func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, taskID, r
 	return err
 }
 
+// completeCloseOut closes the task done, retrying a TRANSIENT plane failure
+// (transport or 5xx) within one cleanup budget. A tool-level refusal is the
+// plane's answer and is returned at once: retrying it would only repeat it.
+func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, taskID, runID string, decl plane.CloseOutDelivery) error {
+	ctx, cancel := d.closeOutCleanupCtx()
+	defer cancel()
+	what := fmt.Sprintf("%s PR %s merged as %s, but closing the task", label, decl.PR, decl.Commit)
+	return retryCloseOutCall(ctx, what, func() error {
+		return client.CompleteCloseOut(ctx, taskID, runID, decl)
+	})
+}
+
 // recordMergedDelivery is the recovery write for a merge that landed but could
 // not be closed. The claim is LEFT HELD on purpose: releasing it would return a
 // merged task to approved with no open PR, and the lease expiry is the safe
 // hand-back - it offers the task as a takeover, and this record tells the
 // successor the merge SHA and PR are already merged.
+//
+// It gets the same bounded retry as the close: a plane that has just answered 502
+// to every close attempt will often fail this write too, and this record is the
+// only durable place the merge SHA and PR are written down.
 func (d *Supervisor) recordMergedDelivery(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, closeErr error) {
 	ctx, cancel := d.closeOutCleanupCtx()
-	recErr := client.RecordCloseOutDelivery(ctx, taskID, runID, decl)
+	what := fmt.Sprintf("%s PR %s merged as %s, but recording the delivery", label, decl.PR, decl.Commit)
+	recErr := retryCloseOutCall(ctx, what, func() error {
+		return client.RecordCloseOutDelivery(ctx, taskID, runID, decl)
+	})
 	cancel()
 	if recErr == nil {
 		d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) - delivery RECORDED (mergeVerified:%t) so a successor can close it; the claim is left held rather than returning a merged PR to approved",
 			label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, decl.MergeVerified)
 		return
 	}
-	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR",
+	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR (if a close attempt was processed and its answer was lost, the task may already be closed)",
 		label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, recErr)
 }
 
