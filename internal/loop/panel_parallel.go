@@ -46,7 +46,9 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 const (
@@ -502,7 +504,7 @@ func panelReviewedTip(ctx context.Context, dir string, prev *harness.Result) (st
 	// exact tip: a branch that moved since the checkpoint is not the revision
 	// the review is for, and the sequential path is the safe answer.
 	fctx, cancel := context.WithTimeout(ctx, panelFetchTimeout)
-	_, ferr := panelGit(fctx, dir, "fetch", "--no-tags", "origin", prev.Claim.Branch)
+	ferr := panelFetch(fctx, dir, "origin", prev.Claim.Branch)
 	cancel()
 	if ferr == nil {
 		if got, gerr := panelGit(ctx, dir, "rev-parse", "FETCH_HEAD^{commit}"); gerr == nil && got == tip {
@@ -510,6 +512,17 @@ func panelReviewedTip(ctx context.Context, dir string, prev *harness.Result) (st
 		}
 	}
 	return "", false
+}
+
+// panelFetch fetches one branch scoped to the account owning the remote it reads
+// (delivery.ScopeRemoteEnv via taskWorktreeRemoteCredEnv, CLA-970). The reviewed
+// branch lives on a private origin the ACTIVE gh account need not see, and a
+// refused fetch here is silent - panelReviewedTip falls back to running the
+// panel sequentially - so it must go out exactly as the prep's fetch does.
+func panelFetch(ctx context.Context, dir, remote, branch string) error {
+	args := []string{"fetch", "--no-tags", remote, branch}
+	_, err := panelGitWithEnv(ctx, dir, taskWorktreeRemoteCredEnv(ctx, dir, args), args...)
+	return err
 }
 
 // panelHasCommit reports whether the checkout already holds commit-ish (no
@@ -626,21 +639,24 @@ func sanitizePanelLabel(label string) string {
 // driver's other git reads use: an unattended run has no terminal, and a git
 // that decides to ask for a password would hang a member instead of failing it.
 func panelGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return panelGitWithEnv(ctx, dir, nil, args...)
+}
+
+// panelGitWithEnv is panelGit with environment additions for THIS invocation -
+// the credential scoping panelFetch needs. delivery.GitEnv strips inherited
+// GIT_CONFIG_* before appending them, so an inherited GIT_CONFIG_COUNT cannot
+// shadow the scoped rewrite (duplicate env keys have unspecified precedence).
+func panelGitWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	)
+	cmd.Env = delivery.GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, firstLineOf(msg))
+			// A scoped fetch's token rides the URL git echoes on failure.
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, secureurl.RedactUserinfo(firstLineOf(msg)))
 		}
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}

@@ -371,11 +371,13 @@ func (s *Salvager) delivered(ctx context.Context, wt worktree, remote string, re
 // a private repo owned by somebody else - "Repository not found" on the very
 // push this package exists to make, defeating the rescue.
 //
-// nil is "run unscoped", byte-identical to the pre-CLA-970 behavior: a
-// non-github host, an ssh remote, an owner gh cannot serve a token for, or a
-// remote whose URL cannot be read. The URL read is local and consults no
-// credentials; the token probe is the only spawn, and it is bounded by
-// tokenProbeTimeout so it cannot spend the rescue's budget.
+// nil is "run unscoped": a non-github host, an ssh remote, an owner gh cannot
+// serve a token for, or a remote whose URL cannot be read. The URL read is a
+// local spawn consulting no credentials; the token probe is the only CREDENTIALED
+// spawn, and it is bounded by tokenProbeTimeout so it cannot spend the rescue's
+// budget. Unscoped, a network command's credentials are exactly what they were
+// before CLA-970 - execGit's inherited GIT_CONFIG_* strip applies to every
+// command, and only removes a channel that could shadow the scoped rewrite.
 func (s *Salvager) credEnv(ctx context.Context, dir, remote string) []string {
 	raw, err := s.run(ctx, dir, "remote", "get-url", remote)
 	if err != nil || raw == "" {

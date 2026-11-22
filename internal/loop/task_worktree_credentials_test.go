@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 const (
@@ -85,6 +87,8 @@ printf 'count=%s\n' "${GIT_CONFIG_COUNT-unset}" >> "__GIT_LOG__"
 [ -n "${GIT_CONFIG_KEY_0+x}" ] && printf 'key0=%s\n' "$GIT_CONFIG_KEY_0" >> "__GIT_LOG__"
 [ -n "${GIT_CONFIG_VALUE_0+x}" ] && printf 'val0=%s\n' "$GIT_CONFIG_VALUE_0" >> "__GIT_LOG__"
 printf 'keys=%s\n' "$(env | grep -c '^GIT_CONFIG_KEY_')" >> "__GIT_LOG__"
+printf 'params=%s\n' "${GIT_CONFIG_PARAMETERS-unset}" >> "__GIT_LOG__"
+printf 'values=%s\n' "$(env | grep -c '^GIT_CONFIG_VALUE_')" >> "__GIT_LOG__"
 
 if [ "$cmd" = fetch ]; then
 	case "$GIT_CONFIG_KEY_0" in
@@ -97,6 +101,13 @@ if [ "$cmd" = fetch ]; then
 	if [ -n "${TASKWT_CRED_FAIL_FETCH:-}" ]; then
 		echo "fatal: unable to access 'https://x-access-token:$TASKWT_CRED_TOKEN@github.com/lecstor/private-repo.git/': The requested URL returned error: 502" >&2
 		exit 128
+	fi
+	# A test that needs the fetch to DELIVER the object names a local bare remote
+	# to replay against. The replay is the same branch read, so FETCH_HEAD holds
+	# what the scoped invocation would have written.
+	if [ -n "${TASKWT_CRED_LOCAL_REMOTE:-}" ]; then
+		for last in "$@"; do :; done
+		exec "__REAL_GIT__" -C "$2" fetch --no-tags "$TASKWT_CRED_LOCAL_REMOTE" "$last"
 	fi
 	# The remote is unreachable offline; the clone already carries the refs the
 	# prep reads, so a scoped fetch succeeds without touching the network.
@@ -172,7 +183,8 @@ func worktreeCredCallsNamed(calls []worktreeCredCall, cmd string) []worktreeCred
 }
 
 // assertWorktreeCredScoped pins exactly the environment CLA-458's scoping
-// produces, including that an inherited GIT_CONFIG_* set did not survive.
+// produces, including that an inherited GIT_CONFIG_* set did not survive on any
+// of git's channels.
 func assertWorktreeCredScoped(t *testing.T, c worktreeCredCall) {
 	t.Helper()
 	if got := c.fields["count"]; got != "1" {
@@ -186,6 +198,28 @@ func assertWorktreeCredScoped(t *testing.T, c worktreeCredCall) {
 	}
 	if got := c.fields["keys"]; got != "1" {
 		t.Errorf("%s saw %s GIT_CONFIG_KEY_* entries, want exactly the scoped one", c.cmd, got)
+	}
+	if got := c.fields["params"]; got != "unset" {
+		t.Errorf("%s carried inherited GIT_CONFIG_PARAMETERS %q, want it stripped", c.cmd, got)
+	}
+	if got := c.fields["values"]; got != "1" {
+		t.Errorf("%s saw %s GIT_CONFIG_VALUE_* entries, want exactly the scoped one", c.cmd, got)
+	}
+}
+
+// assertWorktreeCredUnscoped is the other half: a local command carries no
+// credential config on any channel, including the two a competing insteadOf
+// could arrive on.
+func assertWorktreeCredUnscoped(t *testing.T, c worktreeCredCall) {
+	t.Helper()
+	if c.fields["count"] != "unset" || c.fields["keys"] != "0" {
+		t.Errorf("local %s invocation carried credential scoping: %v", c.cmd, c.fields)
+	}
+	if got := c.fields["params"]; got != "unset" {
+		t.Errorf("local %s invocation carried inherited GIT_CONFIG_PARAMETERS %q, want it stripped", c.cmd, got)
+	}
+	if got := c.fields["values"]; got != "0" {
+		t.Errorf("local %s invocation carried %s GIT_CONFIG_VALUE_* entries, want none", c.cmd, got)
 	}
 }
 
@@ -234,9 +268,7 @@ func TestTaskWorktreeFetchScopesToTheRemoteOwner(t *testing.T) {
 		if c.cmd == "fetch" {
 			continue
 		}
-		if c.fields["count"] != "unset" || c.fields["keys"] != "0" {
-			t.Errorf("local %s invocation carried credential scoping: %v", c.cmd, c.fields)
-		}
+		assertWorktreeCredUnscoped(t, c)
 	}
 
 	// gh was asked for the URL owner's token and nothing else: the fake refuses
@@ -304,5 +336,67 @@ func TestTaskWorktreeFetchRedactsTheScopedToken(t *testing.T) {
 	}
 	if !strings.Contains(msg, "https://redacted@github.com/lecstor/private-repo.git/") {
 		t.Errorf("the error should keep the redacted URL for diagnosis, got %q", msg)
+	}
+}
+
+// The review panel's fetch is the package's third network command (CLA-970).
+// Its failure is silent - panelReviewedTip falls back to sequential review - so
+// this pins the scoping directly: the stand-in refuses the fetch unless it
+// carries the owner's token, and replays it against the local bare origin so the
+// reviewed tip is genuinely present for the FETCH_HEAD check.
+func TestPanelReviewedTipScopesTheFetchToTheRemoteOwner(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	tip := f.commitOn(t, "clanker/reviewed", "origin/staging", "reviewed.txt", "the reviewed work", "reviewed")
+	// The checkout cloned before that branch existed and must not hold the tip,
+	// or panelReviewedTip answers from the local object and never fetches.
+	if panelHasCommit(context.Background(), f.checkout, tip) {
+		t.Fatalf("fixture: the checkout already holds %s, so the fetch would not run", tip)
+	}
+	gitRun(t, f.checkout, "remote", "set-url", "origin", taskWorktreeCredRemoteURL)
+	shims := installTaskWorktreeCredShims(t)
+	useTaskWorktreeCredShims(t, shims)
+	t.Setenv("TASKWT_CRED_LOCAL_REMOTE", f.origin)
+
+	prev := &harness.Result{
+		Claim:         harness.Claim{Branch: "clanker/reviewed"},
+		CheckpointTip: tip,
+	}
+	got, ok := panelReviewedTip(context.Background(), f.checkout, prev)
+
+	if !ok || got != tip {
+		t.Fatalf("panelReviewedTip = (%q, %v), want (%q, true) - the scoped fetch is what proves the reviewed tip", got, ok, tip)
+	}
+	fetches := worktreeCredCallsNamed(worktreeCredCalls(t, shims.gitLog), "fetch")
+	if len(fetches) != 1 {
+		t.Fatalf("%d fetch invocation(s) recorded, want exactly 1", len(fetches))
+	}
+	assertWorktreeCredScoped(t, fetches[0])
+}
+
+// A fetch names its remote after any leading flags. `fetch --prune upstream`
+// must be scoped with upstream's owner, not origin's: origin here is an ssh
+// remote no scoping is derivable for, so a scoped result proves the parse read
+// past the flag.
+func TestTaskWorktreeCredEnvReadsTheNamedRemote(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	gitRun(t, f.checkout, "remote", "set-url", "origin", "git@github.com:lecstor/origin.git")
+	gitRun(t, f.checkout, "remote", "add", "upstream", taskWorktreeCredRemoteURL)
+	shims := installTaskWorktreeCredShims(t)
+	useTaskWorktreeCredShims(t, shims)
+
+	env := taskWorktreeRemoteCredEnv(context.Background(), f.checkout, []string{"fetch", "--prune", "upstream"})
+
+	got := map[string]string{}
+	for _, kv := range env {
+		name, value, _ := strings.Cut(kv, "=")
+		got[name] = value
+	}
+	if got["GIT_CONFIG_COUNT"] != "1" || got["GIT_CONFIG_KEY_0"] != taskWorktreeCredWantKey0 || got["GIT_CONFIG_VALUE_0"] != taskWorktreeCredWantVal0 {
+		t.Errorf("env = %v, want the three GIT_CONFIG_* entries scoping upstream", env)
+	}
+	if body, err := os.ReadFile(shims.ghLog); err != nil {
+		t.Errorf("gh was never consulted for upstream's owner: %v", err)
+	} else if want := "auth token --user " + taskWorktreeCredOwner + " --hostname github.com"; !strings.Contains(string(body), want) {
+		t.Errorf("gh invocations = %q, want %q", string(body), want)
 	}
 }

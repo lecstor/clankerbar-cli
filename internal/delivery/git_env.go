@@ -23,11 +23,14 @@ func isOwnedGitEnv(name string) bool {
 	return false
 }
 
-// isGitConfigEnv reports whether name is a git env-config variable whose
+// IsGitConfigEnv reports whether name is a git env-config variable whose
 // inherited value would collide with ScopeEnv's GIT_CONFIG_* entries.
 // GIT_CONFIG_PARAMETERS is git's other command-line-config channel (`git -c`
 // sets it for children); an inherited one can inject a competing insteadOf.
-func isGitConfigEnv(name string) bool {
+//
+// Exported for the loop's git runner: it keeps its own operator-auth defaults,
+// but the strip list has to be the one the scoping it appends was designed for.
+func IsGitConfigEnv(name string) bool {
 	return name == "GIT_CONFIG_COUNT" ||
 		name == "GIT_CONFIG_PARAMETERS" ||
 		strings.HasPrefix(name, "GIT_CONFIG_KEY_") ||
@@ -46,7 +49,7 @@ func GitEnv(parent, extraEnv []string) []string {
 	env := make([]string, 0, len(parent)+len(extraEnv)+len(gitNonInteractiveEnv))
 	for _, e := range parent {
 		name := envName(e)
-		if isOwnedGitEnv(name) || isGitConfigEnv(name) {
+		if isOwnedGitEnv(name) || IsGitConfigEnv(name) {
 			continue
 		}
 		env = append(env, e)

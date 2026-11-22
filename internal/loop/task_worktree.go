@@ -713,22 +713,32 @@ func taskWorktreeGitWithEnv(ctx context.Context, dir string, extraEnv []string, 
 
 // taskWorktreeRemoteCredEnv returns the credential scoping one NETWORK
 // subcommand needs (delivery.ScopeRemoteEnv, CLA-458/CLA-970), or nil for a
-// local one. Only `fetch` and `ls-remote` reach the remote; every other command
-// in this package is local, and scoping costs a `gh auth token` spawn.
+// local one. `fetch` and `ls-remote` are the subcommands that reach the remote -
+// taskWorktreeGit's fetch and the review panel's both come through here - and
+// scoping costs a `gh auth token` spawn, so a local command must not take it.
 //
-// nil is "run unscoped", byte-identical to the pre-CLA-970 behavior: a
-// non-github host, an ssh remote, an owner gh cannot serve a token for, or an
-// origin whose URL cannot be read. The resolution is bounded so a wedged gh
-// degrades to unscoped rather than holding the prep past the fetch it scopes.
+// nil is "run unscoped": a non-github host, an ssh remote, an owner gh cannot
+// serve a token for, or a remote whose URL cannot be read. Only the credentials
+// of the network invocation change; every fallback stays fail-open to the
+// pre-CLA-970 behavior. The resolution is bounded so a wedged gh degrades to
+// unscoped rather than holding the call past the command it scopes.
 func taskWorktreeRemoteCredEnv(ctx context.Context, dir string, args []string) []string {
 	if len(args) == 0 || (args[0] != "fetch" && args[0] != "ls-remote") {
 		return nil
 	}
 	remote := "origin"
-	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
-		remote = args[1]
+	for _, arg := range args[1:] {
+		// Leading flags are not the remote: `fetch --prune upstream` names
+		// upstream, and scoping it with origin's owner would send the wrong token.
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		remote = arg
+		break
 	}
-	raw, err := taskWorktreeGit(ctx, dir, "remote", "get-url", remote)
+	// The URL read is local and must not re-enter the scoping decision above,
+	// so it goes through the engine directly rather than taskWorktreeGit.
+	raw, err := taskWorktreeGitWithEnv(ctx, dir, nil, "remote", "get-url", remote)
 	if err != nil || raw == "" {
 		return nil
 	}
@@ -777,7 +787,7 @@ func taskWorktreeGitEnv(extraEnv []string) []string {
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
 		// These two must never prompt whatever the caller set.
-		if name == "GIT_TERMINAL_PROMPT" || name == "GCM_INTERACTIVE" || taskWorktreeAddressesRepo(name) || taskWorktreeInheritedConfig(name) {
+		if name == "GIT_TERMINAL_PROMPT" || name == "GCM_INTERACTIVE" || taskWorktreeAddressesRepo(name) || delivery.IsGitConfigEnv(name) {
 			continue
 		}
 		kept = append(kept, kv)
@@ -792,17 +802,8 @@ func taskWorktreeGitEnv(extraEnv []string) []string {
 	return append(kept, extraEnv...)
 }
 
-// taskWorktreeInheritedConfig reports whether name is git config supplied
-// through the environment, which could compete with a scoped command's own
-// GIT_CONFIG_* rewrite. GIT_CONFIG_PARAMETERS is git's other channel (`git -c`
-// sets it for children).
-func taskWorktreeInheritedConfig(name string) bool {
-	return name == "GIT_CONFIG_COUNT" ||
-		name == "GIT_CONFIG_PARAMETERS" ||
-		strings.HasPrefix(name, "GIT_CONFIG_KEY_") ||
-		strings.HasPrefix(name, "GIT_CONFIG_VALUE_")
-}
-
+// taskWorktreeAddressesRepo reports whether name addresses a repository rather
+// than configuring git.
 func taskWorktreeAddressesRepo(name string) bool {
 	for _, repoVar := range taskWorktreeRepoEnvVars {
 		if name == repoVar {

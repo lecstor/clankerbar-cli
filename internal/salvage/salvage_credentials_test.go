@@ -115,10 +115,12 @@ fi
 
 # The stand-in plays the private host: a scoped network command is replayed
 # against the local bare repository, so scoping is the only way it can succeed.
-# $1=subcommand $2/$3 its flags, $4=<remote> $5=<ref or refspec>.
+# The refspec is the LAST argument in both shapes: a push can carry a
+# leading -c <key>=<val> pair, which shifts every positional one along.
+for last in "$@"; do :; done
 case "$cmd" in
-ls-remote) exec "__REAL_GIT__" -C "$PWD" ls-remote --heads -- "$SALVAGE_CRED_LOCAL_REMOTE" "$5" ;;
-push) exec "__REAL_GIT__" -C "$PWD" push --no-verify -- "$SALVAGE_CRED_LOCAL_REMOTE" "$5" ;;
+ls-remote) exec "__REAL_GIT__" -C "$PWD" ls-remote --heads -- "$SALVAGE_CRED_LOCAL_REMOTE" "$last" ;;
+push) exec "__REAL_GIT__" -C "$PWD" push --no-verify -- "$SALVAGE_CRED_LOCAL_REMOTE" "$last" ;;
 esac
 
 exec "__REAL_GIT__" "$@"
@@ -156,7 +158,6 @@ exit 42
 // the git stand-in reads.
 func useSalvageCredShims(t *testing.T, e *env, s salvageCredShims) *Salvager {
 	t.Helper()
-	t.Setenv("SALVAGE_CRED_RECORD", s.gitLog)
 	t.Setenv("SALVAGE_CRED_LOCAL_REMOTE", e.remote)
 	salvager := New(e.root, "")
 	salvager.gitBin = s.git
