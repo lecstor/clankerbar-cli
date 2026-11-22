@@ -96,7 +96,7 @@ func TestGitRunOutStripsInheritedGitConfigAndOwnedVars(t *testing.T) {
 		t.Fatalf("unscoped unexpected error: %v", err)
 	}
 	for _, line := range strings.Split(unscoped, "\n") {
-		if isGitConfigEnv(envName(line)) {
+		if IsGitConfigEnv(envName(line)) {
 			t.Errorf("unscoped gitRunOut leaked inherited git config env: %q", line)
 		}
 	}
