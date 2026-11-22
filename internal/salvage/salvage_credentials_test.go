@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -130,6 +131,9 @@ exec "__REAL_GIT__" "$@"
 # refuses anything else - so a scoping implementation that mutated gh's auth
 # state (login/switch) would fail loudly instead of passing.
 printf '%s\n' "$*" >> "__GH_LOG__"
+if [ -n "${SALVAGE_CRED_GH_SLEEP:-}" ]; then
+	exec sleep "$SALVAGE_CRED_GH_SLEEP"
+fi
 if [ "${SALVAGE_CRED_GH_FAIL:-}" = 1 ]; then
 	echo "no oauth token found for github.com account $4" >&2
 	exit 1
@@ -349,6 +353,38 @@ func TestSalvageRedactsTheScopedTokenFromAFailedPush(t *testing.T) {
 	// The retry reaches the same remote, so it is scoped the same way.
 	if pushes := credCallsNamed(credCalls(t, shims.gitLog), "push"); len(pushes) != 2 {
 		t.Errorf("%d push invocation(s) recorded, want 2 (the original and the HTTP/1.1 retry)", len(pushes))
+	}
+}
+
+// The token probe is a spawn inside a rescue with a minutes-long budget. A
+// wedged gh must be reaped at its own bound and degrade to unscoped, leaving the
+// push the rest of the budget rather than spending all of it before the push
+// starts.
+func TestSalvageBoundsTheTokenProbe(t *testing.T) {
+	e := newEnv(t)
+	git(t, e.repo, "remote", "set-url", "origin", salvageCredRemoteURL)
+	shims := installSalvageCredShims(t)
+	salvager := useSalvageCredShims(t, e, shims)
+	t.Setenv("SALVAGE_CRED_GH_SLEEP", "10")
+	old := tokenProbeTimeout
+	tokenProbeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { tokenProbeTimeout = old })
+	write(t, filepath.Join(e.wt, "work.txt"), "hours of it")
+
+	start := time.Now()
+	out := salvager.Salvage(context.Background(), taskID, "CLA-970")
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("the salvage took %s: the wedged gh was not reaped at its bound", elapsed)
+	}
+	// The degraded path is the unscoped one, which the stand-in refuses - the
+	// point here is that the rescue finished, not that it landed.
+	if out.Status != Failed {
+		t.Errorf("status = %q (%s), want failed (the unscoped push is refused)", out.Status, out.Detail)
+	}
+	if _, err := os.Stat(shims.ghLog); err != nil {
+		t.Errorf("gh was never started, so the bound was not what ended the probe: %v", err)
 	}
 }
 

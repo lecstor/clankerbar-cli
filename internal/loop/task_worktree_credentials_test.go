@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -112,6 +113,9 @@ exec "__REAL_GIT__" "$@"
 # refuses anything else - so a scoping implementation that mutated gh's auth
 # state (login/switch) fails loudly instead of passing.
 printf '%s\n' "$*" >> "__GH_LOG__"
+if [ -n "${TASKWT_CRED_GH_SLEEP:-}" ]; then
+	exec sleep "$TASKWT_CRED_GH_SLEEP"
+fi
 if [ "$1" = auth ] && [ "$2" = token ] && [ "$3" = --user ]; then
 	printf '%s\n' "$TASKWT_CRED_TOKEN"
 	exit 0
@@ -244,6 +248,36 @@ func TestTaskWorktreeFetchScopesToTheRemoteOwner(t *testing.T) {
 	want := "auth token --user " + taskWorktreeCredOwner + " --hostname github.com"
 	if lines := strings.Split(strings.TrimSpace(string(body)), "\n"); len(lines) != 1 || lines[0] != want {
 		t.Errorf("gh invocations = %q, want exactly one %q", lines, want)
+	}
+}
+
+// The credential resolution is one spawn inside a prep that already waits on the
+// network. A wedged gh must be reaped at its own bound and degrade to unscoped,
+// rather than holding the prep indefinitely.
+func TestTaskWorktreeFetchBoundsAWedgedGH(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	gitRun(t, f.checkout, "remote", "set-url", "origin", taskWorktreeCredRemoteURL)
+	shims := installTaskWorktreeCredShims(t)
+	useTaskWorktreeCredShims(t, shims)
+	t.Setenv("TASKWT_CRED_GH_SLEEP", "10")
+	old := taskWorktreeCredTimeout
+	taskWorktreeCredTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { taskWorktreeCredTimeout = old })
+
+	start := time.Now()
+	_, err := f.prepare(t, f.request())
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("the prep took %s: the wedged gh was not reaped at its bound", elapsed)
+	}
+	// The degraded path is the unscoped one, which the stand-in refuses: the
+	// point is that the prep finished, and as a retryable fetch failure.
+	if !errors.Is(err, errWorktreeFetch) {
+		t.Errorf("err = %v, want a fetch failure from the unscoped invocation", err)
+	}
+	if _, statErr := os.Stat(shims.ghLog); statErr != nil {
+		t.Errorf("gh was never started, so the bound was not what ended the probe: %v", statErr)
 	}
 }
 

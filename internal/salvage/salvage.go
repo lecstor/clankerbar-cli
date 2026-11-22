@@ -381,8 +381,17 @@ func (s *Salvager) credEnv(ctx context.Context, dir, remote string) []string {
 	if err != nil || raw == "" {
 		return nil
 	}
+	// The probe is a spawn and Salvage's budget is minutes: a wedged gh must not
+	// spend all of it before the push it scopes even starts. Timing out degrades
+	// to unscoped, the same fallback every other resolution failure takes.
+	ctx, cancel := context.WithTimeout(ctx, tokenProbeTimeout)
+	defer cancel()
 	return delivery.ScopeRemoteEnv(ctx, dir, s.ghBin, raw)
 }
+
+// tokenProbeTimeout bounds the one `gh auth token` spawn a network command pays
+// for. A var, like the loop's equivalent, so a test can shorten it.
+var tokenProbeTimeout = 30 * time.Second
 
 // lsRemote reads the remote's tip for a branch without touching anything local.
 // Empty with a nil error means the remote does not have the branch; an error means
