@@ -31,16 +31,16 @@ type recordingHeartbeat struct {
 	failuresLeft int
 	stall        chan struct{}
 	entered      chan struct{}
+	// enteredOnce guards the close of entered. The fake is shared by every
+	// test in this package, so a check-then-act close would double-close (and
+	// panic) the moment two beats run concurrently.
+	enteredOnce sync.Once
 }
 
 func (f *recordingHeartbeat) Heartbeat(_ context.Context, runID string) error {
 	if f.stall != nil {
 		if f.entered != nil {
-			select {
-			case <-f.entered:
-			default:
-				close(f.entered)
-			}
+			f.enteredOnce.Do(func() { close(f.entered) })
 		}
 		<-f.stall
 	}
@@ -332,64 +332,72 @@ func TestLeaseRenewerPausesWhenTheSessionSettlesItsClaim(t *testing.T) {
 // and a tick are placed in their channels; only then is the stall released, so
 // the loop re-enters select with the claim and the tick ready together. The
 // drain makes the settle win every time - the fixed code never beats here.
-// A regression that drops the drain races the settle against the tick and lets
-// the beat through roughly half the runs, which CI catches fast.
+//
+// A regression that drops the drain races the settle against the tick, and the
+// signal is one select's random pick: a single iteration detects it only about
+// half the time. The promote gate runs the suite once, so the body is repeated
+// - a single run then misses a removed drain about 0.5^drainIterations of the
+// time, at millisecond cost. Each iteration builds fresh state: stall and
+// entered are one-shot.
 func TestLeaseRenewerSettleQueuedBeforeATickNeverLosesToTheBeat(t *testing.T) {
-	hb := &recordingHeartbeat{stall: make(chan struct{}), entered: make(chan struct{})}
-	ticks := make(chan time.Time, 4)
-	r := &leaseRenewer{
-		hb:       hb,
-		interval: time.Minute, // cadence is hand-driven via r.tick, not the timer
-		prefix:   "test: ",
-		claims:   make(chan harness.Claim, 4),
-		done:     make(chan struct{}),
-		stopped:  make(chan struct{}),
-		tick:     ticks,
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	defer r.stop()
-	go r.run(ctx, heartbeatClaim("r-1"))
-
-	// Fire one tick and wait for the renewer to be PARKED INSIDE the stalled
-	// Heartbeat call - entered is only closed once the call has reached the
-	// stall point, so by then the loop is out of the main select. (Waiting on
-	// tick consumption instead is not enough: the loop can be descheduled
-	// between receiving the tick and entering Heartbeat, and a settle queued
-	// in that gap is drained by the same tick case - a false 'no beats'.)
-	ticks <- time.Now()
-	heartbeatWaitFor(t, "the renewer to park inside the stalled heartbeat", func() bool {
-		select {
-		case <-hb.entered:
-			return true
-		default:
-			return false
+	const drainIterations = 20
+	for i := 0; i < drainIterations; i++ {
+		hb := &recordingHeartbeat{stall: make(chan struct{}), entered: make(chan struct{})}
+		ticks := make(chan time.Time, 4)
+		r := &leaseRenewer{
+			hb:       hb,
+			interval: time.Minute, // cadence is hand-driven via r.tick, not the timer
+			prefix:   "test: ",
+			claims:   make(chan harness.Claim, 4),
+			done:     make(chan struct{}),
+			stopped:  make(chan struct{}),
+			tick:     ticks,
 		}
-	})
+		ctx, cancel := context.WithCancel(context.Background())
+		go r.run(ctx, heartbeatClaim("r-1"))
 
-	// Queue the settle and a tick while the renewer is parked, so both are
-	// sitting in their channels the moment it re-enters select.
-	r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
-	ticks <- time.Now()
+		// Fire one tick and wait for the renewer to be PARKED INSIDE the stalled
+		// Heartbeat call - entered is only closed once the call has reached the
+		// stall point, so by then the loop is out of the main select. (Waiting on
+		// tick consumption instead is not enough: the loop can be descheduled
+		// between receiving the tick and entering Heartbeat, and a settle queued
+		// in that gap is drained by the same tick case - a false 'no beats'.)
+		ticks <- time.Now()
+		heartbeatWaitFor(t, "the renewer to park inside the stalled heartbeat", func() bool {
+			select {
+			case <-hb.entered:
+				return true
+			default:
+				return false
+			}
+		})
 
-	// Release the parked heartbeat. The loop now re-enters select with the
-	// settle AND the tick ready together: the drain must fold the settle in
-	// before the beat decision - the tick must not beat.
-	close(hb.stall)
+		// Queue the settle and a tick while the renewer is parked, so both are
+		// sitting in their channels the moment it re-enters select.
+		r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
+		ticks <- time.Now()
 
-	// Wait until the queued tick has been consumed and the beat count holds
-	// across a small quiet window, so the check below cannot pass merely
-	// because the tick is still queued.
-	heartbeatWaitFor(t, "no renewal beat after the settle was queued first", func() bool {
-		if len(ticks) != 0 {
-			return false
+		// Release the parked heartbeat. The loop now re-enters select with the
+		// settle AND the tick ready together: the drain must fold the settle in
+		// before the beat decision - the tick must not beat.
+		close(hb.stall)
+
+		// Wait until the queued tick has been consumed and the beat count holds
+		// across a small quiet window, so the check below cannot pass merely
+		// because the tick is still queued.
+		heartbeatWaitFor(t, "no renewal beat after the settle was queued first", func() bool {
+			if len(ticks) != 0 {
+				return false
+			}
+			n := hb.count()
+			time.Sleep(5 * time.Millisecond)
+			return hb.count() == n
+		})
+		if n := hb.count(); n != 1 {
+			t.Fatalf("iteration %d/%d: queued a settle then a tick, yet %d renewal beat(s) landed (want 1): renewal must never beat a settled lease", i+1, drainIterations, n)
 		}
-		n := hb.count()
-		time.Sleep(5 * time.Millisecond)
-		return hb.count() == n
-	})
-	if n := hb.count(); n != 1 {
-		t.Fatalf("queued a settle then a tick, yet %d renewal beat(s) landed (want 1): renewal must never beat a settled lease", n)
+		cancel()
+		r.stop()
 	}
 }
 
