@@ -237,7 +237,8 @@ an agent that sends the turns itself. It starts no session, spends nothing and
 loads no clankerbar config. Unlike "review run" it reads --repo as given, so
 that checkout must be at --head. The plan always has embedding off.
 
-  --repo <path>             local git checkout (default: .; must be at --head)
+  --repo <path>             local git checkout, or any directory in it
+                            (default: .; must be at --head)
   --base <commit>           commit the review diffs from (required)
   --head <commit>           commit the review diffs to (default: HEAD)
   --chunk-size <n>          map items per notes turn (default: 25)

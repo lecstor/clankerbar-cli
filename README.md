@@ -678,7 +678,8 @@ network, so it works on a machine that has none. It takes the same `--repo`,
 `--flow-max` and `--json` flags as `review run`; the plan is always the
 maps-session one, with hunk embedding off. Unlike `review run` it reads `--repo`
 as given rather than checking out a temporary worktree — the reviewer must work
-in the checkout the map came from — so that checkout must be at `--head`
+in the checkout the map came from, and any directory in it resolves to that
+checkout's root — so the checkout must be at `--head`
 (resolved to a full SHA), and the command exits non-zero naming both commits
 when it is not. A dirty tree is allowed and the repository is never modified.
 The JSON carries the resolved `base` and `head`, `items` (`change` and `flow`

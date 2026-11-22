@@ -28,7 +28,7 @@ type reviewMapFlags struct {
 
 func newReviewMapFlagSet(f *reviewMapFlags) *pflag.FlagSet {
 	fs := newFlagSet("review map")
-	fs.StringVar(&f.repo, "repo", ".", "local git checkout to map (it must be checked out at --head; the repository is never modified)")
+	fs.StringVar(&f.repo, "repo", ".", "local git checkout, or any directory in it, to map (the checkout must be at --head; the repository is never modified)")
 	fs.StringVar(&f.base, "base", "", "commit the review diffs from; required")
 	fs.StringVar(&f.head, "head", "HEAD", "commit the review diffs to (the checkout must be at it)")
 	fs.IntVar(&f.chunkSize, "chunk-size", 0, fmt.Sprintf("map items per notes turn (0 = %d)", config.DefaultMapsSessionChunkSize))

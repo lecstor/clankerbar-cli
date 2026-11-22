@@ -96,6 +96,7 @@ Usage:
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
 --help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
 'clankerbar upload --help', 'clankerbar deck --help', 'clankerbar hook
---help' or 'clankerbar review run --help' for their flags.
+--help', 'clankerbar review run --help' or 'clankerbar review map --help' for
+their flags.
 `)
 }

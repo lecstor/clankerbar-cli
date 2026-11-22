@@ -73,6 +73,13 @@ func ReviewMap(opts ReviewMapOptions) (*ReviewMapReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The flow map's git grep runs in this directory and reports paths relative to it, while the
+	// map's definitions carry repository-relative paths: from a subdirectory it would both miss uses
+	// outside the subtree and fail to drop a definition's own line. Map from the checkout root even
+	// when --repo names a subdirectory, so this stays the plan review run maps from its worktree root.
+	if repo, err = reviewMapRoot(repo); err != nil {
+		return nil, err
+	}
 	base, err := reviewRunCommit(repo, "base", opts.Base)
 	if err != nil {
 		return nil, err
@@ -131,6 +138,22 @@ func ReviewMap(opts ReviewMapOptions) (*ReviewMapReport, error) {
 		})
 	}
 	return report, nil
+}
+
+// reviewMapRoot resolves a checkout directory to its worktree root. git grep is
+// scoped to and prints paths relative to its working directory, so the root,
+// not whatever directory --repo happens to name, is what the flow map has to be
+// built from.
+func reviewMapRoot(repo string) (string, error) {
+	out, err := reviewGit(repo, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("resolve --repo %s to its checkout root: %w%s", repo, err, reviewGitDetail(out))
+	}
+	root := strings.TrimSpace(out)
+	if root == "" {
+		return "", fmt.Errorf("resolve --repo %s to its checkout root: git named none", repo)
+	}
+	return root, nil
 }
 
 // reviewMapFirstTurn is turn 1's prompt: the standalone brief with the plan's

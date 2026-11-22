@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -137,9 +139,60 @@ func TestReviewMapRefusesACheckoutAtTheWrongCommit(t *testing.T) {
 	if err == nil {
 		t.Fatal("ReviewMap accepted a checkout that is not at --head")
 	}
-	for _, want := range []string{head, at, r.dir} {
+	// The checkout is named by its root, which is what the flow map reads from.
+	for _, want := range []string{head, at, r.git("rev-parse", "--show-toplevel")} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %v, want it to name %q", err, want)
+		}
+	}
+}
+
+// TestReviewMapMapsFromTheCheckoutRoot: --repo may name any directory in the
+// checkout (or default to "."), but the flow map's git grep is scoped to its
+// working directory and prints paths relative to it. Mapping from the root is
+// what keeps the F items complete and identical to review run's, which maps a
+// worktree root: a subdirectory would hide uses outside it and defeat the
+// self-line filter.
+func TestReviewMapMapsFromTheCheckoutRoot(t *testing.T) {
+	r := newReviewRunRepo(t)
+	r.write("go.mod", "module example.com/sample\n\ngo 1.22\n")
+	r.write("root.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 1\n}\n")
+	r.write("sub/sub.go", "package sub\n\nfunc Beta() int {\n\treturn 2\n}\n")
+	// The uses sit in files the diff does not touch, on the other side of the
+	// subdirectory boundary from each definition.
+	r.write("caller.go", "package sample\n\nfunc Caller() int {\n\treturn Beta()\n}\n")
+	r.write("sub/use.go", "package sub\n\nfunc Use() int {\n\treturn sample.Alpha(1)\n}\n")
+	base := r.commit("base")
+	r.write("root.go", "package sample\n\nfunc Alpha(x int) int {\n\treturn x + 11\n}\n")
+	r.write("sub/sub.go", "package sub\n\nfunc Beta() int {\n\treturn 22\n}\n")
+	head := r.commit("head")
+
+	fromRoot, err := ReviewMap(ReviewMapOptions{Repo: r.dir, Base: base, Head: head})
+	if err != nil {
+		t.Fatalf("ReviewMap from the checkout root: %v", err)
+	}
+	fromSub, err := ReviewMap(ReviewMapOptions{Repo: filepath.Join(r.dir, "sub"), Base: base, Head: head})
+	if err != nil {
+		t.Fatalf("ReviewMap from a subdirectory: %v", err)
+	}
+	if !reflect.DeepEqual(fromSub, fromRoot) {
+		t.Errorf("the plan built from a subdirectory is not the one from the checkout root\nsub:\n%+v\nroot:\n%+v", fromSub, fromRoot)
+	}
+	if fromRoot.Items.Flow != 2 {
+		t.Errorf("items.flow = %d, want the two changed definitions: %+v", fromRoot.Items.Flow, fromRoot.Items)
+	}
+	var prompts strings.Builder
+	for _, turn := range fromSub.Turns {
+		prompts.WriteString(turn.Prompt)
+	}
+	for _, want := range []string{
+		// Defined at the root, used inside the subdirectory.
+		"`Alpha` defined or changed at root.go:3; used at: sub/use.go:4",
+		// Defined inside the subdirectory, used at the root.
+		"`Beta` defined or changed at sub/sub.go:3; used at: caller.go:4",
+	} {
+		if !strings.Contains(prompts.String(), want) {
+			t.Errorf("the F items built from a subdirectory do not carry %q:\n%s", want, prompts.String())
 		}
 	}
 }

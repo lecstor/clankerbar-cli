@@ -279,6 +279,8 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 // reviewMapsPlan builds the maps-session plan for a standalone review of
 // repo@base..head. `review run --method maps-session` and `review map` both
 // call it, so the plan one sends and the plan the other prints cannot drift.
+// repo must be a checkout ROOT: the flow map's git grep is scoped to and prints
+// paths relative to its working directory.
 func reviewMapsPlan(repo, base, head, phaseModel string, opts ReviewRunOptions) (*mapsSessionPlan, error) {
 	rng := reviewmap.Range{Repo: repo, Base: base, Head: head}
 	diff, err := reviewmap.Diff(rng)
