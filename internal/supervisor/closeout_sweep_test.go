@@ -150,6 +150,36 @@ func TestCloseOutPassDoesNotSweepOnAnUnreadQueue(t *testing.T) {
 	}
 }
 
+// A pass with no project to work - every instance stopped, refused or
+// config-less - read no queue at all. Its empty approved set is the absence of
+// knowledge, not an empty queue, so two such passes (a stopped fleet at the 15s
+// poll) must not prune anyone's state, least of all the conflict retry budget a
+// resumed fleet continues to spend from.
+func TestCloseOutPassDoesNotSweepWithNoTargets(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	d := f.supervisor(0)
+	d.instances[0].desired = RosterDesiredStopped
+
+	d.closeOutSaid = map[string]string{"task:gone": "closed"}
+	d.conflictSaid = map[string]string{"exhausted:gone": "exhausted"}
+	d.closeOutSeenTasks = map[string]bool{"gone": true}
+	d.conflictTried = map[string]conflictAttempt{"gone": {n: maxConflictAttempts}}
+
+	f.run(d)
+	f.run(d)
+
+	if _, ok := d.closeOutSaid["task:gone"]; !ok {
+		t.Errorf("a stopped fleet's empty target list was treated as an empty queue and swept a close-out line: %v", d.closeOutSaid)
+	}
+	if _, ok := d.conflictSaid["exhausted:gone"]; !ok {
+		t.Errorf("a stopped fleet's empty target list was treated as an empty queue and swept a conflict line: %v", d.conflictSaid)
+	}
+	if got := d.conflictTried["gone"].n; got != maxConflictAttempts {
+		t.Errorf("a stopped fleet's empty target list reset the conflict retry budget (%d, want %d)", got, maxConflictAttempts)
+	}
+}
+
 // A capped queue page does not list every approved task, so the tasks past the cap
 // are unknown rather than gone: the sweep must not drop their state.
 func TestCloseOutPassDoesNotSweepACappedQueue(t *testing.T) {

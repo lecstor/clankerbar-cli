@@ -202,21 +202,30 @@ func (d *Supervisor) runCloseOutPass(targets []closeOutTarget) {
 	// One base cache per pass: every task of the same repo resolves the same
 	// branch, so probing origin per task is the same answer at N times the cost.
 	bases := newCloseOutBases()
-	// approved is the union of the queues this pass read, and whole records
-	// whether it read them all: a task missing from a queue that was never read
-	// is not a task that left the queue, so a partial pass must not sweep.
+	// approved is the union of the queues this pass read, whole records whether
+	// it read them all, and read counts the queues it actually read: a task
+	// missing from a queue that was never read is not a task that left the
+	// queue, so neither a partial pass nor a pass with no project to work may
+	// sweep. The latter is every pass while the fleet is stopped, refused or
+	// config-less, and sweeping then would reset a conflict retry budget
+	// (CLA-759) the fleet resumes with.
 	approved := map[string]bool{}
 	whole := true
+	read := 0
 	for _, t := range targets {
 		if ctx.Err() != nil || time.Now().After(budget) {
 			whole = false
 			break
 		}
-		if !d.reconcileCloseOutProject(ctx, t.cfg, t.slug, budget, bases, approved) {
+		wholeProject, readQueue := d.reconcileCloseOutProject(ctx, t.cfg, t.slug, budget, bases, approved)
+		if readQueue {
+			read++
+		}
+		if !wholeProject {
 			whole = false
 		}
 	}
-	if whole {
+	if whole && read > 0 {
 		d.pruneCloseOutState(approved)
 	}
 }
@@ -244,15 +253,16 @@ func closeOutProjects(cfg *config.Config) []string {
 // cancels it, and every call below therefore aborts rather than finishing out its
 // timeout. bases carries the pass's memoised PR bases.
 //
-// It reports whether the pass learned this project's approved queue, which is what
-// lets the end-of-pass sweep prune safely: an unread queue is not an empty one. An
-// operator-integrated project reports TRUE with nothing added - the close-out never
-// creates state for it, so there is nothing to keep for it either.
-func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.Config, slug string, budget time.Time, bases *closeOutBases, approved map[string]bool) bool {
+// whole reports whether the pass learned this project's ENTIRE approved queue, and
+// read whether it read the queue at all; both are what let the end-of-pass sweep
+// prune safely, since an unread queue is not an empty one. An
+// operator-integrated project reports whole with nothing read - the close-out
+// never creates state for it, so there is nothing to keep for it either.
+func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.Config, slug string, budget time.Time, bases *closeOutBases, approved map[string]bool) (whole, read bool) {
 	client := d.closeOutFor(cfg, slug)
 	if client == nil {
 		d.closeOutSay("client:"+slug, "close-out %s: no plane endpoint could be resolved - standing down", slug)
-		return false
+		return false, false
 	}
 	callCtx, cancel := context.WithTimeout(ctx, closeOutCallTimeout)
 	defer cancel()
@@ -260,7 +270,7 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	policy, err := client.ProjectPolicy(callCtx)
 	if err != nil {
 		d.closeOutSay("policy-err:"+slug, "close-out %s: could not read the project policy (%v) - standing down", slug, err)
-		return false
+		return false, false
 	}
 	// The dial is the operator's turn signal: under `human` an approved-but-unmerged
 	// task belongs to them, and this path has nothing to say about it. Anything that
@@ -268,13 +278,13 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	// not read is exactly the direction this path must not fail in.
 	if !strings.EqualFold(policy.AuthorityIntegrate, "clanker") {
 		d.closeOutSay("policy:"+slug, "close-out %s: authorityIntegrate is %q, not %q - approved tasks are not merged here", slug, policy.AuthorityIntegrate, "clanker")
-		return true
+		return true, false
 	}
 
 	queue, err := client.ApprovedForCloseOut(callCtx)
 	if err != nil {
 		d.closeOutSay("queue-err:"+slug, "close-out %s: could not list the approved queue (%v) - standing down", slug, err)
-		return false
+		return false, false
 	}
 	// The whole served page is this pass's knowledge of the queue, including the
 	// tasks it will not reach before the budget: they are still approved.
@@ -282,7 +292,7 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 		approved[task.ID] = true
 	}
 	if len(queue.Tasks) == 0 {
-		return true // an empty close-out queue is not news
+		return true, true // an empty close-out queue is not news
 	}
 	capped := queue.Total > len(queue.Tasks)
 	if capped {
@@ -291,13 +301,13 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	for _, task := range queue.Tasks {
 		if time.Now().After(budget) || ctx.Err() != nil {
 			d.closeOutSay("budget:"+slug, "close-out %s: this poll's close-out budget is spent - the remaining approved tasks wait for the next poll", slug)
-			return false
+			return false, true
 		}
 		d.reconcileCloseOutTask(ctx, cfg, slug, client, task, bases)
 	}
 	// A capped page is not the whole approved queue: the tasks past the cap are
 	// still approved, so the pass must not sweep them away.
-	return !capped
+	return !capped, true
 }
 
 // reconcileCloseOutTask takes one approved task as far as the deterministic path
