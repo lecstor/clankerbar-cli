@@ -76,8 +76,9 @@ type leaseRenewer struct {
 	// tick is a test seam: when non-nil, run drives its cadence from this
 	// channel instead of constructing a time.Ticker (see run). Tests inject
 	// a channel they fire by hand so a claim queued through observe() can be
-	// raced against a tick deterministically.
-	tick chan time.Time
+	// raced against a tick deterministically. Receive-only: the renewer only
+	// ever reads it, and a send here would be a bug, so the type says so.
+	tick <-chan time.Time
 	// reflect, when non-nil, is called on the renewer goroutine with every
 	// observed claim snapshot, so the fleet presence ref follows the CURRENT
 	// claim mid-phase (CLA-510 — see Driver.reflectClaim). Nil for a target
