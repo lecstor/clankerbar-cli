@@ -51,6 +51,14 @@ type CloseOutAPI interface {
 	// claim's run.
 	CompleteCloseOut(ctx context.Context, taskID, runID string, d CloseOutDelivery) error
 
+	// RecordCloseOutDelivery records the delivery on the task WITHOUT changing
+	// its status (`record_progress`). It is the recovery write for a merge that
+	// landed but whose CompleteCloseOut could not be finished: returning the
+	// task to approved would strand it, so the claim is left to its lease and
+	// this record lets the successor see the merge SHA and PR are already merged
+	// instead of looking for an open PR that no longer exists.
+	RecordCloseOutDelivery(ctx context.Context, taskID, runID string, d CloseOutDelivery) error
+
 	// TaskState reads one task's holder state (get_task): the status, whether a
 	// run holds it and the outcome text. The conflict close-out uses it AFTER a
 	// session to tell what that session left behind. There is no holder id to
@@ -141,6 +149,9 @@ func (coNotWired) ClaimCloseOut(context.Context, string) (CloseOutClaim, error) 
 }
 func (coNotWired) ReleaseCloseOut(context.Context, string, string, bool) error { return ErrNotWired }
 func (coNotWired) CompleteCloseOut(context.Context, string, string, CloseOutDelivery) error {
+	return ErrNotWired
+}
+func (coNotWired) RecordCloseOutDelivery(context.Context, string, string, CloseOutDelivery) error {
 	return ErrNotWired
 }
 func (coNotWired) TaskState(context.Context, string) (TaskState, error) {
@@ -300,6 +311,35 @@ func (r *mcpReleaser) CompleteCloseOut(ctx context.Context, taskID, runID string
 	if d.Commit == "" || d.IntegrationBranch == "" {
 		return errors.New("complete close-out: the delivery must name a commit and an integration branch")
 	}
+	return r.call(ctx, "complete_task", map[string]any{
+		"taskId":   taskID,
+		"runId":    runID,
+		"delivery": closeOutDeliveryBlock(d),
+	})
+}
+
+// RecordCloseOutDelivery writes the delivery with `record_progress`, which
+// carries no status and settles no claim. It is signed by the claim's run while
+// that run is still the task's holder, so it is a supported write on a task the
+// close-out could not finish rather than a stolen one.
+func (r *mcpReleaser) RecordCloseOutDelivery(ctx context.Context, taskID, runID string, d CloseOutDelivery) error {
+	if taskID == "" || runID == "" {
+		return errors.New("record close-out delivery: taskId and runId are both required")
+	}
+	if d.Commit == "" || d.IntegrationBranch == "" {
+		return errors.New("record close-out delivery: the delivery must name a commit and an integration branch")
+	}
+	return r.call(ctx, "record_progress", map[string]any{
+		"taskId":   taskID,
+		"runId":    runID,
+		"delivery": closeOutDeliveryBlock(d),
+	})
+}
+
+// closeOutDeliveryBlock is the wire shape both the close and the recovery record
+// send, so the recorded recovery delivery names exactly what a completed one
+// would have.
+func closeOutDeliveryBlock(d CloseOutDelivery) map[string]any {
 	delivery := map[string]any{
 		"commit":            d.Commit,
 		"integrationBranch": d.IntegrationBranch,
@@ -308,9 +348,5 @@ func (r *mcpReleaser) CompleteCloseOut(ctx context.Context, taskID, runID string
 	if d.PR != "" {
 		delivery["pr"] = d.PR
 	}
-	return r.call(ctx, "complete_task", map[string]any{
-		"taskId":   taskID,
-		"runId":    runID,
-		"delivery": delivery,
-	})
+	return delivery
 }

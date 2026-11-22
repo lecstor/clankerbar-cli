@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
@@ -256,6 +257,64 @@ func (v *Verifier) MergePR(ctx context.Context, repo, slug string, num int, base
 		return "", fmt.Errorf("GitHub did not report a merge commit for PR %d into %s: %s", num, base, strings.TrimSpace(res.Message))
 	}
 	return res.SHA, nil
+}
+
+// PRMergeState is one pull request's state as read AFTER an ambiguous merge
+// attempt: whether it is still open, and, when it is not, what it became and the
+// merge commit GitHub made.
+type PRMergeState struct {
+	Number      int
+	State       string // OPEN | CLOSED | MERGED
+	Base        string
+	HeadOID     string
+	MergeCommit string // set when the PR is MERGED, empty otherwise
+}
+
+// ReadPRMergeState re-reads one pull request without polling. It exists for the
+// caller that must tell a refused merge from a merge whose response was lost:
+// MergePR POSTs to GitHub's merges endpoint, and a timeout, a connection reset or
+// an edge 502 after GitHub completed the merge returns an error for a merge that
+// DID land. State and merge commit from the same read are what let that caller
+// hold the claim (the PR is no longer OPEN) rather than release a merged task back
+// to approved.
+func (v *Verifier) ReadPRMergeState(ctx context.Context, repo, slug string, num int) (PRMergeState, error) {
+	if strings.TrimSpace(slug) == "" {
+		return PRMergeState{}, errors.New("read PR merge state: no repository slug")
+	}
+	if num <= 0 {
+		return PRMergeState{}, errors.New("read PR merge state: no pull request number")
+	}
+	if _, err := exec.LookPath(v.ghBin); err != nil {
+		return PRMergeState{}, fmt.Errorf("read PR merge state: %s is not on PATH", v.ghBin)
+	}
+	out, err := v.runGHScoped(ctx, repo, v.ghAPIScope(ctx, repo, slug),
+		"pr", "view", strconv.Itoa(num), "--repo", slug,
+		"--json", "number,state,baseRefName,headRefOid,mergeCommit")
+	if err != nil {
+		return PRMergeState{}, err
+	}
+	var view struct {
+		Number      int    `json:"number"`
+		State       string `json:"state"`
+		BaseRefName string `json:"baseRefName"`
+		HeadRefOid  string `json:"headRefOid"`
+		MergeCommit struct {
+			OID string `json:"oid"`
+		} `json:"mergeCommit"`
+	}
+	if jerr := json.Unmarshal([]byte(out), &view); jerr != nil {
+		return PRMergeState{}, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr view output: %v", jerr),
+			err:    jerr,
+		}
+	}
+	return PRMergeState{
+		Number:      view.Number,
+		State:       strings.TrimSpace(view.State),
+		Base:        strings.TrimSpace(view.BaseRefName),
+		HeadOID:     strings.TrimSpace(view.HeadRefOid),
+		MergeCommit: strings.TrimSpace(view.MergeCommit.OID),
+	}, nil
 }
 
 // IsolatedClone makes a THROWAWAY clone of repo for the close-out's remote reads,

@@ -231,6 +231,53 @@ func TestCompleteCloseOutNeedsACommitAndABase(t *testing.T) {
 	}
 }
 
+// The recovery record is a `record_progress` write: it names the same delivery a
+// completed close would have, and it changes no status and asserts no outcome, so
+// it can never settle a claim the close-out could not finish.
+func TestRecordCloseOutDeliverySendsProgressAndNoStatus(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").RecordCloseOutDelivery(context.Background(), "t-1", "run-1", CloseOutDelivery{
+		Commit:            "38e21749",
+		PR:                "#12",
+		IntegrationBranch: "staging",
+		MergeVerified:     false,
+	})
+	if err != nil {
+		t.Fatalf("RecordCloseOutDelivery: %v", err)
+	}
+	if name := toolName(t, got.body); name != "record_progress" {
+		t.Errorf("tool = %q, want record_progress", name)
+	}
+	args := toolArgs(t, got.body)
+	if args["runId"] != "run-1" || args["taskId"] != "t-1" {
+		t.Errorf("arguments = %+v, want the record signed by the claim's run", args)
+	}
+	for _, forbidden := range []string{"status", "outcome"} {
+		if _, ok := args[forbidden]; ok {
+			t.Errorf("the recovery record carries %q: %+v", forbidden, args)
+		}
+	}
+	delivery, ok := args["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("no delivery block: %+v", args)
+	}
+	if delivery["commit"] != "38e21749" || delivery["pr"] != "#12" ||
+		delivery["integrationBranch"] != "staging" || delivery["mergeVerified"] != false {
+		t.Errorf("delivery = %+v, want the merge commit, PR, base and the honest attestation", delivery)
+	}
+}
+
+func TestRecordCloseOutDeliveryNeedsACommitAndABase(t *testing.T) {
+	api := NewCloseOutAPI("https://plane.example/mcp/demo", "k-1")
+	if err := api.RecordCloseOutDelivery(context.Background(), "t-1", "run-1", CloseOutDelivery{PR: "#1"}); err == nil {
+		t.Error("a delivery with no commit must be refused")
+	}
+	if err := api.RecordCloseOutDelivery(context.Background(), "t-1", "run-1", CloseOutDelivery{Commit: "abc"}); err == nil {
+		t.Error("a delivery with no integration branch must be refused")
+	}
+}
+
 func TestNewCloseOutAPINotWiredRefusesAndStaysNarrow(t *testing.T) {
 	api := NewCloseOutAPI("", "")
 	ctx := context.Background()
@@ -249,6 +296,9 @@ func TestNewCloseOutAPINotWiredRefusesAndStaysNarrow(t *testing.T) {
 	}
 	if err := api.CompleteCloseOut(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}); !errors.Is(err, ErrNotWired) {
 		t.Errorf("CompleteCloseOut err = %v, want ErrNotWired", err)
+	}
+	if err := api.RecordCloseOutDelivery(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}); !errors.Is(err, ErrNotWired) {
+		t.Errorf("RecordCloseOutDelivery err = %v, want ErrNotWired", err)
 	}
 	if _, err := api.TaskState(ctx, "t-1"); !errors.Is(err, ErrNotWired) {
 		t.Errorf("TaskState err = %v, want ErrNotWired", err)

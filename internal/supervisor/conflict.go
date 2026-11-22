@@ -304,6 +304,7 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	})
 
 	started = true
+	d.setConflictActive(task.ID)
 	d.conflictWG.Add(1)
 	go func() {
 		// Declared first, so it runs LAST: the fleet's slot is held until every
@@ -311,6 +312,7 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		defer slot.release()
 		defer d.conflictWG.Done()
 		defer d.conflictBusy.Store(false)
+		defer d.clearConflictActive(task.ID)
 		d.runConflictSession(cfg, slug, client, req, step)
 	}()
 }
@@ -595,6 +597,29 @@ func (d *Supervisor) noteConflictAttempt(taskID string) {
 	prev := d.conflictTried[taskID]
 	prev.n++
 	d.conflictTried[taskID] = prev
+}
+
+// setConflictActive records the task the session goroutine is about to work, so
+// the end-of-pass sweep keeps its retry budget while the claim has it out of the
+// approved queue.
+func (d *Supervisor) setConflictActive(taskID string) {
+	d.conflictMu.Lock()
+	d.conflictActive = taskID
+	d.conflictMu.Unlock()
+}
+
+// clearConflictActive ends that protection once taskID's session has finished
+// its hand-back; a task that returns to approved is then in the next queue read.
+// It clears only when the field still names taskID: the deferred clear runs before
+// conflictBusy is released (LIFO over startConflictSession's defers), so no newer
+// session can own the field yet, and the guard keeps that ordering from being the
+// only thing that makes it safe.
+func (d *Supervisor) clearConflictActive(taskID string) {
+	d.conflictMu.Lock()
+	if d.conflictActive == taskID {
+		d.conflictActive = ""
+	}
+	d.conflictMu.Unlock()
 }
 
 // conflictSay logs one conflict-path line unless the line for that key is

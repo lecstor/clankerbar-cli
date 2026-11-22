@@ -452,6 +452,11 @@ type Supervisor struct {
 	// conflict session started later in the same pair does not have to recompute
 	// (or lose) them. Also pass-goroutine only.
 	closeOutConflicts map[string]conflictEvidence
+	// closeOutSeenTasks is the approved task set the PREVIOUS pass read, so the
+	// end-of-pass sweep gives a task one pass of grace: a conflict session's claim
+	// takes its task out of the approved queue while its retry budget must
+	// survive. Pass-goroutine only, like the maps the sweep prunes.
+	closeOutSeenTasks map[string]bool
 	// closeOutBusy is set while a close-out pass runs on its own goroutine, so the
 	// next poll skips instead of starting a second pass over the same queue.
 	closeOutBusy atomic.Bool
@@ -478,6 +483,10 @@ type Supervisor struct {
 	// goroutine and the session goroutine both write it.
 	conflictMu   sync.Mutex
 	conflictSaid map[string]string
+	// conflictActive is the task a conflict session currently works, empty when
+	// none. Under conflictMu: the sweep keeps that task's state even though its
+	// claim takes it out of the approved queue.
+	conflictActive string
 	// conflictTried bounds the paid retries per task (CLA-759): a failed session
 	// leaves the task approved, so without it the next poll would start another
 	// session forever instead of falling back to the agent close-out. Also under

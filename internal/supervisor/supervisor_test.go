@@ -343,6 +343,10 @@ type fakePlane struct {
 	// refuseWhen, when set, can refuse a call by its ARGUMENTS as well as its tool
 	// name — the shape a close refused while a release is still allowed needs.
 	refuseWhen func(tool string, args map[string]any) string
+	// statusWhen, when set, answers one call with a non-200 HTTP STATUS: the
+	// transient-failure shape (a 502 or a timeout) a tool-level refusal cannot
+	// express. Zero means the ordinary JSON-RPC answer.
+	statusWhen func(tool string, args map[string]any) int
 }
 
 type planeCall struct {
@@ -375,6 +379,7 @@ func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 			}
 			payload, hasPayload := p.tools[rpc.Params.Name]
 			hook := p.refuseWhen
+			statusHook := p.statusWhen
 			p.mu.Unlock()
 			if hook != nil {
 				// Called OUTSIDE the lock: a hook that reads the plane's recorded
@@ -386,6 +391,12 @@ func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 			if down {
 				http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
 				return
+			}
+			if statusHook != nil {
+				if code := statusHook(rpc.Params.Name, rpc.Params.Arguments); code != 0 {
+					http.Error(w, fmt.Sprintf("plane refused the call with status %d", code), code)
+					return
+				}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if refusal != "" {
@@ -474,6 +485,14 @@ func (p *fakePlane) planeCalls() []planeCall {
 func (p *fakePlane) setPlaneRefusal(text string) {
 	p.mu.Lock()
 	p.planeRefusal = text
+	p.mu.Unlock()
+}
+
+// setStatusWhen installs the non-200 answer hook (see fakePlane.statusWhen). It
+// takes the plane's lock because the handler reads the field under it.
+func (p *fakePlane) setStatusWhen(fn func(tool string, args map[string]any) int) {
+	p.mu.Lock()
+	p.statusWhen = fn
 	p.mu.Unlock()
 }
 

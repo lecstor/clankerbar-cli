@@ -1097,9 +1097,14 @@ somewhere instead of just leaving the task alone: the conflicting paths are
 logged once per head/base pair, and a conflict-only session is started for it.
 Anything after a
 successful claim that cannot be finished releases it, so the task goes back to
-`approved` rather than being left held — with one exception: a merge that LANDED
-but whose ancestry could not be verified is closed `done` with `mergeVerified:
-false`, because the PR is no longer open and a release would strand the task.
+`approved` rather than being left held — with one exception: a merge. A failed
+merge request is released only once a re-read shows the PR still OPEN, because
+GitHub can complete the merge and lose the response. A close that fails
+transiently is retried; if it still fails, the delivery (merge SHA and PR) is
+recorded on the task and the claim is left to its lease, never returned to
+`approved`, because a merged PR is no longer open and a release would strand the
+task. A merge that LANDED but whose ancestry could not be verified is closed
+`done` with `mergeVerified: false`, the other post-merge outcome.
 The merge itself names the resolved base and the judged head revision, so a
 PR retargeted after the judgement cannot be merged into `main`; its verification
 and conflict reads run in a throwaway clone, never in the checkout the fleet's
