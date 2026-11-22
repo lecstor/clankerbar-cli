@@ -286,7 +286,36 @@ func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	// The pass runs to completion with the first session still blocked, which is
 	// exactly the window the second task's busy check has to see. Then the
 	// session is released and the pass's wait collects it.
-	f.runWith(d, func() { close(release) })
+	var activeWhileRunning string
+	f.runWith(d, func() {
+		// The claim has taken task-1 out of the approved queue, so only
+		// conflictActive keeps its retry budget: two further passes spend the
+		// one-pass grace, and the budget must still be there.
+		d.conflictMu.Lock()
+		activeWhileRunning = d.conflictActive
+		d.conflictMu.Unlock()
+		if activeWhileRunning != closeOutTestTask {
+			t.Errorf("conflictActive = %q while the session runs, want %q", activeWhileRunning, closeOutTestTask)
+		}
+		f.plane.serveTool("list_tasks", fmt.Sprintf(
+			`{"tasks":[{"id":%q,"ref":%q,"branch":%q,"repo":%q}],"count":1,"total":1,"view":"full"}`,
+			conflictTestTask2, conflictTestRef2, closeOutTestHead, closeOutTestRepo))
+		d.reconcileCloseOuts() // grace pass: task-1 is still in closeOutSeenTasks
+		d.reconcileCloseOuts() // past the grace: only conflictActive keeps it
+		d.conflictMu.Lock()
+		tried := d.conflictTried[closeOutTestTask].n
+		d.conflictMu.Unlock()
+		if tried == 0 {
+			t.Errorf("the live conflict session's retry budget was pruned: %v", d.conflictTried)
+		}
+		close(release)
+	})
+	d.conflictMu.Lock()
+	activeAfter := d.conflictActive
+	d.conflictMu.Unlock()
+	if activeAfter != "" {
+		t.Errorf("conflictActive = %q after the session finished, want empty", activeAfter)
+	}
 
 	if got := len(f.conflictCalls()); got != 1 {
 		t.Errorf("conflict sessions = %d, want exactly one while the first was running", got)

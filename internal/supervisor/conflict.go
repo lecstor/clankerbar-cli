@@ -312,7 +312,7 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		defer slot.release()
 		defer d.conflictWG.Done()
 		defer d.conflictBusy.Store(false)
-		defer d.clearConflictActive()
+		defer d.clearConflictActive(task.ID)
 		d.runConflictSession(cfg, slug, client, req, step)
 	}()
 }
@@ -608,11 +608,17 @@ func (d *Supervisor) setConflictActive(taskID string) {
 	d.conflictMu.Unlock()
 }
 
-// clearConflictActive ends that protection once the session has finished its
-// hand-back; a task that returns to approved is then in the next queue read.
-func (d *Supervisor) clearConflictActive() {
+// clearConflictActive ends that protection once taskID's session has finished
+// its hand-back; a task that returns to approved is then in the next queue read.
+// It clears only when the field still names taskID: the deferred clear runs before
+// conflictBusy is released (LIFO over startConflictSession's defers), so no newer
+// session can own the field yet, and the guard keeps that ordering from being the
+// only thing that makes it safe.
+func (d *Supervisor) clearConflictActive(taskID string) {
 	d.conflictMu.Lock()
-	d.conflictActive = ""
+	if d.conflictActive == taskID {
+		d.conflictActive = ""
+	}
 	d.conflictMu.Unlock()
 }
 
