@@ -104,6 +104,10 @@ if [ "$1" = auth ] && [ "$2" = token ]; then
 		echo "no oauth token found for github.com account $4" >&2
 		exit 1
 	fi
+	if [ -n "$DEPLOY_GH_FAKE_TOKEN_BY_OWNER" ]; then
+		printf 'gho_%s\n' "$4"
+		exit 0
+	fi
 	printf '%s\n' "$DEPLOY_CRED_FAKE_TOKEN"
 	exit 0
 fi
@@ -155,15 +159,15 @@ func deployCredRepo(t *testing.T, originURL string, withStaging bool) (dir, depl
 
 // deployCredEnvFor wires a prepared repo into a doctorEnv whose ONLY
 // substitution is the world (health answer, repo discovery): gitRun stays the
-// production deployGitRun, because the thing under test is exactly the env it
-// assembles around the real exec.
+// production runner (the memoized one defaultDoctorEnv installs), because the
+// thing under test is exactly the env it assembles around the real exec.
 func deployCredEnvFor(repoDir, deployed string) doctorEnv {
 	e := okEnv()
 	e.fetchHealth = func(context.Context, string) (deployHealth, error) {
 		return deployHealth{Version: deployVersion{Commit: deployed}}, nil
 	}
 	e.repos = func(context.Context, string) []string { return []string{repoDir} }
-	e.gitRun = deployGitRun
+	e.gitRun = newDeployGitRun()
 	return e
 }
 
@@ -379,5 +383,115 @@ func TestDeployLagBoundsCredentialResolutionByTheCommandDeadline(t *testing.T) {
 	}
 	if body, err := os.ReadFile(ghRecord); err != nil || !strings.Contains(string(body), "auth token --user lecstor") {
 		t.Errorf("gh should have started its token lookup before the deadline reaped it, got %q (%v)", string(body), err)
+	}
+}
+
+// One check pass can issue up to eight network commands over the same clone
+// (six candidate fetches plus its own ls-remote and fetch), and every uncached
+// resolution costs a local git read plus a gh spawn. This fixture runs two
+// network commands; the gh record is the evidence they shared one resolution.
+func TestDeployLagCredentialsResolveOncePerPass(t *testing.T) {
+	repoDir, deployed := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", false)
+	binDir, record, ghRecord := writeDeployCredShims(t)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DEPLOY_CRED_RECORD", record)
+	t.Setenv("DEPLOY_CRED_GH_RECORD", ghRecord)
+	t.Setenv("DEPLOY_CRED_REQUIRE_TOKEN", deployCredFakeToken)
+	t.Setenv("DEPLOY_CRED_FAKE_TOKEN", deployCredFakeToken)
+	t.Setenv("DEPLOY_CRED_FAKE_TIP_SHA", lagTip)
+
+	c := deployLagCheck(context.Background(), "deploy_lag",
+		"https://plane.example/health", "staging", repoDir, deployCredEnvFor(repoDir, deployed))
+	if c.status != warn {
+		t.Fatalf("tip advertised but unfetchable: got %v, want WARN (%s)", c.status, c.detail)
+	}
+
+	// Both commands went out scoped - the WARN is for the object, not for
+	// credentials - and both carried the SAME resolution.
+	secs := deployCredSections(t, record)
+	for _, cmd := range []string{"ls-remote", "fetch"} {
+		if got := deployCredSectionValue(t, secs, cmd, "key0="); got != deployCredWantKey0 {
+			t.Errorf("%s carried key0 %q, want %q", cmd, got, deployCredWantKey0)
+		}
+	}
+
+	body, err := os.ReadFile(ghRecord)
+	if err != nil {
+		t.Fatalf("credential record missing - gh never ran: %v", err)
+	}
+	calls := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(calls) != 1 {
+		t.Fatalf("one pass ran %d credential resolutions, want 1: %q", len(calls), body)
+	}
+}
+
+// The scope must follow the remote the INVOCATION names, never the
+// repository's default remote. The insteadOf rewrite matches every
+// https://github.com/ URL a command touches, so a scope keyed to origin while
+// the command reads upstream would hand upstream the wrong account's token.
+func TestDeployLagScopesToTheRemoteTheInvocationTargets(t *testing.T) {
+	repoDir, _ := deployCredRepo(t, "https://github.com/org-a/repo.git", true)
+	addRemote := exec.Command("git", "remote", "add", "upstream", "https://github.com/org-b/repo.git")
+	addRemote.Dir = repoDir
+	if out, err := addRemote.CombinedOutput(); err != nil {
+		t.Fatalf("add upstream remote: %v: %s", err, out)
+	}
+
+	binDir, record, ghRecord := writeDeployCredShims(t)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DEPLOY_CRED_RECORD", record)
+	t.Setenv("DEPLOY_CRED_GH_RECORD", ghRecord)
+	t.Setenv("DEPLOY_CRED_FAKE_TOKEN", deployCredFakeToken)
+	t.Setenv("DEPLOY_GH_FAKE_TOKEN_BY_OWNER", "1")
+	t.Setenv("DEPLOY_CRED_FAKE_TIP_SHA", lagTip)
+
+	run := newDeployGitRun()
+	for _, target := range []string{
+		"origin",
+		"upstream",
+		"https://github.com/org-b/repo.git", // a bare URL names its own repository
+	} {
+		if _, err := run(context.Background(), repoDir, "ls-remote", "--heads", "--", target, "refs/heads/staging"); err != nil {
+			t.Fatalf("ls-remote at %s: %v", target, err)
+		}
+	}
+
+	body, err := os.ReadFile(ghRecord)
+	if err != nil {
+		t.Fatalf("credential record missing - gh never ran: %v", err)
+	}
+	calls := strings.Split(strings.TrimSpace(string(body)), "\n")
+	wantOwners := []string{"org-a", "org-b", "org-b"}
+	if len(calls) != len(wantOwners) {
+		t.Fatalf("got %d resolutions (%q), want one per targeted remote %v", len(calls), body, wantOwners)
+	}
+	for i, owner := range wantOwners {
+		if !strings.Contains(calls[i], "--user "+owner) {
+			t.Errorf("resolution %d should ask gh for %q, got %q", i, owner, calls[i])
+		}
+	}
+}
+
+// Network invocations name their repository after `--`; a bare URL is
+// unambiguous without it. Anything else cannot be told apart from git's own
+// option values, so it falls back to the default remote.
+func TestDeployNetworkRemote(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"named remote after terminator", []string{"ls-remote", "--heads", "--", "upstream", "refs/heads/staging"}, "upstream"},
+		{"url after terminator", []string{"fetch", "--quiet", "--", "https://github.com/org/repo.git", "main"}, "https://github.com/org/repo.git"},
+		{"bare url without terminator", []string{"ls-remote", "https://github.com/org/repo.git"}, "https://github.com/org/repo.git"},
+		{"repository not named", []string{"fetch", "--quiet"}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deployNetworkRemote(tc.args); got != tc.want {
+				t.Errorf("deployNetworkRemote(%q) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
 	}
 }
