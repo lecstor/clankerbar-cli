@@ -944,7 +944,7 @@ func TestTaskWorktreeGitEnvKeepsOperatorAuth(t *testing.T) {
 	t.Setenv("GIT_DIR", "/nope")
 	t.Setenv("GIT_SSH_COMMAND", "custom")
 
-	env := taskWorktreeGitEnv()
+	env := taskWorktreeGitEnv(nil)
 	for _, want := range []string{"GIT_AUTHOR_NAME=x", "GIT_SSH_COMMAND=custom", "GIT_TERMINAL_PROMPT=0"} {
 		if got := taskWorktreeEnvCount(env, want); got != 1 {
 			t.Errorf("%s appears %d time(s), want exactly once", want, got)

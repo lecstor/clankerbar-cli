@@ -34,6 +34,9 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // worktreeRequest is one task's worktree to prepare. CloseOut marks an approved
@@ -678,21 +681,65 @@ func taskWorktreeLines(out string) []string {
 // hook or a rebase can carry GIT_DIR/GIT_WORK_TREE, and `-C` would then address
 // the wrong repository. The non-interactive settings mirror panelGit: an
 // unattended run has no terminal, and git must fail rather than wait.
+//
+// A NETWORK subcommand is scoped to the account owning origin
+// (taskWorktreeRemoteCredEnv): `gh auth git-credential` otherwise answers as
+// whichever account is ACTIVE, which need not see a private repo owned by
+// somebody else, so the fetch this prep depends on fails with "Repository not
+// found".
 func taskWorktreeGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return taskWorktreeGitWithEnv(ctx, dir, taskWorktreeRemoteCredEnv(ctx, dir, args), args...)
+}
+
+// taskWorktreeGitWithEnv is taskWorktreeGit's engine, with environment additions
+// for THIS invocation. Local commands pass nil additions and stay unscoped.
+func taskWorktreeGitWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = taskWorktreeGitEnv()
+	cmd.Env = taskWorktreeGitEnv(extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, firstLineOf(msg))
+			// A scoped network command's token rides the URL git echoes on failure,
+			// and prep errors are logged and reported to the plane.
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, secureurl.RedactUserinfo(firstLineOf(msg)))
 		}
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
+
+// taskWorktreeRemoteCredEnv returns the credential scoping one NETWORK
+// subcommand needs (delivery.ScopeRemoteEnv, CLA-458/CLA-970), or nil for a
+// local one. Only `fetch` and `ls-remote` reach the remote; every other command
+// in this package is local, and scoping costs a `gh auth token` spawn.
+//
+// nil is "run unscoped", byte-identical to the pre-CLA-970 behavior: a
+// non-github host, an ssh remote, an owner gh cannot serve a token for, or an
+// origin whose URL cannot be read. The resolution is bounded so a wedged gh
+// degrades to unscoped rather than holding the prep past the fetch it scopes.
+func taskWorktreeRemoteCredEnv(ctx context.Context, dir string, args []string) []string {
+	if len(args) == 0 || (args[0] != "fetch" && args[0] != "ls-remote") {
+		return nil
+	}
+	remote := "origin"
+	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+		remote = args[1]
+	}
+	raw, err := taskWorktreeGit(ctx, dir, "remote", "get-url", remote)
+	if err != nil || raw == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, taskWorktreeCredTimeout)
+	defer cancel()
+	return delivery.ScopeRemoteEnv(ctx, dir, "gh", raw)
+}
+
+// taskWorktreeCredTimeout bounds the credential resolution one network command
+// pays for. A var, like prBaseProbeTimeout, so a test can shorten it.
+var taskWorktreeCredTimeout = 30 * time.Second
 
 // taskWorktreeRepoEnvVars name a repository rather than configure git; an
 // inherited one would override the -C that taskWorktreeGit passes.
@@ -717,16 +764,20 @@ var taskWorktreeGitEnvDefaults = []string{
 }
 
 // taskWorktreeGitEnv is the caller's environment with the repository-addressing
-// variables dropped, the two prompt settings forced off, and defaults for the
-// rest.
-func taskWorktreeGitEnv() []string {
+// variables and inherited GIT_CONFIG_* dropped, the two prompt settings forced
+// off, defaults for the rest, and extraEnv appended last.
+//
+// GIT_CONFIG_* must go before extraEnv is appended: duplicate env keys have
+// unspecified precedence across OS/libc, so an inherited GIT_CONFIG_COUNT could
+// shadow the credential rewrite a scoped network command carries.
+func taskWorktreeGitEnv(extraEnv []string) []string {
 	env := os.Environ()
-	kept := make([]string, 0, len(env)+5)
+	kept := make([]string, 0, len(env)+5+len(extraEnv))
 	present := make(map[string]bool, len(env))
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
 		// These two must never prompt whatever the caller set.
-		if name == "GIT_TERMINAL_PROMPT" || name == "GCM_INTERACTIVE" || taskWorktreeAddressesRepo(name) {
+		if name == "GIT_TERMINAL_PROMPT" || name == "GCM_INTERACTIVE" || taskWorktreeAddressesRepo(name) || taskWorktreeInheritedConfig(name) {
 			continue
 		}
 		kept = append(kept, kv)
@@ -737,7 +788,19 @@ func taskWorktreeGitEnv() []string {
 			kept = append(kept, kv)
 		}
 	}
-	return append(kept, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	kept = append(kept, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	return append(kept, extraEnv...)
+}
+
+// taskWorktreeInheritedConfig reports whether name is git config supplied
+// through the environment, which could compete with a scoped command's own
+// GIT_CONFIG_* rewrite. GIT_CONFIG_PARAMETERS is git's other channel (`git -c`
+// sets it for children).
+func taskWorktreeInheritedConfig(name string) bool {
+	return name == "GIT_CONFIG_COUNT" ||
+		name == "GIT_CONFIG_PARAMETERS" ||
+		strings.HasPrefix(name, "GIT_CONFIG_KEY_") ||
+		strings.HasPrefix(name, "GIT_CONFIG_VALUE_")
 }
 
 func taskWorktreeAddressesRepo(name string) bool {
