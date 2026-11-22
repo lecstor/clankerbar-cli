@@ -18,8 +18,9 @@ import (
 // exactly where measuring real deploy lag matters.
 //
 // The pin does NOT mock git's opinion away: it drives the PRODUCTION runner
-// (deployGitRun, as doctorEnv.gitRun defaults to) end to end over a real
-// temporary repository, with a recording `git` shim and a fake `gh` on PATH.
+// (newDeployGitRun, the memoized runner doctorEnv installs by default) end to
+// end over a real temporary repository, with a recording `git` shim and a fake
+// `gh` on PATH.
 // The shim REFUSES ls-remote with the production failure ("Repository not
 // found", exit 128) unless the invocation carries exactly the credential
 // scoping CLA-458 specifies, so a green check is reachable only through the
@@ -201,6 +202,39 @@ func deployCredSectionValue(t *testing.T, secs map[string][]string, cmd, prefix 
 		}
 	}
 	return ""
+}
+
+// deployCredInvocation is one recorded git invocation in the order the shim
+// wrote it. deployCredSections collapses repeated subcommands; this keeps them
+// apart, for tests that must see each invocation's own scope.
+type deployCredInvocation struct {
+	cmd  string
+	key0 string
+}
+
+func deployCredInvocations(t *testing.T, record string) []deployCredInvocation {
+	t.Helper()
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("credential record missing - the shim never ran: %v", err)
+	}
+	var out []deployCredInvocation
+	cur := deployCredInvocation{}
+	for _, line := range strings.Split(string(body), "\n") {
+		switch {
+		case strings.HasPrefix(line, "=== "):
+			if cur.cmd != "" {
+				out = append(out, cur)
+			}
+			cur = deployCredInvocation{cmd: strings.TrimPrefix(line, "=== ")}
+		case strings.HasPrefix(line, "key0="):
+			cur.key0 = strings.TrimPrefix(line, "key0=")
+		}
+	}
+	if cur.cmd != "" {
+		out = append(out, cur)
+	}
+	return out
 }
 
 // THE pin: a github.com remote readable only as the account that owns it. The
@@ -386,10 +420,13 @@ func TestDeployLagBoundsCredentialResolutionByTheCommandDeadline(t *testing.T) {
 	}
 }
 
-// One check pass can issue up to eight network commands over the same clone
-// (six candidate fetches plus its own ls-remote and fetch), and every uncached
-// resolution costs a local git read plus a gh spawn. This fixture runs two
-// network commands; the gh record is the evidence they shared one resolution.
+// One check pass can issue up to eight network commands, but only two of them
+// share a directory: the check's own ls-remote and fetch resolve against the
+// same clone, while locateDeployRepo's six candidate fetches are in six
+// distinct clones. This fixture runs the two same-clone commands; the gh record
+// is the evidence they shared one resolution. The cross-clone case - the worst
+// path, where no candidate holds the deployed commit - is pinned separately in
+// TestDeployLagCredentialMemoSpansClonesOfOneOwner.
 func TestDeployLagCredentialsResolveOncePerPass(t *testing.T) {
 	repoDir, deployed := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", false)
 	binDir, record, ghRecord := writeDeployCredShims(t)
@@ -426,10 +463,121 @@ func TestDeployLagCredentialsResolveOncePerPass(t *testing.T) {
 	}
 }
 
+// locateDeployRepo fetches into up to maxDeployLagFetches DISTINCT clones, each
+// its own repository directory, so a memo keyed by directory would still spawn
+// gh once per candidate - the worst path doctor sits in when no clone can
+// settle the deployed commit. The memo is keyed by the resolved OWNER instead:
+// two clones of one repository share a single gh resolution, and both network
+// commands still carry its scope.
+func TestDeployLagCredentialMemoSpansClonesOfOneOwner(t *testing.T) {
+	first, _ := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", false)
+	second, _ := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", false)
+	binDir, record, ghRecord := writeDeployCredShims(t)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DEPLOY_CRED_RECORD", record)
+	t.Setenv("DEPLOY_CRED_GH_RECORD", ghRecord)
+	t.Setenv("DEPLOY_CRED_FAKE_TOKEN", deployCredFakeToken)
+
+	run := newDeployGitRun()
+	if _, err := run(context.Background(), first, "fetch", "--quiet", "--", "origin", "staging"); err != nil {
+		t.Fatalf("fetch in first clone: %v", err)
+	}
+	if _, err := run(context.Background(), second, "ls-remote", "--heads", "--", "origin", "refs/heads/staging"); err != nil {
+		t.Fatalf("ls-remote in second clone: %v", err)
+	}
+
+	secs := deployCredSections(t, record)
+	for _, cmd := range []string{"fetch", "ls-remote"} {
+		if got := deployCredSectionValue(t, secs, cmd, "key0="); got != deployCredWantKey0 {
+			t.Errorf("%s carried key0 %q, want %q", cmd, got, deployCredWantKey0)
+		}
+	}
+
+	body, err := os.ReadFile(ghRecord)
+	if err != nil {
+		t.Fatalf("credential record missing - gh never ran: %v", err)
+	}
+	if calls := strings.Split(strings.TrimSpace(string(body)), "\n"); len(calls) != 1 {
+		t.Fatalf("two clones of one owner ran %d credential resolutions, want 1: %q", len(calls), body)
+	}
+}
+
+// A network command that names no repository must run UNSCPED rather than
+// borrow the repository's default remote. A bare `git fetch` reads the branch's
+// tracked upstream, and a named remote written without `--` cannot be told
+// apart from an option value, so scoping to the default remote's owner would
+// hand the wrong account's token to whatever the command actually reads. No
+// caller names none today; pin the fail-open contract so a future one cannot
+// silently reintroduce it.
+func TestDeployLagUnnamedNetworkTargetStaysUnscoped(t *testing.T) {
+	repoDir, _ := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", false)
+	binDir, record, ghRecord := writeDeployCredShims(t)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DEPLOY_CRED_RECORD", record)
+	t.Setenv("DEPLOY_CRED_GH_RECORD", ghRecord)
+	t.Setenv("DEPLOY_CRED_FAKE_TOKEN", deployCredFakeToken)
+
+	run := newDeployGitRun()
+	if _, err := run(context.Background(), repoDir, "fetch", "--quiet"); err != nil {
+		t.Fatalf("bare fetch: %v", err)
+	}
+	if _, err := run(context.Background(), repoDir, "ls-remote", "--heads", "upstream", "refs/heads/staging"); err != nil {
+		t.Fatalf("ls-remote at a named remote without `--`: %v", err)
+	}
+
+	secs := deployCredSections(t, record)
+	for _, cmd := range []string{"fetch", "ls-remote"} {
+		for _, l := range secs[cmd] {
+			if !strings.HasPrefix(l, "count=unset") {
+				t.Errorf("%s named no repository and must stay unscoped, got %q", cmd, l)
+			}
+		}
+	}
+	if body, err := os.ReadFile(ghRecord); err == nil {
+		t.Errorf("gh must not be consulted for an invocation naming no remote, got %q", string(body))
+	}
+}
+
+// An scp-like ssh target is a URL, not a remote NAME: it must not spend a
+// `git remote get-url git@github.com:...` lookup that can only fail. It also
+// needs no token - ssh carries its own auth - so the invocation stays unscoped.
+func TestDeployLagScpLikeTargetSkipsRemoteLookup(t *testing.T) {
+	repoDir, _ := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", false)
+	binDir, record, ghRecord := writeDeployCredShims(t)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DEPLOY_CRED_RECORD", record)
+	t.Setenv("DEPLOY_CRED_GH_RECORD", ghRecord)
+	t.Setenv("DEPLOY_CRED_FAKE_TOKEN", deployCredFakeToken)
+
+	run := newDeployGitRun()
+	if _, err := run(context.Background(), repoDir, "ls-remote", "--heads", "--",
+		"git@github.com:lecstor/ezyapp.git", "refs/heads/staging"); err != nil {
+		t.Fatalf("ls-remote at an scp-like URL: %v", err)
+	}
+
+	for _, inv := range deployCredInvocations(t, record) {
+		if inv.cmd == "remote" {
+			t.Errorf("an scp-like URL must not be resolved as a remote name, saw a %q invocation", inv.cmd)
+		}
+		if inv.cmd == "ls-remote" && inv.key0 != "" {
+			t.Errorf("an ssh target needs no token, got key0 %q", inv.key0)
+		}
+	}
+	if body, err := os.ReadFile(ghRecord); err == nil {
+		t.Errorf("gh must not be consulted for an ssh target, got %q", string(body))
+	}
+}
+
 // The scope must follow the remote the INVOCATION names, never the
 // repository's default remote. The insteadOf rewrite matches every
 // https://github.com/ URL a command touches, so a scope keyed to origin while
 // the command reads upstream would hand upstream the wrong account's token.
+// Each invocation's own recorded key0 proves where its scope came from, and the
+// gh record proves the owner-keyed memo shares org-b's token with the bare URL
+// instead of resolving it again.
 func TestDeployLagScopesToTheRemoteTheInvocationTargets(t *testing.T) {
 	repoDir, _ := deployCredRepo(t, "https://github.com/org-a/repo.git", true)
 	addRemote := exec.Command("git", "remote", "add", "upstream", "https://github.com/org-b/repo.git")
@@ -447,6 +595,7 @@ func TestDeployLagScopesToTheRemoteTheInvocationTargets(t *testing.T) {
 	t.Setenv("DEPLOY_CRED_FAKE_TIP_SHA", lagTip)
 
 	run := newDeployGitRun()
+	wantTokens := []string{"gho_org-a", "gho_org-b", "gho_org-b"}
 	for _, target := range []string{
 		"origin",
 		"upstream",
@@ -457,25 +606,44 @@ func TestDeployLagScopesToTheRemoteTheInvocationTargets(t *testing.T) {
 		}
 	}
 
+	// One gh resolution per OWNER: org-a, then org-b, which the bare URL reuses.
 	body, err := os.ReadFile(ghRecord)
 	if err != nil {
 		t.Fatalf("credential record missing - gh never ran: %v", err)
 	}
 	calls := strings.Split(strings.TrimSpace(string(body)), "\n")
-	wantOwners := []string{"org-a", "org-b", "org-b"}
+	wantOwners := []string{"org-a", "org-b"}
 	if len(calls) != len(wantOwners) {
-		t.Fatalf("got %d resolutions (%q), want one per targeted remote %v", len(calls), body, wantOwners)
+		t.Fatalf("got %d resolutions (%q), want one per owner %v", len(calls), body, wantOwners)
 	}
 	for i, owner := range wantOwners {
 		if !strings.Contains(calls[i], "--user "+owner) {
 			t.Errorf("resolution %d should ask gh for %q, got %q", i, owner, calls[i])
 		}
 	}
+
+	// Every invocation, in order, carried the token of the remote IT names -
+	// including the bare URL that reused org-b's memo entry.
+	var got []string
+	for _, inv := range deployCredInvocations(t, record) {
+		if inv.cmd == "ls-remote" {
+			got = append(got, inv.key0)
+		}
+	}
+	if len(got) != len(wantTokens) {
+		t.Fatalf("recorded %d network invocations, want %d: %q", len(got), len(wantTokens), got)
+	}
+	for i, token := range wantTokens {
+		if !strings.Contains(got[i], "x-access-token:"+token+"@") {
+			t.Errorf("invocation %d carried key0 %q, want token %q", i, got[i], token)
+		}
+	}
 }
 
 // Network invocations name their repository after `--`; a bare URL is
 // unambiguous without it. Anything else cannot be told apart from git's own
-// option values, so it falls back to the default remote.
+// option values, so it returns "" and the invocation runs unscoped - never
+// under the default remote's owner.
 func TestDeployNetworkRemote(t *testing.T) {
 	tests := []struct {
 		name string
@@ -484,13 +652,40 @@ func TestDeployNetworkRemote(t *testing.T) {
 	}{
 		{"named remote after terminator", []string{"ls-remote", "--heads", "--", "upstream", "refs/heads/staging"}, "upstream"},
 		{"url after terminator", []string{"fetch", "--quiet", "--", "https://github.com/org/repo.git", "main"}, "https://github.com/org/repo.git"},
+		{"scp-like url after terminator", []string{"fetch", "--quiet", "--", "git@github.com:org/repo.git", "main"}, "git@github.com:org/repo.git"},
 		{"bare url without terminator", []string{"ls-remote", "https://github.com/org/repo.git"}, "https://github.com/org/repo.git"},
+		{"named remote without terminator stays unnamed", []string{"ls-remote", "--heads", "upstream", "refs/heads/staging"}, ""},
 		{"repository not named", []string{"fetch", "--quiet"}, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := deployNetworkRemote(tc.args); got != tc.want {
 				t.Errorf("deployNetworkRemote(%q) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// The credential scope must tell a URL git reads as written from a remote NAME
+// it must resolve. An scp-like ssh target is a URL: treating it as a name would
+// spend a `git remote get-url git@github.com:...` that can only fail before the
+// (correct) unscoped answer.
+func TestDeployTargetIsURL(t *testing.T) {
+	tests := []struct {
+		target string
+		want   bool
+	}{
+		{"https://github.com/org/repo.git", true},
+		{"ssh://git@github.com/org/repo.git", true},
+		{"git@github.com:org/repo.git", true},
+		{"origin", false},
+		{"upstream", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.target, func(t *testing.T) {
+			if got := deployTargetIsURL(tc.target); got != tc.want {
+				t.Errorf("deployTargetIsURL(%q) = %v, want %v", tc.target, got, tc.want)
 			}
 		})
 	}
