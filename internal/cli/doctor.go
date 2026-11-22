@@ -1,17 +1,6 @@
 package cli
 
 // doctor.go — preflight diagnostics for unattended runs.
-//
-// Every failure mode this checks for is one that otherwise surfaces only as
-// DEGRADED BEHAVIOUR, hours in: a rejected key drops the loop into blind mode, a
-// missing binary kills the first session, an unreachable endpoint is
-// indistinguishable from an empty queue. The point of `doctor` is to convert all
-// of those into one cheap, loud answer before an overnight run starts.
-//
-// The checks are deliberately split into small functions over an injectable
-// doctorEnv: PATH lookups, version execs and the backlog read are the three
-// things a test cannot do for real, and they are the three things most worth
-// testing.
 
 import (
 	"context"
@@ -55,9 +44,8 @@ func (s status) String() string {
 	}
 }
 
-// check is one diagnostic result. remedy is printed only for WARN/FAIL — a
-// remedy line under a PASS is noise the operator learns to skim past, which is
-// how the real ones get missed.
+// check is one diagnostic result. remedy is printed only for WARN/FAIL — a remedy line under a
+// PASS is noise the operator learns to skim past, which is how the real ones get missed.
 type check struct {
 	name   string
 	status status
@@ -66,13 +54,12 @@ type check struct {
 	info   []string // extra indented lines (the config check's resolved values)
 }
 
-// binVersionTimeout bounds the harness version probe. Generous enough for a cold
-// Node/Bun start, short enough that a wedged shim still reports before a cron
-// window is wasted.
+// binVersionTimeout bounds the harness version probe. Generous enough for a cold Node/Bun start,
+// short enough that a wedged shim still reports before a cron window is wasted.
 const binVersionTimeout = 10 * time.Second
 
-// doctorEnv is the seam between the checks and the world. Defaults hit the real
-// PATH, the real binary and the real plane; tests substitute fakes.
+// doctorEnv is the seam between the checks and the world. Defaults hit the real PATH, the real
+// binary and the real plane; tests substitute fakes.
 type doctorEnv struct {
 	lookPath   func(file string) (string, error)
 	binVersion func(ctx context.Context, bin string) (string, error)
@@ -81,36 +68,32 @@ type doctorEnv struct {
 	goos       string
 	pmset      func(ctx context.Context, args ...string) (string, error)
 
-	// The deploy_lag check's three seams (CLA-322): the /health read,
-	// repository discovery under a workdir, and every git exec it runs.
+	// The deploy_lag check's three seams: the /health read, repository discovery under a workdir, and
+	// every git exec it runs.
 	fetchHealth func(ctx context.Context, healthURL string) (deployHealth, error)
 	repos       func(ctx context.Context, workdir string) []string
 	gitRun      func(ctx context.Context, dir string, args ...string) (string, error)
 
-	// The session-env check's two seams (CLA-462): running one declared
-	// fromCommand, and re-checking one "@path" file's owner-only rule.
+	// The session-env check's two seams: running one declared fromCommand, and re-checking one "@path"
+	// file's owner-only rule.
 	runEnvCmd func(ctx context.Context, command string) (string, error)
 	envPath   func(path string) error
 
-	// The fleet check's one seam (CLA-466): the harmless empty-body probe of the
-	// report endpoint. Production is fleet.Probe; tests substitute statuses.
+	// The fleet check's one seam: the harmless empty-body probe of the report endpoint. Production is
+	// fleet.Probe; tests substitute statuses.
 	fleetProbe func(ctx context.Context, endpoint, apiKey string) error
 
-	// The run-config check's seam (CLA-410): building the read/propose client
-	// for one project's MCP endpoint. Production is plane.NewRunConfigAPI; a
-	// field so tests serve stored documents from an httptest plane.
+	// The run-config check's seam: building the read/propose client for one project's MCP endpoint.
+	// Production is plane.NewRunConfigAPI; a field so tests serve stored documents from an httptest
+	// plane.
 	newRCfgAPI func(mcpURL, apiKey string) plane.RunConfigAPI
 
-	// The opencode auth check's seam (CLA-675): count the rows of opencode
-	// 2.x's credential store, per provider, without reading any secret.
-	// Production runs sqlite3 read-only; tests substitute counts.
+	// The opencode auth check's seam: count the rows of opencode 2.x's credential store, per provider,
+	// without reading any secret. Production runs sqlite3 read-only; tests substitute counts.
 	opencodeCredentials func(ctx context.Context, dbPath string) (map[string]int, error)
 
-	// The pr_gate probe's seam (CLA-776): run a REAL `gh pr view --json` against
-	// a pull request found in the workdirs the delivery gate judges, and parse
-	// it with the gate's own decoder. Production is delivery.ProbeGHJSONDirs;
-	// tests substitute every outcome so doctor's classification is pinned
-	// without a network or a gh.
+	// The pr_gate probe's seam: run a REAL `gh pr view --json` against a pull request found in the
+	// workdirs the delivery gate judges, and parse it with the gate's own decoder.
 	probePRGate func(ctx context.Context, ghBin string, workdirs []string) (delivery.PRProbe, error)
 }
 
@@ -118,10 +101,8 @@ func defaultDoctorEnv() doctorEnv {
 	return doctorEnv{
 		lookPath: exec.LookPath,
 		binVersion: func(ctx context.Context, bin string) (string, error) {
-			// Bounded, because the shim this is written to catch typically BLOCKS
-			// rather than erroring — a wrapper waiting on a TTY, say. doctor is
-			// documented as a cron gate (`doctor && run`), where there is nobody to
-			// Ctrl-C it, so an unbounded exec turns a FAIL into a hang.
+			// Bounded, because the shim this is written to catch typically BLOCKS rather than erroring — a
+			// wrapper waiting on a TTY, say.
 			ctx, cancel := context.WithTimeout(ctx, binVersionTimeout)
 			defer cancel()
 			out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
@@ -153,9 +134,8 @@ func defaultDoctorEnv() doctorEnv {
 	}
 }
 
-// doctorFlags holds the parsed `doctor` options, split out from Doctor for the
-// same reason runFlags is: so the parse step can be tested without running the
-// preflight checks behind it.
+// doctorFlags holds the parsed `doctor` options, split out from Doctor for the same reason runFlags
+// is: so the parse step can be tested without running the preflight checks behind it.
 type doctorFlags struct {
 	cfgPath   string
 	harness   string
@@ -163,9 +143,9 @@ type doctorFlags struct {
 	configDir string
 }
 
-// newDoctorFlagSet registers the `doctor` flags onto a pflag set bound to f.
-// GNU-style long options, matching `run` - see newRunFlagSet for why, and for
-// the deliberate break this carries with it.
+// newDoctorFlagSet registers the `doctor` flags onto a pflag set bound to f. GNU-style long
+// options, matching `run` - see newRunFlagSet for why, and for the deliberate break this carries
+// with it.
 func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
 	fs := newFlagSet("doctor")
 	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ~/.config/clankerbar/config.json; a ./clankerbar.json is never auto-loaded - name it here)")
@@ -175,9 +155,8 @@ func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
 	return fs
 }
 
-// Doctor parses the `doctor` flags and runs the preflight checks. It exits
-// non-zero (via a returned error) when any check FAILs, so it is usable as a
-// gate in a cron wrapper: `clankerbar doctor && clankerbar run`.
+// Doctor parses the `doctor` flags and runs the preflight checks. It returns a non-zero error when any
+// check FAILs, so `clankerbar doctor && clankerbar run` is a usable cron gate.
 func Doctor(ctx context.Context, args []string) error {
 	var f doctorFlags
 	fs := newDoctorFlagSet(&f)
@@ -195,13 +174,11 @@ func Doctor(ctx context.Context, args []string) error {
 	}, defaultDoctorEnv())
 }
 
-// doctorRun is Doctor with its IO and world injected, so tests drive the whole
-// command end to end (including the exit-code contract) without a real PATH,
-// plane or stdout.
+// doctorRun is Doctor with its IO and world injected, so tests drive the whole command end to end
+// (including the exit-code contract) without a real PATH, plane or stdout.
 func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overrides, e doctorEnv) error {
-	// A config that will not load or validate makes every later check meaningless
-	// — they would all be answering questions about a config the loop would never
-	// accept. Report it as the config check and stop there.
+	// A config that will not load or validate makes every later check meaningless — they would all
+	// be answering questions about a config the loop would never accept.
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		printCheck(w, check{
@@ -236,9 +213,9 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 	return nil
 }
 
-// doctorChecks runs every check, in the order an operator would want to read
-// them: what am I configured as, can I run the agent, can I reach the backlog,
-// can I write my state, and what will I be allowed to do.
+// doctorChecks runs every check, in the order an operator would want to read them: what am I
+// configured as, can I run the agent, can I reach the backlog, can I write my state, and what will
+// I be allowed to do.
 func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	checks := []check{checkConfig(cfg)}
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
@@ -271,10 +248,10 @@ func doctorFailed(n int) error {
 
 // --- rendering ---------------------------------------------------------------
 
-// checkLabelWidth is the column the check names are padded to. Wide enough for
-// the qualified labels a mixed-harness run produces (`config_dir[opencode]`,
-// `workdir[clankerbar:opencode]`), because doctor output is read at a glance and
-// one over-long name used to push every following detail out of alignment.
+// checkLabelWidth is the column the check names are padded to. Wide enough for the qualified labels
+// a mixed-harness run produces (`config_dir[opencode]`, `workdir[clankerbar:opencode]`), because
+// doctor output is read at a glance and one over-long name used to push every following detail out
+// of alignment.
 const checkLabelWidth = 28
 
 func printCheck(w io.Writer, c check) {
@@ -302,8 +279,8 @@ func firstLine(s string) string {
 	return s
 }
 
-// truncate cuts to at most n bytes, backing off to a rune boundary so a
-// multi-byte character straddling the cut does not render as mojibake.
+// truncate cuts to at most n bytes, backing off to a rune boundary so a multi-byte character
+// straddling the cut does not render as mojibake.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

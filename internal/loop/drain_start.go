@@ -1,8 +1,7 @@
 package loop
 
-// The start of a runner-claimed drain: gather the facts the start-phase table
-// reads, choose the phase to begin the walk at, and prepare the worktree every
-// phase of the drain runs in. See start_phase.go for the table itself.
+// The start of a runner-claimed drain: gather the facts the start-phase table reads, choose the
+// phase to begin the walk at, and prepare the worktree every phase of the drain runs in.
 
 import (
 	"context"
@@ -16,9 +15,8 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// startRefusalBound is how many consecutive worktree refusals of one task reach
-// the operator: a dirty or diverged tree refuses every claim, so the second one
-// is not going to clear itself.
+// startRefusalBound is how many consecutive worktree refusals of one task reach the operator: a
+// dirty or diverged tree refuses every claim, so the second one is not going to clear itself.
 const startRefusalBound = 2
 
 // startPrep is how preparing the start ended.
@@ -29,20 +27,18 @@ const (
 	startAbort                  // hand the claim back and end the drain
 )
 
-// prepareStart reads what the plane and origin know about the claimed task,
-// picks the phase to start at, and prepares the worktree the drain runs in.
-// startAbort means the claim can be neither honoured nor resumed: the caller
-// hands it back (or, when the refusal was deterministic, has parked it).
+// prepareStart reads what the plane and origin know about the claimed task, picks the phase to
+// start at, and prepares the worktree the drain runs in.
 func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
-	// A reclaim may land a different task, so nothing from the previous start —
-	// its worktree above all — may survive into this one.
+	// A reclaim may land a different task, so nothing from the previous start — its worktree above
+	// all — may survive into this one.
 	s.taskDir, s.prep, s.closeOut, s.start = "", worktreePrep{}, false, 0
 	task := s.claimedTask
 	claim := s.carried.Claim
 	st, read := s.d.readTaskStateRetry(ctx, s.t, claim.TaskID, "to choose the start phase")
 	if !read {
-		// Neither the recorded work nor a no-code delivery can be placed without
-		// the plane's record, so every start would be a guess.
+		// Neither the recorded work nor a no-code delivery can be placed without the plane's record, so
+		// every start would be a guess.
 		log.Printf("%siteration %d: %s: the task could not be read, so neither its recorded work nor its delivery can be placed — handing it back",
 			labelOf(s.t), s.drainNum, claimLabel(claim))
 		return startAbort
@@ -55,15 +51,14 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 	}
 	prBase := s.d.prBaseFor(ctx, s.t, checkout, repo)
 	doneTip := task.PhasesDone[config.ImplementPhaseName].Tip
-	// A task with no recorded branch has nothing to ask origin about, and the
-	// fetch would only cost a round-trip before the branch exists.
+	// A task with no recorded branch has nothing to ask origin about, and the fetch would only cost a
+	// round-trip before the branch exists.
 	of := originBranchFacts{Known: true}
 	fetched := false
 	switch {
 	case s.preClaimTask == task.ID && s.preClaimCheckout == checkout && s.preClaimOrigin.Known:
-		// The pre-claim worktree check already fetched origin for this task:
-		// reuse it, then consume it so a retry re-derives origin instead of
-		// resuming on a read that predates a whole session.
+		// The pre-claim worktree check already fetched origin for this task: reuse it, then consume it so
+		// a retry re-derives origin instead of resuming on a read that predates a whole session.
 		of, fetched = s.preClaimOrigin, true
 	case task.HasWIP:
 		of = s.d.originBranchFn()(ctx, checkout, task.Branch, doneTip)
@@ -92,8 +87,8 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 	}
 	s.start = choice.Index
 	if choice.Index > 0 {
-		// The chosen checkpoint carries no branch for a branchless start, which
-		// is how the walk reads "the plane's record is the evidence".
+		// The chosen checkpoint carries no branch for a branchless start, which is how the walk reads
+		// "the plane's record is the evidence".
 		s.carried.Claim.Branch = choice.Checkpoint.Branch
 		s.carried.CheckpointTip = choice.Checkpoint.Tip
 		s.carried.CheckpointUnverified = false
@@ -102,20 +97,15 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 	return startReady
 }
 
-// prepareTaskDir prepares the worktree the drain runs in and returns the choice
-// the tree leaves standing: a tree holding unpushed commits cannot resume the
-// recorded tip, so the start drops to implement. ok=false means the claim is no
-// longer usable — handed back, or parked by startRefused.
-//
-// A close-out still gets a prepared tree: the close-out brief directs a red
-// check's repair onto the branch in this worktree, so there is no close-out
-// shape that provably needs no tree.
+// prepareTaskDir prepares the worktree the drain runs in and returns the choice the tree leaves
+// standing: a tree holding unpushed commits cannot resume the recorded tip, so the start drops to
+// implement.
 func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, claim harness.Claim, task plane.TaskBrief, of originBranchFacts, fetched bool, choice startChoice) (startChoice, bool) {
 	req := worktreeRequest{
 		Checkout: checkout, TaskID: claim.TaskID, Branch: task.Branch, PRBase: prBase,
 		Resume: of.OnOrigin, CloseOut: choice.CloseOut, NoMerge: choice.Index != 0,
-		// A WIP task's origin read already fetched, and so may the pre-claim
-		// worktree check; either way the prep must not pay for a second fetch.
+		// A WIP task's origin read already fetched, and so may the pre-claim worktree check; either way
+		// the prep must not pay for a second fetch.
 		Fetched:     fetched,
 		ScratchRoot: s.d.worktreeScratchRoot(),
 	}
@@ -129,9 +119,8 @@ func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, 
 			labelOf(s.t), s.drainNum, claimLabel(claim), prep.ScratchAside)
 	}
 	if choice.Index != 0 && prep.Ahead > 0 {
-		// The session would see the local tip, not the checkpoint's, so the phase
-		// the choice picked cannot be handed the work it expects. Implement takes
-		// the tree as it is, PR base merged into it.
+		// The session would see the local tip, not the checkpoint's, so the phase the choice picked
+		// cannot be handed the work it expects.
 		log.Printf("%siteration %d: %s: the task worktree holds %d unpushed commit(s), so its tip is not the recorded checkpoint — starting at implement",
 			labelOf(s.t), s.drainNum, claimLabel(claim), prep.Ahead)
 		req.NoMerge = false
@@ -142,9 +131,8 @@ func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, 
 		choice = startChoice{Why: "the worktree holds unpushed commits: implement"}
 	}
 	if choice.Index != 0 && prep.OriginTip != "" && prep.OriginTip != choice.Checkpoint.Tip {
-		// Origin moved between the fact read and the prep, so the checkpoint the
-		// choice was made on is no longer the tip: let the next claim re-derive
-		// the start rather than resume work nobody reviewed.
+		// Origin moved between the fact read and the prep, so the checkpoint the choice was made on is no
+		// longer the tip: let the next claim re-derive the start rather than resume work nobody reviewed.
 		log.Printf("%siteration %d: %s: origin moved to %s after the start was chosen at %s — handing the claim back so the next claim re-derives it",
 			labelOf(s.t), s.drainNum, claimLabel(claim), prep.OriginTip, choice.Checkpoint.Tip)
 		return choice, false
@@ -162,9 +150,8 @@ func (s *drainSeq) prepareTaskDir(ctx context.Context, checkout, prBase string, 
 	return choice, true
 }
 
-// worktreeScratchRoot is where a prepared tree's cleared untracked files go:
-// under the runner's state dir, outside every tree a session may edit. Empty
-// lets prepareTaskWorktree fall back beside the task-worktree root.
+// worktreeScratchRoot is where a prepared tree's cleared untracked files go: under the runner's
+// state dir, outside every tree a session may edit.
 func (d *Driver) worktreeScratchRoot() string {
 	dir, err := d.cfg.ResolveStateDir()
 	if err != nil {
@@ -173,10 +160,9 @@ func (d *Driver) worktreeScratchRoot() string {
 	return filepath.Join(dir, "worktree-scratch")
 }
 
-// startRefused handles a failed worktree prep. A fetch failure is transient, so
-// it only ever hands the claim back; a deterministic refusal counts, and the
-// second consecutive one tries to park the task. Whether the park took decides
-// what the claim needs: a parked task is let go, anything else is handed back.
+// startRefused handles a failed worktree prep. A fetch failure is transient, so it only ever hands
+// the claim back; a deterministic refusal counts, and the second consecutive one tries to park the
+// task.
 func (s *drainSeq) startRefused(ctx context.Context, claim harness.Claim, err error) {
 	if !errors.Is(err, errWorktreeFetch) {
 		if n := s.d.bumpStartRefusal(claim.TaskID); n >= startRefusalBound {
@@ -196,8 +182,7 @@ func (s *drainSeq) startRefused(ctx context.Context, claim harness.Claim, err er
 		labelOf(s.t), s.drainNum, claimLabel(claim), err)
 }
 
-// bumpStartRefusal records one consecutive worktree refusal for taskID and
-// reports the new count.
+// bumpStartRefusal records one consecutive worktree refusal for taskID and reports the new count.
 func (d *Driver) bumpStartRefusal(taskID string) int {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
@@ -208,20 +193,17 @@ func (d *Driver) bumpStartRefusal(taskID string) int {
 	return d.startRefusals[taskID]
 }
 
-// clearStartRefusal forgets a task's refusal streak: a claim that got its
-// worktree prepared is the evidence the streak is over.
+// clearStartRefusal forgets a task's refusal streak: a claim that got its worktree prepared is the
+// evidence the streak is over.
 func (d *Driver) clearStartRefusal(taskID string) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	delete(d.startRefusals, taskID)
 }
 
-// markPhaseDone records the phase marker a later claim's start choice reads: an
-// evidenced, non-handoff checkpoint of implement, fix or review. A review marker
-// says only that the review phase finished — never that the review was clean;
-// only phasesDone.implement is read today. Verify is excluded by name because its
-// checkpoint means open MUSTs remain, so the seam it holds is for another fix
-// round, not a finished phase.
+// markPhaseDone records the phase marker a later claim's start choice reads: an evidenced,
+// non-handoff checkpoint of implement, fix or review. A review marker says only that the review
+// phase finished — never that the review was clean; only phasesDone.implement is read today.
 func (s *drainSeq) markPhaseDone(ctx context.Context, st *seqStep) {
 	if !s.runnerClaimed || !st.end.checkpoint || st.end.handoff != "" {
 		return
@@ -233,8 +215,8 @@ func (s *drainSeq) markPhaseDone(ctx context.Context, st *seqStep) {
 	switch st.ph.Name {
 	case config.ImplementPhaseName, config.FixPhaseName:
 	case config.ReviewPhaseName:
-		// A panel writes one round across several members: only the member that
-		// ends the review is the phase that finished it.
+		// A panel writes one round across several members: only the member that ends the review is the
+		// phase that finished it.
 		if st.panelMember && !st.terminal {
 			return
 		}
@@ -246,8 +228,8 @@ func (s *drainSeq) markPhaseDone(ctx context.Context, st *seqStep) {
 		return
 	}
 	if err := m.RecordPhaseDone(ctx, res.Claim.TaskID, res.Claim.RunID, st.ph.Name, res.CheckpointTip); err != nil {
-		// A missing marker costs the next claim a re-derived start, never this
-		// drain: the work itself is already on the plane and origin.
+		// A missing marker costs the next claim a re-derived start, never this drain: the work itself is
+		// already on the plane and origin.
 		log.Printf("%siteration %d: could not mark the %s phase done on %s (%v) — the next claim re-derives its start without it",
 			labelOf(s.t), s.drainNum, st.ph.Name, res.Claim.TaskID, err)
 	}

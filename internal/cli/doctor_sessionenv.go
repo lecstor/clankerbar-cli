@@ -12,15 +12,10 @@ import (
 
 // --- 1c. session env ---------------------------------------------------------
 
-// requiredSessionEnv is the minimum a triggered allowlist must keep (CLA-714).
-// A session without PATH cannot run a command, without HOME cannot read git's
-// or ssh's configuration, and without CLANKERBAR_API_KEY cannot reach the
-// plane (the MCP config carries it as `Bearer {env:CLANKERBAR_API_KEY}`).
-// CLANKERBAR_WORKDIR_ROOT joins them while the workdir derivation is on: the
-// fleet's layout is what every brief names, and `doctor` has no way to tell an
-// operator's shell from a supervisor's without the one signal both carry
-// (`project_root` on a materialized config, the variable in a base config's
-// environment).
+// requiredSessionEnv is the minimum a triggered allowlist must keep. A session without PATH cannot
+// run a command, without HOME cannot read git's or ssh's configuration, and without
+// CLANKERBAR_API_KEY cannot reach the plane (the MCP config carries it as `Bearer
+// {env:CLANKERBAR_API_KEY}`).
 func requiredSessionEnv(cfg *config.Config) []string {
 	req := []string{"HOME", "PATH", "CLANKERBAR_API_KEY"}
 	if cfg.ProjectRoot || os.Getenv(WorkdirRootEnv) != "" {
@@ -29,34 +24,19 @@ func requiredSessionEnv(cfg *config.Config) []string {
 	return req
 }
 
-// checkSessionEnvAllowlist reports the shape in force for every (project,
-// harness) pair the run will spawn (CLA-714). With no allowlist declared it
-// PASSes and says so: full inheritance is the documented default, not a
-// warning. With one declared it names the variables that will reach the
-// session - names only, never values - and FAILs when the list omits one of
-// requiredSessionEnv, because that failure otherwise appears later as an
-// unexplained repo_not_found or an unauthenticated plane call inside a session.
-//
-// It asks SpawnedHarnesses, not PhaseHarnesses, for the reason the two exist:
-// PhaseHarnesses seeds the run-wide `harness` unconditionally, which is right
-// for "is every declared harness registered and usable" but wrong for "what is
-// true of the sessions this run actually runs". A config whose every phase
-// names its own harness never spawns the run-wide one, and this check is about
-// what a session INHERITS - so reporting (and FAILing) that harness's scope
-// would send the operator to fix a harness no session ever runs on, and a false
-// FAIL blocks a run that works. Same doctrine as runsHarness and
-// costBlindHarnesses in the budget check.
+// checkSessionEnvAllowlist reports the shape in force for every (project, harness) pair the run
+// will spawn. With one declared it names the variables that will reach the session - names only,
+// never values - and FAILs when the list omits one of requiredSessionEnv, because that failure
+// otherwise appears later as an unexplained repo_not_found or an unauthenticated plane call inside
+// a session.
 func checkSessionEnvAllowlist(cfg *config.Config) []check {
 	harnesses := cfg.SpawnedHarnesses()
 	name := func(slug, h string) string {
 		label := "session env allowlist"
 		qualifier := slug
 		if len(harnesses) > 1 {
-			// Same SHAPE as checkSessions' naming: the harness is part of the
-			// name only when more than one is in play, so a single-harness report
-			// stays unqualified. The count itself comes from SpawnedHarnesses, so
-			// it can be smaller than checkSessions' - that check asks what is
-			// configured, this one what a session inherits.
+			// Same SHAPE as checkSessions' naming: the harness is part of the name only when more than one
+			// is in play, so a single-harness report stays unqualified.
 			if qualifier != "" {
 				qualifier += ":"
 			}
@@ -64,8 +44,7 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 		}
 		return label + bracket(qualifier)
 	}
-	// The env a session receives on top of the allowlist, by name. doctor never
-	// reads a value: one of these is routinely a credential.
+	// The env a session receives on top of the allowlist, by name.
 	declaredNames := func(h, slug string) []string { return cfg.SessionEnvNames(h, slug) }
 	report := func(slug, h string) check {
 		c := check{name: name(slug, h)}
@@ -82,11 +61,9 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 		if len(declared) > 0 {
 			c.detail += "; the env block adds: " + strings.Join(declared, ", ")
 		}
-		// The env overlay is appended AFTER the inheritEnv filter and WINS (every
-		// adapter's env() puts in.Env last), so a required variable the env block
-		// declares reaches the session even when the allowlist omits it. Computing
-		// the miss from the allowlist alone FAILed that working shape, and a false
-		// FAIL blocks a run that works (CLA-736 review 1.review-2.1).
+		// The env overlay is appended AFTER the inheritEnv filter and WINS (every adapter's env() puts
+		// in.Env last), so a required variable the env block declares reaches the session even when the
+		// allowlist omits it.
 		present := append(append([]string(nil), allow...), declared...)
 		var missing []string
 		for _, want := range requiredSessionEnv(cfg) {
@@ -100,9 +77,8 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), or declare it in the session env block, or drop env_allowlist to inherit everything"
 			return c
 		}
-		// ADVICE, not a verdict (CLA-736 review 1.review-2.2): an ssh clone_url_base
-		// works from an on-disk key without the agent, so this is only a footgun
-		// when the key is agent-held - not something to FAIL, or even WARN, a
+		// ADVICE, not a verdict: an ssh clone_url_base works from an on-disk key without the agent, so
+		// this is only a footgun when the key is agent-held - not something to FAIL, or even WARN, a
 		// working run over.
 		if !contains(present, "SSH_AUTH_SOCK") {
 			c.info = append(c.info, "SSH_AUTH_SOCK is not in the session env: a session pushing over an ssh origin needs it only when the key is agent-held (an on-disk key does not)")
@@ -126,8 +102,8 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 	return out
 }
 
-// contains reports whether names holds want. Small and local: the minimum is
-// four entries, and a set would cost more lines than it saves.
+// contains reports whether names holds want. Small and local: the minimum is four entries, and a
+// set would cost more lines than it saves.
 func contains(names []string, want string) bool {
 	for _, n := range names {
 		if n == want {
@@ -137,14 +113,9 @@ func contains(names []string, want string) bool {
 	return false
 }
 
-// checkSessionEnv verifies every DECLARED env entry that needs resolving can be
-// resolved right now (CLA-462): each fromCommand is executed and each "@path"
-// literal is re-read under its owner-only rule. Outputs are discarded — doctor
-// reports the verdict and the variable's name, never a credential. One FAIL
-// here means every spawn that overlay reaches will refuse until it is fixed,
-// so seeing it in the preflight is the cheap copy of the same fact.
-//
-// Plain literals need no check and get none: there is nothing to resolve.
+// checkSessionEnv verifies every DECLARED env entry that needs resolving can be resolved right now:
+// each fromCommand is executed and each "@path" literal is re-read under its owner-only rule.
+// Outputs are discarded — doctor reports the verdict and the variable's name, never a credential.
 func checkSessionEnv(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	var out []check
 	for _, d := range cfg.DeclaredEnvs() {
@@ -178,14 +149,11 @@ func checkSessionEnv(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 	return out
 }
 
-// checkTokenSources warns when a scope whose repos PUSH has declared no source
-// for GH_TOKEN anywhere its sessions' overlays look — top level, any harness
-// block, or the project's own two blocks (CLA-462). This is exactly the shape
-// of the 2026-08-24 incident: a daemon launched without the wrapper spawned
-// sessions with no token, which died later at `git push` with an error naming
-// nothing. A WARN, not a FAIL: a repo may push over ssh or not at all, and the
-// operator owns that call — the heuristic (repos declared = pushes happen) is
-// only allowed to speak up, not to stop the run.
+// checkTokenSources warns when a scope whose repos PUSH has declared no source for GH_TOKEN
+// anywhere its sessions' overlays look — top level, any harness block, or the project's own two
+// blocks. A WARN, not a FAIL: a repo may push over ssh or not at all, and the operator owns that
+// call — the heuristic (repos declared = pushes happen) is only allowed to speak up, not to stop
+// the run.
 func checkTokenSources(cfg *config.Config) []check {
 	report := func(label, slug string) check {
 		c := check{name: label}

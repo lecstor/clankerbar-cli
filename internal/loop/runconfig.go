@@ -1,18 +1,5 @@
-// Run-config consumption in the driver (CLA-410): the plane's stored execution
-// config, fetched per project and applied AT THE ITERATION BOUNDARY.
-//
-// The signal is free: the backlog-summary poll this loop already makes between
-// iterations carries `runConfigVersion` (CLA-408). When it moves for a target —
-// or on the very first poll, which is how "at start of run" is satisfied — the
-// target's effective config is rebuilt here, before the spawn gate reads it.
-// A session already in flight finishes on the config it started with: the poll
-// never happens mid-session, so "never applies mid-session" is structural,
-// not a promise to keep.
-//
-// The failure posture copies applyReload's (CLA-461): a fetch that fails is
-// retried at a poll-bounded rate; a document that arrives but fails local
-// validation is refused loudly and the previous config stays. Neither converts
-// an operator's ratify click into a daemon outage.
+// Run-config consumption in the driver: the plane's stored execution config, fetched per project
+// and applied AT THE ITERATION BOUNDARY.
 package loop
 
 import (
@@ -27,14 +14,14 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// SetOverrides records the run's flag overrides so they can be re-applied after
-// every stored-config overlay. Flags are the operator's explicit invocation-time
-// statement; a ratified document outranks the FILE but not the command line.
+// SetOverrides records the run's flag overrides so they can be re-applied after every stored-config
+// overlay. Flags are the operator's explicit invocation-time statement; a ratified document
+// outranks the FILE but not the command line.
 func (d *Driver) SetOverrides(o config.Overrides) { d.overrides = o }
 
-// targetCfg is the config one drain reads: the target's own effective config
-// when a stored document is in force, else the driver's base — which is exactly
-// yesterday's behaviour for every target that never had one.
+// targetCfg is the config one drain reads: the target's own effective config when a stored document
+// is in force, else the driver's base — which is exactly yesterday's behaviour for every target
+// that never had one.
 func (d *Driver) targetCfg(t Target) *config.Config {
 	if t.Cfg != nil {
 		return t.Cfg
@@ -42,12 +29,11 @@ func (d *Driver) targetCfg(t Target) *config.Config {
 	return d.cfg
 }
 
-// liveCfg is targetCfg re-read NOW: the same answer invocationFor gets, taken
-// fresh at the moment of asking rather than held from the drain's start. A
-// boundary hold calls it at every wake (CLA-947 review 1.review-1.1) because
-// d.cfg is swapped by a RELOAD on another goroutine — it is read under controlMu
-// the way pauseState reads it — so the hold decides from the config the next
-// spawn will use, not from a schedule the operator has since removed.
+// liveCfg is targetCfg re-read NOW: the same answer invocationFor gets, taken fresh at the moment
+// of asking rather than held from the drain's start. A boundary hold calls it at every wake because
+// d.cfg is swapped by a RELOAD on another goroutine — it is read under controlMu the way
+// pauseState reads it — so the hold decides from the config the next spawn will use, not from a
+// schedule the operator has since removed.
 func (d *Driver) liveCfg(t Target) *config.Config {
 	if t.Cfg != nil {
 		return t.Cfg
@@ -58,30 +44,24 @@ func (d *Driver) liveCfg(t Target) *config.Config {
 	return base
 }
 
-// overlayBudgetAt reports whether target i is judged by a stored budget of its
-// own. A stored document that sets no budget leaves the target in the local
-// pool: the README's exception is the document's BUDGET, not its mere existence,
-// and applying a model-only document must not quietly split the instance-wide
-// pool into one-per-project ceilings. Set at applyRunConfig time from
-// doc.Budget != nil.
+// overlayBudgetAt reports whether target i is judged by a stored budget of its own. A stored
+// document that sets no budget leaves the target in the local pool: the README's exception is the
+// document's BUDGET, not its mere existence, and applying a model-only document must not quietly
+// split the instance-wide pool into one-per-project ceilings.
 func (d *Driver) overlayBudgetAt(i int) bool {
 	return i >= 0 && i < len(d.overlayBudget) && d.overlayBudget[i]
 }
 
-// checkRunConfigVersion applies the boundary rule for one polled target: a
-// version other than the one the current effective config was built from (or
-// any version at all, before the first fetch) triggers a refetch-and-overlay.
-// Called only from the poll's default case — the iteration boundary.
+// checkRunConfigVersion applies the boundary rule for one polled target: a version other than the
+// one the current effective config was built from (or any version at all, before the first fetch)
+// triggers a refetch-and-overlay. Called only from the poll's default case — the iteration
+// boundary.
 func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, version int) {
 	if t.RCfg == nil || version == d.rcVersions[i] {
 		return
 	}
-	// Permanent nothing-stored (CLA-481): version 0 IS the plane's "never set"
-	// answer, so when nothing is in force (unfetched or already at none) the
-	// answer is known without a fetch. Latch silently — staying at none is not
-	// news — instead of fetching every boundary only to learn ErrNoConfig.
-	// A 0 arriving while a stored overlay is in force (rcVersions > 0) still
-	// fetches below, so the drop to local is confirmed and logged.
+	// Permanent nothing-stored: version 0 IS the plane's "never set" answer, so when nothing is in
+	// force (unfetched or already at none) the answer is known without a fetch.
 	if version == 0 && d.rcVersions[i] <= 0 {
 		if d.targets[i].Cfg != nil {
 			log.Printf("%srun-config: nothing stored on the plane - the local file rules", d.prefix(i))
@@ -94,24 +74,17 @@ func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, ve
 		d.rcFails[i] = 0
 		return
 	}
-	// Rate-limit RETRIES after a failed fetch of the SAME version to one per
-	// backoff window, so a blip at ratify time retries without spamming the log.
-	// A DIFFERENT version always fetches: the operator moved the document again,
-	// and no throttle may delay that past the boundary it arrived on. The window
-	// widens with consecutive failures (CLA-481), so a permanently unreachable
-	// plane backs off instead of logging every 30s forever.
+	// Rate-limit RETRIES after a failed fetch of the SAME version to one per backoff window, so a blip
+	// at ratify time retries without spamming the log.
 	if version == d.rcAttemptVer[i] && !time.Now().After(d.rcAttempt[i]) {
 		return
 	}
 	st, err := t.RCfg.RunConfig(ctx)
 	if err != nil {
 		if errors.Is(err, plane.ErrNoConfig) || errors.Is(err, plane.ErrNotWired) {
-			// Permanent: nothing to fetch, ever, for this version. ErrNotWired
-			// is the slug-less / project-scoped-key shape (rcNotWired) — the
-			// same "local file rules" posture as nothing stored, silent
-			// thereafter, never retried. Say it once per transition, not every
-			// poll — dropping from a stored doc to none is real news, staying
-			// at none is not.
+			// Permanent: nothing to fetch, ever, for this version. ErrNotWired is the slug-less /
+			// project-scoped-key shape (rcNotWired) — the same "local file rules" posture as nothing
+			// stored, silent thereafter, never retried.
 			if d.targets[i].Cfg != nil || d.rcVersions[i] > 0 {
 				log.Printf("%srun-config: nothing stored on the plane - the local file rules", d.prefix(i))
 				d.targets[i].Cfg = nil
@@ -141,11 +114,8 @@ func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, ve
 	d.applyRunConfig(i, t, st)
 }
 
-// rcFetchBackoff is how long a failed refetch waits before trying the SAME
-// version again: 30s, 60s, 120s, ..., capped at 5m. The first failure retries
-// promptly (a blip at ratify time), a persistently unreachable plane backs off
-// instead of spamming every boundary. A DIFFERENT version always fetches
-// immediately — the operator moved the document, and no throttle may delay it.
+// rcFetchBackoff is how long a failed refetch waits before trying the SAME version again: 30s, 60s,
+// 120s, ..., capped at 5m.
 func rcFetchBackoff(fails int) time.Duration {
 	const (
 		base = 30 * time.Second
@@ -164,8 +134,8 @@ func rcFetchBackoff(fails int) time.Duration {
 	return d
 }
 
-// cfgSourceDesc names what a target's sessions currently run under, for log
-// lines that have to distinguish "the stored document" from "the local file".
+// cfgSourceDesc names what a target's sessions currently run under, for log lines that have to
+// distinguish "the stored document" from "the local file".
 func (d *Driver) cfgSourceDesc(i int) string {
 	if d.targets[i].Cfg != nil {
 		return "run-config overlay"
@@ -173,16 +143,10 @@ func (d *Driver) cfgSourceDesc(i int) string {
 	return "local rules"
 }
 
-// invalidateRunConfigs marks every wired target's stored-config state as
-// unfetched again, so the next poll refetches and re-overlays on the CURRENT
-// base. Called from applyReload: a RELOAD swaps d.cfg, and a target's existing
-// overlay was built from the OLD base — its phases, prompts and any dial the
-// stored document does not set are the pre-reload file's, and must not outlive
-// it. The refetch lands on the poll immediately after the RELOAD marker was
-// consumed, which is still an iteration boundary — never mid-session. The
-// existing overlay is NOT dropped here: if that refetch fails, the previous
-// config stays in force (the same posture as any failed fetch), and it
-// self-heals on a later boundary.
+// invalidateRunConfigs marks every wired target's stored-config state as unfetched again, so the
+// next poll refetches and re-overlays on the CURRENT base. Called from applyReload: a RELOAD swaps
+// d.cfg, and a target's existing overlay was built from the OLD base — its phases, prompts and
+// any dial the stored document does not set are the pre-reload file's, and must not outlive it.
 func (d *Driver) invalidateRunConfigs() {
 	for i := range d.targets {
 		if d.targets[i].RCfg == nil {
@@ -195,11 +159,11 @@ func (d *Driver) invalidateRunConfigs() {
 	}
 }
 
-// applyRunConfig overlays a fetched document onto a clone of the base config
-// and swaps it in as the target's effective config. Flag overrides re-apply on
-// top (they outrank the document), then Validate referees: an overlaid combo
-// the local rules refuse — a stored harness name nobody registered, a phase on
-// an unconfigured harness — keeps the PREVIOUS config rather than half-running.
+// applyRunConfig overlays a fetched document onto a clone of the base config and swaps it in as the
+// target's effective config. Flag overrides re-apply on top (they outrank the document), then
+// Validate referees: an overlaid combo the local rules refuse — a stored harness name nobody
+// registered, a phase on an unconfigured harness — keeps the PREVIOUS config rather than
+// half-running.
 func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 	var doc config.RunConfigDoc
 	if err := json.Unmarshal(st.Config, &doc); err != nil {
@@ -209,17 +173,16 @@ func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 		return
 	}
 	if doc.SchemaNewer() {
-		// A newer schema may have changed the meaning of the keys this build
-		// knows: applying the familiar-looking half would run a policy the
-		// operator did not ratify. Keep the previous config, loudly.
+		// A newer schema may have changed the meaning of the keys this build knows: applying the
+		// familiar-looking half would run a policy the operator did not ratify.
 		log.Printf("%srun-config v%d: schema v%d is newer than this build understands (v%d) - keeping %s; upgrade the CLI and re-ratify",
 			d.prefix(i), st.Version, doc.SchemaVersion, config.RunConfigSchemaVersion, d.cfgSourceDesc(i))
 		d.rcVersions[i] = st.Version // deterministic refusal: don't hot-loop
 		return
 	}
 	if doc.Empty() {
-		// A stored-but-empty document consumes to nothing: same posture as
-		// version 0, said once on the transition.
+		// A stored-but-empty document consumes to nothing: same posture as version 0, said once on the
+		// transition.
 		if d.targets[i].Cfg != nil {
 			log.Printf("%srun-config v%d: document sets nothing consumable - the local file rules", d.prefix(i), st.Version)
 			d.targets[i].Cfg = nil

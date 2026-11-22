@@ -1,10 +1,5 @@
 package loop
 
-// Choosing which phase a freshly claimed task starts at. Every fact below is
-// already on the plane or one ls-remote plus git away, so the decision is pure
-// and the caller only has to gather the facts. The rows are the start-phase
-// table in docs/runner-owned-mechanics.md ("Implementation session decisions").
-
 import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
@@ -12,39 +7,34 @@ import (
 
 // startFacts is what the start-phase table reads, as the caller finds it.
 type startFacts struct {
-	// CloseOut marks a claim of an approved-awaiting-merge task: the job is the
-	// close-out, which runs implement with the close-out brief and no prBase
-	// merge.
+	// CloseOut marks a claim of an approved-awaiting-merge task: the job is the close-out, which runs
+	// implement with the close-out brief and no prBase merge.
 	CloseOut bool
-	// HasWIP is the plane's branch signal. Branch is always set (the plane
-	// synthesises a name), so this flag is the one to trust.
+	// HasWIP is the plane's branch signal. Branch is always set (the plane synthesises a name), so
+	// this flag is the one to trust.
 	HasWIP bool
 	Branch string
 	// NoCodeDelivered is the task's delivery.noCode declaration.
 	NoCodeDelivered bool
-	// OriginKnown is false when ls-remote failed: nothing about the branch on
-	// origin can be decided, which is why a WIP claim aborts.
+	// OriginKnown is false when ls-remote failed: nothing about the branch on origin can be decided,
+	// which is why a WIP claim aborts.
 	OriginKnown bool
 	// OnOrigin is whether Branch exists on origin.
 	OnOrigin bool
 	// Tip is origin's tip of Branch, empty when it is not on origin.
 	Tip string
-	// ImplementDoneTip is phasesDone["implement"].tip, empty when the plane
-	// carries no marker.
+	// ImplementDoneTip is phasesDone["implement"].tip, empty when the plane carries no marker.
 	ImplementDoneTip string
-	// ImplementDoneIsAncestor is the caller's git answer to "is
-	// ImplementDoneTip Tip itself or an ancestor of it": ancestry is the one
-	// fact no plane read can supply.
+	// ImplementDoneIsAncestor is the caller's git answer to "is ImplementDoneTip Tip itself or an
+	// ancestor of it": ancestry is the one fact no plane read can supply.
 	ImplementDoneIsAncestor bool
 	// Reviews is the task's durable review records from get_task.
 	Reviews []plane.ReviewRecordState
-	// OpenMustIDs is every open MUST, by finding id, on a released (State
-	// "open") record only: fill it with openMustIDs, because the plane's own
-	// openMustIds also lists a void record's findings.
+	// OpenMustIDs is every open MUST, by finding id, on a released (State "open") record only: fill it
+	// with openMustIDs, because the plane's own openMustIds also lists a void record's findings.
 	OpenMustIDs []string
-	// OpenMustAtTip is whether a released (State "open") record that reviewed
-	// Tip itself carries an open MUST. Only that selects fix: an older record's
-	// MUST beside a clean record at Tip does not.
+	// OpenMustAtTip is whether a released (State "open") record that reviewed Tip itself carries an
+	// open MUST. Only that selects fix: an older record's MUST beside a clean record at Tip does not.
 	OpenMustAtTip bool
 }
 
@@ -52,25 +42,23 @@ type startFacts struct {
 type startChoice struct {
 	// Index is the position in phases to begin the walk at.
 	Index int
-	// Abort means the claim can be neither honoured nor resumed: hand it back
-	// and end the drain as transient.
+	// Abort means the claim can be neither honoured nor resumed: hand it back and end the drain as
+	// transient.
 	Abort bool
-	// Branchless marks a start whose checkpoint carries no branch — the no-code
-	// review, which has no tip to check out.
+	// Branchless marks a start whose checkpoint carries no branch — the no-code review, which has no
+	// tip to check out.
 	Branchless bool
-	// CloseOut marks a close-out claim, which uses the close-out brief and no
-	// prBase merge.
+	// CloseOut marks a close-out claim, which uses the close-out brief and no prBase merge.
 	CloseOut bool
-	// Checkpoint is the claim the start resumes. Index 0 has no claim to carry,
-	// so it is never filled there.
+	// Checkpoint is the claim the start resumes. Index 0 has no claim to carry, so it is never filled
+	// there.
 	Checkpoint struct{ Branch, Tip string }
 	// Why is one log line naming the row that decided it.
 	Why string
 }
 
-// chooseStartPhase is the whole table. Rows are evaluated in priority order, so
-// an overlap resolves the way the table says rather than by accident of ordering
-// inside a switch.
+// chooseStartPhase is the whole table. Rows are evaluated in priority order, so an overlap resolves
+// the way the table says rather than by accident of ordering inside a switch.
 func chooseStartPhase(phases []config.Phase, f startFacts) startChoice {
 	if f.CloseOut {
 		c := startAtName(phases, f, config.ImplementPhaseName, true,
@@ -78,13 +66,13 @@ func chooseStartPhase(phases []config.Phase, f startFacts) startChoice {
 		c.CloseOut = true
 		return c
 	}
-	// Without origin the recorded branch's state is unknowable, so resuming or
-	// redoing it are both guesses: only the caller can end this cleanly.
+	// Without origin the recorded branch's state is unknowable, so resuming or redoing it are both
+	// guesses: only the caller can end this cleanly.
 	if !f.OriginKnown && f.HasWIP {
 		return startChoice{Abort: true, Why: "origin unreadable while the task has a recorded branch: hand the claim back and end the drain as transient"}
 	}
-	// An unphased or single-phase run has no positions to choose between; its
-	// one session carries its own prompt and is never a built-in phase.
+	// An unphased or single-phase run has no positions to choose between; its one session carries its
+	// own prompt and is never a built-in phase.
 	if len(phases) < 2 {
 		return startChoice{Why: "single-phase sequence: there is no start phase to choose"}
 	}
@@ -106,10 +94,8 @@ func chooseStartPhase(phases []config.Phase, f startFacts) startChoice {
 		return startAtName(phases, f, config.FixPhaseName, true,
 			"open MUSTs on the released record at the tip: fix")
 	case open:
-		// The findings outlived the tip they were raised on — whether the fix is
-		// pushed or the record at the tip is clean and did not re-raise them —
-		// so the fix is not this session's job: whoever adjudicates the MUSTs is
-		// the verifier when the sequence has a fix->verify pair, else the review.
+		// The findings outlived the tip they were raised on, so adjudicating them is not the fix's
+		// job: the verifier does it when the sequence has a fix->verify pair, else review does.
 		if i := verifyAfterFix(phases); i >= 0 {
 			return startAtIndex(f, i, true, "open MUSTs with none on the record at the tip: verify")
 		}
@@ -127,10 +113,7 @@ func chooseStartPhase(phases []config.Phase, f startFacts) startChoice {
 		"WIP with no implement marker and no records: implement")
 }
 
-// startAtName resolves a phase name to its position. An absent phase falls back
-// to 0 — there is nothing else to run — and the Why says which phase was
-// missing, so a mis-shaped sequence shows in the log instead of silently
-// running the wrong brief.
+// startAtName resolves a phase name to its position.
 func startAtName(phases []config.Phase, f startFacts, name string, withBranch bool, why string) startChoice {
 	i := phaseIndex(phases, name)
 	if i < 0 {
@@ -139,9 +122,8 @@ func startAtName(phases []config.Phase, f startFacts, name string, withBranch bo
 	return startAtIndex(f, i, withBranch, why)
 }
 
-// startAtIndex fills the choice for a known position. Index 0 never carries a
-// checkpoint: the phase there takes its own claim, so there is nothing to
-// resume.
+// startAtIndex fills the choice for a known position. Index 0 never carries a checkpoint: the phase
+// there takes its own claim, so there is nothing to resume.
 func startAtIndex(f startFacts, i int, withBranch bool, why string) startChoice {
 	c := startChoice{Index: i, Why: why}
 	if i == 0 {
@@ -155,9 +137,9 @@ func startAtIndex(f startFacts, i int, withBranch bool, why string) startChoice 
 	return c
 }
 
-// phaseIndex is the FIRST phase with this name. An expanded review panel is
-// several consecutive phases named review and one position to start at — its
-// first member — so a later member is never a start candidate.
+// phaseIndex is the FIRST phase with this name. An expanded review panel is several consecutive
+// phases named review and one position to start at — its first member — so a later member is
+// never a start candidate.
 func phaseIndex(phases []config.Phase, name string) int {
 	for i, ph := range phases {
 		if ph.Name == name {
@@ -167,9 +149,8 @@ func phaseIndex(phases []config.Phase, name string) int {
 	return -1
 }
 
-// handOverIndex is who owns the terminal step: the verify phase of a fix->verify
-// pair, else the last phase. It is an index, not a name, because the last phase
-// of a custom sequence need not have one.
+// handOverIndex is who owns the terminal step: the verify phase of a fix->verify pair, else the
+// last phase.
 func handOverIndex(phases []config.Phase) int {
 	if i := verifyAfterFix(phases); i >= 0 {
 		return i
@@ -177,10 +158,10 @@ func handOverIndex(phases []config.Phase) int {
 	return len(phases) - 1
 }
 
-// verifyAfterFix is the position of the verify phase immediately following a
-// fix phase — the pair drain_phases.go repeats (its fixIdx). Keyed on NAMES
-// because phase selection runs before EffectivePhases resolves prompts, and the
-// resolved-prompt predicate isVerifyPhase cannot answer for a hand-built phase.
+// verifyAfterFix is the position of the verify phase immediately following a fix phase — the pair
+// drain_phases.go repeats (its fixIdx). Keyed on NAMES because phase selection runs before
+// EffectivePhases resolves prompts, and the resolved-prompt predicate isVerifyPhase cannot answer
+// for a hand-built phase.
 func verifyAfterFix(phases []config.Phase) int {
 	at := -1
 	for i := 1; i < len(phases); i++ {
@@ -191,11 +172,8 @@ func verifyAfterFix(phases []config.Phase) int {
 	return at
 }
 
-// countedAtTip reports whether a released (State "open") record reviewed this
-// exact tip. A sealed record's findings are withheld and a void record is an
-// aborted round, so neither can hand work over. An empty tip matches nothing: a
-// record with no reviewed tip is not evidence about a branch, and treating the
-// two empties as equal would hand over work nobody reviewed.
+// countedAtTip reports whether a released (State "open") record reviewed this exact tip. Sealed and
+// void records cannot hand work over, and an empty tip matches nothing — two empties are not equal.
 func countedAtTip(records []plane.ReviewRecordState, tip string) bool {
 	if tip == "" {
 		return false
@@ -208,9 +186,9 @@ func countedAtTip(records []plane.ReviewRecordState, tip string) bool {
 	return false
 }
 
-// openMustIDs is the startFacts.OpenMustIDs list: open MUSTs on released records
-// only, in record then finding order. The plane's openMustIds is not filtered by
-// state, so a void record's MUSTs would otherwise count as work to do.
+// openMustIDs is the startFacts.OpenMustIDs list: open MUSTs on released records only, in record
+// then finding order. The plane's openMustIds is not filtered by state, so a void record's MUSTs
+// would otherwise count as work to do.
 func openMustIDs(records []plane.ReviewRecordState) []string {
 	var ids []string
 	for _, r := range records {
@@ -226,11 +204,9 @@ func openMustIDs(records []plane.ReviewRecordState) []string {
 	return ids
 }
 
-// openMustAtTip reports whether a released record reviewed this exact tip and
-// carries an open MUST itself. Only that record's own findings count: an older
-// record's MUST is not evidence that the tip needs fixing, because a review at
-// the tip that found it clean did not re-raise it. Sealed records are withheld
-// findings and void records are aborted rounds, so neither can speak.
+// openMustAtTip reports whether a released record reviewed this exact tip and carries an open MUST
+// itself. Only that record's own findings count: an older record's MUST is not evidence that the
+// tip needs fixing, because a review at the tip that found it clean did not re-raise it.
 func openMustAtTip(records []plane.ReviewRecordState, tip string) bool {
 	if tip == "" {
 		return false
@@ -240,7 +216,6 @@ func openMustAtTip(records []plane.ReviewRecordState, tip string) bool {
 			continue
 		}
 		if len(r.Findings) == 0 {
-			// A read trimmed to counts still knows the round raised MUSTs.
 			if r.Counts.Must > 0 {
 				return true
 			}

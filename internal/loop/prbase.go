@@ -15,18 +15,12 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
-// prBaseProbeTimeout bounds the one network round-trip prBaseFor runs. It is a
-// var so tests can shrink it rather than waiting out the real bound, the same
-// discipline deployGitTimeout sets in internal/cli.
+// prBaseProbeTimeout bounds the one network round-trip prBaseFor runs.
 var prBaseProbeTimeout = 30 * time.Second
 
-// prBaseFor resolves the branch this task's repo PRs target, substituted into
-// the phase briefs as {{prBase}}. The rule itself is config.ResolvePRBase, shared
-// with the deterministic close-out so both judge a repo's merge target the same.
-//
-// The probe runs afresh per phase rather than caching: a phase is spawned at most
-// a few times per task, and a cache keyed on remote state would outlive the branch
-// creations it is supposed to observe.
+// prBaseFor resolves the branch this task's repo PRs target, substituted into the phase briefs as
+// {{prBase}}. The rule itself is config.ResolvePRBase, shared with the deterministic close-out so
+// both judge a repo's merge target the same.
 func (d *Driver) prBaseFor(ctx context.Context, t Target, dir, repo string) string {
 	var probe config.PRBaseProbe
 	if d.probePRBase != nil && dir != "" {
@@ -48,8 +42,8 @@ func (d *Driver) prBaseFor(ctx context.Context, t Target, dir, repo string) stri
 	return res.Base
 }
 
-// displayRepo names the subject of a prBaseFor log line: the task's repo
-// identity when the plane supplied one, else the checkout the probe ran in.
+// displayRepo names the subject of a prBaseFor log line: the task's repo identity when the plane
+// supplied one, else the checkout the probe ran in.
 func displayRepo(dir, repo string) string {
 	if repo != "" {
 		return repo
@@ -57,30 +51,13 @@ func displayRepo(dir, repo string) string {
 	return dir
 }
 
-// ProbeOriginPRBase asks the origin remote of dir two questions in ONE network
-// round-trip: whether refs/heads/<integration> exists there, and what its
-// symbolic HEAD points at — the answers config.ResolvePRBase's resolution order
-// needs. Exported so the deterministic close-out can resolve the same merge
-// target the phase briefs were given (internal/supervisor/closeout.go).
-//
-// `git ls-remote --symref origin HEAD refs/heads/<integration>` prints the
-// symref line ("ref: refs/heads/main	HEAD") plus each matching ref, so one call
-// answers both. Reading origin is deliberate and the local origin/HEAD symref
-// is NOT an alternative: it is unset in some of this fleet's clones (the
-// makespdf-zed-extension and clankerbar-cli checkouts the task that filed this
-// recorded), and where it is set it can be stale. A remote whose HEAD is
-// detached prints no symref line: the default is then unknown and prBaseFor
-// falls back.
-//
-// The read is scoped to the account owning the remote (delivery.ScopeRemoteEnv,
-// CLA-458) exactly as the delivery verifier's own ls-remote is: without it an
-// HTTPS github origin that names no account is read as whichever gh account is
-// ACTIVE, which on the operator's machine cannot see the private lecstor repos,
-// and every probe would silently degrade to the integration-branch fallback —
-// the feature would never fire where it was filed from. Any scoping failure
-// degrades to running unscoped, the same fail-open shape delivery keeps; the
-// probe has no correctness cliff on top of it because its own failure mode is
-// prBaseFor's fallback.
+// ProbeOriginPRBase asks the origin remote of dir two questions in ONE network round-trip: whether
+// refs/heads/<integration> exists there, and what its symbolic HEAD points at — the answers
+// config.ResolvePRBase's resolution order needs. The read is scoped to the account owning the
+// remote exactly as the delivery verifier's own ls-remote is: without it an HTTPS github origin
+// that names no account is read as whichever gh account is ACTIVE, which on the operator's machine
+// cannot see the private lecstor repos, and every probe would silently degrade to the
+// integration-branch fallback — the feature would never fire where it was filed from.
 func ProbeOriginPRBase(ctx context.Context, dir, integration string) (bool, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, prBaseProbeTimeout)
 	defer cancel()
@@ -89,9 +66,9 @@ func ProbeOriginPRBase(ctx context.Context, dir, integration string) (bool, stri
 	return runOriginLsRemote(ctx, dir, integration, extraEnv)
 }
 
-// originRemoteURL reads origin's URL in dir for the credential-scoping lookup.
-// A local read: it never consults credentials, and an error (no origin, not a
-// repository) leaves the scoping empty, which means "run unscoped".
+// originRemoteURL reads origin's URL in dir for the credential-scoping lookup. A local read: it
+// never consults credentials, and an error (no origin, not a repository) leaves the scoping empty,
+// which means "run unscoped".
 func originRemoteURL(ctx context.Context, dir string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin")
 	out, err := cmd.Output()
@@ -101,12 +78,9 @@ func originRemoteURL(ctx context.Context, dir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// runOriginLsRemote is ProbeOriginPRBase's one git exec, split out so the probe
-// reads as its two answers. The environment discipline is delivery.Verifier's
-// gitRun: an unattended run has no terminal, and a git that decides to ask for
-// a password would hang the phase rather than answer. WaitDelay reaps the
-// helpers ls-remote spawns — they inherit the pipes behind these buffers, and a
-// killed git can otherwise leave the call sitting past its deadline.
+// runOriginLsRemote is ProbeOriginPRBase's one git exec, split out so the probe reads as its two
+// answers. WaitDelay reaps the helpers ls-remote spawns — they inherit the pipes behind these
+// buffers, and a killed git can otherwise leave the call sitting past its deadline.
 func runOriginLsRemote(ctx context.Context, dir, integration string, extraEnv []string) (bool, string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "ls-remote", "--symref", "origin", "HEAD", "refs/heads/"+integration)
 	cmd.Env = delivery.GitEnv(os.Environ(), extraEnv)
@@ -127,12 +101,10 @@ func runOriginLsRemote(ctx context.Context, dir, integration string, extraEnv []
 	return onOrigin, defaultBranch, nil
 }
 
-// parseOriginRefs reads runOriginLsRemote's output: the "ref: refs/heads/X
-// HEAD" symref line when the remote's HEAD is symbolic, and any line naming
-// refs/heads/<integration>. A detached remote HEAD prints no symref line, so
-// the default comes back empty and prBaseFor falls back. Exact-field matching,
-// never substring: "refs/heads/staging" must not be read as a match for an
-// integration branch named "ging".
+// parseOriginRefs reads runOriginLsRemote's output: the "ref: refs/heads/X HEAD" symref line when
+// the remote's HEAD is symbolic, and any line naming refs/heads/<integration>. Exact-field
+// matching, never substring: "refs/heads/staging" must not be read as a match for an integration
+// branch named "ging".
 func parseOriginRefs(out, integration string) (onOrigin bool, defaultBranch string) {
 	want := "refs/heads/" + integration
 	for _, line := range strings.Split(out, "\n") {
@@ -149,8 +121,8 @@ func parseOriginRefs(out, integration string) (onOrigin bool, defaultBranch stri
 	return onOrigin, defaultBranch
 }
 
-// firstLineOf trims a git stderr message to its first line, so a two-line
-// remote error does not run into the log's next sentence.
+// firstLineOf trims a git stderr message to its first line, so a two-line remote error does not run
+// into the log's next sentence.
 func firstLineOf(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return s[:i]

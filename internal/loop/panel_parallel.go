@@ -1,38 +1,6 @@
 package loop
 
-// panel_parallel.go — running a review panel's members concurrently (CLA-697).
-//
-// The panel (CLA-639) expands one review phase into N review-shaped phases.
-// Until CLA-697 the phase loop ran them one after another, which made a round
-// cost the SUM of its members' sessions. The members are independent by design
-// (D5): the same diff, no fixes, and no member sees another's findings until the
-// driver closes the round. Nothing about the review needs the ordering, so the
-// fan-out is driver-level: this file spawns the contiguous run of panel-member
-// phases at once, joins, and lets the ordinary phase loop continue at the fix.
-//
-// Two things make concurrency safe that are NOT this file's invention:
-//
-//   - the plane's heartbeat is an idempotent lease renewal — one UPDATE of
-//     last_heartbeat_at and `heartbeat_count + 1`, with no version predicate
-//     (plane: apps/web/src/repositories/runs.ts heartbeat), so N members
-//     renewing ONE run id cannot corrupt each other; and
-//   - a review record is keyed by (round, reviewerRole), and each member has a
-//     distinct positional role, so concurrent appends land as distinct rows in
-//     the same round (plane: apps/web/src/repositories/task-reviews.ts append).
-//     The round number is derived from the rows already present (max + 1 when
-//     none is sealed), which is deterministic for concurrent first writers; the
-//     duplicate check is per role, which is exactly what makes two DIFFERENT
-//     roles safe and a repeated role a retry.
-//
-// What IS this file's job is keeping the members from sharing a checkout. Each
-// member gets a DETACHED worktree at the reviewed tip, created here and removed
-// when the member ends. The worktree is throwaway by construction: a review-only
-// session changes nothing, salvage is already disabled for a review-shaped
-// phase, and a dirty member tree is logged and DISCARDED — never committed,
-// never handed to the fix phase.
-//
-// With `review_panel_concurrency: 1` none of this runs: the phase loop's shipped
-// sequential path executes, byte for byte, worktree and all.
+// panel_parallel.go — running a review panel's members concurrently.
 
 import (
 	"context"
@@ -52,28 +20,23 @@ import (
 )
 
 const (
-	// panelFetchTimeout bounds the one network call a fan-out may need: fetching
-	// a reviewed tip this checkout does not yet hold.
+	// panelFetchTimeout bounds the one network call a fan-out may need: fetching a reviewed tip this
+	// checkout does not yet hold.
 	panelFetchTimeout = 30 * time.Second
-	// panelCleanupTimeout bounds removing a member's throwaway worktree. It runs
-	// detached from the drain context so a cancelled run still cleans up, which
-	// means it needs a bound of its own.
+	// panelCleanupTimeout bounds removing a member's throwaway worktree.
 	panelCleanupTimeout = 30 * time.Second
 )
 
-// panelMemberOutcome is one member's finished pass, before the join folds it
-// into the drain's panel bookkeeping.
+// panelMemberOutcome is one member's finished pass, before the join folds it into the drain's panel
+// bookkeeping.
 type panelMemberOutcome struct {
 	label string
 	role  string
-	// optional marks a TRIAL seat (CLA-784): its end is that seat's own result
-	// and never the panel's. The join must not fold its sequence-end into the
-	// drain's run-level wait, nor let its error end the drain, and its record
-	// alone never earns a round close.
+	// optional marks a TRIAL seat: its end is that seat's own result and never the panel's. The join
+	// must not fold its sequence-end into the drain's run-level wait, nor let its error end the drain,
+	// and its record alone never earns a round close.
 	optional bool
-	// setupErr is a member whose own worktree could not be made. It is a FAILED
-	// member (recorded as INCOMPLETE), never a run error: one reviewer's checkout
-	// failing says nothing about the others.
+	// setupErr is a member whose own worktree could not be made.
 	setupErr string
 	// end/perr/stop are exactly drainPhase's returns.
 	end    phaseEnd
@@ -83,10 +46,9 @@ type panelMemberOutcome struct {
 	cost   float64
 }
 
-// panelRunOutcome is what the join hands back to drainPhases: the accumulated
-// spend and sessions, the member results in spawn order, and the panel-level
-// facts (round, incomplete list, whether anyone recorded, whether the join owes
-// a wait) it derives from them.
+// panelRunOutcome is what the join hands back to drainPhases: the accumulated spend and sessions,
+// the member results in spawn order, and the panel-level facts (round, incomplete list, whether
+// anyone recorded, whether the join owes a wait) it derives from them.
 type panelRunOutcome struct {
 	members []panelMemberOutcome
 	tokens  int
@@ -100,52 +62,30 @@ type panelRunOutcome struct {
 	failed      map[string]panelMemberFailure
 	closeFailed bool
 
-	// limitWait/sequenceEnded carry a member's run-level sequence end (a rolling
-	// limit or a transient failure) for the drain to take after the join, exactly
-	// as the sequential member handler does.
+	// limitWait/sequenceEnded carry a member's run-level sequence end (a rolling limit or a transient
+	// failure) for the drain to take after the join, exactly as the sequential member handler does.
 	limitWait     *phaseLimitWait
 	sequenceEnded bool
 	transientKey  resumedTransientKey
 
-	// claim is the last member claim observed, for the drain's iteration record
-	// (the deferred handback keeps `carried`, the run the panel resumed).
+	// claim is the last member claim observed, for the drain's iteration record (the deferred handback
+	// keeps `carried`, the run the panel resumed).
 	claim       *harness.Result
 	disposition string
 
-	// finalDead/lastProducedNothing mirror the LAST member's classification for
-	// the iteration record, exactly as the sequential loop's locals do.
+	// finalDead/lastProducedNothing mirror the LAST member's classification for the iteration record,
+	// exactly as the sequential loop's locals do.
 	finalDead           bool
 	lastProducedNothing bool
 
-	// runLost reports that a member's session was ended because the plane says
-	// the run no longer holds the task. The task is someone else's from that
-	// point: no later phase may run and nothing may be handed back.
+	// runLost reports that a member's session was ended because the plane says the run no longer holds
+	// the task.
 	runLost bool
 }
 
-// runPanelMembers runs n work functions with at most `concurrency` in flight.
-// A slot is acquired BEFORE the member's goroutine is spawned, and the loop
-// waits for that member to call started() before spawning the next, so no
-// member is spawned until its predecessor's work has begun: the panel's
-// sessions begin in the config's list order. A finished member frees its slot
-// and the next member in list order starts immediately — a backfill queue, not a
+// runPanelMembers runs n work functions with at most `concurrency` in flight. A finished member
+// frees its slot and the next member in list order starts immediately — a backfill queue, not a
 // wave barrier, so a short reviewer never waits for a long one in its batch.
-//
-// run MUST call started exactly once, as soon as its work has begun. A panel
-// member's "work" is its SESSION LAUNCH, so it passes started down to the
-// launch boundary (phaseRunOpts.onSessionLaunch) rather than calling it when its
-// checkout exists (CLA-738 review 3.2); a member that never launches — setup
-// failed, budget refused — calls it itself before returning. The test calls it
-// at the top of its callback.
-//
-// onRelease, when non-nil, is called with the member's index at the moment that
-// member releases its successor — from inside the started wrapper, before the
-// successor is unblocked, on every path that ends the wait including the
-// safety-net defer. It exists so the release POINT can be observed where a
-// release actually is, not inferred from the panel's intentions: a regression
-// that calls started() from somewhere earlier (worktree-ready) is reported
-// there, which a probe wrapped around the panel's own call site could not see
-// (CLA-757). Nil in production: it is a test seam, like panelLaunch.
 func runPanelMembers(n, concurrency int, run func(k int, started func()), onRelease func(k int)) {
 	if concurrency < 1 {
 		concurrency = 1
@@ -165,9 +105,8 @@ func runPanelMembers(n, concurrency int, run func(k int, started func()), onRele
 		go func(k int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// The defer is a safety net: a path that forgets to call started
-			// still unblocks the loop when the member ends, instead of deadlocking
-			// the panel.
+			// The defer is a safety net: a path that forgets to call started still unblocks the loop when
+			// the member ends, instead of deadlocking the panel.
 			defer release()
 			run(k, release)
 		}(k)
@@ -176,16 +115,12 @@ func runPanelMembers(n, concurrency int, run func(k int, started func()), onRele
 	wg.Wait()
 }
 
-// releaseMember is the WHOLE of a member's release: it reports the release to
-// the observer (onRelease, test-only), and only then unblocks the scheduler that
-// spawns the successor. The order is the guarantee the release-point probe rests
-// on (CLA-757): when member k+1's session launches, exactly members 0..k have
-// been released. Keeping both steps in one function makes that order structural
-// rather than two adjacent statements a later edit could silently swap: a swap
-// would leave the panel fixture green, because the successor needs a
-// `git worktree add` subprocess before it can reach its own launch and would win
-// that race every time, turning the count observed at a launch into a race.
-// TestReleaseFiresBeforeTheSuccessorIsUnblocked pins it without a schedule.
+// releaseMember is the WHOLE of a member's release: it reports the release to the observer
+// (onRelease, test-only), and only then unblocks the scheduler that spawns the successor. Keeping
+// both steps in one function makes that order structural rather than two adjacent statements a
+// later edit could silently swap: a swap would leave the panel fixture green, because the successor
+// needs a `git worktree add` subprocess before it can reach its own launch and would win that race
+// every time, turning the count observed at a launch into a race.
 func releaseMember(k int, onRelease func(k int), unblock func()) {
 	if onRelease != nil {
 		onRelease(k)
@@ -193,14 +128,10 @@ func releaseMember(k int, onRelease func(k int), unblock func()) {
 	unblock()
 }
 
-// runPanelInParallel runs phases[start:end] concurrently, each in its own
-// detached worktree at the reviewed tip. ok=false means the fan-out could not be
-// set up at all (no live claim, no repo, no resolvable tip) and the caller must
-// run the shipped sequential path instead — a worktree failure that would only
-// make one member fail does not refuse the panel.
-//
-// baseSHA is the start prep's merge-base, threaded into every member so its
-// brief diffs from the same commit a single reviewer's would.
+// runPanelInParallel runs phases[start:end] concurrently, each in its own detached worktree at the
+// reviewed tip. ok=false means the fan-out could not be set up at all (no live claim, no repo, no
+// resolvable tip) and the caller must run the shipped sequential path instead — a worktree
+// failure that would only make one member fail does not refuse the panel.
 func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Target, phases []config.Phase, start, end, concurrency int, carried *harness.Result, prior spend, baseSHA string) (*panelRunOutcome, bool) {
 	if carried == nil || !carried.Claim.Held() {
 		log.Printf("%siteration %d: the review panel has no live claim to resume — running its members sequentially",
@@ -213,10 +144,8 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			labelOf(t), drainNum, err)
 		return nil, false
 	}
-	// sessionDir returns "" for the legacy single-repo shape (nothing declared
-	// to resolve); the session then runs in the configured workdir, and so must
-	// the git probes. Never the process cwd: `git -C ""` reads the driver's own
-	// checkout, which is not the task's.
+	// sessionDir returns "" for the legacy single-repo shape (nothing declared to resolve); the
+	// session then runs in the configured workdir, and so must the git probes.
 	if baseDir == "" {
 		baseDir = t.WorkDir
 		if baseDir == "" {
@@ -239,18 +168,16 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	out := &panelRunOutcome{failed: map[string]panelMemberFailure{}, sequenceEnded: false}
 	n := end - start
 	out.members = make([]panelMemberOutcome, n)
-	// One presence beacon for the panel, not one per member: beginIteration also
-	// writes the local BEACON file (remove-then-create), and N goroutines doing
-	// that to one name would race for a line nobody reads mid-panel. The sessions
-	// themselves are reported per member in the iteration record's Sessions.
+	// One presence beacon for the panel, not one per member: beginIteration also writes the local
+	// BEACON file (remove-then-create), and N goroutines doing that to one name would race for a line
+	// nobody reads mid-panel.
 	d.beginIteration(ti, t, drainNum, claimLabel(carried.Claim), phases[start].Label(start))
 	log.Printf("%siteration %d: review panel: running %d members concurrently (cap %d), each in its own detached worktree at %s",
 		labelOf(t), drainNum, n, concurrency, shortSHA(tip))
 
-	// One shared account serves the whole panel through the Driver's per-target
-	// ledger: charge() books each member's counted spend as it lands, so every
-	// member's pre-spawn check already sees a sibling's money (CLA-697, CLA-480).
-	// Nothing extra is wired here.
+	// One shared account serves the whole panel through the Driver's per-target ledger: charge() books
+	// each member's counted spend as it lands, so every member's pre-spawn check already sees a
+	// sibling's money.
 
 	runPanelMembers(n, concurrency, func(k int, started func()) {
 		idx := start + k
@@ -264,9 +191,8 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		if werr != nil {
 			m.setupErr = "could not create its own detached worktree: " + werr.Error()
 			out.members[k] = m
-			// This member never launches a session, so nothing will fire the
-			// launch boundary: release the next member here or the panel waits
-			// forever for a session that will not run.
+			// This member never launches a session, so nothing will fire the launch boundary: release the
+			// next member here or the panel waits forever for a session that will not run.
 			started()
 			return
 		}
@@ -278,23 +204,10 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			panelState{}, phaseRunOpts{
 				worktree:      dir,
 				panelParallel: true,
-				// A member carries no runner briefing (it writes no report), so
-				// the prep's merge-base rides the opts instead: its brief must
-				// diff from the same commit the single reviewer's would.
+				// A member carries no runner briefing (it writes no report), so the prep's merge-base rides the
+				// opts instead: its brief must diff from the same commit the single reviewer's would.
 				baseSHA: baseSHA,
-				// The next member starts only once THIS member's session launch
-				// has actually begun (CLA-738 review 3.2). Signalling when the
-				// worktree was ready woke the scheduler first: a later member
-				// whose setup happened to finish sooner could reach its adapter
-				// ahead of this one, so the config list order was not the
-				// adapter/start order the panel promises.
-				//
-				// The release is also the only point a test can see the launch
-				// order exactly, so d.panelLaunch fires here, BEFORE the release:
-				// the recorded sequence cannot then be reordered by the
-				// scheduling gap between the release and the adapter call, which
-				// is what made an Invoke-entry assertion race (CLA-755
-				// 1.review-5.1).
+				// The next member starts only once THIS member's session launch has actually begun.
 				onSessionLaunch: func() {
 					if d.panelLaunch != nil {
 						d.panelLaunch(role)
@@ -308,17 +221,12 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	for k, m := range out.members {
 		out.tokens += m.tokens
 		out.cost += m.cost
-		// CLA-784: a CANCEL is the run's, not the member's, so it stops the run
-		// whoever the seat is. A budget stop is account-scoped (CLA-480): it
-		// ends this drain and exhausts the target, and the run continues with
-		// its siblings. A member's OWN Stop — credit exhaustion — is converted
-		// to a recorded failure in drainPhase before it reaches here, so an
-		// optional seat cannot end the run through this flag.
+		// CLA-784: a CANCEL is the run's, not the member's, so it stops the run whoever the seat is.
 		if m.stop {
 			out.stop = true
 		}
-		// An optional seat's error is that seat's failure, not the drain's: the
-		// panel carries on and the required members' records still reach the fix.
+		// An optional seat's error is that seat's failure, not the drain's: the panel carries on and the
+		// required members' records still reach the fix.
 		if m.perr != nil && out.err == nil && !m.optional {
 			out.err = m.perr
 		}
@@ -332,25 +240,21 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		out.finalDead = m.end.dead
 		out.lastProducedNothing = m.end.producedNothing
 		out.round = max(out.round, m.end.reviewRound)
-		// CLA-784: an optional seat's sequence-end (a rolling limit or a
-		// transient failure) is recorded against that seat and never ends the
-		// sequence or hands back the panel's shared claim. The required members
-		// still finish, the round still closes, and the fix still runs.
+		// CLA-784: an optional seat's sequence-end (a rolling limit or a transient failure) is recorded
+		// against that seat and never ends the sequence or hands back the panel's shared claim.
 		if m.end.sequenceEnd != nil && !m.optional && !out.sequenceEnded {
 			out.sequenceEnded = true
 			out.limitWait = m.end.sequenceEnd.limitWait
 			if out.limitWait == nil {
-				// The drain notes the streak when it takes the wait; this is the
-				// target+harness whose ladder the failure belongs to.
+				// The drain notes the streak when it takes the wait; this is the target+harness whose ladder
+				// the failure belongs to.
 				out.transientKey = resumedTransientKey{target: ti, harness: d.targetCfg(t).HarnessFor(phases[start+k])}
 			}
 		}
 	}
 
-	// Judge every member exactly as the sequential handler does: recorded, or
-	// named INCOMPLETE with the reason. The plane is asked only for the members
-	// whose session ended the sequence before the seam could match the record —
-	// the same narrow question the sequential path asks (CLA-639 fix pass 4).
+	// Judge every member exactly as the sequential handler does: recorded, or named INCOMPLETE with
+	// the reason.
 	live := carried != nil && carried.Claim.Held()
 	for k, m := range out.members {
 		recorded := m.end.reviewRecorded || m.end.reviewCloseFailed
@@ -363,10 +267,8 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			}
 		}
 		if recorded {
-			// CLA-784: a required member's record is a review; an optional
-			// (trial) seat's record is that seat's own result. It still resets
-			// the member's failure streak, but a round where ONLY optional seats
-			// recorded earns no close and no fix.
+			// CLA-784: a required member's record is a review; an optional (trial) seat's record is that
+			// seat's own result.
 			if !m.optional {
 				out.recorded = true
 			}
@@ -378,11 +280,8 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		out.failed[m.role] = panelMemberFailure{reason: reason, optional: m.optional}
 		verdict := "recording it as failed"
 		if m.end.windowHeld {
-			// CLA-947 review 1.review-1.6: the fan-out's own hold runs over every
-			// member's list, so this is the race where a window opened between
-			// that check and the spawn. The seat is named INCOMPLETE (the fix
-			// brief must know it is empty) but charged to nobody: a schedule is
-			// not a harness fault.
+			// CLA-947 review 1.review-1.6: the fan-out's own hold runs over every member's list, so this is
+			// the race where a window opened between that check and the spawn.
 			verdict = "a pricing window opened before it could spawn; not counted against the member"
 		}
 		log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — %s",
@@ -390,9 +289,9 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		if !m.end.windowHeld && !m.end.deadBooked && !m.end.runLost {
 			d.tallyEmpty(m.label, d.targetCfg(t).HarnessFor(phases[start+k]))
 		}
-		// The streak is charged only for a member that actually failed: a
-		// window-held seat never ran, so counting it would let a schedule put a
-		// healthy reviewer's harness on the "not producing reviews" warning.
+		// The streak is charged only for a member that actually failed: a window-held seat never ran, so
+		// counting it would let a schedule put a healthy reviewer's harness on the "not producing
+		// reviews" warning.
 		if !m.end.windowHeld {
 			if n := d.panelMemberFailed(m.label); n >= panelMemberFailBound {
 				ph := phases[start+k]
@@ -403,10 +302,8 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		}
 	}
 
-	// Close the round once, by the live holder, before anything hands the claim
-	// back — a sealed round would be voided by a takeover and every member's
-	// record lost. A close is owed only when a member recorded; a panel where
-	// none did has no round to release and ends without a fix.
+	// Close the round once, by the live holder, before anything hands the claim back — a sealed
+	// round would be voided by a takeover and every member's record lost.
 	if out.recorded && out.round > 0 && live {
 		if cerr := d.closeReviewRound(ctx, t, *carried, out.round); cerr != nil {
 			log.Printf("%siteration %d: the panel's round %d could not be closed (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
@@ -420,11 +317,9 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	return out, true
 }
 
-// panelIncompleteRole is how a failed panel member is named in the INCOMPLETE
-// log line: its positional reviewer role, marked "(optional)" for a TRIAL seat
-// (CLA-784), so an operator can tell a required reviewer's failure from a seat
-// we were only evaluating. The role stays first, so anything keying on it still
-// matches.
+// panelIncompleteRole is how a failed panel member is named in the INCOMPLETE log line: its
+// positional reviewer role, marked "(optional)" for a TRIAL seat, so an operator can tell a
+// required reviewer's failure from a seat we were only evaluating.
 func panelIncompleteRole(role string, optional bool) string {
 	if optional {
 		return role + " (optional)"
@@ -432,8 +327,8 @@ func panelIncompleteRole(role string, optional bool) string {
 	return role
 }
 
-// panelMemberFailureReason names why a member produced no durable record, in the
-// same words the sequential handler uses.
+// panelMemberFailureReason names why a member produced no durable record, in the same words the
+// sequential handler uses.
 func panelMemberFailureReason(m panelMemberOutcome) string {
 	switch {
 	case m.setupErr != "":
@@ -457,8 +352,8 @@ func panelMemberFailureReason(m panelMemberOutcome) string {
 	}
 }
 
-// shortSHA is the first 12 characters of a commit id for a log line; the full
-// id is in the member's own log when it matters.
+// shortSHA is the first 12 characters of a commit id for a log line; the full id is in the member's
+// own log when it matters.
 func shortSHA(sha string) string {
 	if len(sha) > 12 {
 		return sha[:12]
@@ -466,8 +361,7 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// panelRepoRoot is the git top-level of dir: the checkout the worktrees are
-// created from.
+// panelRepoRoot is the git top-level of dir: the checkout the worktrees are created from.
 func panelRepoRoot(ctx context.Context, dir string) (string, error) {
 	if strings.TrimSpace(dir) == "" {
 		return "", fmt.Errorf("no checkout to read")
@@ -482,27 +376,21 @@ func panelRepoRoot(ctx context.Context, dir string) (string, error) {
 	return out, nil
 }
 
-// panelReviewedTip is the commit every member must review: the tip the
-// checkpoint verified on the origin remote. A branchless or UNVERIFIED
-// checkpoint has no such tip and refuses the fan-out — the sequential path lets
-// each reviewer establish the hand-off itself, which is what the unverified
-// brief prescribes.
+// panelReviewedTip is the commit every member must review: the tip the checkpoint verified on the
+// origin remote. A branchless or UNVERIFIED checkpoint has no such tip and refuses the fan-out —
+// the sequential path lets each reviewer establish the hand-off itself, which is what the
+// unverified brief prescribes.
 func panelReviewedTip(ctx context.Context, dir string, prev *harness.Result) (string, bool) {
 	if prev == nil || prev.Claim.Branch == "" || prev.CheckpointTip == "" {
 		// A BRANCHLESS or UNVERIFIED checkpoint has no tip the driver verified.
-		// The sequential path lets each reviewer establish the hand-off itself,
-		// which is exactly what the unverified brief prescribes; fanning out on a
-		// guessed local ref would let members review a revision nobody verified.
 		return "", false
 	}
 	tip := prev.CheckpointTip
 	if panelHasCommit(ctx, dir, tip) {
 		return tip, true
 	}
-	// The seam verified the tip on the ORIGIN remote, which does not mean
-	// this checkout has the object. Fetch the reviewed branch and demand the
-	// exact tip: a branch that moved since the checkpoint is not the revision
-	// the review is for, and the sequential path is the safe answer.
+	// The seam verified the tip on the ORIGIN remote, which does not mean this checkout has the
+	// object.
 	fctx, cancel := context.WithTimeout(ctx, panelFetchTimeout)
 	ferr := panelFetch(fctx, dir, "origin", prev.Claim.Branch)
 	cancel()
@@ -525,19 +413,16 @@ func panelFetch(ctx context.Context, dir, remote, branch string) error {
 	return err
 }
 
-// panelHasCommit reports whether the checkout already holds commit-ish (no
-// network): an object present in the shared object database needs no fetch.
+// panelHasCommit reports whether the checkout already holds commit-ish (no network): an object
+// present in the shared object database needs no fetch.
 func panelHasCommit(ctx context.Context, dir, commitish string) bool {
 	_, err := panelGit(ctx, dir, "cat-file", "-e", commitish+"^{commit}")
 	return err == nil
 }
 
-// createPanelWorktree makes the member's own DETACHED checkout at tip. The
-// directory is unique and does not pre-exist: git itself refuses an existing
-// path, so the driver cannot accidentally adopt a tree somebody else owns. It
-// lives in the fleet's worktrees directory when that exists (the project-root
-// layout), else beside the checkout's conventional `-wt` area, else the OS temp
-// directory — each still inside a directory the session is allowed to use.
+// createPanelWorktree makes the member's own DETACHED checkout at tip. The directory is unique and
+// does not pre-exist: git itself refuses an existing path, so the driver cannot accidentally adopt
+// a tree somebody else owns.
 func (d *Driver) createPanelWorktree(ctx context.Context, repoRoot, tip, label string) (string, error) {
 	root := panelWorktreeRoot(repoRoot)
 	dir := filepath.Join(root, fmt.Sprintf("panel-%s-%s-%s", sanitizePanelLabel(label), time.Now().Format("20060102-150405"), randomTail()))
@@ -550,11 +435,10 @@ func (d *Driver) createPanelWorktree(ctx context.Context, repoRoot, tip, label s
 	return dir, nil
 }
 
-// removePanelWorktree discards a member's throwaway checkout. A dirty tree is
-// reported (paths, first line each) and then discarded: a review-only session's
-// deliverable is its DURABLE record, and salvage from this tree is forbidden by
-// design — committing a member's generated artifacts would move the tip past the
-// revision every member recorded.
+// removePanelWorktree discards a member's throwaway checkout. A dirty tree is reported (paths,
+// first line each) and then discarded: a review-only session's deliverable is its DURABLE record,
+// and salvage from this tree is forbidden by design — committing a member's generated artifacts
+// would move the tip past the revision every member recorded.
 func (d *Driver) removePanelWorktree(repoRoot, dir string) {
 	if dir == "" {
 		return
@@ -578,9 +462,8 @@ func (d *Driver) removePanelWorktree(repoRoot, dir string) {
 	}
 }
 
-// panelWorktreeRoot picks where a member's worktree is made, preferring the
-// fleet's own worktrees directory so it sits inside the project's permission
-// scope.
+// panelWorktreeRoot picks where a member's worktree is made, preferring the fleet's own worktrees
+// directory so it sits inside the project's permission scope.
 func panelWorktreeRoot(repoRoot string) string {
 	if root, ok := fleetWorktreeRoot(repoRoot); ok {
 		return root
@@ -588,21 +471,20 @@ func panelWorktreeRoot(repoRoot string) string {
 	return os.TempDir()
 }
 
-// fleetWorktreeRoot resolves the fleet's worktree area for a checkout. ok=false
-// means no known layout exists; each caller supplies its own fallback, because a
-// panel tree is throwaway and a task tree is not.
+// fleetWorktreeRoot resolves the fleet's worktree area for a checkout. ok=false means no known
+// layout exists; each caller supplies its own fallback, because a panel tree is throwaway and a
+// task tree is not.
 func fleetWorktreeRoot(repoRoot string) (string, bool) {
 	abs, err := filepath.Abs(repoRoot)
 	if err != nil {
 		return "", false
 	}
-	// The checkout may already BE a worktree under <project>/worktrees/<name>;
-	// its parent is then the fleet's area.
+	// The checkout may already BE a worktree under <project>/worktrees/<name>; its parent is then the
+	// fleet's area.
 	if filepath.Base(filepath.Dir(abs)) == config.WorktreesDirName {
 		return filepath.Dir(abs), true
 	}
-	// The documented per-project layout: <project root>/worktrees beside the
-	// repo clone.
+	// The documented per-project layout: <project root>/worktrees beside the repo clone.
 	if wt := filepath.Join(filepath.Dir(abs), config.WorktreesDirName); isDir(wt) {
 		return wt, true
 	}
@@ -635,9 +517,9 @@ func sanitizePanelLabel(label string) string {
 	return b.String()
 }
 
-// panelGit runs one git command with the same non-interactive environment the
-// driver's other git reads use: an unattended run has no terminal, and a git
-// that decides to ask for a password would hang a member instead of failing it.
+// panelGit runs one git command with the same non-interactive environment the driver's other git
+// reads use: an unattended run has no terminal, and a git that decides to ask for a password would
+// hang a member instead of failing it.
 func panelGit(ctx context.Context, dir string, args ...string) (string, error) {
 	return panelGitWithEnv(ctx, dir, nil, args...)
 }

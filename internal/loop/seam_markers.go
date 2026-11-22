@@ -5,36 +5,24 @@ import (
 	"log"
 )
 
-// STOP and RESTART act at a VERIFIED PHASE SEAM as well as between iterations
-// (CLA-879). Releasing a checkpointed claim at the seam lets the next claim
-// resume at the following phase from `phasesDone`, so a stop or roll waits one
-// phase session instead of a whole task sequence.
-//
-// A seam is only safe where the resume mechanism actually exists: a
-// runner-claimed drain whose checkpoint is verified. PROJECT PAUSE is
-// deliberately not read here — it gates new claims and lets the in-flight task
-// finish every phase (decision 6019ea26-1464-43a3-a152-3271510b8b42). RELOAD,
-// RESTART_NOW and HALT keep their existing boundaries.
+// STOP and RESTART act at a VERIFIED PHASE SEAM as well as between iterations. A seam is only safe
+// where the resume mechanism actually exists: a runner-claimed drain whose checkpoint is verified.
 func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx int, nextPhase string) bool {
 	d := s.d
-	// Only a runner-claimed sequence writes `phasesDone`, and only a checkpoint
-	// with a next phase would resume anywhere. Everything else keeps today's
-	// iteration-boundary handling.
+	// Only a runner-claimed sequence writes `phasesDone`, and only a checkpoint with a next phase
+	// would resume anywhere.
 	if d.state == nil || s.carried == nil || !s.runnerClaimed || !st.end.checkpoint ||
 		nextIdx < 0 || nextIdx >= len(s.phases) {
 		return false
 	}
-	// Verified checkpoints only. The CLA-576 unverified form writes no
-	// `phasesDone` marker (markPhaseDone skips it), and a HANDOFF checkpoint
-	// writes none either — markPhaseDone cannot know yet whether the handoff
-	// will be accepted, so it skips them all. Acting on either would let the
-	// next claim re-run this phase instead of resuming the next.
+	// Verified checkpoints only. The CLA-576 unverified form writes no `phasesDone` marker
+	// (markPhaseDone skips it), and a HANDOFF checkpoint writes none either — markPhaseDone cannot
+	// know yet whether the handoff will be accepted, so it skips them all.
 	if s.carried.CheckpointUnverified || st.end.handoff != "" {
 		return false
 	}
-	// Read-then-remove is not atomic; controlMu serialises it against a
-	// concurrent waitOrStop consumer of the same markers. Held only for the
-	// read — the claim release below reaches the plane and must not block it.
+	// Read-then-remove is not atomic; controlMu serialises it against a concurrent waitOrStop consumer
+	// of the same markers.
 	d.controlMu.Lock()
 	var marker, msg string
 	if present, m := d.readMarker("STOP"); present {
@@ -49,15 +37,14 @@ func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx in
 		return false
 	}
 
-	// Release exactly as the RESTART_NOW path does, through the drain's own
-	// handback: a held claim with no pushed work goes straight back to the
-	// queue; one with pushed work has its lease ended so the takeover hand-off
-	// survives. There is no session to kill — the phase has already ended.
+	// Release exactly as the RESTART_NOW path does, through the drain's own handback: a held claim
+	// with no pushed work goes straight back to the queue; one with pushed work has its lease ended so
+	// the takeover hand-off survives.
 	ref := claimLabel(s.carried.Claim)
 	pushed := !s.carried.Claim.Releasable()
 	handed, _ := d.handBackClaim(ctx, s.t, *s.carried, false)
-	// A FAILED handback keeps the claim: the deferred handback at the end of the
-	// drain is a free retry before the daemon exits.
+	// A FAILED handback keeps the claim: the deferred handback at the end of the drain is a free retry
+	// before the daemon exits.
 	if handed {
 		s.carried = nil
 	}

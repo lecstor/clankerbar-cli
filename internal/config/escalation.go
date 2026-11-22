@@ -1,7 +1,4 @@
-// Escalation holds config-owned review-tier escalation rules (CLA-379).
-// Two mechanical triggers, both operator-owned and both evaluated by the CLI
-// at review-spawn time — the plane holds the rules; the CLI only evaluates the
-// diff and reports which rule fired (operator decision 2026-08-23).
+// Escalation holds config-owned review-tier escalation rules.
 package config
 
 import (
@@ -11,34 +8,29 @@ import (
 
 // EscalationRule is one path-glob or category mapping.
 type EscalationRule struct {
-	// Match is either a glob pattern against changed paths (path trigger) or
-	// a category value (task-declared risk trigger).
+	// Match is either a glob pattern against changed paths (path trigger) or a category value
+	// (task-declared risk trigger).
 	Match string `json:"match"`
 
 	// Tier is the tier bucket to escalate TO ("strong", etc.).
 	Tier string `json:"tier"`
 }
 
-// Escalation is the per-project escalation block in CLI config.
-// Both triggers are mechanical and operator-owned; no content-based
-// classification, and escalation only ever raises (standard -> strong),
-// never lowers. If both triggers fire, the result is the same single
-// escalation (the tier is raised once).
+// Escalation is the per-project escalation block in CLI config. Both triggers are mechanical and
+// operator-owned; no content-based classification, and escalation only ever raises (standard ->
+// strong), never lowers.
 type Escalation struct {
-	// PathRules maps file-path globs to tier bucket names. Any changed path
-	// that matches any glob escalates the review phase to that tier.
+	// PathRules maps file-path globs to tier bucket names. Any changed path that matches any glob
+	// escalates the review phase to that tier.
 	PathRules map[string]string `json:"path_rules"`
 
-	// CategoryRules maps task category values to tier bucket names. Any
-	// claimed task whose category matches escalates its review phase.
+	// CategoryRules maps task category values to tier bucket names. Any claimed task whose category
+	// matches escalates its review phase.
 	CategoryRules map[string]string `json:"category_rules"`
 }
 
-// Evaluate returns the escalated tier (if any) and which rule fired.
-// It takes the changed file paths from the branch diff and the task's
-// category. Only raises; never lowers; empty rules change nothing.
-// matchGlob matches a file path against a glob that may contain "**" for
-// recursive directory matching (any number of levels).
+// Evaluate returns the escalated tier (if any) and which rule fired. Only raises; never lowers;
+// empty rules change nothing.
 func matchGlob(glob, path string) bool {
 	// If no **, use standard filepath.Match.
 	if !strings.Contains(glob, "**") {

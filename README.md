@@ -3148,6 +3148,10 @@ the catch-all matches last, denying every read.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 - [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
 - [`docs/agent-events.md`](./docs/agent-events.md) - the agent event channel the CLI feeds: what the claude and opencode adapters emit in the activity and transcript tiers, the project dials and the machine-local opt-out, batching, sequence numbering, the 50 MB transcript cap and CLI-side redaction.
+- [`docs/loop-rationale.md`](./docs/loop-rationale.md) - the design and process reasoning behind the loop: polling and drains, phase sequencing, claims and checkpoints, budgets, dead-phase bounds, worktrees, routes and waits.
+- [`docs/config-rationale.md`](./docs/config-rationale.md) - the reasoning behind the configuration surface: defaults and their calibration, layering and precedence, validation, prompts, budgets, endpoints and trust.
+- [`docs/harness-rationale.md`](./docs/harness-rationale.md) - the adapter contract and per-CLI behaviour: invocation, permissions, stream/event parsing, usage and limits, resumes and session hand-offs.
+- [`docs/doctor-rationale.md`](./docs/doctor-rationale.md) - what each doctor check reads, what it refuses, and the failure each warning is meant to catch.
 
 ## License
 

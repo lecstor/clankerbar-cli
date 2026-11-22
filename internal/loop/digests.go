@@ -14,10 +14,9 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// findingIDRound parses the round prefix out of a plane finding id
-// (`<round>.<reviewer role>.<n>`, B13). The plane assigns and serves these
-// namespaced ids (CLA-636); the driver reads the round back rather than
-// tracking one of its own, so the derivation survives a takeover.
+// findingIDRound parses the round prefix out of a plane finding id (`<round>.<reviewer role>.<n>`,
+// B13). The plane assigns and serves these namespaced ids; the driver reads the round back rather
+// than tracking one of its own, so the derivation survives a takeover.
 func findingIDRound(id string) (int, bool) {
 	dot := strings.Index(id, ".")
 	if dot <= 0 {
@@ -30,18 +29,10 @@ func findingIDRound(id string) (int, bool) {
 	return n, true
 }
 
-// verificationDigest is the driver's brief for a verification round (CLA-638):
-// the prior open MUST ids, their findings, and the delta base, read from the
-// plane's released records and PREPENDED to the verify brief the way the fix
-// phase's graded list is. It exists because ids and rounds are plane state, not
-// config: the driver reads them after the previous round closed and hands the
-// session exactly what it must adjudicate.
-//
-// A record still sealed or void contributes nothing: a sealed round's findings
-// are withheld by design (B2), and a void round never happened (B4). An empty
-// open list is not an empty digest — the session is still told the delta base
-// and that the gate currently reads as clear, so a verifier that sees a problem
-// states it rather than silently passing a hand-over it cannot explain.
+// verificationDigest is the driver's brief for a verification round: the prior open MUST ids, their
+// findings, and the delta base, read from the plane's released records and PREPENDED to the verify
+// brief the way the fix phase's graded list is. A record still sealed or void contributes nothing:
+// a sealed round's findings are withheld by design (B2), and a void round never happened (B4).
 func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string, recordsTotal int) string {
 	byID := map[string]plane.ReviewFindingState{}
 	newestRound, newestTip, newestCycle := 0, "", 0
@@ -56,9 +47,9 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 			newestCycle = r.Cycle
 		}
 	}
-	// cycleOf maps a finding to its record's cycle, so the settled list below is
-	// this review cycle's alone: a human verdict starts a new cycle, and the
-	// previous cycle's MUSTs were judged by that verdict, not by this round.
+	// cycleOf maps a finding to its record's cycle, so the settled list below is this review cycle's
+	// alone: a human verdict starts a new cycle, and the previous cycle's MUSTs were judged by that
+	// verdict, not by this round.
 	cycleOf := map[string]int{}
 	for _, r := range records {
 		if r.State == "sealed" || r.State == "void" {
@@ -69,9 +60,7 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 			cycleOf[f.ID] = r.Cycle
 		}
 	}
-	// The plane's openMustIds is the authoritative gate input (CLA-636); the
-	// records supply the finding detail. Union them, so a findings block
-	// truncated by the read budget still yields every id it must adjudicate.
+	// The plane's openMustIds is the authoritative gate input; the records supply the finding detail.
 	openIDs := append([]string(nil), openMustIDs...)
 	seen := map[string]bool{}
 	for _, id := range openMustIDs {
@@ -84,12 +73,11 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 		}
 	}
 	sort.Strings(openIDs)
-	// CLA-671: the fix phase marks the MUSTs it answers `fixed` or `refuted`
-	// itself, so a verifier handed only the OPEN list never sees a refutation —
-	// it changes no code, so the delta does not show it either — and a wrong one
-	// rode to in_review unexamined. Every MUST of this cycle already marked
-	// settled is listed for the verifier to confirm (leave it) or reject (set it
-	// back to open). Bounded: the round cap keeps a cycle to three rounds.
+	// CLA-671: the fix phase marks the MUSTs it answers `fixed` or `refuted` itself, so a verifier
+	// handed only the OPEN list never sees a refutation — it changes no code, so the delta does not
+	// show it either — and a wrong one rode to in_review unexamined. Every MUST of this cycle
+	// already marked settled is listed for the verifier to confirm (leave it) or reject (set it back
+	// to open).
 	var settledIDs []string
 	for id, f := range byID {
 		if f.Severity != "must" || f.Status == "open" || seen[id] {
@@ -101,10 +89,9 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 		settledIDs = append(settledIDs, id)
 	}
 	sort.Strings(settledIDs)
-	// The plane serves only the newest records, and their findings within a byte
-	// budget (get_task's reviews block); open MUST ids survive the trim, settled
-	// ones do not. Say what was left out, so a verifier never reads a partial
-	// settled list as the whole of it.
+	// The plane serves only the newest records, and their findings within a byte budget (get_task's
+	// reviews block); open MUST ids survive the trim, settled ones do not. Say what was left out, so a
+	// verifier never reads a partial settled list as the whole of it.
 	var unserved []string
 	for _, r := range records {
 		if r.State == "sealed" || r.State == "void" {
@@ -160,53 +147,13 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 	return b.String()
 }
 
-// planeUnparkOption is the plane's own unpark offer, byte for byte
-// (ESCALATION_UNPARK_OPTION, apps/web/src/server/mcp/stale.ts). The console acts
-// on an answered question by VALUE: when the operator picks exactly this string,
-// it sets the task back to ready. Any other wording is prose the plane does not
-// act on, so the round-cap park offers this one verbatim for the unpark path.
+// planeUnparkOption is the plane's own unpark offer, byte for byte (ESCALATION_UNPARK_OPTION,
+// apps/web/src/server/mcp/stale.ts).
 const planeUnparkOption = "Set it back to `ready` — the blocker is gone, let the fleet try again"
 
-// mergedFindingsDigest is the fix phase's work list when the review ran as a
-// PANEL (CLA-639, B11): every finding from every member's released record, in
-// one list, with the union rule the design settled on (A1).
-//
-//   - Every MUST from ANY member is open and printed by its plane id. Consensus
-//     never filters a MUST out — the evidence that motivated the panel (section
-//     1.2) is two blockers a single reviewer missed entirely, so the union is the
-//     gate.
-//   - SHOULD and NIT are listed with the members that raised them, so the fixer
-//     can see which are opinions repeated by two reviewers and which are one
-//     reviewer's preference. They are recorded, never gating.
-//
-// The driver builds the list, never the fixer (B11/D3): the fixer applies it and
-// has no vote on severity — a MUST it disagrees with is refuted through the
-// plane, not downgraded here.
-//
-// expected is the panel's reviewer roles, in order, as the driver resolved them.
-// A role with no record in round is named INCOMPLETE: that is the member a
-// dead, capped or failed session never got to record, and the fixer must know
-// the list is the union of the reviewers that RAN, not of the panel that was
-// meant to. round is the panel's round; 0 means no record was matched at all.
-//
-// Round and status are BOTH filters (CLA-639 S1). The round is the one this
-// panel actually wrote: listing every released record would relist an earlier
-// cycle's findings after a verify rewind, and a member that recorded in an
-// earlier round would count as having recorded THIS one. The status filter
-// drops every finding the plane already shows settled — fixed, refuted or filed
-// by the fix phase's own findingUpdates, or by a verifier — because handing the
-// fixer a settled MUST back as open work is how a fix round spends itself
-// re-fixing what already landed. An open (`""`/`open`) finding is the list.
-//
-// Empty only when there is nothing to grade (no member recorded and none is
-// missing) — the shipped single-review path then keeps its own digest, so a
-// config with no panel is byte-for-byte unchanged.
-//
-// failed carries, per reviewer role, the reason that member recorded nothing
-// and whether the seat was a TRIAL one (CLA-639 M4, CLA-784): naming the
-// missing member is not enough for the fixer to judge whether the short list is
-// bad luck or a member that never ran, and a trial seat's failure must not read
-// as a lost required reviewer.
+// mergedFindingsDigest is the fix phase's work list when the review ran as a PANEL: every finding
+// from every member's released record, in one list, with the union rule the design settled on (A1).
+// - Every MUST from ANY member is open and printed by its plane id.
 func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, round int, failed map[string]panelMemberFailure) string {
 	type merged struct {
 		finding plane.ReviewFindingState
@@ -221,19 +168,15 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 		if r.State == "sealed" || r.State == "void" || (round > 0 && r.Round != round) {
 			continue
 		}
-		// Only a RELEASED record counts as this member having recorded — a sealed
-		// one exists but its findings are withheld, so the fixer is seeing the
-		// panel's shape without its content. It counts even when EVERY finding in
-		// it is settled: the member did record, and saying it did not would read
-		// as a lost reviewer.
+		// Only a RELEASED record counts as this member having recorded — a sealed one exists but its
+		// findings are withheld, so the fixer is seeing the panel's shape without its content.
 		recorded[r.ReviewerRole] = true
 		if r.FindingsTotal > len(r.Findings) {
 			unserved = append(unserved, fmt.Sprintf("%s: %d of %d finding(s) not served", r.ReviewerRole, r.FindingsTotal-len(r.Findings), r.FindingsTotal))
 		}
 		for _, f := range r.Findings {
-			// A finding the plane already shows settled is not open work. The
-			// statuses are the plane's own (CLA-636): "", "open", "fixed",
-			// "refuted", "filed", and any future one is treated as NOT open — a
+			// A finding the plane already shows settled is not open work. The statuses are the plane's own:
+			// "", "open", "fixed", "refuted", "filed", and any future one is treated as NOT open — a
 			// status the driver does not know is not evidence that work remains.
 			switch f.Status {
 			case "", "open":
@@ -253,11 +196,8 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 			missing = append(missing, role)
 		}
 	}
-	// Nothing to grade at all: no finding to list, no member missing, and nothing
-	// the plane shows settled either — the shipped single-review path then keeps
-	// its own digest, byte for byte. A round whose findings are ALL settled is
-	// not nothing: the fixer is told what this round holds and that every one of
-	// them is already answered.
+	// Nothing to grade at all: no finding to list, no member missing, and nothing the plane shows
+	// settled either — the shipped single-review path then keeps its own digest, byte for byte.
 	if len(ids) == 0 && len(missing) == 0 && settled == 0 {
 		return ""
 	}
@@ -274,15 +214,14 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 	if settled > 0 {
 		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through "+config.ReviewFindingsCall+", not by re-fixing it blind.\n", settled)
 	}
-	// CLA-639 M5: a panel member writes no `## Review` block — its record is the
-	// durable one — so the fixer must not wait for a block to preserve, and its
-	// own outcome is where this merged list reaches the task.
+	// CLA-639 M5: a panel member writes no `## Review` block — its record is the durable one — so
+	// the fixer must not wait for a block to preserve, and its own outcome is where this merged list
+	// reaches the task.
 	b.WriteString("No panel member wrote a `## Review` block into the task's outcome (each writes only its sealed record), so there is no block to keep verbatim and no legacy copy to rely on: your outcome is the only place this round's result reaches the task. Keep everything the outcome already carries unchanged, answer EVERY finding above in it by its plane id (severity, one line on what it was, and what you did about it), and add your `### Fixes` list.\n")
 	if len(missing) > 0 {
-		// CLA-784: a trial seat is marked `(optional)` in the fix brief exactly
-		// as the daemon log marks it — in BOTH the INCOMPLETE sentence and the
-		// per-member line — so the fixer never reads a lost trial seat as a lost
-		// required reviewer.
+		// CLA-784: a trial seat is marked `(optional)` in the fix brief exactly as the daemon log marks
+		// it — in BOTH the INCOMPLETE sentence and the per-member line — so the fixer never reads a
+		// lost trial seat as a lost required reviewer.
 		names := make([]string, len(missing))
 		for i, role := range missing {
 			names[i] = panelIncompleteRole(role, failed[role].optional)
@@ -320,10 +259,9 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 	return b.String()
 }
 
-// mergedFindingLine is one finding as the merged list prints it: its plane id,
-// reviewer, location, summary and required fix — the same fields the shipped
-// digest prints, plus the member, because "who raised this" is the field the
-// panel exists to make visible.
+// mergedFindingLine is one finding as the merged list prints it: its plane id, reviewer, location,
+// summary and required fix — the same fields the shipped digest prints, plus the member, because
+// "who raised this" is the field the panel exists to make visible.
 func mergedFindingLine(f plane.ReviewFindingState, r plane.ReviewRecordState) string {
 	loc := f.File
 	if f.Line > 0 {
@@ -348,16 +286,9 @@ func mergedFindingLine(f plane.ReviewFindingState, r plane.ReviewRecordState) st
 	return line + "\n"
 }
 
-// panelRoles lists the reviewer roles a fix phase's prompt should treat as the
-// panel: the member phases immediately before it in the CAPTURED sequence.
-// Empty when the phase does not follow a panel, which is the shipped
-// single-review shape.
-//
-// The role is POSITIONAL (`reviewerRoleFor`), never the member's log label. The
-// durable record and the seam gate are keyed on the positional role, so a named
-// member (`alpha`) writes `review-1`; returning the label here would make the
-// merged list look for an `alpha` record and report a member that recorded as
-// INCOMPLETE (CLA-639).
+// panelRoles lists the reviewer roles a fix phase's prompt should treat as the panel: the member
+// phases immediately before it in the CAPTURED sequence. The role is POSITIONAL
+// (`reviewerRoleFor`), never the member's log label.
 func panelRoles(phases []config.Phase, fixIdx int) []string {
 	var roles []string
 	for i := fixIdx - 1; i >= 0 && phases[i].IsPanelMember(); i-- {
@@ -366,9 +297,8 @@ func panelRoles(phases []config.Phase, fixIdx int) []string {
 	return roles
 }
 
-// openMustFixDigest is the fix phase's work list across rounds (CLA-671): every
-// MUST the plane shows open on any released record, with its detail. Empty when
-// none is open, which on a first fix round is the review's own list anyway.
+// openMustFixDigest is the fix phase's work list across rounds: every MUST the plane shows open on
+// any released record, with its detail.
 func openMustFixDigest(records []plane.ReviewRecordState, openMustIDs []string) string {
 	if len(openMustIDs) == 0 {
 		return ""
@@ -393,9 +323,9 @@ func openMustFixDigest(records []plane.ReviewRecordState, openMustIDs []string) 
 	return b.String()
 }
 
-// digestFindingLine is one MUST as the verification digest lists it: id, round,
-// location, what is wrong and the required fix, plus — for a finding already
-// marked settled — its status and the evidence the marking carries.
+// digestFindingLine is one MUST as the verification digest lists it: id, round, location, what is
+// wrong and the required fix, plus — for a finding already marked settled — its status and the
+// evidence the marking carries.
 func digestFindingLine(id string, byID map[string]plane.ReviewFindingState) string {
 	f, ok := byID[id]
 	if !ok {
@@ -432,8 +362,8 @@ func digestFindingLine(id string, byID map[string]plane.ReviewFindingState) stri
 	return line + "\n"
 }
 
-// orNone is a digest field's text, or a visible placeholder when the plane
-// carries none, so a marking with no evidence reads as exactly that.
+// orNone is a digest field's text, or a visible placeholder when the plane carries none, so a
+// marking with no evidence reads as exactly that.
 func orNone(s string) string {
 	if s = strings.TrimSpace(s); s == "" {
 		return "none given"
@@ -441,13 +371,11 @@ func orNone(s string) string {
 	return s
 }
 
-// branchlessVerificationDigest is verificationDigest for a BRANCHLESS task
-// (CLA-638 × CLA-670): the branchless review writes no durable record (question
-// 03a12578, option 1), so there are no plane finding ids for the round to
-// adjudicate. The digest therefore hands the verifier the LAST `## Review`
-// block itself — the block IS this shape's round record — and says so up front,
-// because the empty record set is expected here and must not read as a failed
-// hand-off.
+// branchlessVerificationDigest is verificationDigest for a BRANCHLESS task: the branchless review
+// writes no durable record (question 03a12578, option 1), so there are no plane finding ids for the
+// round to adjudicate. The digest therefore hands the verifier the LAST `## Review` block itself
+// — the block IS this shape's round record — and says so up front, because the empty record set
+// is expected here and must not read as a failed hand-off.
 func branchlessVerificationDigest(outcome string) string {
 	block := lastReviewBlock(outcome)
 	if block == "" {
@@ -458,12 +386,8 @@ func branchlessVerificationDigest(outcome string) string {
 		config.ReviewRecordHeading + "` block below IS this round's record — adjudicate it in its own terms, not by a plane id. The fix round amended it; verify the amendment.\n\n" + block + "\n"
 }
 
-// resolvedFindingIDs lists the MUST ids on released records that a verifier has
-// ALREADY marked resolved (fixed, filed or refuted). The driver remembers them
-// across the round loop: an id that is open again in a later round was reopened
-// after a verifier marked it resolved, which is non-convergence and parks the
-// task (A6). Sealed and void records contribute nothing, exactly as in the
-// digest.
+// resolvedFindingIDs lists the MUST ids on released records that a verifier has ALREADY marked
+// resolved (fixed, filed or refuted).
 func resolvedFindingIDs(records []plane.ReviewRecordState) []string {
 	var out []string
 	for _, r := range records {
@@ -479,9 +403,8 @@ func resolvedFindingIDs(records []plane.ReviewRecordState) []string {
 	return out
 }
 
-// openMustDetails pairs each open MUST id with its served summary, so the park
-// question carries what is actually open rather than only the ids. A finding
-// the read did not serve is still named by id.
+// openMustDetails pairs each open MUST id with its served summary, so the park question carries
+// what is actually open rather than only the ids.
 func openMustDetails(openIDs []string, records []plane.ReviewRecordState) []string {
 	summary := map[string]string{}
 	for _, r := range records {
@@ -505,13 +428,10 @@ func openMustDetails(openIDs []string, records []plane.ReviewRecordState) []stri
 	return out
 }
 
-// nonConvergenceReason reports why the round loop must stop and park rather than
-// spawn another fix (CLA-638, A6): a MUST a previous verifier marked resolved
-// that the latest round has open again, or a MUST still open after two fix
-// attempts (its id's round prefix is at least two behind the round that just
-// closed). Empty means the loop may continue. It reads plane state plus the
-// driver's in-memory resolved set, so a takeover (empty set) loses the reopened
-// half but the round-prefix half still holds.
+// nonConvergenceReason reports why the round loop must stop and park rather than spawn another fix:
+// a MUST a previous verifier marked resolved that the latest round has open again, or a MUST still
+// open after two fix attempts (its id's round prefix is at least two behind the round that just
+// closed).
 func nonConvergenceReason(open []string, round int, resolved map[string]bool) string {
 	for _, id := range open {
 		if resolved[id] {
@@ -526,18 +446,10 @@ func nonConvergenceReason(open []string, round int, resolved map[string]bool) st
 	return ""
 }
 
-// parkVerification parks a task whose verification round cannot proceed
-// (CLA-638): the round cap with an open MUST (B7), the non-convergence breaker
-// (A6), or a round the driver could not judge. The question CARRIES THE RECORDS
-// — the open ids, the round, and where the durable records live — because the
-// operator is being asked to overrule the stopping rule, and that needs the
-// evidence.
-//
-// Non-blocking `clarification`, matching parkDeadPhase: the task is already
-// parked, so a blocking question would be the wrong shape (any answer would
-// un-block it to `ready`, handing the same open MUSTs straight back to a fleet
-// whose cycle counter has not moved — the cap would park it again). The park's
-// outcome stands alone if the question insert fails.
+// parkVerification parks a task whose verification round cannot proceed: the round cap with an open
+// MUST (B7), the non-convergence breaker (A6), or a round the driver could not judge. The question
+// CARRIES THE RECORDS — the open ids, the round, and where the durable records live — because
+// the operator is being asked to overrule the stopping rule, and that needs the evidence.
 func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Result, reason string, round, counted int, open, details []string) {
 	if res.Claim.TaskID == "" {
 		log.Printf("%sverification park: no claim observed, so there is no task to park (%s)", labelOf(t), reason)
@@ -582,9 +494,8 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 			labelOf(t), ref, err)
 		return
 	}
-	// The park moved the task out of the holding run: nothing is left for a
-	// supervisor to hand back (CLA-708), exactly as a settle observed from the
-	// stream would have said.
+	// The park moved the task out of the holding run: nothing is left for a supervisor to hand back,
+	// exactly as a settle observed from the stream would have said.
 	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
 		log.Printf("%sparked %s — %s, but the question for the operator could not be filed: %v",
@@ -594,20 +505,11 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 	log.Printf("%sparked %s — %s; question filed for the operator", labelOf(t), ref, reason)
 }
 
-// verifiedBranch returns the branch the previous phase recorded — the hand-off
-// the successor's brief names (CLA-457). The seam folds the branch onto the
-// carried claim when it checkpoints, so for a checkpointed phase the claim's
-// branch is the one the evidence gate judged; the recorded-Branches fallback
-// covers a claim that was never re-judged (a resumed-with-WIP predecessor, or
-// a defensive hole). The predecessor's checkpoint is gated on this same
-// evidence, so an empty return here is a misconfigured sequence announcing
-// itself via a standing {{branch}} placeholder rather than a plausible runtime
-// state.
-//
-// CLA-576: for an UNVERIFIED checkpoint — the origin could not be read — the
-// returned branch is recorded but NOT verified, and the caller that builds the
-// successor's brief must read Result.CheckpointUnverified and select the
-// unverified brief: this function names the branch, it does not vouch for it.
+// verifiedBranch returns the branch the previous phase recorded — the hand-off the successor's
+// brief names. The seam folds the branch onto the carried claim when it checkpoints, so for a
+// checkpointed phase the claim's branch is the one the evidence gate judged; the recorded-Branches
+// fallback covers a claim that was never re-judged (a resumed-with-WIP predecessor, or a defensive
+// hole).
 func verifiedBranch(res *harness.Result) string {
 	if res == nil {
 		return ""
@@ -621,9 +523,9 @@ func verifiedBranch(res *harness.Result) string {
 	return ""
 }
 
-// attributionOr renders a harness/model value for a phase brief's record block.
-// An empty model is normal (the harness default) and must not render as the bare
-// word "model" followed by nothing, which reads like a truncated write.
+// attributionOr renders a harness/model value for a phase brief's record block. An empty model is
+// normal (the harness default) and must not render as the bare word "model" followed by nothing,
+// which reads like a truncated write.
 func attributionOr(v, fallback string) string {
 	if strings.TrimSpace(v) == "" {
 		return fallback

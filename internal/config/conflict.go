@@ -1,65 +1,34 @@
 package config
 
-// The supervisor's conflict-only session step (CLA-759).
-//
-// CLA-758's deterministic close-out integrates a CLEAN approved task with no
-// agent session. A CONFLICTING one still waited for an agent close-out: the next
-// clanker to finish the task it was on ran a FULL implement-phase session, with
-// the whole drain protocol in its brief, to resolve a merge conflict.
-//
-// This is the narrow replacement: one short session that claims the task, merges
-// the PR's base into its branch, resolves ONLY the conflicting hunks, runs the
-// repo-wide gate and pushes. The supervisor starts it (and the supervisor's own
-// package carries that code and its tests); this file owns the STEP's config and
-// the brief, because both are operator-facing text the config package already
-// owns for every other brief.
-//
-// The step is deliberately its own top-level block rather than another entry in
-// `phases`: a phase is a step in ONE task's sequence, while this runs outside any
-// sequence, for one task the supervisor picked, at most one at a time. It still
-// reads like the rest of the pipeline — A step with a harness and a model — and
-// defaults to the fleet's IMPLEMENT step, because resolving a conflict is
-// implementation work that wants the model already trusted with the task's code.
+// The supervisor's conflict-only session step.
 
 import "strings"
 
-// ConflictStep is the config block controlling the supervisor's conflict-only
-// session.
-//
-// Resolution order for every field is "this block, else the implement step": an
-// unset block runs the conflict session on exactly the harness and model that
-// implemented the branch, which is the fleet's documented default and needs no
-// repetition in the config file. A set field pins only itself, so an operator can
-// name a cheaper model for conflict resolution without repeating the harness.
+// ConflictStep is the config block controlling the supervisor's conflict-only session. A set field
+// pins only itself, so an operator can name a cheaper model for conflict resolution without
+// repeating the harness.
 type ConflictStep struct {
-	// Harness pins the harness the conflict session runs on. Empty = the
-	// harness of the config's IMPLEMENT step (the first phase named
-	// "implement", else the run-wide harness).
+	// Harness pins the harness the conflict session runs on. Empty = the harness of the config's
+	// IMPLEMENT step (the first phase named "implement", else the run-wide harness).
 	Harness string `json:"harness,omitempty"`
 
-	// Model pins the model alias (or an ordered route list, like a phase's own
-	// `model`) directly, skipping the tier map. Empty = the implement step's
-	// WHOLE route list, so the conflict session inherits the fallback chain that
-	// implemented the branch rather than its first entry alone: a quota on the
-	// first route is exactly the case the list exists for (CLA-890).
+	// Model pins the model alias (or an ordered route list, like a phase's own `model`) directly,
+	// skipping the tier map. Empty = the implement step's WHOLE route list, so the conflict session
+	// inherits the fallback chain that implemented the branch rather than its first entry alone: a
+	// quota on the first route is exactly the case the list exists for.
 	Model ModelRoutes `json:"model,omitempty"`
 
-	// MaxTurns caps the session's turns (harness permitting). 0 = the fleet's
-	// effective cap, exactly as a phase with no cap of its own reads it. The
-	// supervisor ALSO bounds the session by wall clock, so a harness whose CLI
-	// takes no turn flag is still bounded.
+	// MaxTurns caps the session's turns (harness permitting). 0 = the fleet's effective cap, exactly
+	// as a phase with no cap of its own reads it.
 	MaxTurns int `json:"max_turns,omitempty"`
 }
 
 // implemented reports whether the config declares a conflict block at all.
 func (c *Config) conflictDeclared() bool { return c != nil && c.Conflict != nil }
 
-// ConflictStep resolves the effective conflict step: the block's own fields where
-// it names them, and the implement step's harness/model routes everywhere else.
-//
-// Total, never an error: an unset or partly set block is the documented default,
-// not a refusal. Validate is where an unknown harness is refused, using the same
-// registry check every other harness-naming field gets.
+// ConflictStep resolves the effective conflict step: the block's own fields where it names them,
+// and the implement step's harness/model routes everywhere else. Total, never an error: an unset or
+// partly set block is the documented default, not a refusal.
 func (c *Config) ConflictStep() ConflictStep {
 	if c == nil {
 		return ConflictStep{}
@@ -77,39 +46,31 @@ func (c *Config) ConflictStep() ConflictStep {
 		if step.Harness == implHarness {
 			step.Model = implRoutes
 		} else {
-			// A different harness is a different dialect with its own default
-			// route list; another harness's alias would be a name it does not
-			// serve.
+			// A different harness is a different dialect with its own default route list; another harness's
+			// alias would be a name it does not serve.
 			step.Model = c.SessionFor(step.Harness).Model
 		}
 	}
-	// The routes are trimmed and de-duplicated in ONE place, on the way out, so
-	// every consumer (the log line, the spawn, the fallback ladder) reads the
-	// same answer whether the block pinned them or they were inherited.
+	// The routes are trimmed and de-duplicated in ONE place, on the way out, so every consumer (the
+	// log line, the spawn, the fallback ladder) reads the same answer whether the block pinned them or
+	// they were inherited.
 	step.Model = ModelRoutes(step.Model.List())
 	if step.MaxTurns <= 0 {
 		step.MaxTurns = c.MaxTurns
 	}
-	// The config's turn-cap chain has no "uncapped" value (see Config.MaxTurns):
-	// an unphased run, which this session is not part of, still resolves through
-	// DefaultMaxTurns. A daemon-started session must never be the one uncapped
-	// session on the machine.
+	// The config's turn-cap chain has no "uncapped" value (see Config.MaxTurns): an unphased run,
+	// which this session is not part of, still resolves through DefaultMaxTurns.
 	if step.MaxTurns <= 0 {
 		step.MaxTurns = DefaultMaxTurns
 	}
 	return step
 }
 
-// implementStep answers the harness and the WHOLE model route list of the
-// config's implement step: the first configured phase named "implement", or the
-// run-wide harness/model for an unphased run (where EffectivePhases synthesizes a
-// single implement phase).
-//
-// The routes are resolved through the phase's own tier, so a tiered review panel
-// beside an untiered implement phase cannot shift the conflict session's models.
-// The whole list is carried because the conflict session runs the same fallback
-// ladder a phase does (CLA-890): resolving only the first route left a free-tier
-// quota death with nowhere to go.
+// implementStep answers the harness and the WHOLE model route list of the config's implement step:
+// the first configured phase named "implement", or the run-wide harness/model for an unphased run
+// (where EffectivePhases synthesizes a single implement phase). The routes are resolved through the
+// phase's own tier, so a tiered review panel beside an untiered implement phase cannot shift the
+// conflict session's models.
 func (c *Config) implementStep() (harnessName string, model ModelRoutes) {
 	for _, ph := range c.Phases {
 		if ph.Name != ImplementPhaseName {
@@ -122,9 +83,9 @@ func (c *Config) implementStep() (harnessName string, model ModelRoutes) {
 	return c.Harness, c.SessionFor(c.Harness).Model
 }
 
-// conflictHarness is the harness the conflict block names, or "" when the config
-// declares no conflict step (in which case the session runs on the implement
-// harness, which the harness lists already carry).
+// conflictHarness is the harness the conflict block names, or "" when the config declares no
+// conflict step (in which case the session runs on the implement harness, which the harness lists
+// already carry).
 func (c *Config) conflictHarness() string {
 	if !c.conflictDeclared() {
 		return ""
@@ -132,11 +93,7 @@ func (c *Config) conflictHarness() string {
 	return strings.TrimSpace(c.Conflict.Harness)
 }
 
-// ConflictResolution kinds. The brief requires the session to begin its outcome
-// with an exact `RESOLUTION: <kind>` line, so the supervisor can tell a
-// mechanical resolution from a failed one after the session has ended: both
-// leave the task approved with the claim released, and the plane status alone
-// cannot distinguish them.
+// ConflictResolution kinds.
 const (
 	ConflictResolutionMechanical  = "mechanical"
 	ConflictResolutionBehavioural = "behavioural"
@@ -146,13 +103,7 @@ const (
 // ConflictResolutionMarker is the exact line prefix the brief prescribes.
 const ConflictResolutionMarker = "RESOLUTION: "
 
-// ConflictResolution reads the LAST resolution marker in outcome. It returns the
-// kind, the first explanatory line after that marker (the note for a behavioural
-// resolution, the reason for a failure) and whether a marker was found at all.
-// The brief tells a session to copy the stored outcome verbatim and APPEND its
-// block, so the newest marker is the last one. Total and forgiving: the outcome
-// is written by a model, so a marker among prose is found line by line rather
-// than required to be the whole outcome.
+// ConflictResolution reads the LAST resolution marker in outcome.
 func ConflictResolution(outcome string) (kind, detail string, ok bool) {
 	lines := strings.Split(outcome, "\n")
 	for i, raw := range lines {
@@ -194,16 +145,10 @@ func ConflictResolution(outcome string) (kind, detail string, ok bool) {
 	return kind, detail, ok
 }
 
-// ConflictResolutionSince reads the marker THIS session appended, given the
-// outcome the claim response served BEFORE the session (prior) and the outcome
-// served after it (current). An unchanged outcome means the session wrote
-// nothing, and therefore left no marker — the accumulated text's older markers
-// belong to earlier attempts and must not classify this one (CLA-889). Otherwise
-// the session's own text is the suffix it appended to the stored outcome, and the
-// LAST marker in it wins.
-//
-// Total and forgiving like ConflictResolution: a session that replaced the
-// stored outcome instead of appending to it is classified on what it wrote.
+// ConflictResolutionSince reads the marker THIS session appended, given the outcome the claim
+// response served BEFORE the session (prior) and the outcome served after it (current). An
+// unchanged outcome means the session wrote nothing, and therefore left no marker — the
+// accumulated text's older markers belong to earlier attempts and must not classify this one.
 func ConflictResolutionSince(prior, current string) (kind, detail string, ok bool) {
 	if strings.TrimSpace(current) == strings.TrimSpace(prior) {
 		return "", "", false
@@ -215,11 +160,10 @@ func ConflictResolutionSince(prior, current string) (kind, detail string, ok boo
 	return ConflictResolution(fresh)
 }
 
-// ConflictBriefInput is everything one conflict-only session's brief names. Every
-// field is rendered into the brief verbatim, so an empty one would leave a hole a
-// model would fill by guessing; the supervisor only renders the brief once it has
-// resolved all of them (the gate may be the repo's documented fallback wording,
-// never empty).
+// ConflictBriefInput is everything one conflict-only session's brief names. Every field is rendered
+// into the brief verbatim, so an empty one would leave a hole a model would fill by guessing; the
+// supervisor only renders the brief once it has resolved all of them (the gate may be the repo's
+// documented fallback wording, never empty).
 type ConflictBriefInput struct {
 	TaskID  string
 	TaskRef string
@@ -230,36 +174,21 @@ type ConflictBriefInput struct {
 	Repo    string
 	WorkDir string
 	// Worktree is the exact path the session must create its branch worktree at.
-	// It is named rather than left to the session because the supervisor grants
-	// the session's permission scope on that path: a worktree in a directory the
-	// session may not write would fail at the first `git worktree add`.
 	Worktree string
 	Paths    []string
-	// Gate is the repo-wide check command, or "" when it could not be derived
-	// from the checkout; the brief then points at the repo's own documented
-	// gate instead of inventing a command.
+	// Gate is the repo-wide check command, or "" when it could not be derived from the checkout; the
+	// brief then points at the repo's own documented gate instead of inventing a command.
 	Gate string
 }
 
-// ConflictBrief renders the short brief a conflict-only session runs. It is NOT
-// the implement brief: the session must not claim anything (the supervisor
-// already did), must not work another task, and must not review or merge.
-//
-// The instructions are the task's own contract (CLA-759):
-//
-//   - merge, NEVER rebase: the branch is already pushed, and rewriting published
-//     history invalidates the fleet's tip checks;
-//   - resolve ONLY the conflicting hunks: no unrelated edits, no formatter sweep,
-//     no dependency bump hiding inside a conflict resolution;
-//   - run the repo-wide gate and push;
-//   - then hand back in exactly one of three states: mechanical (the task stays
-//     approved for the deterministic close-out), behavioural/unsure (the code
-//     changed behaviour, so it goes back to review) or failed (the claim is
-//     released and the task stays approved for the agent close-out).
-//
-// The outcome markers are load-bearing rather than decorative: the supervisor
-// reads them after the session ends to tell a mechanical hand-back from a failed
-// one, because both leave the task in the same plane status.
+// ConflictBrief renders the short brief a conflict-only session runs. The instructions are the
+// task's own contract: - merge, NEVER rebase: the branch is already pushed, and rewriting published
+// history invalidates the fleet's tip checks; - resolve ONLY the conflicting hunks: no unrelated
+// edits, no formatter sweep, no dependency bump hiding inside a conflict resolution; - run the
+// repo-wide gate and push; - then hand back in exactly one of three states: mechanical (the task
+// stays approved for the deterministic close-out), behavioural/unsure (the code changed behaviour,
+// so it goes back to review) or failed (the claim is released and the task stays approved for the
+// agent close-out).
 func ConflictBrief(in ConflictBriefInput) string {
 	paths := strings.Join(in.Paths, ", ")
 	if paths == "" {

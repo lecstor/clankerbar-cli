@@ -9,47 +9,21 @@ import (
 	"time"
 )
 
-// Usage accounting on opencode 2.x (CLA-675).
-//
-// The 2.x stream under-reports. Verified against 2.0.32: step_finish is emitted
-// only for steps that ended in tool calls, never for the step that ends the
-// session with a plain answer, and never for the title-generation request a new
-// session makes. A plain text answer emits no usage at all. Summing the stream
-// therefore misses at least one request per session, and all of a text-only
-// session.
-//
-// `opencode session export --standalone <sid>` reads the session record out of
-// the local database after the process has exited. Its `info` block carries the
-// session's cumulative cost and tokens (title generation included), and every
-// assistant message carries its own `finish`, `cost` and `tokens`. That is the
-// authoritative source, and it also supplies what the stream no longer does:
-// how the final step ended. The export spawns a private server but reads only
-// the database; it does not start the session's MCP servers (verified: no MCP
-// process launched, ~0.4s).
-//
-// Attribution. One Invoke can run several processes into ONE session (the
-// CLA-406 resurrection probe and continuation, the CLA-584 stall resume), and
-// their Results are summed by mergeResume and the probe fold. The export is
-// cumulative, so each process is charged only the assistant messages created
-// after it started. The difference between the session total and the sum of
-// all its assistant messages (title generation) is charged to the process that
-// created the session, which is the one not started with `-s`.
+// Usage accounting on opencode 2.x.
 
 const (
-	// OpencodeErrorTypeKey is the Result.Raw key carrying the type of the last
-	// typed error event a 2.x session emitted ("provider.auth", ...).
+	// OpencodeErrorTypeKey is the Result.Raw key carrying the type of the last typed error event a 2.x
+	// session emitted ("provider.auth", ...).
 	OpencodeErrorTypeKey = "opencode_error_type"
 
-	// opencodeUsageSourceKey records where a Result's usage figures came from:
-	// "session_export" when the export was read, absent when the stream sums
-	// stand (the export failed or the run produced no session).
+	// opencodeUsageSourceKey records where a Result's usage figures came from: "session_export" when
+	// the export was read, absent when the stream sums stand (the export failed or the run produced no
+	// session).
 	opencodeUsageSourceKey = "usage_source"
 	opencodeUsageExport    = "session_export"
 )
 
-// opencodeExportTimeout bounds one export. It reads a local database, so
-// anything near the bound means something is wrong; the stream sums stand in
-// that case. A var so tests can shorten it.
+// opencodeExportTimeout bounds one export.
 var opencodeExportTimeout = 15 * time.Second
 
 type opencodeExportTokens struct {
@@ -94,8 +68,8 @@ type opencodeExport struct {
 	Messages []opencodeExportMessage `json:"messages"`
 }
 
-// parseOpencodeExport decodes an export and refuses one without the session
-// totals: a document missing them is not something to account against.
+// parseOpencodeExport decodes an export and refuses one without the session totals: a document
+// missing them is not something to account against.
 func parseOpencodeExport(data []byte) (opencodeExport, error) {
 	var doc opencodeExport
 	if err := json.Unmarshal(bytes.TrimSpace(data), &doc); err != nil {
@@ -107,14 +81,8 @@ func parseOpencodeExport(data []byte) (opencodeExport, error) {
 	return doc, nil
 }
 
-// settleUsage replaces a finished run's streamed usage with the session
-// export's figures when the export can be read, and leaves the stream sums in
-// place when it cannot. It runs on every path where the process ran (clean
-// exit, non-zero exit, our own kill), never on a launch failure.
-//
-// The export is run on a context detached from the caller's cancellation: a
-// session killed by the wall-clock cap or a Ctrl-C still spent money, and the
-// budget has to see it. opencodeExportTimeout bounds it instead.
+// settleUsage replaces a finished run's streamed usage with the session export's figures when the
+// export can be read, and leaves the stream sums in place when it cannot.
 func (o opencode) settleUsage(ctx context.Context, in Invocation, res *Result, started time.Time, resume bool) {
 	sid, _ := res.Raw[opencodeSessionIDKey].(string)
 	if sid == "" {
@@ -130,9 +98,8 @@ func (o opencode) settleUsage(ctx context.Context, in Invocation, res *Result, s
 	applyOpencodeExport(res, doc, started, resume)
 }
 
-// exportSession runs `opencode session export --standalone <sid>` with the
-// session's own environment and directory, so it reads the same data dir the
-// session wrote.
+// exportSession runs `opencode session export --standalone <sid>` with the session's own
+// environment and directory, so it reads the same data dir the session wrote.
 func (o opencode) exportSession(ctx context.Context, in Invocation, sid string) (opencodeExport, error) {
 	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opencodeExportTimeout)
 	defer cancel()
@@ -149,8 +116,8 @@ func (o opencode) exportSession(ctx context.Context, in Invocation, sid string) 
 		return opencodeExport{}, err
 	}
 	cmd.Env = env
-	// The standalone server is a grandchild that could hold stdout open; the
-	// group kill and WaitDelay keep a stuck export from outliving its bound.
+	// The standalone server is a grandchild that could hold stdout open; the group kill and WaitDelay
+	// keep a stuck export from outliving its bound.
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Cancel = func() error {
 		killProcessGroup(cmd)
@@ -163,9 +130,9 @@ func (o opencode) exportSession(ctx context.Context, in Invocation, sid string) 
 	return parseOpencodeExport(out)
 }
 
-// applyOpencodeExport charges res with this run's share of the export (see the
-// attribution note above) and recomputes the final-step verdicts from the last
-// assistant message, which the 2.x stream does not report.
+// applyOpencodeExport charges res with this run's share of the export (see the attribution note
+// above) and recomputes the final-step verdicts from the last assistant message, which the 2.x
+// stream does not report.
 func applyOpencodeExport(res *Result, doc opencodeExport, started time.Time, resume bool) {
 	since := started.UnixMilli()
 	var run, all opencodeExportTokens
@@ -182,8 +149,8 @@ func applyOpencodeExport(res *Result, doc opencodeExport, started time.Time, res
 		if m.Time.Created >= since {
 			run.add(*m.Tokens, 1)
 			runCost += m.Cost
-			// A message the provider never answered (a 401 still records one,
-			// with no finish and no usage) is not a report.
+			// A message the provider never answered (a 401 still records one, with no finish and no usage)
+			// is not a report.
 			if m.Finish != "" || m.Tokens.total() > 0 || m.Cost > 0 {
 				runMsgs++
 			}
@@ -205,21 +172,16 @@ func applyOpencodeExport(res *Result, doc opencodeExport, started time.Time, res
 	if res.Raw == nil {
 		res.Raw = map[string]any{}
 	}
-	// Reported means the provider answered at least once in this run (or the
-	// session overhead cost something). A run that failed before its first
-	// request - a 401, an unknown model - has an export too, all zeroes, and
-	// counting that as a report would tip IsUnclassifiedTransient's "failed
-	// after paid work started" heuristic into retrying a startup refusal.
+	// Reported means the provider answered at least once in this run (or the session overhead cost
+	// something).
 	res.UsageReported = res.UsageReported || runMsgs > 0 || run.total() > 0 || runCost > 0
 	res.Tokens = run.total()
 	res.CostUSD = runCost
-	// The export IS the cost figure — parseOpencodeExport refuses a document
-	// without info.cost — so this run's dollars are known, even when they are 0
-	// (CLA-691).
+	// The export IS the cost figure — parseOpencodeExport refuses a document without info.cost —
+	// so this run's dollars are known, even when they are 0.
 	res.CostReported = true
-	// The normalised breakdown (CLA-691), from the same export figures the
-	// budget figures above are computed from — including the session's own
-	// overhead (title generation) when this run is not a resume.
+	// The normalised breakdown, from the same export figures the budget figures above are computed
+	// from — including the session's own overhead (title generation) when this run is not a resume.
 	res.Usage = TokenUsage{
 		Input:      run.Input,
 		Output:     run.Output,
@@ -234,18 +196,16 @@ func applyOpencodeExport(res *Result, doc opencodeExport, started time.Time, res
 	res.Raw["cache_read_tokens"] = run.Cache.Read
 	res.Raw[opencodeUsageSourceKey] = opencodeUsageExport
 
-	// The final-step verdicts, only when this run produced the session's last
-	// assistant message. A run that added none (it died before its first step)
-	// keeps whatever the stream said.
+	// The final-step verdicts, only when this run produced the session's last assistant message.
 	if last == nil || last.Time.Created < since {
 		return
 	}
 	if last.Finish != "" {
 		res.Raw[FinishReasonKey] = last.Finish
 	}
-	// Our own wall-clock marker is a verdict on how the PROCESS ended and wins;
-	// otherwise the two final-step markers are recomputed from the export, which
-	// is the only place 2.x reports the final step at all.
+	// Our own wall-clock marker is a verdict on how the PROCESS ended and wins; otherwise the two
+	// final-step markers are recomputed from the export, which is the only place 2.x reports the final
+	// step at all.
 	if tr, _ := res.Raw[TerminalReasonKey].(string); tr == wallClockReason {
 		return
 	}

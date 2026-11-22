@@ -10,34 +10,30 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
-// The runner takes the drain's claim before the phase walk starts, so every
-// phase session resumes a task the DRIVER holds rather than the first session
-// claiming one of its own. A retry inside the walk must therefore re-claim
-// before it respawns, because the dead or empty exit handed the claim back.
+// The runner takes the drain's claim before the phase walk starts, so every phase session resumes a
+// task the DRIVER holds rather than the first session claiming one of its own.
 
-// runnerClaimAttempts bounds the offer-and-claim rounds: each round is a fresh
-// offer, so three is room for two races without turning a busy queue into a
-// spin.
+// runnerClaimAttempts bounds the offer-and-claim rounds: each round is a fresh offer, so three is
+// room for two races without turning a busy queue into a spin.
 const runnerClaimAttempts = 3
 
 // drainClaim is what the runner's claim step decided for this drain.
 type drainClaim int
 
 const (
-	// claimSessionPath means the first session claims, exactly as before: the
-	// drain is not eligible, or NextOffer says this plane is not wired.
+	// claimSessionPath means the first session claims, exactly as before: the drain is not eligible,
+	// or NextOffer says this plane is not wired.
 	claimSessionPath drainClaim = iota
 	// claimHeld means the runner holds a claim, seeded into s.carried.
 	claimHeld
-	// claimNothing means there is nothing to work: no offer, every attempt lost
-	// the task, or the queue failed. The drain ends without spawning.
+	// claimNothing means there is nothing to work: no offer, every attempt lost the task, or the queue
+	// failed.
 	claimNothing
 )
 
-// runnerClaimEligible reports whether the runner should take this drain's claim
-// itself. An unphased run is one session and claims as it always has, a
-// custom-prompt phase owns its own wording, and a blind run cannot read the
-// queue — all three keep the session-claim path.
+// runnerClaimEligible reports whether the runner should take this drain's claim itself. An unphased
+// run is one session and claims as it always has, a custom-prompt phase owns its own wording, and a
+// blind run cannot read the queue — all three keep the session-claim path.
 func (s *drainSeq) runnerClaimEligible() (plane.TaskClaimer, bool) {
 	if s.d.blind || len(s.phases) < 2 {
 		return nil, false
@@ -54,9 +50,8 @@ func (s *drainSeq) runnerClaimEligible() (plane.TaskClaimer, bool) {
 	return claimer, true
 }
 
-// claimForDrain takes one task for the whole drain, re-reading the queue when a
-// race costs the offer. It says which of the three endings applies; only
-// claimHeld has a claim planted in s.carried.
+// claimForDrain takes one task for the whole drain, re-reading the queue when a race costs the
+// offer.
 func (s *drainSeq) claimForDrain(ctx context.Context) drainClaim {
 	claimer, ok := s.runnerClaimEligible()
 	if !ok {
@@ -83,8 +78,8 @@ func (s *drainSeq) claimForDrain(ctx context.Context) drainClaim {
 		}
 		ct, err := claimer.ClaimTask(ctx, next.ID, next.RequiresTakeover)
 		if errors.Is(err, plane.ErrNotClaimable) && offer.ReadyNext != nil && !usedReady {
-			// The takeover or close-out was withheld, so take what the plane
-			// offers a plain claim instead — checked before the claim like Next.
+			// The takeover or close-out was withheld, so take what the plane offers a plain claim instead
+			// — checked before the claim like Next.
 			if next, _ = s.declineUnpreparable(ctx, plane.Offer{Next: offer.ReadyNext}); next == nil {
 				return claimNothing
 			}
@@ -97,9 +92,9 @@ func (s *drainSeq) claimForDrain(ctx context.Context) drainClaim {
 		case errors.Is(err, plane.ErrClaimLost):
 			// Somebody else got it: the offer is stale, so re-read.
 		default:
-			// A transport error may hide a claim the plane DID accept. The error
-			// cannot tell that from a refusal, and the lease expires on its own,
-			// so the drain ends rather than retrying over a possibly-live lease.
+			// A transport error may hide a claim the plane DID accept. The error cannot tell that from a
+			// refusal, and the lease expires on its own, so the drain ends rather than retrying over a
+			// possibly-live lease.
 			log.Printf("%siteration %d: claiming %s failed (%v) — ending the drain without a session; the lease, if the plane took the claim, expires on its own",
 				labelOf(s.t), s.drainNum, claimLabel(harness.Claim{TaskID: next.ID, Ref: next.Ref}), err)
 			return claimNothing
@@ -110,9 +105,8 @@ func (s *drainSeq) claimForDrain(ctx context.Context) drainClaim {
 	return claimNothing
 }
 
-// plantClaim seeds a held claim into the walk: the first phase resumes it, and
-// the deferred handback owns releasing it. The brief is kept for the start
-// phase's wiring.
+// plantClaim seeds a held claim into the walk: the first phase resumes it, and the deferred
+// handback owns releasing it. The brief is kept for the start phase's wiring.
 func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 	res := &harness.Result{Claim: harness.Claim{
 		TaskID:   ct.Task.ID,
@@ -122,8 +116,8 @@ func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 		Category: ct.Task.Category,
 	}}
 	if ct.Task.HasWIP {
-		// The plane always synthesises a branch name, so an UNRECORDED one is
-		// not a checkpoint and must not read as one.
+		// The plane always synthesises a branch name, so an UNRECORDED one is not a checkpoint and must
+		// not read as one.
 		res.Claim.Branch = ct.Task.Branch
 	}
 	s.carried = res
@@ -141,22 +135,11 @@ func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 	log.Printf("%siteration %d: runner claimed %s (%s)", labelOf(s.t), s.drainNum, claimLabel(res.Claim), kind)
 }
 
-// declineUnpreparable returns the task to claim after the pre-claim worktree
-// check, or nil when the offer must be left alone. A deterministic local
-// refusal is found BEFORE the claim, so it normally costs no reclaim: the task
-// is simply not claimed, the drain idles, and the next offer retries once the
-// tree is fixed.
-//
-// That is only safe while the tree can be fixed. A tree that refuses every
-// check never parks and never lets the queue advance — next_task keeps offering
-// the same head — so the refusal streak is bounded: at startRefusalBound the
-// claim is taken anyway, the post-claim prep refuses it again, and startRefused
-// parks the task for the operator. One reclaim buys the park, which is the
-// ending the claimless path can never reach.
-//
-// When the plane offered a ReadyNext (a declined takeover or close-out), that
-// task is checked and claimed instead; usedReady says the returned task is that
-// fallback, so the caller does not offer it twice.
+// declineUnpreparable returns the task to claim after the pre-claim worktree check, or nil when the
+// offer must be left alone. A tree that refuses every check never parks and never lets the queue
+// advance — next_task keeps offering the same head — so the refusal streak is bounded: at
+// startRefusalBound the claim is taken anyway, the post-claim prep refuses it again, and
+// startRefused parks the task for the operator.
 func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) (next *plane.TaskBrief, usedReady bool) {
 	next = offer.Next
 	for {
@@ -182,10 +165,10 @@ func (s *drainSeq) declineUnpreparable(ctx context.Context, offer plane.Offer) (
 	}
 }
 
-// worktreeRefusal runs the driver's pre-claim worktree check for one offered
-// task and caches the origin facts its fetch produced, keyed to the task and
-// checkout they describe. A check that cannot run is NOT a refusal: the claim is
-// worth taking and the post-claim prep repeats the decision with the same facts.
+// worktreeRefusal runs the driver's pre-claim worktree check for one offered task and caches the
+// origin facts its fetch produced, keyed to the task and checkout they describe. A check that
+// cannot run is NOT a refusal: the claim is worth taking and the post-claim prep repeats the
+// decision with the same facts.
 func (s *drainSeq) worktreeRefusal(ctx context.Context, b *plane.TaskBrief) string {
 	if b == nil {
 		return ""
@@ -199,8 +182,8 @@ func (s *drainSeq) worktreeRefusal(ctx context.Context, b *plane.TaskBrief) stri
 		Resume: b.HasWIP, CloseOut: b.AwaitingMerge,
 	}
 	if !b.HasWIP && !b.AwaitingMerge {
-		// A create cuts from origin/<PRBase>, so resolving the base now lets the
-		// pre-claim check prove a missing one; a resume never uses it.
+		// A create cuts from origin/<PRBase>, so resolving the base now lets the pre-claim check prove a
+		// missing one; a resume never uses it.
 		req.PRBase = s.d.prBaseFor(ctx, s.t, checkout, b.Repo)
 	}
 	doneTip := b.PhasesDone[config.ImplementPhaseName].Tip
@@ -221,27 +204,24 @@ func (s *drainSeq) worktreeRefusal(ctx context.Context, b *plane.TaskBrief) stri
 	return reason
 }
 
-// clearPreClaimOrigin drops the cached pre-claim read, so nothing can resume on
-// facts that belong to another task or a failed fetch.
+// clearPreClaimOrigin drops the cached pre-claim read, so nothing can resume on facts that belong
+// to another task or a failed fetch.
 func (s *drainSeq) clearPreClaimOrigin() {
 	s.preClaimOrigin = originBranchFacts{}
 	s.preClaimTask = ""
 	s.preClaimCheckout = ""
 }
 
-// reclaimForRetry re-takes the claim a runner-claimed retry is about to resume,
-// and re-chooses the start the respawn begins at. A plain claim first; an
-// expired lease needs the takeover. When this task is gone it falls back to any
-// claim at all — the dead-retry counters key on task id, so a different task
-// simply earns its own budget.
+// reclaimForRetry re-takes the claim a runner-claimed retry is about to resume, and re-chooses the
+// start the respawn begins at.
 func (s *drainSeq) reclaimForRetry(ctx context.Context, taskID string) bool {
 	claimer, ok := s.runnerClaimEligible()
 	if !ok {
 		return false
 	}
 	if taskID == "" {
-		// The dead session named no task, so a claim by id cannot be tried:
-		// fall through to whatever the queue offers.
+		// The dead session named no task, so a claim by id cannot be tried: fall through to whatever the
+		// queue offers.
 		return s.claimForDrain(ctx) == claimHeld && s.startAfterReclaim(ctx)
 	}
 	ct, err := claimer.ClaimTask(ctx, taskID, false)
@@ -261,9 +241,9 @@ func (s *drainSeq) reclaimForRetry(ctx context.Context, taskID string) bool {
 	}
 }
 
-// startAfterReclaim re-chooses the start for the claim a retry just planted: the
-// retry may land a different task, or a different start on the same one, so the
-// walk resumes wherever the fresh facts say.
+// startAfterReclaim re-chooses the start for the claim a retry just planted: the retry may land a
+// different task, or a different start on the same one, so the walk resumes wherever the fresh
+// facts say.
 func (s *drainSeq) startAfterReclaim(ctx context.Context) bool {
 	if s.prepareStart(ctx) != startReady {
 		return false

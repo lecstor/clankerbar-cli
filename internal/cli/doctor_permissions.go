@@ -10,20 +10,9 @@ import (
 
 // --- 9. permission policy ----------------------------------------------------
 
-// opencodeEnvOverride finds a declaration of key that would override the
-// adapter's own export of it — exec takes the last duplicate key, so ANY
-// declared value wins — across all four env levels. On 2.x the key that matters
-// is OPENCODE_CONFIG_CONTENT, which carries the fail-closed policy. It
-// scans MOST-SPECIFIC-FIRST inside each project's scope (the
-// project-per-harness block for this harness, then the project block), then the
-// harness block, then top level: SessionEnv composes the child env per key by
-// exactly that precedence, so when two levels declare the same name it is the
-// more specific one the session actually carries. Naming a layer whose value
-// loses the overlay would send the operator to edit the wrong line. Across
-// projects the first declaring project is reported — each session carries only
-// its own project's layers, so no single entry wins a whole multi-project run.
-// The value reported is the declared source — the literal, or the command that
-// produces it — never the resolved output.
+// opencodeEnvOverride finds a declaration of key that would override the adapter's own export of it
+// — exec takes the last duplicate key, so ANY declared value wins — across all four env levels.
+// On 2.x the key that matters is OPENCODE_CONFIG_CONTENT, which carries the fail-closed policy.
 func opencodeEnvOverride(cfg *config.Config, harnessName, key string) (where, value string, ok bool) {
 	scan := func(label string, m config.EnvMap) (string, string, bool) {
 		if v, found := m[key]; found {
@@ -56,17 +45,16 @@ func opencodeEnvOverride(cfg *config.Config, harnessName, key string) (where, va
 	return "", "", false
 }
 
-// checkPermissions reports on the run harness's permission policy. See
-// checkPermissionsAll, which is what doctorChecks calls.
+// checkPermissions reports on the run harness's permission policy. See checkPermissionsAll, which
+// is what doctorChecks calls.
 func checkPermissions(cfg *config.Config) check {
 	return checkPermissionsNamed(cfg, "permissions", cfg.Harness)
 }
 
-// checkPermissionsAll reports on the policy of every harness this config will
-// declares (CLA-366). The policy is per harness in both senses — a different
-// mechanism each (a settings file, a sandbox flag, an env var) and a different
-// file — so a mixed run that checked only `harness` would certify the policy of
-// one session and say nothing about the other.
+// checkPermissionsAll reports on the policy of every harness this config will declares. The policy
+// is per harness in both senses — a different mechanism each (a settings file, a sandbox flag, an
+// env var) and a different file — so a mixed run that checked only `harness` would certify the
+// policy of one session and say nothing about the other.
 func checkPermissionsAll(cfg *config.Config) []check {
 	names := cfg.PhaseHarnesses()
 	out := make([]check, 0, len(names))
@@ -99,8 +87,8 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 			return c
 		}
 		if !json.Valid(data) {
-			// Claude rejects an unparseable --settings file at startup, so this kills
-			// the first session rather than degrading it.
+			// Claude rejects an unparseable --settings file at startup, so this kills the first session
+			// rather than degrading it.
 			c.status = fail
 			c.detail = settingsPath + " is not valid JSON"
 			c.remedy = "fix the JSON — the harness refuses to start with an unparseable --settings file"
@@ -110,8 +98,7 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 		c.detail = settingsPath + " parses"
 
 	case "codex":
-		// The adapter pins both axes itself, so there is nothing an operator can
-		// leave incoherent today. Report what will actually be used.
+		// The adapter pins both axes itself, so there is nothing an operator can leave incoherent today.
 		c.status = pass
 		c.detail = "adapter pins --sandbox workspace-write --ask-for-approval never"
 
@@ -119,8 +106,8 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 		return checkOpencodePermissions(cfg, label, harnessName)
 
 	case "copilot":
-		// The adapter pins both halves itself: -p refuses anything that would
-		// prompt, and the four --allow-tool grants are all the working set.
+		// The adapter pins both halves itself: -p refuses anything that would prompt, and the four
+		// --allow-tool grants are all the working set.
 		c.status = pass
 		c.detail = "adapter pins fail-closed --allow-tool rules (-p denies anything unapproved); --deny-tool write/shell on probes"
 

@@ -11,10 +11,9 @@ import (
 
 // --- 10. toolchain grants -----------------------------------------------------
 
-// toolchainMarkers maps a marker file to the command a session must be allowed
-// to execute to verify that repo. Only markers that name their tool
-// UNAMBIGUOUSLY are listed: a bare package.json could be npm, pnpm or yarn, so
-// the lockfile is the marker and a lockless repo is left alone rather than
+// toolchainMarkers maps a marker file to the command a session must be allowed to execute to verify
+// that repo. Only markers that name their tool UNAMBIGUOUSLY are listed: a bare package.json could
+// be npm, pnpm or yarn, so the lockfile is the marker and a lockless repo is left alone rather than
 // guessed at.
 var toolchainMarkers = []struct{ marker, tool string }{
 	{"go.mod", "go"},
@@ -24,23 +23,9 @@ var toolchainMarkers = []struct{ marker, tool string }{
 	{"package-lock.json", "npm"},
 }
 
-// checkToolchains cross-references the build tools the backlog's repos need
-// against what the permission policy actually grants.
-//
-// A headless claude session FAILS CLOSED: anything the policy does not name is
-// refused outright, with no prompt reaching the operator. So a toolchain the
-// repos need but the allowlist never mentions does not stop a run — it produces
-// work that CANNOT BE VERIFIED, which is worse. One overnight run wrote a whole
-// Go subcommand, pushed it, and re-discovered the same wall on three separate
-// iterations because nothing checked this up front.
-//
-// Every finding here is a WARN, never a FAIL: doctor reads the settings files it
-// knows about, and a grant can also arrive by a rule form it does not parse or a
-// flag on the harness invocation. A false FAIL would block a run that works.
-// runsHarness reports whether the named harness will actually START A SESSION in
-// this config. SpawnedHarnesses, not PhaseHarnesses: a run-wide `harness` that
-// every phase overrides is declared and never spawned, and a check reasoning
-// about what the run DOES must not count it.
+// checkToolchains cross-references the build tools the backlog's repos need against what the
+// permission policy actually grants. A headless claude session FAILS CLOSED: anything the policy
+// does not name is refused outright, with no prompt reaching the operator.
 func runsHarness(cfg *config.Config, name string) bool {
 	for _, h := range cfg.SpawnedHarnesses() {
 		if h == name {
@@ -50,13 +35,10 @@ func runsHarness(cfg *config.Config, name string) bool {
 	return false
 }
 
-// costBlindHarnesses names every harness this run spawns that cannot report what
-// a session cost, in the order SpawnedHarnesses lists them. Empty means a cost
-// ceiling can see the whole run.
-//
-// SPAWNED, not declared: a never-spawned cost-blind harness would make the run's
-// live `max_cost_usd` report as INERT and send the operator to fix a harness no
-// session ever runs on.
+// costBlindHarnesses names every harness this run spawns that cannot report what a session cost, in
+// the order SpawnedHarnesses lists them. SPAWNED, not declared: a never-spawned cost-blind harness
+// would make the run's live `max_cost_usd` report as INERT and send the operator to fix a harness
+// no session ever runs on.
 func costBlindHarnesses(cfg *config.Config) []string {
 	var out []string
 	for _, h := range cfg.SpawnedHarnesses() {
@@ -69,17 +51,14 @@ func costBlindHarnesses(cfg *config.Config) []string {
 
 func checkToolchains(cfg *config.Config) check {
 	c := check{name: "toolchains", status: pass}
-	// The allowlist is Claude's, but claude need not be the RUN's harness: a
-	// mixed sequence can implement elsewhere and review on claude, and it is the
-	// claude session that runs the verification verbs this check is about
-	// (CLA-366). So ask whether claude runs any phase at all, and audit the
-	// settings file THAT session gets.
+	// The allowlist is Claude's, but claude need not be the RUN's harness: a mixed sequence can
+	// implement elsewhere and review on claude, and it is the claude session that runs the
+	// verification verbs this check is about.
 	if !runsHarness(cfg, "claude") {
-		// SpawnedHarnesses, to agree with the gate directly above it. Listing
-		// PhaseHarnesses here named the DECLARED harness too, so a config whose
-		// phases all override it printed "no allowlist to audit for claude,
-		// opencode" - a sentence naming claude among the harnesses it has just
-		// said have no claude allowlist.
+		// SpawnedHarnesses, to agree with the gate directly above it. Listing PhaseHarnesses here named
+		// the DECLARED harness too, so a config whose phases all override it printed "no allowlist to
+		// audit for claude, opencode" - a sentence naming claude among the harnesses it has just said
+		// have no claude allowlist.
 		c.detail = "no allowlist to audit for " + strings.Join(cfg.SpawnedHarnesses(), ", ")
 		return c
 	}
@@ -96,8 +75,8 @@ func checkToolchains(cfg *config.Config) check {
 	}
 
 	if settingsPath == "" {
-		// checkPermissions already warns about running on the ambient allowlist; here
-		// the useful thing is to name what would have to be in it.
+		// checkPermissions already warns about running on the ambient allowlist; here the useful thing is
+		// to name what would have to be in it.
 		c.detail = "needs " + strings.Join(tools, ", ") + " — grants come from the ambient allowlist, which doctor does not audit"
 		return c
 	}
@@ -107,15 +86,14 @@ func checkToolchains(cfg *config.Config) check {
 	for _, t := range needed {
 		switch {
 		case denyAll[t.tool]:
-			// A bare-head deny wins over every allow, so this one is decided and worth
-			// naming separately — an operator looking at an allow entry would call it
-			// granted.
+			// A bare-head deny wins over every allow, so this one is decided and worth naming separately —
+			// an operator looking at an allow entry would call it granted.
 			blocked = append(blocked, t.tool+" ("+t.where+")")
 		case !allow[t.tool]:
 			missing = append(missing, t.tool+" ("+t.where+")")
 		case len(denyVerbs[t.tool]) > 0:
-			// Granted, but with holes. Not a warning on its own — this is what a
-			// careful policy looks like — so it is reported alongside the PASS.
+			// Granted, but with holes. Not a warning on its own — this is what a careful policy looks like
+			// — so it is reported alongside the PASS.
 			narrowed = append(narrowed, t.tool+" (except "+strings.Join(denyVerbs[t.tool], ", ")+")")
 		}
 	}
@@ -139,26 +117,18 @@ func checkToolchains(cfg *config.Config) check {
 	return c
 }
 
-// neededToolchain is a tool the repos require, with one example of where the
-// requirement was found — an operator fixing a grant wants to know which repo
-// asked for it.
+// neededToolchain is a tool the repos require, with one example of where the requirement was found
+// — an operator fixing a grant wants to know which repo asked for it.
 type neededToolchain struct {
 	tool  string
 	where string
 }
 
-// detectToolchains looks in each session workdir and, when that workdir is a
-// multi-repo parent, in the checkouts under it that belong to the project.
-//
-// Scope is the whole difficulty here. A session rooted in a multi-repo parent
-// COULD be sent into any repo below it, but only the project's own repos are
-// plausibly in its backlog — and warning about every unrelated checkout on the
-// machine is how a WARN line becomes something an operator skims. The project's
-// repos are taken to be the ones named after its slug (`clankerbar` covers
-// `clankerbar/` and `clankerbar-cli/`), which under-reports for a project whose
-// repos are named differently. That direction is deliberate: a missed grant
-// surfaces as one refused command, while a wall of irrelevant warnings buries the
-// one that mattered.
+// detectToolchains looks in each session workdir and, when that workdir is a multi-repo parent, in
+// the checkouts under it that belong to the project. A session rooted in a multi-repo parent COULD
+// be sent into any repo below it, but only the project's own repos are plausibly in its backlog —
+// and warning about every unrelated checkout on the machine is how a WARN line becomes something an
+// operator skims.
 func detectToolchains(cfg *config.Config) []neededToolchain {
 	type target struct{ dir, slug string }
 	var targets []target
@@ -198,9 +168,9 @@ func detectToolchains(cfg *config.Config) []neededToolchain {
 	return out
 }
 
-// projectRepos returns the immediate subdirectories of dir that are checkouts
-// belonging to slug. An empty slug matches nothing: without a project name there
-// is no way to tell the project's repos from everything else on the disk.
+// projectRepos returns the immediate subdirectories of dir that are checkouts belonging to slug. An
+// empty slug matches nothing: without a project name there is no way to tell the project's repos
+// from everything else on the disk.
 func projectRepos(dir, slug string) []string {
 	if slug == "" {
 		return nil
@@ -222,19 +192,12 @@ func projectRepos(dir, slug string) []string {
 	return out
 }
 
-// policySettingsPaths lists every settings file Claude will MERGE for these
-// sessions, in no particular order — auditing only the drain policy would report
-// a tool as ungranted when another layer already allows it.
-//
-// The session's cwd matters as much as the config dir: `<workdir>/.claude/settings.json`
-// and its `.local` sibling are the project layer, and are where an operator is
-// most likely to have put `Bash(go test:*)` in the first place.
+// policySettingsPaths lists every settings file Claude will MERGE for these sessions, in no
+// particular order — auditing only the drain policy would report a tool as ungranted when another
+// layer already allows it.
 func policySettingsPaths(cfg *config.Config) []string {
-	// The claude SESSION's fields, not the run's: in a mixed sequence claude may
-	// be a phase rather than the top-level harness, and then the policy that
-	// gates it is the one in its own block (CLA-366). SessionFor collapses to the
-	// run-wide fields whenever claude IS the top-level harness, which is every
-	// single-harness config.
+	// The claude SESSION's fields, not the run's: in a mixed sequence claude may be a phase rather
+	// than the top-level harness, and then the policy that gates it is the one in its own block.
 	hc := cfg.SessionFor("claude")
 	paths := []string{hc.SettingsPath}
 	if hc.ConfigDir != "" {
@@ -243,9 +206,7 @@ func policySettingsPaths(cfg *config.Config) []string {
 			filepath.Join(hc.ConfigDir, "settings.local.json"),
 		)
 	}
-	// config owns this list: it is the confinement boundary, and statedir.Open is
-	// handed the same one. Two copies of "where do sessions run" is exactly the
-	// drift projectWorkDir exists to prevent.
+	// config owns this list: it is the confinement boundary, and statedir.Open is handed the same one.
 	for _, dir := range cfg.SessionWorkDirs() {
 		paths = append(paths,
 			filepath.Join(dir, ".claude", "settings.json"),
@@ -255,15 +216,11 @@ func policySettingsPaths(cfg *config.Config) []string {
 	return paths
 }
 
-// grantedCommands returns, per Bash command head, whether the policy grants it
-// and whether it denies it OUTRIGHT.
-//
-// "Outright" is the load-bearing word. Deny wins over allow in Claude's policy,
-// but only for what the deny rule actually covers: a narrow `Bash(go run:*)` deny
-// alongside a `Bash(go test:*)` allow is a normal, careful setup, and reporting
-// that as "go is denied, tasks in those repos cannot be verified" would be flatly
-// wrong. So only a BARE head deny (`Bash(go)` / `Bash(go:*)`) counts as decisive;
-// a verb-qualified deny is recorded separately and merely narrows.
+// grantedCommands returns, per Bash command head, whether the policy grants it and whether it
+// denies it OUTRIGHT. Deny wins over allow in Claude's policy, but only for what the deny rule
+// actually covers: a narrow `Bash(go run:*)` deny alongside a `Bash(go test:*)` allow is a normal,
+// careful setup, and reporting that as "go is denied, tasks in those repos cannot be verified"
+// would be flatly wrong.
 func grantedCommands(cfg *config.Config) (allow, denyAll map[string]bool, denyVerbs map[string][]string) {
 	allow, denyAll, denyVerbs = map[string]bool{}, map[string]bool{}, map[string][]string{}
 	for _, path := range policySettingsPaths(cfg) {
@@ -302,9 +259,9 @@ func grantedCommands(cfg *config.Config) (allow, denyAll map[string]bool, denyVe
 	return allow, denyAll, denyVerbs
 }
 
-// bashHead splits a Bash permission rule into its command word and the verb that
-// qualifies it, if any: `Bash(go build:*)` yields ("go", "build"), while
-// `Bash(go:*)` and `Bash(go)` yield ("go", ""). Non-Bash rules yield ("", "").
+// bashHead splits a Bash permission rule into its command word and the verb that qualifies it, if
+// any: `Bash(go build:*)` yields ("go", "build"), while `Bash(go:*)` and `Bash(go)` yield ("go",
+// "").
 func bashHead(rule string) (head, verb string) {
 	inner, ok := strings.CutPrefix(strings.TrimSpace(rule), "Bash(")
 	if !ok {
