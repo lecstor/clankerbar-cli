@@ -668,6 +668,28 @@ the run did produce is still written when there is one, so a failed eval keeps
 its evidence. A failed `git worktree remove` also exits non-zero, with the
 report.
 
+#### The plan without the session: `clankerbar review map`
+
+`clankerbar review map --repo <checkout> --base <commit> [--head <commit>]`
+prints the plan `review run --method maps-session` would send, as JSON, and
+starts no session: it spends nothing, loads no clankerbar config and touches no
+network, so it works on a machine that has none. It takes the same `--repo`,
+`--base`, `--head`, `--title`, `--description-file`, `--chunk-size`,
+`--flow-max` and `--json` flags as `review run`; the plan is always the
+maps-session one, with hunk embedding off. Unlike `review run` it reads `--repo`
+as given rather than checking out a temporary worktree — the reviewer must work
+in the checkout the map came from — so that checkout must be at `--head`
+(resolved to a full SHA), and the command exits non-zero naming both commits
+when it is not. A dirty tree is allowed and the repository is never modified.
+The JSON carries the resolved `base` and `head`, `items` (`change` and `flow`
+count the numbered `M` and `F` items — the flow map's unnumbered overflow note
+is not an item — and `chunks` the notes turns), and `turns`: each notes turn with
+its `kind` `notes`, `chunk` and `of`, then exactly one `kind` `findings` turn,
+last. Turn 1's prompt is the standalone brief plus the first chunk, so an agent
+driving the sequence itself sends that verbatim to a fresh reviewer session and
+each later prompt to the same session; the prompts are byte for byte the ones
+`review run` puts on its invocation.
+
 ### Session-initiated handoff: a boundary the session chooses
 
 Phases cut at two fixed, driver-chosen points. A session can also choose its own
