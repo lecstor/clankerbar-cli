@@ -31,9 +31,8 @@ type recordingHeartbeat struct {
 	failuresLeft int
 	stall        chan struct{}
 	entered      chan struct{}
-	// enteredOnce guards the close of entered. The fake is shared by every
-	// test in this package, so a check-then-act close would double-close (and
-	// panic) the moment two beats run concurrently.
+	// enteredOnce guards the close of entered: Heartbeat may be called on one
+	// fake by more than one goroutine, and a second close would panic.
 	enteredOnce sync.Once
 }
 
@@ -342,62 +341,67 @@ func TestLeaseRenewerPausesWhenTheSessionSettlesItsClaim(t *testing.T) {
 func TestLeaseRenewerSettleQueuedBeforeATickNeverLosesToTheBeat(t *testing.T) {
 	const drainIterations = 20
 	for i := 0; i < drainIterations; i++ {
-		hb := &recordingHeartbeat{stall: make(chan struct{}), entered: make(chan struct{})}
-		ticks := make(chan time.Time, 4)
-		r := &leaseRenewer{
-			hb:       hb,
-			interval: time.Minute, // cadence is hand-driven via r.tick, not the timer
-			prefix:   "test: ",
-			claims:   make(chan harness.Claim, 4),
-			done:     make(chan struct{}),
-			stopped:  make(chan struct{}),
-			tick:     ticks,
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		go r.run(ctx, heartbeatClaim("r-1"))
-
-		// Fire one tick and wait for the renewer to be PARKED INSIDE the stalled
-		// Heartbeat call - entered is only closed once the call has reached the
-		// stall point, so by then the loop is out of the main select. (Waiting on
-		// tick consumption instead is not enough: the loop can be descheduled
-		// between receiving the tick and entering Heartbeat, and a settle queued
-		// in that gap is drained by the same tick case - a false 'no beats'.)
-		ticks <- time.Now()
-		heartbeatWaitFor(t, "the renewer to park inside the stalled heartbeat", func() bool {
-			select {
-			case <-hb.entered:
-				return true
-			default:
-				return false
+		func() {
+			hb := &recordingHeartbeat{stall: make(chan struct{}), entered: make(chan struct{})}
+			ticks := make(chan time.Time, 4)
+			r := &leaseRenewer{
+				hb:       hb,
+				interval: time.Minute, // cadence is hand-driven via r.tick, not the timer
+				prefix:   "test: ",
+				claims:   make(chan harness.Claim, 4),
+				done:     make(chan struct{}),
+				stopped:  make(chan struct{}),
+				tick:     ticks,
 			}
-		})
+			ctx, cancel := context.WithCancel(context.Background())
+			go r.run(ctx, heartbeatClaim("r-1"))
+			// Clean up on every exit path, a t.Fatalf included: otherwise the
+			// run goroutine (and a heartbeat parked on f.stall) outlives the
+			// iteration for the rest of the package run.
+			defer cancel()
+			defer r.stop()
 
-		// Queue the settle and a tick while the renewer is parked, so both are
-		// sitting in their channels the moment it re-enters select.
-		r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
-		ticks <- time.Now()
+			// Fire one tick and wait for the renewer to be PARKED INSIDE the stalled
+			// Heartbeat call - entered is only closed once the call has reached the
+			// stall point, so by then the loop is out of the main select. (Waiting on
+			// tick consumption instead is not enough: the loop can be descheduled
+			// between receiving the tick and entering Heartbeat, and a settle queued
+			// in that gap is drained by the same tick case - a false 'no beats'.)
+			ticks <- time.Now()
+			heartbeatWaitFor(t, "the renewer to park inside the stalled heartbeat", func() bool {
+				select {
+				case <-hb.entered:
+					return true
+				default:
+					return false
+				}
+			})
 
-		// Release the parked heartbeat. The loop now re-enters select with the
-		// settle AND the tick ready together: the drain must fold the settle in
-		// before the beat decision - the tick must not beat.
-		close(hb.stall)
+			// Queue the settle and a tick while the renewer is parked, so both are
+			// sitting in their channels the moment it re-enters select.
+			r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
+			ticks <- time.Now()
 
-		// Wait until the queued tick has been consumed and the beat count holds
-		// across a small quiet window, so the check below cannot pass merely
-		// because the tick is still queued.
-		heartbeatWaitFor(t, "no renewal beat after the settle was queued first", func() bool {
-			if len(ticks) != 0 {
-				return false
+			// Release the parked heartbeat. The loop now re-enters select with the
+			// settle AND the tick ready together: the drain must fold the settle in
+			// before the beat decision - the tick must not beat.
+			close(hb.stall)
+
+			// Wait until the queued tick has been consumed and the beat count holds
+			// across a small quiet window, so the check below cannot pass merely
+			// because the tick is still queued.
+			heartbeatWaitFor(t, "no renewal beat after the settle was queued first", func() bool {
+				if len(ticks) != 0 {
+					return false
+				}
+				n := hb.count()
+				time.Sleep(5 * time.Millisecond)
+				return hb.count() == n
+			})
+			if n := hb.count(); n != 1 {
+				t.Fatalf("iteration %d/%d: queued a settle then a tick, yet %d renewal beat(s) landed (want 1): renewal must never beat a settled lease", i+1, drainIterations, n)
 			}
-			n := hb.count()
-			time.Sleep(5 * time.Millisecond)
-			return hb.count() == n
-		})
-		if n := hb.count(); n != 1 {
-			t.Fatalf("iteration %d/%d: queued a settle then a tick, yet %d renewal beat(s) landed (want 1): renewal must never beat a settled lease", i+1, drainIterations, n)
-		}
-		cancel()
-		r.stop()
+		}()
 	}
 }
 
