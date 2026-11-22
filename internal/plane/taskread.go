@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -512,12 +514,47 @@ func (r *mcpReleaser) callText(ctx context.Context, tool string, args map[string
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: HTTP %d: %s", tool, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &httpStatusError{Tool: tool, Status: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
 	if err := checkResult(tool, raw); err != nil {
 		return nil, err
 	}
 	return resultText(sseData(raw)), nil
+}
+
+// httpStatusError is the endpoint's non-200 answer, kept typed so a caller can
+// tell a transient server-side failure from an answer a retry will not improve.
+type httpStatusError struct {
+	Tool   string
+	Status int
+	Body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s: HTTP %d: %s", e.Tool, e.Status, e.Body)
+}
+
+// Transient reports whether a plane call's error is one a bounded retry may fix:
+// a transport failure (no response at all — a timeout, a connection reset, DNS)
+// or a 5xx/429 answer. A tool-level refusal arrives as a 200 with `isError` and
+// is the plane's considered answer, so it is never classified transient.
+func Transient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status *httpStatusError
+	if errors.As(err, &status) {
+		return status.Status >= 500 || status.Status == http.StatusTooManyRequests
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return !errors.Is(err, context.Canceled)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // resultText concatenates a tools/call result's text contents — where the

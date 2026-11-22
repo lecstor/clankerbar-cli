@@ -43,9 +43,10 @@ package supervisor
 //   - a refused claim (someone else holds it);
 //   - any failure after the claim: the claim is RELEASED, so the task returns to
 //     `approved` and the agent close-out can take it. A task is never left claimed
-//     by a run that has stopped. The one exception is a merge that landed but could
-//     not be verified: that is closed with `mergeVerified: false`, because a
-//     merged PR is no longer OPEN and releasing would strand the task forever.
+//     by a run that has stopped. The one exception is a merge that LANDED but could
+//     not be finished: its close is retried on transient failures, the delivery is
+//     recorded if it still fails, and the claim is left to its lease — because a
+//     merged PR is no longer OPEN, so releasing would strand the task forever.
 //
 // One log line per outcome, and each unchanged stand-down is said once rather than
 // on every poll: the supervisor's own log is a status surface, and a line repeated
@@ -83,7 +84,18 @@ const (
 	// reports) for longer than the fleet can tolerate: two minutes is well over a
 	// dozen clean close-outs, and everything past it waits for the next poll.
 	closeOutPassBudget = 2 * time.Minute
+
+	// closeOutCompleteAttempts bounds the retries of the final close after a
+	// merge landed. It is the one write whose failure must not fall back to a
+	// release: the PR is gone from the open list, so a release strands the task.
+	// Four attempts spend 1.75s of backoff inside the single cleanup timeout.
+	closeOutCompleteAttempts = 4
 )
+
+// closeOutCompleteBackoff is the wait before the second close attempt; it doubles
+// each retry. A var so a test can shrink it rather than wait the real bound out,
+// the same discipline closeOutBaseProbeTimeout keeps.
+var closeOutCompleteBackoff = 250 * time.Millisecond
 
 // closeOutBaseProbeTimeout bounds the close-out's own origin probe. The driver
 // gives its probe 30s (loop.prBaseProbeTimeout) because a phase spawn has nothing
@@ -190,11 +202,22 @@ func (d *Supervisor) runCloseOutPass(targets []closeOutTarget) {
 	// One base cache per pass: every task of the same repo resolves the same
 	// branch, so probing origin per task is the same answer at N times the cost.
 	bases := newCloseOutBases()
+	// approved is the union of the queues this pass read, and whole records
+	// whether it read them all: a task missing from a queue that was never read
+	// is not a task that left the queue, so a partial pass must not sweep.
+	approved := map[string]bool{}
+	whole := true
 	for _, t := range targets {
 		if ctx.Err() != nil || time.Now().After(budget) {
-			return
+			whole = false
+			break
 		}
-		d.reconcileCloseOutProject(ctx, t.cfg, t.slug, budget, bases)
+		if !d.reconcileCloseOutProject(ctx, t.cfg, t.slug, budget, bases, approved) {
+			whole = false
+		}
+	}
+	if whole {
+		d.pruneCloseOutState(approved)
 	}
 }
 
@@ -220,11 +243,16 @@ func closeOutProjects(cfg *config.Config) []string {
 // its approved queue. ctx is the pass's own (the supervisor lifetime): a fleet stop
 // cancels it, and every call below therefore aborts rather than finishing out its
 // timeout. bases carries the pass's memoised PR bases.
-func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.Config, slug string, budget time.Time, bases *closeOutBases) {
+//
+// It reports whether the pass learned this project's approved queue, which is what
+// lets the end-of-pass sweep prune safely: an unread queue is not an empty one. An
+// operator-integrated project reports TRUE with nothing added - the close-out never
+// creates state for it, so there is nothing to keep for it either.
+func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.Config, slug string, budget time.Time, bases *closeOutBases, approved map[string]bool) bool {
 	client := d.closeOutFor(cfg, slug)
 	if client == nil {
 		d.closeOutSay("client:"+slug, "close-out %s: no plane endpoint could be resolved - standing down", slug)
-		return
+		return false
 	}
 	callCtx, cancel := context.WithTimeout(ctx, closeOutCallTimeout)
 	defer cancel()
@@ -232,7 +260,7 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	policy, err := client.ProjectPolicy(callCtx)
 	if err != nil {
 		d.closeOutSay("policy-err:"+slug, "close-out %s: could not read the project policy (%v) - standing down", slug, err)
-		return
+		return false
 	}
 	// The dial is the operator's turn signal: under `human` an approved-but-unmerged
 	// task belongs to them, and this path has nothing to say about it. Anything that
@@ -240,16 +268,21 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	// not read is exactly the direction this path must not fail in.
 	if !strings.EqualFold(policy.AuthorityIntegrate, "clanker") {
 		d.closeOutSay("policy:"+slug, "close-out %s: authorityIntegrate is %q, not %q - approved tasks are not merged here", slug, policy.AuthorityIntegrate, "clanker")
-		return
+		return true
 	}
 
 	queue, err := client.ApprovedForCloseOut(callCtx)
 	if err != nil {
 		d.closeOutSay("queue-err:"+slug, "close-out %s: could not list the approved queue (%v) - standing down", slug, err)
-		return
+		return false
+	}
+	// The whole served page is this pass's knowledge of the queue, including the
+	// tasks it will not reach before the budget: they are still approved.
+	for _, task := range queue.Tasks {
+		approved[task.ID] = true
 	}
 	if len(queue.Tasks) == 0 {
-		return // an empty close-out queue is not news
+		return true // an empty close-out queue is not news
 	}
 	if queue.Total > len(queue.Tasks) {
 		d.closeOutSay("queue-cap:"+slug, "close-out %s: %d approved task(s) waiting but only %d were served - the rest wait for the agent close-out", slug, queue.Total, len(queue.Tasks))
@@ -257,10 +290,11 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	for _, task := range queue.Tasks {
 		if time.Now().After(budget) || ctx.Err() != nil {
 			d.closeOutSay("budget:"+slug, "close-out %s: this poll's close-out budget is spent - the remaining approved tasks wait for the next poll", slug)
-			return
+			return false
 		}
 		d.reconcileCloseOutTask(ctx, cfg, slug, client, task, bases)
 	}
+	return true
 }
 
 // reconcileCloseOutTask takes one approved task as far as the deterministic path
@@ -396,19 +430,20 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	}
 	runID := claim.RunID
 
-	// From here on the claim is ours, so every failure has to hand it back: a task
-	// left claimed by a run that has stopped is a task nobody is working.
+	// From here on the claim is ours, so every failure up to the merge has to
+	// hand it back: a task left claimed by a run that has stopped is a task nobody
+	// is working. AFTER a merge lands there is deliberately no release path (see
+	// settleMergedCloseOut): the PR is no longer OPEN, so releasing would strand
+	// the task on `approved` with nothing to find.
 	//
-	// checkGreen is what the plane's CI-repair ladder reads: true means "the PR's
-	// checks were green, so do not count this as a failed repair". That is right for
-	// a post-merge write that failed, and wrong for a MERGE that failed - there the
-	// repair ladder is the only thing bounding a green-but-unmergeable PR (branch
-	// protection, a base that moved), which would otherwise be claimed, refused and
-	// released every poll with no escalation.
-	release := func(checkGreen bool, reason string, args ...any) {
+	// The release attests checkGreen false because the MERGE is what failed: a
+	// green-but-unmergeable PR (branch protection, a base that moved) is bounded
+	// only by the plane's CI-repair ladder, and attesting green would leave it
+	// claimed, refused and released every poll with no escalation.
+	release := func(reason string, args ...any) {
 		rctx, rcancel := d.closeOutCleanupCtx()
 		defer rcancel()
-		if rerr := client.ReleaseCloseOut(rctx, task.ID, runID, checkGreen); rerr != nil {
+		if rerr := client.ReleaseCloseOut(rctx, task.ID, runID, false); rerr != nil {
 			log.Printf("close-out: %s claim could NOT be released (%v) - the task stays claimed until its lease expires", label, rerr)
 			d.closeOutSay(key, "close-out: %s %s - and the claim could not be released; its lease must expire before an agent can take it", label, fmt.Sprintf(reason, args...))
 			return
@@ -422,45 +457,90 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	// landed after the judgement.
 	mergeSHA, err := verifier.MergePR(ctx, dir, task.Repo, state.Number, base, state.HeadOID)
 	if err != nil {
-		release(false, "could not merge PR #%d into %s (%v)", state.Number, base, err)
+		release("could not merge PR #%d into %s (%v)", state.Number, base, err)
 		return
 	}
 	check := d.verifyMerge(ctx, verifier, dir, base, mergeSHA)
-	if check.Status != delivery.Pass {
-		// The merge DID land — MergePR only returns a commit GitHub made — so the
-		// claim must not be handed back: the PR is no longer OPEN, and a release
-		// would put the task back on `approved` with no PR for either path to find
-		// again. Record the delivery honestly as unverified instead.
-		decl := plane.CloseOutDelivery{
-			Commit:            mergeSHA,
-			PR:                fmt.Sprintf("#%d", state.Number),
-			IntegrationBranch: base,
-			MergeVerified:     false,
-		}
-		cctx, ccancel := d.closeOutCleanupCtx()
-		err := client.CompleteCloseOut(cctx, task.ID, runID, decl)
-		ccancel()
-		if err != nil {
-			release(true, "merged PR #%d as %s but the merge could not be verified (%s) and the plane refused to close the task (%v)", state.Number, shortSHA(mergeSHA), check.Detail, err)
-			return
-		}
-		d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s, but the merge could not be verified (%s) - task closed done with mergeVerified:false", label, state.Number, shortSHA(mergeSHA), base, check.Detail)
-		return
-	}
+	// The merge is ON THE REMOTE now: MergePR only returns a commit GitHub made,
+	// so the PR is no longer OPEN and there is deliberately no release path from
+	// here. settleMergedCloseOut retries the close and, if it still cannot
+	// finish, records the delivery and leaves the claim to its lease - because a
+	// release would put the task back on `approved` with no PR for either path to
+	// find again.
+	d.settleMergedCloseOut(client, label, key, task.ID, runID, state.Number, base, mergeSHA, check)
+}
+
+// settleMergedCloseOut finishes a task whose PR this pass has already merged.
+//
+// It has NO release path, by construction: the merge landed, so the task must
+// never return to `approved` — there is no open PR left for the agent close-out
+// to find. A close that fails transiently (a 502, a timeout) is retried within
+// one cleanup budget, and a close that still cannot be finished leaves the claim
+// to its lease with the delivery recorded, so the successor can close the task
+// from the merge SHA and PR rather than rediscovering a merge that already
+// happened.
+func (d *Supervisor) settleMergedCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, pr int, base, mergeSHA string, check delivery.Check) {
+	verified := check.Status == delivery.Pass
 	decl := plane.CloseOutDelivery{
 		Commit:            mergeSHA,
-		PR:                fmt.Sprintf("#%d", state.Number),
+		PR:                fmt.Sprintf("#%d", pr),
 		IntegrationBranch: base,
-		MergeVerified:     true,
+		MergeVerified:     verified,
 	}
-	cctx, ccancel := d.closeOutCleanupCtx()
-	err = client.CompleteCloseOut(cctx, task.ID, runID, decl)
-	ccancel()
-	if err != nil {
-		release(true, "merged PR #%d as %s but the plane refused to close the task (%v)", state.Number, shortSHA(mergeSHA), err)
+	if err := d.completeCloseOut(client, label, taskID, runID, decl); err != nil {
+		d.recordMergedDelivery(client, label, key, taskID, runID, decl, err)
 		return
 	}
-	d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s (merge commit is an ancestor of the remote tip) - task closed done", label, state.Number, shortSHA(mergeSHA), base)
+	if !verified {
+		d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s, but the merge could not be verified (%s) - task closed done with mergeVerified:false", label, pr, shortSHA(mergeSHA), base, check.Detail)
+		return
+	}
+	d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s (merge commit is an ancestor of the remote tip) - task closed done", label, pr, shortSHA(mergeSHA), base)
+}
+
+// completeCloseOut closes the task done, retrying a TRANSIENT plane failure
+// (transport or 5xx) within one cleanup budget. A tool-level refusal is the
+// plane's answer and is returned at once: retrying it would only repeat it.
+func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, taskID, runID string, decl plane.CloseOutDelivery) error {
+	ctx, cancel := d.closeOutCleanupCtx()
+	defer cancel()
+	wait := closeOutCompleteBackoff
+	var err error
+	for attempt := 1; attempt <= closeOutCompleteAttempts; attempt++ {
+		if err = client.CompleteCloseOut(ctx, taskID, runID, decl); err == nil {
+			return nil
+		}
+		if !plane.Transient(err) || attempt == closeOutCompleteAttempts {
+			return err
+		}
+		log.Printf("close-out: %s PR %s merged as %s, but closing the task failed transiently (attempt %d of %d: %v) - retrying",
+			label, decl.PR, decl.Commit, attempt, closeOutCompleteAttempts, err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		wait *= 2
+	}
+	return err
+}
+
+// recordMergedDelivery is the recovery write for a merge that landed but could
+// not be closed. The claim is LEFT HELD on purpose: releasing it would return a
+// merged task to approved with no open PR, and the lease expiry is the safe
+// hand-back - it offers the task as a takeover, and this record tells the
+// successor the merge SHA and PR are already merged.
+func (d *Supervisor) recordMergedDelivery(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, closeErr error) {
+	ctx, cancel := d.closeOutCleanupCtx()
+	recErr := client.RecordCloseOutDelivery(ctx, taskID, runID, decl)
+	cancel()
+	if recErr == nil {
+		d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) - delivery RECORDED (mergeVerified:%t) so a successor can close it; the claim is left held rather than returning a merged PR to approved",
+			label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, decl.MergeVerified)
+		return
+	}
+	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR",
+		label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, recErr)
 }
 
 // verifyMerge settles that the merge commit is an ancestor of base on origin. Two
@@ -606,6 +686,77 @@ func (d *Supervisor) closeOutSay(key, format string, args ...any) {
 	}
 	d.closeOutSaid[key] = line
 	log.Print(line)
+}
+
+// pruneCloseOutState drops the per-task entries of the say maps, the conflict
+// evidence cache and the conflict attempt budget for tasks that are no longer
+// approved, so a supervisor that runs for weeks does not accumulate one entry per
+// task it has ever seen.
+//
+// approved is the union of the approved queues this pass read. A task gets ONE
+// pass of grace (closeOutSeenTasks holds the previous pass's set), and the task a
+// conflict session is still working is kept outright: both are tasks a claim has
+// taken out of the approved queue while their state is still live, and dropping a
+// conflict budget there would reset the paid-retry bound (CLA-759). The keys
+// scoped to a project, repo or the fleet are not task state and stay.
+func (d *Supervisor) pruneCloseOutState(approved map[string]bool) {
+	keep := make(map[string]bool, len(approved)+len(d.closeOutSeenTasks)+1)
+	for id := range approved {
+		keep[id] = true
+	}
+	for id := range d.closeOutSeenTasks {
+		keep[id] = true
+	}
+	d.conflictMu.Lock()
+	if d.conflictActive != "" {
+		keep[d.conflictActive] = true
+	}
+	for id := range d.conflictTried {
+		if !keep[id] {
+			delete(d.conflictTried, id)
+		}
+	}
+	for key := range d.conflictSaid {
+		if id, ok := conflictTaskKey(key); ok && !keep[id] {
+			delete(d.conflictSaid, key)
+		}
+	}
+	d.conflictMu.Unlock()
+	for id := range d.closeOutConflicts {
+		if !keep[id] {
+			delete(d.closeOutConflicts, id)
+		}
+	}
+	for key := range d.closeOutSaid {
+		if id, ok := closeOutTaskKey(key); ok && !keep[id] {
+			delete(d.closeOutSaid, key)
+		}
+	}
+	d.closeOutSeenTasks = approved
+}
+
+// closeOutTaskKey is the task ID a closeOutSaid key names: every per-task key
+// starts "task:<id>", optionally followed by ":<suffix>" for a more specific
+// line about the same task.
+func closeOutTaskKey(key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, "task:")
+	if !ok {
+		return "", false
+	}
+	id, _, _ := strings.Cut(rest, ":")
+	return id, id != ""
+}
+
+// conflictTaskKey is the task ID a conflictSaid key names. The conflict path's
+// per-task keys are "<prefix>:<id>"; its slug, harness and fleet keys are not
+// task-scoped, so they are never pruned here.
+func conflictTaskKey(key string) (string, bool) {
+	for _, prefix := range []string{"paused:", "routespaused:", "busy:", "worktree:", "exhausted:", "slot:", "claimed:"} {
+		if id, ok := strings.CutPrefix(key, prefix); ok && id != "" {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // closeOutFor builds the close-out client for one project's endpoint, mirroring

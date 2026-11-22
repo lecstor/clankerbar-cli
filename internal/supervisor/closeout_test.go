@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1072,7 +1073,11 @@ func TestCloseOutClosesAMergeItCannotVerify(t *testing.T) {
 	}
 }
 
-func TestCloseOutReleasesTheClaimWhenThePlaneRefusesTheClose(t *testing.T) {
+// A tool-level refusal of the final close is NOT retried (it is the plane's
+// considered answer), and it must never become a release: the merge landed, so the
+// PR is no longer OPEN and a release would strand the task on approved forever. The
+// delivery is recorded instead, and the claim is left to its lease.
+func TestCloseOutHoldsTheClaimWhenThePlaneRefusesTheClose(t *testing.T) {
 	f := newCloseOutFixture(t, false)
 	f.servePlane(t, "clanker")
 	f.plane.refuseWhen = func(tool string, args map[string]any) string {
@@ -1085,11 +1090,122 @@ func TestCloseOutReleasesTheClaimWhenThePlaneRefusesTheClose(t *testing.T) {
 
 	lines := f.run(d)
 
-	if releases := f.releases(); releases != 1 {
-		t.Fatalf("release calls = %d, want 1 after the plane refused the close: %v", releases, f.plane.planeCalls())
+	if releases := f.releases(); releases != 0 {
+		t.Fatalf("release calls = %d after the plane refused the close: a merged PR must never return to approved: %v", releases, f.plane.planeCalls())
 	}
-	if !strings.Contains(lines, "refused to close the task") {
-		t.Errorf("the stand-down does not name the refused close:\n%s", lines)
+	if got := len(f.callsFor("complete_task")); got != 1 {
+		t.Errorf("complete_task calls = %d, want 1 (a tool-level refusal is not retried): %v", got, f.plane.planeCalls())
+	}
+	records := f.callsFor("record_progress")
+	if len(records) != 1 {
+		t.Fatalf("record_progress calls = %d, want 1 (the delivery must be recorded so a successor can close the task): %v", len(records), f.plane.planeCalls())
+	}
+	delivery, ok := records[0].args["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("the recovery record carries no delivery block: %v", records[0].args)
+	}
+	if got := delivery["pr"]; got != fmt.Sprintf("#%d", closeOutTestPR) {
+		t.Errorf("recorded delivery.pr = %v, want #%d", got, closeOutTestPR)
+	}
+	if got, _ := delivery["commit"].(string); len(got) != 40 {
+		t.Errorf("recorded delivery.commit = %q, want the merge commit's sha", got)
+	}
+	if _, ok := records[0].args["status"]; ok {
+		t.Errorf("the recovery record changed the task's status: %v", records[0].args)
+	}
+	for _, want := range []string{"PR #" + fmt.Sprint(closeOutTestPR), "left held", "delivery RECORDED"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the stand-down does not say %q:\n%s", want, lines)
+		}
+	}
+}
+
+// A transient close failure is retried: a 502 that clears in a moment must not
+// cost the task its claim, and it must not be mistaken for an answer.
+func TestCloseOutRetriesATransientCloseFailure(t *testing.T) {
+	oldBackoff := closeOutCompleteBackoff
+	closeOutCompleteBackoff = time.Millisecond
+	defer func() { closeOutCompleteBackoff = oldBackoff }()
+
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	var mu sync.Mutex
+	attempts := 0
+	f.plane.setStatusWhen(func(tool string, _ map[string]any) int {
+		if tool != "complete_task" {
+			return 0
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		attempts++
+		if attempts < 3 {
+			return http.StatusBadGateway
+		}
+		return 0
+	})
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := len(f.callsFor("complete_task")); got != 3 {
+		t.Fatalf("complete_task calls = %d, want 3 (two 502s, then the close): %v", got, f.plane.planeCalls())
+	}
+	if releases := f.releases(); releases != 0 {
+		t.Errorf("a merged PR was released during a transient close failure: %v", f.plane.planeCalls())
+	}
+	if records := f.callsFor("record_progress"); len(records) != 0 {
+		t.Errorf("a close that succeeded on retry still recorded a recovery delivery: %v", records)
+	}
+	if !strings.Contains(lines, "task closed done") {
+		t.Errorf("the close-out did not report the eventual close:\n%s", lines)
+	}
+	if !strings.Contains(lines, "failed transiently") {
+		t.Errorf("the retry was not reported:\n%s", lines)
+	}
+}
+
+// A close that never succeeds still never releases. The delivery is recorded (so a
+// successor knows the merge SHA and PR are already merged) and the claim is left
+// held for its lease.
+func TestCloseOutRecordsTheDeliveryWhenTheCloseNeverSucceeds(t *testing.T) {
+	oldBackoff := closeOutCompleteBackoff
+	closeOutCompleteBackoff = time.Millisecond
+	defer func() { closeOutCompleteBackoff = oldBackoff }()
+
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.plane.setStatusWhen(func(tool string, _ map[string]any) int {
+		if tool == "complete_task" {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	})
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := len(f.callsFor("complete_task")); got != closeOutCompleteAttempts {
+		t.Fatalf("complete_task calls = %d, want the full retry bound %d: %v", got, closeOutCompleteAttempts, f.plane.planeCalls())
+	}
+	if releases := f.releases(); releases != 0 {
+		t.Fatalf("release calls = %d after the close exhausted its retries: a merged PR must never return to approved: %v", releases, f.plane.planeCalls())
+	}
+	records := f.callsFor("record_progress")
+	if len(records) != 1 {
+		t.Fatalf("record_progress calls = %d, want 1 (the delivery must be recorded): %v", len(records), f.plane.planeCalls())
+	}
+	delivery, ok := records[0].args["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("the recovery record carries no delivery block: %v", records[0].args)
+	}
+	sha, _ := delivery["commit"].(string)
+	if len(sha) != 40 {
+		t.Fatalf("recorded delivery.commit = %q, want the merge commit's full sha", sha)
+	}
+	for _, want := range []string{fmt.Sprintf("PR #%d", closeOutTestPR), "merged as " + sha, "left held", "delivery RECORDED"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the failure line does not say %q:\n%s", want, lines)
+		}
 	}
 }
 
@@ -1109,6 +1225,147 @@ func TestCloseOutNotWiredIsSilentOnThePlane(t *testing.T) {
 	}
 	if got := f.callsFor("claim_task"); len(got) != 0 {
 		t.Errorf("a task was claimed with no plane wired: %v", got)
+	}
+}
+
+// The state sweep keeps a task's entries while it is approved (or was, on the
+// previous pass) and drops them once it has left the queue for good. Keys scoped
+// to a project or the fleet are not task state and stay, and the task a conflict
+// session is working is kept even though the claim has taken it out of the queue.
+func TestCloseOutSweepPrunesOnlyTasksNoLongerApproved(t *testing.T) {
+	d := &Supervisor{
+		closeOutSaid: map[string]string{
+			"task:t-1":                "closed",
+			"task:t-1:conflict-stale": "stale",
+			"task:t-2":                "closed",
+			"base:acme:acme/widgets":  "base",
+			"policy:acme":             "policy",
+		},
+		closeOutConflicts: map[string]conflictEvidence{"t-1": {pair: "a@b"}, "t-2": {pair: "c@d"}},
+		conflictSaid: map[string]string{
+			"claimed:t-1":   "claimed",
+			"exhausted:t-2": "exhausted",
+			"policy:acme":   "policy",
+			"claude":        "claude",
+		},
+		conflictTried:     map[string]conflictAttempt{"t-1": {n: 2}, "t-2": {n: 1}},
+		closeOutSeenTasks: map[string]bool{"t-1": true},
+	}
+
+	// t-1 was approved on the previous pass, so the first pass without it is
+	// grace: a conflict session's claim takes a task out of the queue while its
+	// retry budget must survive.
+	d.pruneCloseOutState(map[string]bool{"t-2": true})
+	for _, check := range []struct {
+		name string
+		kept bool
+	}{
+		{"closeOutSaid task line", d.closeOutSaid["task:t-1"] != ""},
+		{"closeOutSaid suffixed task line", d.closeOutSaid["task:t-1:conflict-stale"] != ""},
+		{"closeOutConflicts evidence", d.closeOutConflicts["t-1"].pair == "a@b"},
+		{"conflictSaid task line", d.conflictSaid["claimed:t-1"] == "claimed"},
+		{"conflictTried budget", d.conflictTried["t-1"].n == 2},
+	} {
+		if !check.kept {
+			t.Errorf("%s was pruned on the grace pass", check.name)
+		}
+	}
+
+	// A second pass without it is knowledge: every per-task entry goes.
+	d.pruneCloseOutState(map[string]bool{"t-2": true})
+	if _, ok := d.closeOutSaid["task:t-1"]; ok {
+		t.Error("a task that left the approved queue kept its close-out line")
+	}
+	if _, ok := d.closeOutSaid["task:t-1:conflict-stale"]; ok {
+		t.Error("a task that left the approved queue kept its suffixed close-out line")
+	}
+	if _, ok := d.closeOutConflicts["t-1"]; ok {
+		t.Error("a task that left the approved queue kept its conflict evidence")
+	}
+	if _, ok := d.conflictSaid["claimed:t-1"]; ok {
+		t.Error("a task that left the approved queue kept its conflict line")
+	}
+	if _, ok := d.conflictTried["t-1"]; ok {
+		t.Error("a task that left the approved queue kept its conflict retry budget")
+	}
+
+	// The still-approved task and the non-task keys are untouched: a project's
+	// stand-down and the fleet-wide no-Claude line are not task state.
+	if _, ok := d.closeOutSaid["task:t-2"]; !ok {
+		t.Error("an approved task lost its close-out line")
+	}
+	if _, ok := d.conflictTried["t-2"]; !ok {
+		t.Error("an approved task lost its conflict retry budget")
+	}
+	for _, key := range []string{"base:acme:acme/widgets", "policy:acme"} {
+		if _, ok := d.closeOutSaid[key]; !ok {
+			t.Errorf("the project-scoped key %q was pruned", key)
+		}
+	}
+	if _, ok := d.conflictSaid["claude"]; !ok {
+		t.Error("the fleet-wide no-Claude line was pruned")
+	}
+
+	// A conflict session's live task is kept outright: its claim is what took it
+	// out of the approved queue, and dropping its budget would reset the bound.
+	d.setConflictActive("t-3")
+	d.conflictTried["t-3"] = conflictAttempt{n: 1}
+	d.conflictSaid["busy:t-3"] = "busy"
+	d.pruneCloseOutState(nil)
+	d.pruneCloseOutState(nil)
+	if _, ok := d.conflictTried["t-3"]; !ok {
+		t.Error("the conflict session's live task lost its retry budget")
+	}
+	if _, ok := d.conflictSaid["busy:t-3"]; !ok {
+		t.Error("the conflict session's live task lost its line")
+	}
+}
+
+// The pass wires the sweep: a task that leaves the approved queue is pruned, but
+// only after one grace pass, so a claim that hides it for a pass does not reset
+// its state.
+func TestCloseOutPassSweepsTaskStateOnceTheTaskLeavesTheQueue(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	d := f.supervisor(0)
+
+	f.run(d)
+	key := "task:" + closeOutTestTask
+	if _, ok := d.closeOutSaid[key]; !ok {
+		t.Fatalf("the pass did not record its task line: %v", d.closeOutSaid)
+	}
+
+	f.plane.serveTool("list_tasks", `{"tasks":[],"count":0,"total":0,"view":"full"}`)
+	f.run(d)
+	if _, ok := d.closeOutSaid[key]; !ok {
+		t.Errorf("the sweep dropped a task on the first pass that no longer listed it: %v", d.closeOutSaid)
+	}
+
+	f.run(d)
+	if _, ok := d.closeOutSaid[key]; ok {
+		t.Errorf("the sweep kept a task that has left the approved queue: %v", d.closeOutSaid)
+	}
+}
+
+// A pass that could not read a queue learned nothing about it: it must not sweep,
+// because a task missing from an unread queue is not a task that left the queue.
+func TestCloseOutPassDoesNotSweepOnAnUnreadQueue(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	d := f.supervisor(0)
+
+	f.run(d)
+	key := "task:" + closeOutTestTask
+	if _, ok := d.closeOutSaid[key]; !ok {
+		t.Fatalf("the pass did not record its task line: %v", d.closeOutSaid)
+	}
+
+	f.plane.refuseTool("list_tasks", "plane read failed")
+	f.run(d)
+	f.run(d)
+
+	if _, ok := d.closeOutSaid[key]; !ok {
+		t.Errorf("an unread queue was treated as an empty one and swept: %v", d.closeOutSaid)
 	}
 }
 
