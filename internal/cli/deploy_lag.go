@@ -147,18 +147,46 @@ var deployGitTimeout = time.Minute
 // github origin that names no account is otherwise read as whichever gh account
 // is ACTIVE, and on this machine that account cannot see the private lecstor
 // repos, so the check degraded to "could not read refs" exactly where measuring
-// real deploy lag matters. Local commands never consult credentials and stay
-// unscoped, byte-identical to before.
+// real deploy lag matters. The scope follows the remote the invocation itself
+// names; one that names none runs unscoped rather than borrowing the
+// repository's default, because the insteadOf rewrite matches every
+// https://github.com/ URL the command touches - a scope keyed to a remote it
+// does not read would hand over the wrong account's token rather than miss
+// harmlessly. Local commands never consult credentials and stay unscoped,
+// byte-identical to before.
 //
 // The deadline is applied BEFORE the credential resolution, so the `gh` that
 // scoping spawns is a child of this same deadline: a wedged gh must end as the
 // bounded fail-open error, not stall the preflight past deployGitTimeout.
 func deployGitRun(ctx context.Context, dir string, args ...string) (string, error) {
+	return deployGitRunMemo(ctx, dir, nil, args...)
+}
+
+// newDeployGitRun returns the production runner with a credential memo shared
+// across every call it makes. The memo lives for one doctor invocation - a
+// superset of the single checkDeployLags pass it serves, which can issue up to
+// eight network commands (six candidate fetches in six DISTINCT clones of one
+// repository, plus the check's own ls-remote and fetch). It is keyed by the
+// resolved OWNER rather than by repository: every clone of one repository names
+// the same account, so the gh spawn - the expensive part - happens once per
+// owner per pass. Each invocation still reads its repository's remote URL with
+// a local `git remote get-url`; that is the residual cost, and it stays local.
+// A seconds-lived memo cannot outlive a gh auth change in any way that matters,
+// so delivery's no-cache reasoning does not apply here.
+func newDeployGitRun() gitRunner {
+	memo := newDeployCredMemo()
+	return func(ctx context.Context, dir string, args ...string) (string, error) {
+		return deployGitRunMemo(ctx, dir, memo, args...)
+	}
+}
+
+// deployGitRunMemo is deployGitRun's engine. A nil memo resolves per call.
+func deployGitRunMemo(ctx context.Context, dir string, memo *deployCredMemo, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, deployGitTimeout)
 	defer cancel()
 	var extraEnv []string
 	if len(args) > 0 && (args[0] == "ls-remote" || args[0] == "fetch") {
-		extraEnv = deployCredEnv(ctx, dir)
+		extraEnv = deployCredEnvMemo(ctx, memo, dir, deployNetworkRemote(args))
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -180,28 +208,134 @@ func deployGitRun(ctx context.Context, dir string, args ...string) (string, erro
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// deployCredEnv returns the environment additions that scope one git
-// invocation at repo to the github account that owns its remote URL, or nil
-// when no scoping applies. It is delivery.Verifier.remoteCredEnv's twin for
-// this check, sharing the resolution through delivery.ScopeRemoteEnv rather
-// than copying it (CLA-459): the remote is resolved the same way the check
-// resolves it everywhere else (deployRemoteOf), its URL read with a local
-// `git remote get-url`, and owner/token/env come from the ONE mechanism
-// CLA-458 shipped. nil - non-github host, ssh remote, owner with no gh token,
-// a failing gh - means run unscoped: fail-open stays fail-open.
+// deployCredEnv returns the environment additions that scope one NETWORK git
+// invocation at repo to the github account that owns the remote THAT invocation
+// targets. target is the remote name or URL from its own arguments (see
+// deployNetworkRemote); empty means the invocation names none, and it runs
+// unscoped rather than borrowing the repository's default remote. That default
+// is not necessarily what the command reads - a bare `git fetch` uses the
+// branch's tracked upstream - and the insteadOf rewrite matches every
+// https://github.com/ URL the command touches, so a scope keyed to a remote the
+// command does not read would send the wrong account's token rather than miss
+// harmlessly. No caller names none today; fail-open is the safe answer if one
+// ever does.
 //
-// It spawns only local commands plus at most one `gh auth token`; no cache,
-// for the reason delivery records: a cache would outlive the gh auth state it
-// was keyed on. The whole resolution runs under the caller's deployGitTimeout
-// deadline (deployGitRun applies it before calling here), so a wedged gh is
-// reaped at the deadline rather than stalling the preflight.
-func deployCredEnv(ctx context.Context, repo string) []string {
-	remote := deployRemoteOf(ctx, deployGitRun, repo)
-	raw, err := deployGitRun(ctx, repo, "remote", "get-url", remote)
-	if err != nil || raw == "" {
+// A configured name's URL is read with a local `git remote get-url`; a URL
+// (explicit scheme, or scp-like user@host:path) is used as written, because
+// neither can be resolved as a remote name. A name git itself resolves is never
+// guessed at from the argument vector: deployNetworkRemote returns "" unless
+// the name sits after `--`, where git's option parsing cannot consume it.
+//
+// It is delivery.Verifier.remoteCredEnv's twin for this check, reusing the ONE
+// mechanism CLA-458 shipped (delivery.GithubOwner, TokenForOwner, ScopeEnv)
+// rather than copying it (CLA-459). nil - non-github host, ssh remote, a target
+// whose URL cannot be read, an owner with no gh token, a failing gh - means run
+// unscoped: fail-open stays fail-open.
+//
+// It spawns only local commands plus at most one `gh auth token`, and the
+// caller memoizes that resolution per owner for the pass
+// (deployCredEnvMemo). The whole resolution runs under the caller's
+// deployGitTimeout deadline (deployGitRun applies it before calling here), so a
+// wedged gh is reaped at the deadline rather than stalling the preflight.
+func deployCredEnv(ctx context.Context, repo, target string) []string {
+	return deployCredEnvMemo(ctx, nil, repo, target)
+}
+
+// deployCredMemo is the credential memo one doctor invocation carries across
+// every deploy_lag network command. It is keyed by the resolved OWNER, not by
+// repository: locateDeployRepo fetches into up to six candidate clones, each a
+// distinct directory of the same history, and ScopeEnv's result depends only on
+// the token. A repo-keyed memo would still spawn gh once per clone, and a
+// wedged gh would be waited out once per clone; this one spawns it once per
+// owner per pass, while each invocation still reads its own repository's remote
+// URL with a local `git remote get-url` (the residual, purely local cost). A
+// seconds-lived memo cannot outlive a gh auth change in any way that matters,
+// so delivery's no-cache reasoning does not apply here.
+type deployCredMemo struct {
+	env map[string][]string // owner -> scope env; nil = run unscoped
+}
+
+func newDeployCredMemo() *deployCredMemo {
+	return &deployCredMemo{env: map[string][]string{}}
+}
+
+// deployCredEnvMemo is deployCredEnv's engine; a non-nil memo caches the
+// resolution per owner for the pass. A nil memo resolves every call.
+func deployCredEnvMemo(ctx context.Context, memo *deployCredMemo, repo, target string) []string {
+	raw := target
+	if !deployTargetIsURL(target) {
+		if target == "" {
+			return nil
+		}
+		out, err := deployGitRun(ctx, repo, "remote", "get-url", target)
+		if err != nil || out == "" {
+			return nil
+		}
+		raw = out
+	}
+	owner := delivery.GithubOwner(raw)
+	if owner == "" {
 		return nil
 	}
-	return delivery.ScopeRemoteEnv(ctx, repo, deployGhBin, raw)
+	if memo != nil {
+		if env, ok := memo.env[owner]; ok {
+			return env
+		}
+	}
+	var env []string
+	if token := delivery.TokenForOwner(ctx, repo, deployGhBin, owner); token != "" {
+		env = delivery.ScopeEnv(token)
+	}
+	if memo != nil {
+		memo.env[owner] = env
+	}
+	return env
+}
+
+// deployTargetIsURL reports whether a network invocation's repository argument
+// is something git reads as a URL rather than the name of a configured remote.
+// Both an explicit scheme and scp-like (user@host:path) syntax count: git
+// accepts no remote name containing either form, so treating one as a name
+// would only spend a doomed `git remote get-url` before falling back unscoped.
+func deployTargetIsURL(target string) bool {
+	if strings.Contains(target, "://") {
+		return true
+	}
+	at := strings.IndexByte(target, '@')
+	if at <= 0 {
+		return false
+	}
+	colon := strings.IndexByte(target[at+1:], ':')
+	if colon <= 0 {
+		return false
+	}
+	host := target[at+1 : at+1+colon]
+	return host != "" && !strings.ContainsAny(host, "/\\")
+}
+
+// deployNetworkRemote extracts the repository a network invocation targets - a
+// configured remote name or a URL - from its own arguments, so the credential
+// scope can be keyed to it. Every network command this file issues passes the
+// remote after the `--` option terminator; without one only a URL is
+// unambiguous (git's option syntax otherwise consumes the neighbouring words),
+// so a bare URL is found wherever it sits and a named remote falls back to ""
+// - which runs the command unscoped, never under another remote's owner (see
+// deployCredEnv).
+func deployNetworkRemote(args []string) string {
+	for i, a := range args {
+		if a == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+	}
+	for _, a := range args[1:] {
+		if strings.Contains(a, "://") {
+			return a
+		}
+	}
+	return ""
 }
 
 // deployGhBin is the binary deployCredEnv resolves per-owner tokens with -
