@@ -71,6 +71,9 @@ func TestReviewMapMatchesReviewRunTurns(t *testing.T) {
 	if inv.Prompt == "" || len(inv.Turns) == 0 {
 		t.Fatal("review run put no maps sequence on its invocation")
 	}
+	if len(inv.Turns) < 2 {
+		t.Fatalf("review run's invocation carries %d follow-up turns; the fixture must exercise several notes turns", len(inv.Turns))
+	}
 
 	report, err := ReviewMap(ReviewMapOptions{
 		Repo: r.dir, Base: base, Head: head, ChunkSize: 1, Title: "Ship the guard",

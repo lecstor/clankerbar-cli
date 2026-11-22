@@ -190,6 +190,48 @@ func TestReviewMapWritesFileOrStdout(t *testing.T) {
 	}
 }
 
+// TestReviewMapRefusesCheckoutNotAtHeadAtTheCLI: the error reviewMap returns
+// is what main turns into the non-zero exit, and it names both SHAs.
+func TestReviewMapRefusesCheckoutNotAtHeadAtTheCLI(t *testing.T) {
+	repo, base, head := reviewMapCLIRepo(t)
+	at := reviewE2ECommit(t, repo, "later\n")
+
+	var stdout, stderr bytes.Buffer
+	err := reviewMap([]string{"--repo", repo, "--base", base, "--head", head}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("reviewMap exited successfully from a checkout that is not at --head")
+	}
+	for _, want := range []string{head, at} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to name %q", err, want)
+		}
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing on a refusal", stdout.String())
+	}
+}
+
+// TestReviewMapStartsNoSession proves the command's whole point behaviourally:
+// a harness binary on PATH that would leave a sentinel is never run.
+func TestReviewMapStartsNoSession(t *testing.T) {
+	repo, base, head := reviewMapCLIRepo(t)
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "session-started")
+	script := "#!/bin/sh\ntouch " + sentinel + "\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	if err := reviewMap([]string{"--repo", repo, "--base", base, "--head", head}, &stdout, &stderr); err != nil {
+		t.Fatalf("reviewMap: %v", err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Errorf("review map spawned a harness session (sentinel %s exists)", sentinel)
+	}
+}
+
 // TestReviewMapLoadsNoConfig: the command is documented to work on a machine
 // with no clankerbar config, so a config that would make config.Load fail must
 // not reach it.
