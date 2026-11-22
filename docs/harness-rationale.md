@@ -967,6 +967,17 @@ section note.
 > instead of letting a run reach a phase that cannot start. opencode is the
 > adapter with session continuation today.
 
+### HonoursNoBacklogMCP
+
+> HonoursNoBacklogMCP reports whether this adapter implements
+> Invocation.NoBacklogMCP: it switches off every backlog MCP server the
+> harness would otherwise load from its own config layers, so the session is
+> offered no backlog tools and nothing waits for a connection. False means the
+> flag is inert for this harness — the session gets whatever MCP servers its
+> config declares — so a caller that must keep the backlog unreachable
+> (`clankerbar review run`) refuses the harness rather than promise a guarantee
+> the adapter cannot keep. opencode is the adapter that implements it today.
+
 ### EmitsEvents
 
 > EmitsEvents reports whether this adapter normalizes its structured tool
@@ -1112,6 +1123,20 @@ section note.
 > claim as an end. It covers BOTH uses of that guard: the one report
 > re-emit, and the later turns of a multi-turn sequence, which would
 > otherwise stop after the first one with "claim_not_held".
+
+### NoBacklogMCP
+
+> NoBacklogMCP forbids this session the backlog: the adapter switches off every
+> clankerbar MCP server opencode would otherwise load from its config layers, so
+> the session is offered no backlog tools and nothing waits for a connection. It
+> is NOT AllowUnclaimed's opposite face: a caller can be unclaimed and still want
+> the tools, and it exists as its own field because the review that must not
+> touch the backlog says so explicitly.
+>
+> Only opencode honours it today (see disableBacklogMCPServers and
+> Capabilities.HonoursNoBacklogMCP); a caller must not read "ignored by this
+> adapter" as "the backlog is unreachable". clankerbar review run is the caller,
+> and it refuses a harness whose adapter does not honour the field.
 
 ### OnClaim
 
@@ -2138,6 +2163,9 @@ section note.
 > opencodeSessionConfig builds the document pinned as OPENCODE_CONFIG_CONTENT:
 > the mcp config file's own keys, with every MCP server moved out of Code Mode
 > and the fail-closed permission policy under `permission`.
+>
+> env is the environment built so far (before the content layer is appended), so
+> the NoBacklogMCP switch can resolve the same ambient layers opencode will load.
 >
 > The file is parsed as strict JSON, the same rule config applies to every file
 > the driver names (readMCPFile): those feed fail-closed gates, and a lenient
@@ -3760,6 +3788,19 @@ section note.
 > killed-mid-call one is not, and it is a property of opencode's stream rather
 > than something this adapter can fix.
 
+
+## `internal/harness/opencode_subscription_limit.go`
+
+### opencodeSubscriptionLimit
+
+> opencodeSubscriptionLimitRe matches a provider saying the SUBSCRIPTION's own
+> limit is spent, e.g. Synthetic's "You've exceeded your subscription rate
+> limits". opencode types that `provider.rate-limit`, the same as a burst 429,
+> so the type cannot tell them apart; the wording can. A burst limit names no
+> plan ("Rate limit reached for requests"), so this stays narrow on purpose.
+>
+> opencodeSubscriptionLimit is a usage limit, not a transient: retrying repeats
+> the refusal, and only a limit marks the route and moves the session on.
 
 ## `internal/harness/opencode_timeout.go`
 

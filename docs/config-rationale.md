@@ -1045,6 +1045,11 @@ section note.
 > DoneMarker reads "=====CLANKERBAR DONE=====". Two constraints govern it: it
 > must not collide with HandoffMarker (the two markers are read out of the same
 > final message), and the parser and the briefs must name the same string.
+>
+> isDoneMarkerLine also accepts one pair of single backticks around it: some
+> models copy the inline-code span a brief once showed the marker in, and the
+> string cannot occur by accident, so that form adds no false match. Every
+> accepted form contains DoneMarker, which escapeDoneMarker relies on.
 
 ## `internal/config/done_report.go`
 

@@ -437,25 +437,16 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 }
 
 // opencodeSessionConfigWithEnv builds the document pinned as
-// OPENCODE_CONFIG_CONTENT: the mcp config file's own keys, with every MCP server
-// moved out of Code Mode and the fail-closed permission policy under
-// `permission`.
+// OPENCODE_CONFIG_CONTENT: the mcp config file's own keys, every MCP server out
+// of Code Mode, and the fail-closed permission policy under `permission`.
 //
-// env is the environment built so far (before the content layer is appended), so
-// the NoBacklogMCP switch can resolve the same ambient layers opencode will load.
+// env is the environment built so far, BEFORE the content layer is appended, so
+// the NoBacklogMCP switch resolves the same ambient layers opencode will load.
 //
-// The file is parsed as strict JSON, the same rule config applies to every file
-// the driver names (readMCPFile): those feed fail-closed gates, and a lenient
-// parse here would let the adapter accept what config refused. Numbers are kept
-// as written (UseNumber) so a re-marshalled timeout or port is byte-for-byte the
-// operator's value.
-//
-// The file's own `permission` key, if any, is replaced here rather than merged.
-// That does not neutralise it: the same file is also loaded as OPENCODE_CONFIG,
-// an earlier layer, and opencode merges permission blocks key by key in
-// insertion order, so a key the file declares sorts ahead of this policy's `*`
-// catch-all. doctor WARNs on a named file carrying one (and config refuses one
-// in a DISCOVERED file, checkDiscoveredMCPConfig).
+// The file is parsed as strict JSON with numbers kept as written (UseNumber): it
+// feeds fail-closed gates, so a lenient parse would accept what config refused.
+// Its own `permission` is replaced, not merged - the file also loads as an
+// earlier OPENCODE_CONFIG layer, where its keys would sort ahead of `*`.
 func opencodeSessionConfigWithEnv(in Invocation, env []string) ([]byte, error) {
 	if in.NoBacklogMCP {
 		// A declared OPENCODE_CONFIG_CONTENT replaces this document wholesale
