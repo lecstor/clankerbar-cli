@@ -122,7 +122,7 @@ func defaultDoctorEnv() doctorEnv {
 		},
 		fetchHealth: fetchDeployHealth,
 		repos:       delivery.Repos,
-		gitRun:      deployGitRun,
+		gitRun:      newDeployGitRun(),
 		runEnvCmd: func(ctx context.Context, command string) (string, error) {
 			return config.RunEnvCommand(command)
 		},

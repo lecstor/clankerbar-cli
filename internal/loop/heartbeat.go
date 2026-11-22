@@ -53,8 +53,9 @@ type leaseRenewer struct {
 	done    chan struct{}
 	stopped chan struct{}
 	// tick is a test seam: when non-nil, run drives its cadence from this channel instead of
-	// constructing a time.Ticker (see run).
-	tick chan time.Time
+	// constructing a time.Ticker (see run). Receive-only: the renewer only ever reads it, and a
+	// send here would be a bug, so the type says so.
+	tick <-chan time.Time
 	// reflect, when non-nil, is called on the renewer goroutine with every observed claim snapshot, so
 	// the fleet presence ref follows the CURRENT claim mid-phase.
 	reflect func(harness.Claim)
