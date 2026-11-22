@@ -284,7 +284,8 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 	if len(queue.Tasks) == 0 {
 		return true // an empty close-out queue is not news
 	}
-	if queue.Total > len(queue.Tasks) {
+	capped := queue.Total > len(queue.Tasks)
+	if capped {
 		d.closeOutSay("queue-cap:"+slug, "close-out %s: %d approved task(s) waiting but only %d were served - the rest wait for the agent close-out", slug, queue.Total, len(queue.Tasks))
 	}
 	for _, task := range queue.Tasks {
@@ -294,7 +295,9 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 		}
 		d.reconcileCloseOutTask(ctx, cfg, slug, client, task, bases)
 	}
-	return true
+	// A capped page is not the whole approved queue: the tasks past the cap are
+	// still approved, so the pass must not sweep them away.
+	return !capped
 }
 
 // reconcileCloseOutTask takes one approved task as far as the deterministic path

@@ -1369,6 +1369,27 @@ func TestCloseOutPassDoesNotSweepOnAnUnreadQueue(t *testing.T) {
 	}
 }
 
+// A capped queue page does not list every approved task, so the tasks past the cap
+// are unknown rather than gone: the sweep must not drop their state.
+func TestCloseOutPassDoesNotSweepACappedQueue(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.writePRList() // the served task stands down at "no OPEN pull request"
+	f.plane.serveTool("list_tasks", fmt.Sprintf(
+		`{"tasks":[{"id":%q,"ref":%q,"title":"a task","branch":%q,"repo":%q}],"count":1,"total":60,"view":"full"}`,
+		closeOutTestTask, closeOutTestRef, closeOutTestHead, closeOutTestRepo))
+	d := f.supervisor(0)
+	d.closeOutSaid = map[string]string{"task:gone": "closed"}
+	d.closeOutSeenTasks = map[string]bool{"gone": true}
+
+	f.run(d)
+	f.run(d)
+
+	if _, ok := d.closeOutSaid["task:gone"]; !ok {
+		t.Errorf("a capped queue was treated as the whole queue and swept a task past the cap: %v", d.closeOutSaid)
+	}
+}
+
 // releases counts the release calls the plane received.
 func (f *closeOutFixture) releases() int {
 	return len(f.callsFor("release_task"))
