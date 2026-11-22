@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // Status is what became of one salvage attempt.
@@ -131,6 +132,7 @@ const branchIDLen = 8
 type Salvager struct {
 	workdir string
 	gitBin  string
+	ghBin   string
 	remote  string
 }
 
@@ -141,7 +143,7 @@ func New(workdir, remote string) *Salvager {
 	if remote == "" {
 		remote = "origin"
 	}
-	return &Salvager{workdir: workdir, gitBin: "git", remote: remote}
+	return &Salvager{workdir: workdir, gitBin: "git", ghBin: "gh", remote: remote}
 }
 
 // Salvage finds the worktree this task was being worked in and, if it holds
@@ -342,13 +344,16 @@ func (s *Salvager) delivered(ctx context.Context, wt worktree, remote string, re
 	if err != nil || head == "" {
 		return "", false
 	}
+	// One resolution for this read: every recorded branch names the same remote,
+	// and each scoped invocation would otherwise pay its own gh token probe.
+	extraEnv := s.credEnv(ctx, wt.path, remote)
 	seen := map[string]bool{}
 	for _, branch := range recorded {
 		if branch == "" || seen[branch] {
 			continue
 		}
 		seen[branch] = true
-		sha, err := s.lsRemote(ctx, wt.path, remote, branch)
+		sha, err := s.lsRemote(ctx, wt.path, extraEnv, remote, branch)
 		if err != nil || sha == "" {
 			continue
 		}
@@ -359,12 +364,32 @@ func (s *Salvager) delivered(ctx context.Context, wt worktree, remote string, re
 	return "", false
 }
 
+// credEnv resolves the remote once and returns the environment additions that
+// let ONE network git command reach it as the github account that owns it
+// (delivery.ScopeRemoteEnv, CLA-458/CLA-970). Without it, `gh auth
+// git-credential` answers as whichever gh account is ACTIVE, which need not see
+// a private repo owned by somebody else - "Repository not found" on the very
+// push this package exists to make, defeating the rescue.
+//
+// nil is "run unscoped", byte-identical to the pre-CLA-970 behavior: a
+// non-github host, an ssh remote, an owner gh cannot serve a token for, or a
+// remote whose URL cannot be read. The URL read is local and consults no
+// credentials; the token probe is the only spawn, and it runs under the caller's
+// context, which the driver bounds with salvageTimeout.
+func (s *Salvager) credEnv(ctx context.Context, dir, remote string) []string {
+	raw, err := s.run(ctx, dir, "remote", "get-url", remote)
+	if err != nil || raw == "" {
+		return nil
+	}
+	return delivery.ScopeRemoteEnv(ctx, dir, s.ghBin, raw)
+}
+
 // lsRemote reads the remote's tip for a branch without touching anything local.
 // Empty with a nil error means the remote does not have the branch; an error means
 // it could not be read, which the caller treats the same way - both are "not
 // delivered", and the difference is not one this rescue needs.
-func (s *Salvager) lsRemote(ctx context.Context, dir, remote, branch string) (string, error) {
-	out, err := s.run(ctx, dir, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
+func (s *Salvager) lsRemote(ctx context.Context, dir string, extraEnv []string, remote, branch string) (string, error) {
+	out, err := s.runEnv(ctx, dir, extraEnv, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
@@ -402,12 +427,16 @@ func (s *Salvager) commitAndPush(ctx context.Context, wt worktree, taskID, label
 	out.Commit = sha
 
 	remote := delivery.Remote(ctx, wt.path, s.remote)
+	// The push is the network half, so it goes out scoped to the account that
+	// owns the remote (CLA-458/CLA-970); the retry below reaches the same remote
+	// and rides the same env.
+	extraEnv := s.credEnv(ctx, wt.path, remote)
 	ref := "refs/heads/" + wt.branch
 	// No --force, and no lease variant either: this branch belongs to the run that
 	// created it, and a push the remote refuses is a fact to report, never one to
 	// overrule. --no-verify for the same reason the commit has it.
 	pushArgs := []string{"push", "--no-verify", "--", remote, ref + ":" + ref}
-	_, stderr, err := s.runFull(ctx, wt.path, pushArgs...)
+	_, stderr, err := s.runFull(ctx, wt.path, extraEnv, pushArgs...)
 	if err != nil && http2PushFailure(stderr) {
 		// The known git-over-HTTP/2 transport failure against GitHub's smart HTTP
 		// endpoint (CLA-354): the pack uploads and is rejected mid-stream, and the
@@ -416,7 +445,7 @@ func (s *Salvager) commitAndPush(ctx context.Context, wt worktree, taskID, label
 		// the work stay unreachable. Both attempts are named in the detail, which
 		// is what the driver logs either way.
 		retryArgs := append([]string{"-c", "http.version=HTTP/1.1", "-c", "http.postBuffer=" + httpPostBuffer}, pushArgs...)
-		_, retryStderr, retryErr := s.runFull(ctx, wt.path, retryArgs...)
+		_, retryStderr, retryErr := s.runFull(ctx, wt.path, extraEnv, retryArgs...)
 		if retryErr == nil {
 			out.Status, out.Branch = Saved, wt.branch
 			out.Detail = fmt.Sprintf(
@@ -625,7 +654,7 @@ func (s *Salvager) inProgressOp(ctx context.Context, dir string) string {
 // exactly (CLA-695 review). Git's own quoting of such a name is git's spelling of
 // it; stripping anything here would be ours.
 func (s *Salvager) status(ctx context.Context, dir string) (string, error) {
-	stdout, stderr, err := s.execGit(ctx, dir, "status", "--porcelain")
+	stdout, stderr, err := s.execGit(ctx, dir, nil, "status", "--porcelain")
 	if err != nil {
 		return "", runError("status", err, stderr)
 	}
@@ -640,7 +669,15 @@ func (s *Salvager) status(ctx context.Context, dir string) (string, error) {
 // inheritor closes its write end - so a killed git can still leave the call
 // sitting there. Same reasoning, and the same numbers, as internal/delivery.
 func (s *Salvager) run(ctx context.Context, dir string, args ...string) (string, error) {
-	stdout, stderr, err := s.execGit(ctx, dir, args...)
+	return s.runEnv(ctx, dir, nil, args...)
+}
+
+// runEnv is run with environment additions for THIS invocation: the credential
+// scoping a network command needs. Local commands pass nil and stay unscoped,
+// because scoping costs a `gh auth token` spawn and they never consult
+// credentials.
+func (s *Salvager) runEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
+	stdout, stderr, err := s.execGit(ctx, dir, extraEnv, args...)
 	if err != nil {
 		return "", runError(args[0], err, stderr)
 	}
@@ -652,32 +689,31 @@ func (s *Salvager) run(ctx context.Context, dir string, args ...string) (string,
 // git writes its progress to stderr - so on a failed push the first line is
 // usually "Enumerating objects" rather than the error, and the HTTP/2 signature
 // (CLA-354) sits further down where run would drop it.
-func (s *Salvager) runFull(ctx context.Context, dir string, args ...string) (stdout, stderr string, err error) {
-	stdout, stderr, err = s.execGit(ctx, dir, args...)
+func (s *Salvager) runFull(ctx context.Context, dir string, extraEnv []string, args ...string) (stdout, stderr string, err error) {
+	stdout, stderr, err = s.execGit(ctx, dir, extraEnv, args...)
 	return strings.TrimSpace(stdout), strings.TrimSpace(stderr), err
 }
 
 // runError is the one error shape a failed git command produces, so every runner
-// reports the same way.
+// reports the same way. A scoped network command carries its token in the URL git
+// echoes on failure, so the quoted line is redacted before it can reach a log.
 func runError(arg string, err error, stderr string) error {
 	if msg := strings.TrimSpace(stderr); msg != "" {
-		return fmt.Errorf("git %s: %w: %s", arg, err, firstLine(msg))
+		return fmt.Errorf("git %s: %w: %s", arg, err, secureurl.RedactUserinfo(firstLine(msg)))
 	}
 	return fmt.Errorf("git %s: %w", arg, err)
 }
 
 // execGit runs one git command and hands back its RAW stdout and stderr, for the
 // runners above to trim as their caller needs.
-func (s *Salvager) execGit(ctx context.Context, dir string, args ...string) (stdout, stderr string, err error) {
+//
+// GitEnv strips inherited GIT_CONFIG_* before appending extraEnv: duplicate env
+// keys have unspecified precedence, so an inherited GIT_CONFIG_COUNT could
+// shadow the credential rewrite a network command is scoped with.
+func (s *Salvager) execGit(ctx context.Context, dir string, extraEnv []string, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, s.gitBin, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	)
+	cmd.Env = delivery.GitEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -719,19 +755,20 @@ func firstLine(s string) string {
 // git writes its progress to stderr too, so the first line of a failed push is
 // usually "Enumerating objects" and the reason sits further down; the detail
 // lines this feeds are read by an operator, so they carry the reason or nothing
-// worth quoting at all.
+// worth quoting at all. The line can quote the token-bearing URL a scoped
+// network command failed against, so it is redacted before it reaches a detail.
 func errorLine(stderr string) string {
 	lines := strings.Split(stderr, "\n")
 	for _, want := range []string{"error:", "fatal:"} {
 		for _, line := range lines {
 			if trimmed := strings.TrimSpace(line); trimmed != "" && strings.Contains(trimmed, want) {
-				return trimmed
+				return secureurl.RedactUserinfo(trimmed)
 			}
 		}
 	}
 	for _, line := range lines {
 		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			return trimmed
+			return secureurl.RedactUserinfo(trimmed)
 		}
 	}
 	return ""
