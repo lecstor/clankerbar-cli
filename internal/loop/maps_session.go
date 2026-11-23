@@ -21,6 +21,10 @@ type mapsSessionPlan struct {
 	// notesTurns counts the NOTES turns, including the first. TurnMessages before this index are notes
 	// and go to the iteration log.
 	notesTurns int
+	// changeItems and flowItems are how many numbered M and F items the plan carries. The flow map's
+	// overflow note is not an item.
+	changeItems int
+	flowItems   int
 	// section is appended to the first turn's prompt, after the brief.
 	section string
 	// turns are the follow-up turns: notes turns 2..notesTurns, then findings.
@@ -136,6 +140,10 @@ func gitHeadSHA(repo string) (string, error) {
 func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string, severity, ending string) *mapsSessionPlan {
 	entries := reviewmap.ChangeEntries(diff, reviewmap.Unlimited)
 	items, overflow := mapsSessionItems(entries, flow)
+	// mapsSessionItems numbers every change item and every non-overflow flow item, so the two counts
+	// are exact rather than re-derived.
+	changeItems := len(entries)
+	flowItems := len(items) - changeItems
 	items, hunkCutoff := config.EmbedMapsSessionHunks(items, mapsSessionHunks(entries), base, opts.EmbedHunks)
 	size := opts.ChunkSize
 	if size < 1 {
@@ -154,6 +162,8 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 
 	plan := &mapsSessionPlan{
 		notesTurns:  len(chunks),
+		changeItems: changeItems,
+		flowItems:   flowItems,
 		section:     config.MapsSessionFirstTurn(base, 1, len(chunks), bodies[0], hunksEmbedded),
 		notesModel:  notesModel,
 		reportModel: reportModel,

@@ -265,10 +265,27 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 		return inv, stage, nil
 	}
 
-	rng := reviewmap.Range{Repo: wt, Base: base, Head: head}
+	plan, err := reviewMapsPlan(wt, base, head, inv.Model, opts)
+	if err != nil {
+		return inv, stage, err
+	}
+	var reportModel string
+	inv, reportModel = wireMapsPlan(inv, plan)
+	stage.models = map[string]string{"notes": plan.notesModel, "findings": reportModel}
+	stage.notesTurns = plan.notesTurns
+	return inv, stage, nil
+}
+
+// reviewMapsPlan builds the maps-session plan for a standalone review of
+// repo@base..head. `review run --method maps-session` and `review map` both
+// call it, so the plan one sends and the plan the other prints cannot drift.
+// repo must be a checkout ROOT: the flow map's git grep is scoped to and prints
+// paths relative to its working directory.
+func reviewMapsPlan(repo, base, head, phaseModel string, opts ReviewRunOptions) (*mapsSessionPlan, error) {
+	rng := reviewmap.Range{Repo: repo, Base: base, Head: head}
 	diff, err := reviewmap.Diff(rng)
 	if err != nil {
-		return inv, stage, fmt.Errorf("map the change: %w", err)
+		return nil, fmt.Errorf("map the change: %w", err)
 	}
 	mapOpts := config.MapsSessionOptions{
 		ChunkSize:     opts.ChunkSize,
@@ -282,16 +299,11 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	mapOpts = mapOpts.Resolved()
 	flow, err := reviewmap.FlowMap(diff, rng, mapOpts.FlowMax)
 	if err != nil {
-		return inv, stage, fmt.Errorf("map the changed definitions: %w", err)
+		return nil, fmt.Errorf("map the changed definitions: %w", err)
 	}
 	// A standalone review has no task, so its findings turn grades MUST against the repo's gates and
 	// correctness/safety only — never a done-when bar.
-	plan := planMapsSession(mapOpts, inv.Model, base, diff, flow, config.MapsSessionSeverityTaskless, config.MapsSessionDoneReportEnding)
-	var reportModel string
-	inv, reportModel = wireMapsPlan(inv, plan)
-	stage.models = map[string]string{"notes": plan.notesModel, "findings": reportModel}
-	stage.notesTurns = plan.notesTurns
-	return inv, stage, nil
+	return planMapsSession(mapOpts, phaseModel, base, diff, flow, config.MapsSessionSeverityTaskless, config.MapsSessionDoneReportEnding), nil
 }
 
 // reviewRunParseDone reads the session's final message as the phase's review report. The error is
