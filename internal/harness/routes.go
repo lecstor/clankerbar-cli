@@ -14,9 +14,8 @@ type RouteFallback struct {
 
 const (
 	// RouteStartedKey and RouteFinishedKey are the Result.Raw keys naming the route the session
-	// started on and the route that finished it. Both are set only when the adapter actually switched:
-	// a single-route result carries neither, so its Raw stays exactly the shape it had before this
-	// existed.
+	// started on and the route that finished it. Both are set only when the session switched routes or
+	// ended limited on its route list; a clean single-route result carries neither.
 	RouteStartedKey  = "route_started"
 	RouteFinishedKey = "route_finished"
 
@@ -33,8 +32,8 @@ func RouteFallbacks(res Result) (started, finished string, fallbacks []RouteFall
 	return started, finished, fallbacks
 }
 
-// RouteFinished is the route that ended the session, or "" when it finished on the route it started
-// on (or never reported).
+// RouteFinished is the route that ended the session, or "" when no route report was written (a
+// clean session that never switched). A limited one-route session reports its own route.
 func RouteFinished(res Result) string {
 	_, finished, _ := RouteFallbacks(res)
 	return finished

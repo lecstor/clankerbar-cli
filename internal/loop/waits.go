@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -155,20 +156,67 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
+		got, cst, verdict := d.probeWake(ctx, a, t, tc, ph, sofar)
+		tokens += got
+		cost += cst
+		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only here.
+		// A refused spawn is still an attempt: the next one is a full probeWait away, never sooner.
+		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
+		switch verdict {
+		case wakeStop:
+			return tokens, cost, true
+		case wakeLifted:
+			return tokens, cost, false
+		}
+	}
+}
+
+// wakeVerdict is what one wake's probes concluded.
+type wakeVerdict int
+
+const (
+	wakeStillLimited wakeVerdict = iota
+	wakeLifted
+	wakeStop
+)
+
+// probeWake runs one wake's probes. A phase with a route list walks it: a route that probes limited
+// is marked exactly as a session limit marks it (stated reset, else the mark interval), and the next
+// unmarked routable route is probed in the same wake, so a route with no stated reset cannot mask
+// the routes behind it. The walk ends at the first unlimited probe, or when the next route is
+// already marked, tried, or window-blocked; at most one probe per route per wake.
+func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc *config.Config, ph config.Phase, sofar spend) (tokens int, cost float64, verdict wakeVerdict) {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	tried := map[string]bool{}
+	for {
+		if len(tried) > 0 {
+			// Each walk probe is another paid session, so the ceiling is re-read before it, not only at the wake.
+			if v := d.budgetStop(sofar.ti, time.Since(sofar.start)); v.dim != "" {
+				log.Printf("budget reached while paused: %s — ending the wait rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
+					v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
+				return tokens, cost, wakeStop
+			}
+		}
 		inv, ierr := d.probeInvocation(t, tc, ph)
 		if ierr != nil {
+			var blocked *routeWindowBlocked
+			if len(tried) > 0 && errors.As(ierr, &blocked) {
+				log.Printf("still limited on %s, and every other route is window-blocked (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
+				return tokens, cost, wakeStillLimited
+			}
 			// A refused probe spawn spends nothing and learns nothing about the limit, so it reads exactly
 			// like any other probe error: log the named variable (the error carries it) and poll again next
 			// interval.
 			log.Printf("probe error: %v — will retry next interval", ierr)
-			// A refusal is still a probe ATTEMPT: the next one is a full probeWait from the end of this one,
-			// never sooner.
-			nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
-			continue
+			return tokens, cost, wakeStillLimited
+		}
+		if len(tried) > 0 {
+			if until, marked := d.routeMarkExpiry(inv.Model); tried[inv.Model] || (marked && time.Now().Before(until)) {
+				log.Printf("still limited on every routable route — continuing to wait")
+				return tokens, cost, wakeStillLimited
+			}
 		}
 		got, err := a.Probe(ctx, inv)
-		// The successor deadline is measured from HERE, the end of the attempt, and only here.
-		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 		// Count the probe BEFORE reading its verdict, and before the error branch: a probe that failed
 		// still spawned the harness and still spent.
 		tokens += got.Tokens
@@ -179,7 +227,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		d.charge(sofar.ti, tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
-				return tokens, cost, true
+				return tokens, cost, wakeStop
 			}
 			// A probe whose own output could not be read is not a blip that clears itself: it reports no
 			// verdict AND no spend, so a wait that keeps polling on it re-spawns a paid session every
@@ -190,20 +238,48 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				// project stops draining and the siblings keep going; the local pool keeps the daemon-wide
 				// stop.
 				if d.exhaustUnmeasurable(sofar.ti, fmt.Sprintf("the pause probe's spend cannot be read (%v)", err)) {
-					return tokens, cost, true
+					return tokens, cost, wakeStop
 				}
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
-				return tokens, cost, true
+				return tokens, cost, wakeStop
 			}
 			log.Printf("probe error: %v — will retry next interval", err)
-			continue
+			return tokens, cost, wakeStillLimited
 		}
 		if !got.Limit.Limited {
-			log.Print("limit lifted — resuming")
-			return tokens, cost, false
+			if len(tried) > 0 {
+				log.Printf("limit lifted on %s — resuming", inv.Model)
+			} else {
+				log.Print("limit lifted — resuming")
+			}
+			return tokens, cost, wakeLifted
 		}
-		log.Print("still limited — continuing to wait")
+		if len(routes) == 0 || inv.Model == "" || len(tried) >= len(routes) {
+			log.Print("still limited — continuing to wait")
+			return tokens, cost, wakeStillLimited
+		}
+		tried[inv.Model] = true
+		until := got.Limit.ResetAt
+		if !until.After(time.Now()) {
+			until = time.Now().Add(d.routeMarkInterval())
+		}
+		d.markRouteLimited(inv.Model, until)
+		// An existing later mark wins, so name the stored one.
+		if stored, ok := d.routeMarkExpiry(inv.Model); ok {
+			until = stored
+		}
+		log.Printf("probe on %s still limited — retrying it after %s", inv.Model, routeRetryLabel(until))
 	}
+}
+
+// sortedKeys is a set's members in a stable order, for a log line.
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // backoff is the exponential delay before transient retry n (1-based): 30s, 60s, 120s, ..., capped

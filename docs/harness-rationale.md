@@ -3273,12 +3273,22 @@ section note.
 >
 > A runSession error on a next route is returned after its spend is charged: a
 > launch failure is the driver's failure to act on, not a limit to hide.
+>
+> A list of ONE route has no walk, but a session that ends limited on it still
+> reports that route (CLA-984). One-route sessions happen exactly when the other
+> routes are marked or windowed, and without the report the route that just
+> failed stayed routable, so the next session was sent straight back onto it,
+> re-sending the transcript for the same limit. A plain-string model reaches the
+> adapter as a list of one, so it is reported and marked too; that is harmless,
+> because a sole route is still selected while marked. An invocation with
+> `in.Routes` nil (a phase with no model at all, or a turn on its own model)
+> reports nothing.
 
 ### setRouteReport
 
 > setRouteReport writes the fallback report onto the Result. Nothing is written
-> when the session never switched, so a single-route run's Raw is exactly the
-> shape it had before this feature existed.
+> when the session neither switched nor ended limited, so a clean single-route
+> run's Raw is exactly the shape it had before this feature existed.
 >
 > The report is CUMULATIVE across switches: a multi-turn session can exhaust more
 > than one route, and the driver marks EVERY abandoned route from this report
