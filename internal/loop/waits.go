@@ -189,11 +189,19 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	tried := map[string]bool{}
 	for {
+		if len(tried) > 0 {
+			// Each walk probe is another paid session, so the ceiling is re-read before it, not only at the wake.
+			if v := d.budgetStop(sofar.ti, time.Since(sofar.start)); v.dim != "" {
+				log.Printf("budget reached while paused: %s — ending the wait rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
+					v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
+				return tokens, cost, wakeStop
+			}
+		}
 		inv, ierr := d.probeInvocation(t, tc, ph)
 		if ierr != nil {
-			if len(tried) > 0 {
-				// Every route this wake could reach has been probed; the refusal names the rest's window.
-				log.Printf("still limited on %s, and no other route is open (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
+			var blocked *routeWindowBlocked
+			if len(tried) > 0 && errors.As(ierr, &blocked) {
+				log.Printf("still limited on %s, and every other route is window-blocked (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
 				return tokens, cost, wakeStillLimited
 			}
 			// A refused probe spawn spends nothing and learns nothing about the limit, so it reads exactly
@@ -256,6 +264,10 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 			until = time.Now().Add(d.routeMarkInterval())
 		}
 		d.markRouteLimited(inv.Model, until)
+		// An existing later mark wins, so name the stored one.
+		if stored, ok := d.routeMarkExpiry(inv.Model); ok {
+			until = stored
+		}
 		log.Printf("probe on %s still limited — retrying it after %s", inv.Model, routeRetryLabel(until))
 	}
 }

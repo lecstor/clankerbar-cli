@@ -15,8 +15,9 @@ const routeFallbackPrompt = "The previous model route hit a usage limit. " +
 
 // switchRoutesOnLimit walks the remaining routes while the session's Result keeps classifying as a
 // usage limit, resuming the same session id on each next route. A list of one has no walk, but still
-// reports its route when the session ended limited, so the driver marks it. An invocation with no
-// route list (in.Routes nil: no route config, or a turn on its own model) reports nothing.
+// reports its route when the session ended limited, so the driver marks it; a plain-string model is
+// such a list of one. An invocation with in.Routes nil (a phase with no model at all, or a turn on
+// its own model) reports nothing.
 func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes []string, res *Result, deadline time.Time, delivery *opencodeInbox) error {
 	if len(in.Routes) == 0 || len(routes) == 0 {
 		return nil

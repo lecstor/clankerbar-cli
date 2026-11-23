@@ -5855,7 +5855,8 @@ section note.
 > a daemon sat "still limited" for hours while a later route was open
 > (headless, 2026-11-23).
 >
-> The walk ends at the first unlimited probe (resume), or when the next route
+> The walk ends at the first unlimited probe (resume), at a budget ceiling
+> (stop), or when the next route
 > probeInvocation would aim at is already marked, already tried this wake, or
 > window-blocked; at most one probe per route per wake. Only then does the wait
 > sleep its interval, so walking cannot become a tight loop, and every probe is
@@ -5863,8 +5864,12 @@ section note.
 > probe per route per wake: routes are few and a probe is minimal.
 >
 > A wake's first probe may land on a marked route: when every route is marked,
-> probeInvocation aims at the one whose mark lifts first, as before. A phase
-> with no route list probes and marks nothing, exactly as before.
+> probeInvocation aims at the one whose mark lifts first, as before. A
+> plain-string model is a route list of one, so its probe marks it; a phase
+> with no model at all probes and marks nothing, exactly as before. The budget
+> ceiling is re-read before every walk probe after the first, since each is a
+> paid session; STOP and HALT are read only between wakes, as a wake's probes
+> are few and short.
 
 ### waitOrStop
 

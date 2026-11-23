@@ -3278,8 +3278,11 @@ section note.
 > reports that route (CLA-984). One-route sessions happen exactly when the other
 > routes are marked or windowed, and without the report the route that just
 > failed stayed routable, so the next session was sent straight back onto it,
-> re-sending the transcript for the same limit. An invocation with no route list
-> (`in.Routes` nil: no route config, or a turn on its own model) reports nothing.
+> re-sending the transcript for the same limit. A plain-string model reaches the
+> adapter as a list of one, so it is reported and marked too; that is harmless,
+> because a sole route is still selected while marked. An invocation with
+> `in.Routes` nil (a phase with no model at all, or a turn on its own model)
+> reports nothing.
 
 ### setRouteReport
 

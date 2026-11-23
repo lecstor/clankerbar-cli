@@ -127,10 +127,15 @@ func TestSupervisedWait_EveryRouteLimitedStillSleepsThePollIntervalAndChargesEve
 		}
 		wakes = append(wakes, []time.Time{h.probeStarts[i]})
 	}
+	seen := 0
 	for i, w := range wakes {
 		if len(w) > 2 {
 			t.Errorf("wake %d ran %d probes, want at most one per route (2)\n%s", i, len(w), logs.String())
 		}
+		if len(w) == 2 && h.probeModels[seen] == h.probeModels[seen+1] {
+			t.Errorf("wake %d probed %s twice, want each route at most once per wake", i, h.probeModels[seen])
+		}
+		seen += len(w)
 		if i == 0 {
 			continue
 		}
@@ -145,6 +150,27 @@ func TestSupervisedWait_EveryRouteLimitedStillSleepsThePollIntervalAndChargesEve
 	want := 7 * h.probeCalls
 	if tokens != want || d.targetSpendAt(0).tokens != want {
 		t.Errorf("tokens returned=%d ledger=%d, want every probe charged (%d)", tokens, d.targetSpendAt(0).tokens, want)
+	}
+}
+
+// A ceiling crossed by the first probe of a wake ends the wait before the walk
+// spends another paid probe on the next route.
+func TestSupervisedWait_ABudgetCrossedMidWalkStopsBeforeTheNextRoute(t *testing.T) {
+	h := &fakeAdapter{probeTokens: 50, probeLimitFor: func(int, string) harness.Limit {
+		return harness.Limit{Limited: true}
+	}}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routePaidAlias)
+	d.cfg.PollInterval = config.Duration(30 * time.Millisecond)
+	d.cfg.Budget = config.Budget{MaxTokens: 40}
+
+	logs := captureLogs(t)
+	_, _, stop := d.supervisedWait(context.Background(), harness.Limit{Limited: true},
+		h, d.cfg.Phases[0], d.targets[0], spend{start: time.Now()})
+	if !stop {
+		t.Fatalf("the probe crossed the ceiling; the wait should stop\n%s", logs.String())
+	}
+	if h.probeCalls != 1 {
+		t.Errorf("got %d probes, want 1: the walk must re-read the ceiling before probing the next route\n%s", h.probeCalls, logs.String())
 	}
 }
 
