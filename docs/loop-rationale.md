@@ -5844,6 +5844,28 @@ section note.
 > (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 > ceiling there is nothing to protect, so it waits on as before.
 
+### probeWake
+
+> probeWake runs one wake's probes (CLA-984). A phase with a route list walks
+> it: a route that probes limited is marked exactly as a session limit marks it
+> (the probe's stated reset, else routeMarkInterval), and the next unmarked
+> routable route is probed in the same wake. Without the walk, a route with no
+> stated reset was re-marked by nothing: its 30-minute fallback mark expired,
+> it came back to first place, and every probe after that tested it alone, so
+> a daemon sat "still limited" for hours while a later route was open
+> (headless, 2026-11-23).
+>
+> The walk ends at the first unlimited probe (resume), or when the next route
+> probeInvocation would aim at is already marked, already tried this wake, or
+> window-blocked; at most one probe per route per wake. Only then does the wait
+> sleep its interval, so walking cannot become a tight loop, and every probe is
+> still charged to the ledger as it lands (CLA-287). The cost is at most one
+> probe per route per wake: routes are few and a probe is minimal.
+>
+> A wake's first probe may land on a marked route: when every route is marked,
+> probeInvocation aims at the one whose mark lifts first, as before. A phase
+> with no route list probes and marks nothing, exactly as before.
+
 ### waitOrStop
 
 > waitOrStop waits up to dur, but stays responsive to a STOP marker (consuming it)
