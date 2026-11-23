@@ -1,18 +1,6 @@
 package loop
 
-// Restart and reload control (CLA-461). Three markers sit beside STOP/HALT in
-// the state dir, written by `clankerbar ctl`:
-//
-//	RESTART       finish the in-flight session, then re-exec at the iteration boundary
-//	RESTART_NOW   kill the in-flight session now (existing process-group kill),
-//	              release any held claim, re-exec
-//	RELOAD        re-read the config file at the iteration boundary, no exec
-//
-// They are honoured exactly where STOP is honoured: at the top of the run loop
-// (the ITERATION boundary), inside waitOrStop (idle polls and supervised limit
-// waits) and — for STOP and RESTART — at a verified PHASE SEAM (CLA-879, see
-// stopAtSeamMarker). Never inside a session's lifetime for anything but
-// RESTART_NOW, whose whole point is to cut that lifetime short.
+// Restart and reload control.
 
 import (
 	"context"
@@ -23,9 +11,8 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 )
 
-// loadValidatedConfig is the fallback reloader when no closure was wired: the
-// same Load+Validate production performs, minus the flag overrides only the
-// caller knows.
+// loadValidatedConfig is the fallback reloader when no closure was wired: the same Load+Validate
+// production performs, minus the flag overrides only the caller knows.
 func loadValidatedConfig(path string) (*config.Config, error) {
 	c, err := config.Load(path)
 	if err != nil {
@@ -37,47 +24,38 @@ func loadValidatedConfig(path string) (*config.Config, error) {
 	return c, nil
 }
 
-// Control-marker file names. STOP/HALT stay string literals at their call sites
-// (they predate this file); the restart family lives here so ctl and doctor can
-// name the same files the loop reads.
+// Control-marker file names.
 const (
 	MarkerRestart    = "RESTART"
 	MarkerRestartNow = "RESTART_NOW"
 	MarkerReload     = "RELOAD"
 )
 
-// restartCheckInterval is how often the daemon looks for a RESTART_NOW marker
-// while it has work in flight. The graceful markers need no watcher — they are
-// picked up at the next boundary by construction — but --now exists to end an
-// in-flight session that may have hours left, so it is polled for. Two seconds
-// keeps the operator's wait short next to a session measured in minutes without
-// making the state dir hot.
+// restartCheckInterval is how often the daemon looks for a RESTART_NOW marker while it has work in
+// flight. The graceful markers need no watcher — they are picked up at the next boundary by
+// construction — but --now exists to end an in-flight session that may have hours left, so it is
+// polled for.
 const restartCheckInterval = 2 * time.Second
 
-// SetReloader wires the closure a RELOAD marker uses to rebuild the config from
-// disk. It must return a VALIDATED config (Load + ApplyFlagOverrides + Validate
-// in production), because applyReload swaps it in without re-validating. Nil
-// falls back to Load(cfg.Source()) + Validate — flag-only overrides do not
-// survive that path, which is why production always sets one.
+// SetReloader wires the closure a RELOAD marker uses to rebuild the config from disk. Nil falls
+// back to Load(cfg.Source()) + Validate — flag-only overrides do not survive that path, which is
+// why production always sets one.
 func (d *Driver) SetReloader(load func() (*config.Config, error)) {
 	d.reloadConfig = load
 }
 
-// RestartRequested reports whether the run ended because a restart marker was
-// honoured. The caller (cli.Run) turns this into a re-exec; Run itself only
-// unwinds, exactly as it does for STOP.
+// RestartRequested reports whether the run ended because a restart marker was honoured. The caller
+// (cli.Run) turns this into a re-exec; Run itself only unwinds, exactly as it does for STOP.
 func (d *Driver) RestartRequested() bool {
 	return d.restartRequested.Load()
 }
 
-// watchRestartNow polls for a RESTART_NOW marker for as long as the run lives.
-// On finding one it consumes the marker FIRST (so a crash between here and the
-// re-exec cannot leave a surprise-restart behind for the next boot), flags the
-// restart, and cancels the run context — which is the SAME cancellation a
-// Ctrl-C rides: the adapters kill the whole process group with their WaitDelay
-// backstop, salvage runs per its existing paths, and any held claim is released
-// by the drain's deferred handback. The daemon then exits cleanly and cli.Run
-// re-execs it.
+// watchRestartNow polls for a RESTART_NOW marker for as long as the run lives. On finding one it
+// consumes the marker FIRST (so a crash between here and the re-exec cannot leave a
+// surprise-restart behind for the next boot), flags the restart, and cancels the run context —
+// which is the SAME cancellation a Ctrl-C rides: the adapters kill the whole process group with
+// their WaitDelay backstop, salvage runs per its existing paths, and any held claim is released by
+// the drain's deferred handback.
 func (d *Driver) watchRestartNow(ctx context.Context, cancel context.CancelFunc) {
 	poll := d.restartPoll
 	if poll <= 0 {
@@ -110,17 +88,8 @@ func (d *Driver) watchRestartNow(ctx context.Context, cancel context.CancelFunc)
 	}()
 }
 
-// applyReload acts on a consumed RELOAD marker: re-read the config file and
-// swap it in. Everything the driver reads through d.cfg picks the new values up
-// from the next gate/iteration on (budgets, max-iterations, phases and their
-// prompts, poll intervals); what does NOT follow is everything resolved before
-// the loop started — the harness adapter built at startup, the target list and
-// its pollers, and the process image and environment, all of which need a
-// restart (that is what the exec path is for).
-//
-// A config that fails to reload is NOT fatal. The daemon was running fine on
-// the old one; a broken edit mid-flight must not convert a dial tweak into an
-// outage, so the error is logged loudly and the current config stays.
+// applyReload acts on a consumed RELOAD marker: re-read the config file and swap it in. A config
+// that fails to reload is NOT fatal.
 func (d *Driver) applyReload() {
 	load := d.reloadConfig
 	src := ""
@@ -141,9 +110,8 @@ func (d *Driver) applyReload() {
 		return
 	}
 	d.cfg = fresh
-	// A stored run-config overlay (CLA-410) was built from the OLD base; mark it
-	// for a rebuild on the fresh one at the next poll — still this boundary,
-	// never mid-session.
+	// A stored run-config overlay was built from the OLD base; mark it for a rebuild on the fresh one
+	// at the next poll — still this boundary, never mid-session.
 	d.invalidateRunConfigs()
 	log.Printf("config reloaded from %s — dial edits apply from this iteration; harness/env/binary changes need a restart", fresh.Source())
 }

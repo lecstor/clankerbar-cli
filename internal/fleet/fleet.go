@@ -259,8 +259,8 @@ type Report struct {
 }
 
 // Reporter sends activity reports. Both methods are fail-soft by contract:
-// neither blocks meaningfully, neither returns an error, and neither may be
-// load-bearing for the caller.
+// Send returns at once, Close returns by its context's deadline at the latest,
+// and neither returns an error or may be load-bearing for the caller.
 type Reporter interface {
 	// Send enqueues one report and returns at once. Under an unresponsive
 	// endpoint the queue fills and the report is dropped (counted, mentioned in
@@ -268,14 +268,23 @@ type Reporter interface {
 	// no-op.
 	Send(r Report)
 	// Close ends reporting. Everything still queued is delivered first (newest
-	// first, bounded — a run that ends at a drain boundary must not lose the
-	// iteration record that boundary just posted), then r is POSTed
-	// synchronously — the run is over, so a short blocking wait costs nothing —
-	// and the reporter goes inert: r is the LAST POST it ever makes, so after
-	// it, console silence means the daemon is gone rather than stopped talking.
+	// first), then r is POSTed synchronously — the run is over, so a short
+	// blocking wait costs nothing — and the reporter goes inert: r is the LAST
+	// POST it ever makes, so after it, console silence means the daemon is gone
+	// rather than stopped talking.
+	//
+	// ctx bounds the whole goodbye: Close returns at the deadline rather than
+	// waiting out a pump POST that started before it, and every POST it does
+	// make takes its timeout from what the deadline leaves. A longer deadline
+	// is capped at CloseBudget. A daemon with several targets passes ONE
+	// deadline shared by all of them (Shutdown), so shutdown costs one budget
+	// rather than one per target. After the deadline nothing more is posted —
+	// that is what keeps an old daemon's late `stopping` beacon from
+	// overwriting its replacement's presence row.
+	//
 	// Idempotent: only the first call speaks. Used for the `stopping` beacon on
 	// shutdown paths.
-	Close(r Report)
+	Close(ctx context.Context, r Report)
 }
 
 // notWired is the Reporter for an operator who configured no reachable plane
@@ -283,8 +292,61 @@ type Reporter interface {
 // not-wired poller degrades the gate rather than stopping the run.
 type notWired struct{}
 
-func (notWired) Send(Report)  {}
-func (notWired) Close(Report) {}
+func (notWired) Send(Report)                   {}
+func (notWired) Close(context.Context, Report) {}
+
+// ShutdownBeacon is one target's goodbye: the reporter and the report it must
+// carry.
+type ShutdownBeacon struct {
+	Reporter Reporter
+	Report   Report
+}
+
+// Shutdown delivers every beacon concurrently and returns when they have all
+// been delivered or ctx expires, whichever is first. One deadline for the whole
+// set is the point: a daemon serving N projects must not spend N times the
+// goodbye on a hanging plane, and the operator's Ctrl-C waits for this.
+//
+// The deadline is the guarantee for the reporters this package builds — each
+// Close returns by it. A ctx carrying no deadline is capped at closeBudget, so
+// the bound holds for a direct caller too. The abandon below is a backstop for
+// a reporter that does not honour it: one must never be able to hold process
+// exit past the budget.
+func Shutdown(ctx context.Context, beacons []ShutdownBeacon) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, closeBudget)
+		defer cancel()
+	}
+	var wg sync.WaitGroup
+	for _, b := range beacons {
+		if b.Reporter == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(b ShutdownBeacon) {
+			defer wg.Done()
+			b.Reporter.Close(ctx, b.Report)
+		}(b)
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// The last Close may have returned at the same instant the deadline
+		// fired; report an abandoned wait only if one is still running.
+		select {
+		case <-done:
+			return
+		default:
+		}
+		log.Printf("fleet: shutdown deadline reached with a stopping beacon still unsent")
+	}
+}
 
 // New builds a Reporter. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
@@ -302,6 +364,7 @@ func New(endpoint, apiKey string) Reporter {
 		client:   &http.Client{Timeout: reportTimeout, CheckRedirect: noDowngradeRedirect},
 		queue:    make(chan Report, queueCap),
 		done:     make(chan struct{}),
+		postMu:   newCtxMutex(),
 	}
 }
 
@@ -310,17 +373,54 @@ func New(endpoint, apiKey string) Reporter {
 // loop never notices.
 const reportTimeout = 5 * time.Second
 
-// closeFlushBudget bounds how long Close may spend delivering what is still
-// queued before the `stopping` beacon. One report's worth of patience: it lets
-// a run that ends right at a drain boundary get that boundary's iteration
-// record out (the newest queued report, posted first) while a wedged plane
-// still cannot hold process exit hostage for the whole queue.
-const closeFlushBudget = 5 * time.Second
+// CloseBudget is the wall-clock ceiling on a daemon's whole goodbye: ONE
+// deadline shared by every target's Close (via Shutdown), so a hanging plane
+// costs it once per daemon rather than once per project. A healthy plane
+// finishes in milliseconds; this is patience, not a timeout the loop needs.
+// Nothing is posted after it — a late `stopping` beacon would overwrite the
+// presence row of the daemon that replaced this one.
+const CloseBudget = 5 * time.Second
+
+// closeBudget is the value Close and Shutdown enforce. A var so a test can
+// shrink it and pin the cap without waiting out the production five seconds.
+var closeBudget = CloseBudget
 
 // queueCap is how many reports may sit unread while the pump works through a
 // slow endpoint. Generous next to the production cadence (one per idle poll);
 // anything beyond this during an outage is dropped by design.
 const queueCap = 16
+
+// ctxMutex is a mutex whose acquisition can be abandoned at a deadline.
+// sync.Mutex cannot be: Close must not spend the entire shutdown budget waiting
+// out a pump POST that started before the budget did, or the bound it promises
+// is a fiction. Construct with newCtxMutex: the zero value's nil token blocks
+// forever.
+type ctxMutex struct{ token chan struct{} }
+
+func newCtxMutex() *ctxMutex {
+	m := &ctxMutex{token: make(chan struct{}, 1)}
+	m.token <- struct{}{}
+	return m
+}
+
+// Lock acquires the mutex, waiting as long as it takes. The pump uses this: it
+// has no deadline to honour.
+func (m *ctxMutex) Lock() { <-m.token }
+
+// LockContext acquires the mutex unless ctx is done first. False means the
+// caller does not hold it and must not Unlock.
+func (m *ctxMutex) LockContext(ctx context.Context) bool {
+	select {
+	case <-m.token:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Unlock releases an acquisition. Only called by a holder, so it cannot block:
+// the token buffer is empty exactly while it is held.
+func (m *ctxMutex) Unlock() { m.token <- struct{}{} }
 
 type httpReporter struct {
 	endpoint string
@@ -331,9 +431,10 @@ type httpReporter struct {
 	// done is closed by Close; the pump's select on queue-vs-done then parks
 	// it for good. postMu serialises every POST so that after Close takes the
 	// lock nothing can land after the `stopping` beacon. closed makes Send a
-	// no-op once Close has run, and guards Close's own idempotence.
+	// no-op once Close has run, guards Close's own idempotence, and guarantees
+	// the pump starts no POST after Close returns.
 	done       chan struct{}
-	postMu     sync.Mutex
+	postMu     *ctxMutex
 	closed     atomic.Bool
 	startOnce  sync.Once
 	dropped    atomic.Int64
@@ -355,18 +456,31 @@ func (r *httpReporter) Send(rep Report) {
 }
 
 // Close ends the reporter: it waits out whatever POST is in flight, delivers
-// what is still queued (newest first, within closeFlushBudget), then POSTs rep
-// itself — the last POST this reporter ever makes. Serialising on postMu across
-// the whole sequence is what makes that "last" claim hold: the pump takes the
-// same lock to receive, so once Close holds it the pump can neither deliver
-// nor receive, and any report the pump was already delivering has landed
-// before Close's critical section begins.
-func (r *httpReporter) Close(rep Report) {
+// what is still queued (newest first), then POSTs rep itself — the last POST
+// this reporter ever makes. Serialising on postMu across the whole sequence is
+// what makes that "last" claim hold: the pump takes the same lock to receive, so
+// once Close holds it the pump can neither deliver nor receive, and any report
+// the pump was already delivering has landed before Close's critical section
+// begins.
+//
+// The whole sequence is bounded by ctx: the wait for the pump, each queued
+// POST, and the final beacon all draw on what the deadline leaves, so a hanging
+// plane cannot stretch one target past it. See Reporter.Close.
+func (r *httpReporter) Close(ctx context.Context, rep Report) {
 	if !r.closed.CompareAndSwap(false, true) {
 		return // idempotent: only the first Close speaks
 	}
 	close(r.done) // the pump delivers nothing further — its in-flight one first
-	r.postMu.Lock()
+
+	// A caller passing an unbounded context (a direct Close outside Shutdown)
+	// still gets the ceiling; a caller sharing a tighter deadline keeps it.
+	ctx, cancel := context.WithTimeout(ctx, closeBudget)
+	defer cancel()
+
+	if !r.postMu.LockContext(ctx) {
+		log.Printf("fleet: shutdown: the pump was still delivering at the shutdown deadline - no stopping beacon sent")
+		return
+	}
 	defer r.postMu.Unlock()
 
 	// Everything still queued is what the pump did not deliver before the run
@@ -384,13 +498,12 @@ drain:
 			break drain
 		}
 	}
-	flushStart := time.Now()
 	delivered, lost := 0, 0
 	for i := len(queued) - 1; i >= 0; i-- {
-		if time.Since(flushStart) > closeFlushBudget {
+		if ctx.Err() != nil {
 			break
 		}
-		if err := r.sendOnce(queued[i]); err != nil {
+		if err := r.sendOnce(ctx, queued[i]); err != nil {
 			lost++
 		} else {
 			delivered++
@@ -402,7 +515,13 @@ drain:
 
 	// The stopping beacon itself — the last POST this reporter makes; after it,
 	// console silence means the daemon is gone, not that it stopped talking.
-	r.deliver(rep)
+	// Skipping it once the deadline has passed is deliberate: a beacon that
+	// lands after the daemon is gone would mark the replacement as stopping.
+	if ctx.Err() != nil {
+		log.Printf("fleet: shutdown: deadline reached before the stopping beacon - not sent")
+		return
+	}
+	r.deliver(ctx, rep)
 }
 
 // pump serialises every queued report through deliver, one goroutine for the
@@ -414,9 +533,18 @@ drain:
 func (r *httpReporter) pump() {
 	for {
 		r.postMu.Lock()
+		// Close may be waiting for this lock with a deadline. Checking closed
+		// under it gives the invariant that matters: no POST starts after Close
+		// returns. A report already selected when Close sets closed may still
+		// land while Close waits for the lock — bounded by reportTimeout, and
+		// inside the accepted "pump POST started before Close" tradeoff.
+		if r.closed.Load() {
+			r.postMu.Unlock()
+			return
+		}
 		select {
 		case rep := <-r.queue:
-			r.deliver(rep)
+			r.deliver(context.Background(), rep)
 			r.postMu.Unlock()
 		case <-r.done:
 			r.postMu.Unlock()
@@ -429,8 +557,8 @@ func (r *httpReporter) pump() {
 // rule: the FIRST failure of a streak is logged, further consecutive failures
 // are silent (an overnight outage must not write a line per poll), and recovery
 // is logged once with how many reports were lost. Callers hold postMu.
-func (r *httpReporter) deliver(rep Report) {
-	if err := r.sendOnce(rep); err != nil {
+func (r *httpReporter) deliver(ctx context.Context, rep Report) {
+	if err := r.sendOnce(ctx, rep); err != nil {
 		if r.failStreak.Add(1) == 1 {
 			log.Printf("fleet report failed and was dropped (further consecutive failures stay silent): %v", err)
 		}
@@ -443,12 +571,12 @@ func (r *httpReporter) deliver(rep Report) {
 	}
 }
 
-func (r *httpReporter) sendOnce(rep Report) error {
+func (r *httpReporter) sendOnce(ctx context.Context, rep Report) error {
 	body, err := marshalReport(rep)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
+	ctx, cancel := context.WithTimeout(ctx, reportTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(body))
 	if err != nil {

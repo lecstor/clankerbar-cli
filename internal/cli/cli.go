@@ -64,6 +64,13 @@ Usage:
                                detached worktree; the repository is never
                                modified. --method maps-session runs the map
                                method on a session that can continue turns.
+  clankerbar review map        Print the maps-session plan for one local
+    --base <commit>            base..head as JSON without starting a session:
+                               the brief-plus-first-chunk prompt and every
+                               follow-up turn, for an agent that sends them
+                               itself. Takes the same repo/base/head, chunk and
+                               JSON flags as review run, and spends nothing.
+                               The checkout must be at --head.
   clankerbar supervise roll    Roll the fleet onto the version THIS binary
                                 runs, one child at a time: install the new
                                 build at the fleet's launch path and run this
@@ -89,6 +96,7 @@ Usage:
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
 --help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
 'clankerbar upload --help', 'clankerbar deck --help', 'clankerbar hook
---help' or 'clankerbar review run --help' for their flags.
+--help', 'clankerbar review run --help' or 'clankerbar review map --help' for
+their flags.
 `)
 }

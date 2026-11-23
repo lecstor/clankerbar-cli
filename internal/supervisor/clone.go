@@ -99,17 +99,6 @@ func cloneRepo(ctx context.Context, dir, repo, cloneBase string) error {
 	}
 	tmp := fmt.Sprintf("%s.clone-%d", dir, os.Getpid())
 
-	env := []string{
-		// The same interaction-hostile discipline delivery.gitRun applies to
-		// every network git it runs: an unattended supervisor has no terminal,
-		// and a git that decides to ask for a password would hang the reconcile
-		// instead of answering the question.
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
-		"GCM_INTERACTIVE=never",
-	}
 	// Scope the credential by the URL we are actually cloning FROM, not by the
 	// owner alone: ScopeRemoteEnv degrades to "run unscoped" for anything its
 	// github.com HTTPS resolution does not understand, which is exactly what an
@@ -117,12 +106,15 @@ func cloneRepo(ctx context.Context, dir, repo, cloneBase string) error {
 	// not spawn `gh auth token` at all - the key is the credential there, and
 	// CLA-713 exists to stop branch pushes depending on a token in the session's
 	// environment.
-	env = append(env, delivery.ScopeRemoteEnv(ctx, filepath.Dir(dir), cloneGHBin, url)...)
+	scoped := delivery.ScopeRemoteEnv(ctx, filepath.Dir(dir), cloneGHBin, url)
 
 	ctx, cancel := context.WithTimeout(ctx, cloneTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "clone", "--", url, tmp)
-	cmd.Env = append(os.Environ(), env...)
+	// GitEnv strips inherited GIT_CONFIG_*/owned vars before appending the
+	// scoped insteadOf: a duplicate inherited GIT_CONFIG_COUNT could otherwise
+	// shadow the credential rewrite.
+	cmd.Env = delivery.GitEnv(os.Environ(), scoped)
 	cmd.WaitDelay = 5 * time.Second
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

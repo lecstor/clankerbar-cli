@@ -180,6 +180,44 @@ func TestNew_NotWired(t *testing.T) {
 	}
 }
 
+// Transient is the close-out's retry gate: a 5xx or a transport failure may clear
+// and is retried, while a tool-level refusal is the plane's considered answer and
+// must never be. The refusal cases are the ones with teeth — retrying a
+// `not_holding` would hammer the plane with a call that cannot succeed.
+func TestTransientClassifiesPlaneErrors(t *testing.T) {
+	const toolRefusal = `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"done refused: evidence_required"}]}}`
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"server failure", http.StatusBadGateway, "bad gateway", true},
+		{"throttled", http.StatusTooManyRequests, "slow down", true},
+		{"auth refusal", http.StatusUnauthorized, "unauthorized", false},
+		{"tool refusal", http.StatusOK, toolRefusal, false},
+		{"success", http.StatusOK, okBody, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := serve(t, tc.status, tc.body)
+			err := New(srv.URL+"/mcp/demo", "k-1").ReleaseDriver(context.Background(), "t-1", "r-1")
+			if got := Transient(err); got != tc.want {
+				t.Errorf("Transient(%v) = %v, want %v", err, got, tc.want)
+			}
+		})
+	}
+
+	// A transport failure never reaches a response at all; a closed server is the
+	// shape a restarting plane leaves behind.
+	srv, _ := serve(t, http.StatusOK, okBody)
+	srv.Close()
+	err := New(srv.URL+"/mcp/demo", "k-1").ReleaseDriver(context.Background(), "t-1", "r-1")
+	if !Transient(err) {
+		t.Errorf("Transient(%v) = false, want true for a transport failure", err)
+	}
+}
+
 // Both ids are required: a half-claim must never reach the plane as a write.
 func TestReleaseDriver_RequiresBothIDs(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)

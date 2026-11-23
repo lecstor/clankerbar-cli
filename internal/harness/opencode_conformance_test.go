@@ -846,6 +846,118 @@ func TestOpencodeConformance_largeClaim(t *testing.T) {
 	}
 }
 
+// CLA-927: a standalone review of a checkout that CHECKS IN a clankerbar MCP
+// server must reach the model with no connection attempt and no backlog tools.
+// The reviewed repo declares the fake server, the invocation is review run's own
+// shape (NoBacklogMCP, no named MCP config), and the assertions are the two
+// halves of the incident: the server is never started (so no needs_auth), and no
+// request the model saw offers a clankerbar tool (so the operator's backlog is
+// not reachable with a key in the environment either).
+func TestOpencodeConformance_noBacklogMCP(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	// The provider config is the GLOBAL layer, and the invocation below names no
+	// MCP config at all: that is review run's real shape. A named file would have
+	// made the preflight read only itself, which is not the path the incident
+	// took (and would not have waited for the checkout's server either).
+	global, err := json.Marshal(fakeConfigDoc(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(iso.cfgDir, "opencode.json"), global, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// run starts a session over a checkout that itself declares the fake
+	// clankerbar server, and reports the server's start marker and the tool names
+	// the model was offered.
+	run := func(t *testing.T, noBacklog bool) (started bool, tools []string) {
+		t.Helper()
+		mcpDir := t.TempDir()
+		work := t.TempDir()
+		marker := filepath.Join(t.TempDir(), "starts")
+		project, err := json.Marshal(map[string]any{
+			"mcp": map[string]any{"servers": map[string]any{"clankerbar": fakeMCPStartMarkerEntry(t, mcpDir, marker)}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, "opencode.json"), project, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		in := iso.invocation(conformancePrompt, work, "")
+		in.NoBacklogMCP = noBacklog
+		before := len(fake.requests())
+		res := invokeConformance(t, in)
+		requireHit(t, fake)
+		for _, req := range fake.requests()[before:] {
+			tools = append(tools, req.Tools...)
+		}
+		_, err = os.Stat(marker)
+		if res.ExitCode != 0 || strings.TrimSpace(res.FinalMessage) != "OK" {
+			t.Errorf("the session ended %s with final %q, want a clean OK", res.ExitString(), res.FinalMessage)
+		}
+		return err == nil, tools
+	}
+
+	// The control: without the switch this checkout does hand the session the
+	// backlog server and its tools. If this stops being true the assertions below
+	// are testing a config nothing was contending.
+	started, tools := run(t, false)
+	if !started {
+		t.Fatal("the control session did not start the checkout's clankerbar server - the no-backlog case below would pass for the wrong reason")
+	}
+	if indexOfTool(tools, "clankerbar_claim_task") < 0 {
+		t.Fatalf("the control session was offered no clankerbar tool (tools: %v)", tools)
+	}
+
+	started, tools = run(t, true)
+	if started {
+		t.Error("the checkout's clankerbar MCP server was started for a no-backlog session")
+	}
+	for _, name := range tools {
+		if strings.HasPrefix(name, "clankerbar") {
+			t.Errorf("the no-backlog session was offered the backlog tool %q (tools: %v)", name, tools)
+		}
+	}
+}
+
+// fakeMCPStartMarkerEntry is a local MCP entry whose start marker does not
+// depend on the entry's environment. The no-backlog switch strips environment,
+// so a marker written only when CLANKERBAR_FAKE_MCP_DIR is set cannot tell a
+// switched-off server from one started without the variable: an entry emitted
+// without `disabled` would start, write nothing and offer no tools, and both
+// assertions would still pass. The command here is a wrapper that appends to
+// the marker first and then execs the fake server with the directory the entry
+// passed it, so a started entry always leaves evidence.
+func fakeMCPStartMarkerEntry(t *testing.T, dir, marker string) map[string]any {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "fake-mcp-start")
+	body := "#!/bin/sh\n" +
+		"printf 'start\\n' >> " + shellSingleQuote(marker) + "\n" +
+		`if [ "$#" -eq 0 ]; then exit 0; fi` + "\n" +
+		fakeMCPDirEnv + "=$1 exec " + shellSingleQuote(self) + "\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{
+		"type":    "local",
+		"command": []string{script, dir},
+	}
+}
+
+// shellSingleQuote quotes s for /bin/sh.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // Switching off a server the global config declares takes a FULL entry in the
 // mcp config: verified on 2.0.32, a partial `{"enabled": false}` (1.x) or
 // `servers.X: {"disabled": true}` (2.x) leaves it running, and doctor's

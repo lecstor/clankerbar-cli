@@ -142,9 +142,14 @@ type fakeAdapter struct {
 	// probeTokens/probeCost are what EACH probe reports spending. A probe is a real
 	// paid session (CLA-287), so the fake has to be able to charge for one; zero
 	// keeps every pre-existing test's arithmetic exactly as it was.
-	probeTokens  int
-	probeCost    float64
-	limitResetAt time.Time
+	probeTokens int
+	probeCost   float64
+	// probeModels records each probe's Invocation.Model, and probeLimitFor, when set, answers a probe
+	// by call number and model instead of probeResults: the seam for a route walk, where the verdict
+	// depends on which route was probed.
+	probeModels   []string
+	probeLimitFor func(call int, model string) harness.Limit
+	limitResetAt  time.Time
 	// limitWindow is the usage window the fake's "limit" kind reports, so a test
 	// can pin what the loop's wait logs say about WHICH cap it is waiting out
 	// (CLA-752 review). Empty keeps every pre-existing test's limit exactly as it
@@ -260,9 +265,14 @@ func (f *fakeAdapter) Probe(ctx context.Context, in harness.Invocation) (harness
 	// Charged on every path, including the error one. That is the loop's contract
 	// with an adapter — whatever a ProbeResult carries is counted — not a claim
 	// about what the real adapters manage to parse from a failed run (CLA-299).
+	f.probeModels = append(f.probeModels, in.Model)
 	out := harness.ProbeResult{Tokens: f.probeTokens, CostUSD: f.probeCost}
 	if i < len(f.probeErrs) && f.probeErrs[i] != nil {
 		return out, f.probeErrs[i]
+	}
+	if f.probeLimitFor != nil {
+		out.Limit = f.probeLimitFor(i, in.Model)
+		return out, nil
 	}
 	if i < len(f.probeResults) {
 		out.Limit = f.probeResults[i]

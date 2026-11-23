@@ -5,42 +5,21 @@ import (
 	"time"
 )
 
-// The runner-claimed briefs. A runner-claimed session is started for ONE
-// prepared task, in a worktree the runner created, on a branch the runner
-// pushed and tracks, with the task already claimed and the lease held by the
-// runner. Everything mechanical therefore leaves the brief: the session gets
-// the context block (TaskContextBlock) above it and does only the phase's own
-// work. It also writes no record: it ends with a done report
-// (runnerDoneReport) and the runner turns that into every record. These
-// constants are added beside the shipped briefs, not in place of them; the
-// driver selects them in a later wiring step.
+// The runner-claimed briefs.
 
-// runnerToolWaitBound is the longest a runner-claimed session may block inside
-// ONE tool call. The adapters kill a call left open past the harness's
-// max_tool_call, so the brief has to name a figure below it: "a bounded wait"
-// with no number is how sessions chose a wait the driver killed (CLA-900).
-//
-// Ten minutes, because a fixed figure in a package-level brief cannot see the
-// project's config. It has to clear three shipped bounds: both 30m tool caps, and
-// opencode's 15m idle bound, which is still what ends a call the adapter never
-// saw opened (claude's open calls are never idle-bounded, so its 10m idle bound
-// is not a constraint - see idleGuard). A project that lowers max_tool_call below
-// this must lower the brief too, or its sessions will choose a wait the driver
-// kills. TestRunnerWaitBoundStaysUnderTheToolCallCaps pins all three.
+// runnerToolWaitBound is the longest a runner-claimed session may block inside ONE tool call. Ten
+// minutes, because a fixed figure in a package-level brief cannot see the project's config.
 const runnerToolWaitBound = 10 * time.Minute
 
-// runnerWaitRule replaces rerunGuidance's pointer at the served waiting
-// reference: a runner-claimed session is forbidden from fetching skill pages,
-// so the polling discipline and the driver's own bound are stated in the brief
-// instead.
+// runnerWaitRule replaces rerunGuidance's pointer at the served waiting reference: a runner-claimed
+// session is forbidden from fetching skill pages, so the polling discipline and the driver's own
+// bound are stated in the brief instead.
 var runnerWaitRule = "Waiting on a background job: block inside ONE tool call with a bounded wait " +
 	"instead of polling across turns, and never sleep-poll - keep that one call open for no more than " +
 	runnerToolWaitBound.Round(time.Minute).String() + ", because the driver kills a session whose single tool call stays open " +
 	"past its own cap."
 
-// runnerRerunGuidance is rerunGuidance's bound with that pointer replaced. It is
-// derived rather than copied so the bound itself cannot drift between a
-// session-claimed and a runner-claimed session.
+// runnerRerunGuidance is rerunGuidance's bound with that pointer replaced.
 var runnerRerunGuidance = strings.Replace(rerunGuidance,
 	"Consecutive turns spent idling on a background job or re-polling its output are the "+
 		"WAITING problem, not the rerun problem: read "+
@@ -48,55 +27,47 @@ var runnerRerunGuidance = strings.Replace(rerunGuidance,
 		"discipline while keeping hold of this task.",
 	runnerWaitRule, 1)
 
-// runnerForbidden is the shared prohibition every runner-claimed brief carries.
-// The runner owns the lifecycle around the session, and a session doing any of
-// this competes with it: a second claim or a heartbeat races the lease, a PR or
-// a CI poll duplicates what the runner opens and waits for, and a fetched skill
-// page is the turn cost this design exists to remove.
-//
-// The PR clause is scoped to the brief's own terminal step because the fix and
-// verify briefs still open the PR until the runner owns the close-out (B7/B8).
+// runnerForbidden is the shared prohibition every runner-claimed brief carries. The PR clause is
+// scoped to the brief's own terminal step because the fix and verify briefs still open the PR until
+// the runner owns the close-out (B7/B8).
 const runnerForbidden = " NEVER in this session: do NOT open a PR (unless this brief's own terminal step tells " +
 	"you to), do NOT poll or sleep-wait on CI, do NOT call next_task or claim_task, do NOT call heartbeat (the " +
 	"lease is the runner's), do NOT create or switch worktrees, and do NOT fetch clankerbar skill documents (curl " +
 	"or webfetch of any page under clankerbar.com) - the runner owns all of that, and this brief plus the context " +
 	"block carry everything the task needs." + runnerNoWrites
 
-// runnerCloseOutForbidden is runnerForbidden for the close-out brief, and keeps
-// its own write rules: the close-out still repairs a red check and hands the
-// task back itself, so it must not carry runnerNoWrites. The PR already exists
-// and a red check is the session's to repair, so neither the PR clause nor the
-// CI-polling ban applies here.
+// runnerCloseOutForbidden is runnerForbidden for the close-out brief, and keeps its own write
+// rules: the close-out still repairs a red check and hands the task back itself, so it must not
+// carry runnerNoWrites.
 const runnerCloseOutForbidden = " NEVER in this session: do NOT call next_task or claim_task, do NOT call " +
 	"heartbeat (the lease is the runner's), do NOT create or switch worktrees, do NOT fetch clankerbar skill " +
 	"documents (curl or webfetch of any page under clankerbar.com), and do NOT pass phaseDone to " +
 	"record_progress (the plane does not check who writes it, and the runner writes that phase marker itself) " +
 	"- the runner owns all of that, and this brief plus the context block carry everything the task needs."
 
-// runnerWorktreeAtTip is the runner's replacement for every "work in the
-// worktree for branch X" clause: the runner has already put the session there.
+// runnerWorktreeAtTip is the runner's replacement for every "work in the worktree for branch X"
+// clause: the runner has already put the session there.
 const runnerWorktreeAtTip = "You were started in the task worktree at tip " + ReviewedTipPlaceholder +
 	" (the context block above names the worktree, the branch and the tip; confirm `git rev-parse HEAD` is that " +
 	"tip), and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd " +
 	"is already the main checkout sitting on that branch is not a decision to commit where you are, it is this " +
 	"failure mode."
 
-// runnerResumeNoClaim replaces the claim/heartbeat resume step. The session is
-// already inside a held run, so a heartbeat of its own is a second holder.
+// runnerResumeNoClaim replaces the claim/heartbeat resume step. The session is already inside a
+// held run, so a heartbeat of its own is a second holder.
 const runnerResumeNoClaim = " You are RESUMING that run, not starting a new one: the runner claimed the task and " +
 	"holds its lease, so do NOT claim anything and do NOT call heartbeat - the lease is the runner's. Call plain " +
 	"get_task to re-read the bar: the context block above already carries the task, the phase, the branch and the " +
 	"standing decisions."
 
-// runnerTaskPrepared states the two facts the old brief spent turns
-// establishing: the claim and the worktree already exist.
+// runnerTaskPrepared states the two facts the old brief spent turns establishing: the claim and the
+// worktree already exist.
 const runnerTaskPrepared = " The task is already claimed and your worktree is prepared: work in the directory and on " +
 	"the branch the context block names, and do NOT claim anything or create, switch or re-create a worktree."
 
-// runnerResumedRevalidate keeps the substance of implementResumedBranchRule's
-// re-validation and supersession handling, without its merge instruction: the
-// runner did that merge (or reported its conflicts in the context block), and it
-// writes the park from the done report.
+// runnerResumedRevalidate keeps the substance of implementResumedBranchRule's re-validation and
+// supersession handling, without its merge instruction: the runner did that merge (or reported its
+// conflicts in the context block), and it writes the park from the done report.
 const runnerResumedRevalidate = " If the context block says Resumed, the branch already carried prior work, so " +
 	"re-validate the task against the current merged tip BEFORE doing or verifying anything: a clean merge proves " +
 	"nothing - a non-conflicting merge can silently revert a newer fix - so the check is the task's own bar (for a " +
@@ -106,9 +77,9 @@ const runnerResumedRevalidate = " If the context block says Resumed, the branch 
 	"runner a whole phase rediscovering the staleness - or salvage only what still adds value and carry on with " +
 	"the normal flow. Either way do NOT spend the run re-verifying and pushing stale work."
 
-// runnerImplementCheckpoint is implementCommitEarlyRule's floor, shorter. The
-// runner records the branch itself, so the push is the only thing that protects
-// the work - and the runner only sees a branch that is on origin.
+// runnerImplementCheckpoint is implementCommitEarlyRule's floor, shorter. The runner records the
+// branch itself, so the push is the only thing that protects the work - and the runner only sees a
+// branch that is on origin.
 const runnerImplementCheckpoint = " COMMIT AND PUSH AS YOU GO: get a first commit down before the design is fully " +
 	"settled - a skeleton, a failing test, a stub with the signatures, the first thing that compiles - push it to " +
 	"origin " + PhaseBranchPlaceholder + ", then keep committing and pushing as you go rather than once at the " +
@@ -119,9 +90,8 @@ const runnerImplementCheckpoint = " COMMIT AND PUSH AS YOU GO: get a first commi
 	"force-push - the branch may already be pushed, and rewriting pushed history invalidates the runner's tip " +
 	"checks."
 
-// runnerImplementBrief is the implement phase's brief for a runner-claimed
-// session: implementation only, in a worktree the runner prepared, ending at
-// the pushed branch the runner continues from.
+// runnerImplementBrief is the implement phase's brief for a runner-claimed session: implementation
+// only, in a worktree the runner prepared, ending at the pushed branch the runner continues from.
 var runnerImplementBrief = "Work the task in the context block above. This session is PHASE " +
 	PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + ", and its scope is implementation ONLY: there is " +
 	"no review gate and no in_review step in this session." + runnerTaskPrepared + runnerResumedRevalidate +
@@ -133,14 +103,9 @@ var runnerImplementBrief = "Work the task in the context block above. This sessi
 	"the task being abandoned." +
 	runnerDoneReport(runnerImplementReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
-// runnerCloseOutBrief is the close-out phase's brief for a runner-claimed
-// session: the task is approved and awaiting merge, and the plane's own
-// close-out instruction - which the context block carries, not this brief -
-// owns the work after a red check is repaired. It must agree with that
-// instruction: the plane tells an unclaimed session to "claim it", and here the
-// runner already holds the claim, so the brief says so rather than leave the
-// session claiming a task it already owns. This phase keeps its own writes: it
-// hands the task back itself.
+// runnerCloseOutBrief is the close-out phase's brief for a runner-claimed session: the task is
+// approved and awaiting merge, and the plane's own close-out instruction - which the context block
+// carries, not this brief - owns the work after a red check is repaired.
 var runnerCloseOutBrief = "This session is PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder +
 	" on the task in the context block above, and it is a CLOSE-OUT: its implementation and review are done " +
 	"and approved, and it is awaiting merge. The task is already claimed - the runner holds that claim and its " +
@@ -156,14 +121,13 @@ var runnerCloseOutBrief = "This session is PHASE " + PhaseNumberPlaceholder + " 
 	"task back with `release_task` and `checkGreen` false, then STOP and end the session." +
 	runnerCloseOutForbidden + handoffGuidance
 
-// runnerReviewResume is the review variant's resume step: the same
-// no-claim, no-heartbeat rule plus the hand-off check only a branch-shaped
-// phase can make.
+// runnerReviewResume is the review variant's resume step: the same no-claim, no-heartbeat rule plus
+// the hand-off check only a branch-shaped phase can make.
 const runnerReviewResume = runnerResumeNoClaim + " An empty branch field on the task is a FAILED hand-off: " +
 	"report it as a MUST finding of kind failure in your done report, not work to silently adopt and implement."
 
-// runnerReviewWorktreeAndGate is reviewOnlyBriefWorktreeAndGate with the
-// worktree hunt replaced: the session starts at the reviewed tip.
+// runnerReviewWorktreeAndGate is reviewOnlyBriefWorktreeAndGate with the worktree hunt replaced:
+// the session starts at the reviewed tip.
 var runnerReviewWorktreeAndGate = " " + runnerWorktreeAtTip +
 	" Read the diff against the PR base (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder +
 	") and run the adversarial review gate." + reviewGateScope +
@@ -171,35 +135,31 @@ var runnerReviewWorktreeAndGate = " " + runnerWorktreeAtTip +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
 
-// runnerReviewRecord replaces the shipped two-form record shape: the review is
-// handed over in the done report alone, and the runner renders the legacy block
-// and writes the sealed durable record from it. The grading rules are
-// reviewMUSTBarGrades verbatim - they are the bar, not the write.
+// runnerReviewRecord replaces the shipped two-form record shape: the review is handed over in the
+// done report alone, and the runner renders the legacy block and writes the sealed durable record
+// from it.
 const runnerReviewRecord = " THE REVIEW IS YOUR DELIVERABLE, and the done report is where you put it: do NOT write " +
 	"the `" + ReviewRecordHeading + "` block with record_progress, and do NOT call record_review. The runner " +
 	"renders the block and writes the sealed durable record from your report, attributed to this session's " +
 	"harness and model." + reviewMUSTBarGrades
 
-// runnerReviewTerminalStep ends the review-only phase as a checkpoint: the
-// runner records the review and the fix phase resumes the same run from the
-// branch.
+// runnerReviewTerminalStep ends the review-only phase as a checkpoint: the runner records the
+// review and the fix phase resumes the same run from the branch.
 const runnerReviewTerminalStep = " This is a CHECKPOINT: keep holding, do NOT commit, push or open a PR. The runner " +
 	"checkpoints on the branch the implement phase recorded, and the phase after you resumes this same run from " +
 	"it. Ending this session after the report is this phase FINISHING, not the task being abandoned. The ONLY " +
 	"exception is a declared handoff."
 
-// runnerReviewOnlyBrief is the review-only gate's brief for a runner-claimed
-// session: the shipped core, with the runner's resume and worktree facts in
-// place of the claim and the worktree hunt, and the done report in place of the
-// two record writes.
+// runnerReviewOnlyBrief is the review-only gate's brief for a runner-claimed session: the shipped
+// core, with the runner's resume and worktree facts in place of the claim and the worktree hunt,
+// and the done report in place of the two record writes.
 var runnerReviewOnlyBrief = reviewOnlyBriefOpening + reviewHandoffVerified + runnerReviewResume +
 	runnerReviewWorktreeAndGate + runnerReviewRecord + runnerDoneReport(runnerReviewReportFields) +
 	runnerReviewTerminalStep + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
-// runnerFixCore is the fix phase's substance for a runner-claimed session,
-// written fresh rather than derived: the record it reads is still the shipped
-// one, but the park and the updates it used to write itself now leave in the
-// done report.
+// runnerFixCore is the fix phase's substance for a runner-claimed session, written fresh rather
+// than derived: the record it reads is still the shipped one, but the park and the updates it used
+// to write itself now leave in the done report.
 var runnerFixCore = "Read BOTH the durable record and the block: `reviews.records` carries every released record " +
 	"in the newest round, each with its findings[] and the plane-assigned id (`<round>.<reviewer role>.<n>`) you " +
 	"report a findingUpdate by; the outcome's `" + ReviewRecordHeading + "` block is the legacy copy. On a later " +
@@ -219,23 +179,21 @@ var runnerFixCore = "Read BOTH the durable record and the block: `reviews.record
 	"SCOPED to those fixes: run the gates the repo's own instructions name, and any check a finding says was " +
 	"red, not the whole suite again for no reason."
 
-// runnerFixUpdates puts the per-finding updates and the fix summary in the done
-// report instead of a record_review call: the runner sends them and appends the
-// `### Fixes` outcome itself.
+// runnerFixUpdates puts the per-finding updates and the fix summary in the done report instead of a
+// record_review call: the runner sends them and appends the `### Fixes` outcome itself.
 const runnerFixUpdates = " THE FINDING UPDATES GO IN THE SAME REPORT, never with record_review: the report's " +
 	"`findingUpdates` carries one entry per finding by its plane id, in the shape the report's field list gives. " +
 	"The runner sends the updates and appends the `### Fixes` outcome itself, so do not write an outcome, and do " +
 	"not preserve one - that is the runner's job now."
 
-// runnerFixCreateTask is the one write a fix session may still make: a follow-up
-// the review asked for stays a task of its own, and its ref travels back in the
-// report rather than being recorded by the session.
+// runnerFixCreateTask is the one write a fix session may still make: a follow-up the review asked
+// for stays a task of its own, and its ref travels back in the report rather than being recorded by
+// the session.
 const runnerFixCreateTask = " The ONE write that is yours in this session is create_task, for a follow-up a " +
 	"finding deserves (with a real doneWhen): send the new task's ref back as that finding's `filed` update."
 
-// runnerFixBrief is fixBrief for a runner-claimed session: the fix phase that
-// still opens the PR, with the hand-over and the record writes owned by the
-// runner.
+// runnerFixBrief is fixBrief for a runner-claimed session: the fix phase that still opens the PR,
+// with the hand-over and the record writes owned by the runner.
 var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the runner has now " +
@@ -251,8 +209,8 @@ var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"task over with submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) + runnerRerunGuidance +
 	runnerForbidden + handoffGuidance + runnerReportReminder
 
-// runnerFixVerifyBrief is fixVerifyBrief for a runner-claimed session: a
-// verification round follows, so the PR and the hand-over stay the verifier's.
+// runnerFixVerifyBrief is fixVerifyBrief for a runner-claimed session: a verification round
+// follows, so the PR and the hand-over stay the verifier's.
 var runnerFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder +
 	" on task " + PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the runner has now " +
@@ -271,10 +229,9 @@ var runnerFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + 
 	"verifier never saw. Ending this session holding the task is the checkpoint the verification round resumes " +
 	"from." + runnerDoneReport(runnerFixReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
-// runnerVerifyBrief is verifyBrief for a runner-claimed session: the review
-// scope, the adjudication and the stopping rule are the shipped substance; the
-// resume, the worktree, the polling rule and the record - a done report the
-// runner writes from - differ.
+// runnerVerifyBrief is verifyBrief for a runner-claimed session: the review scope, the adjudication
+// and the stopping rule are the shipped substance; the resume, the worktree, the polling rule and
+// the record - a done report the runner writes from - differ.
 var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the VERIFICATION round. A review round found issues and a fix round applied " +
 	"them; your job is to verify the FIXES, not to review the whole diff again. The driver has closed the " +
@@ -317,17 +274,16 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	verifyStoppingRule + verifyDriverBounds + runnerDoneReport(runnerVerifyReportFields) + runnerRerunGuidance +
 	runnerForbidden + handoffGuidance + runnerReportReminder
 
-// RunnerHandoffPreamble is HandoffPreamble for a runner-claimed session: the
-// runner holds the lease, so no heartbeat, and the work stays in the worktree the
-// runner started it in.
+// RunnerHandoffPreamble is HandoffPreamble for a runner-claimed session: the runner holds the
+// lease, so no heartbeat, and the work stays in the worktree the runner started it in.
 const RunnerHandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on task " + PhaseTaskPlaceholder +
 	", handed to you by the previous session on this task via a self-chosen handoff. The runner claimed the task " +
 	"and holds its lease: do NOT call next_task, claim_task or heartbeat, and stay within this phase's scope and " +
 	"in the worktree you were started in. What follows is the previous session's own continuation prompt:\n\n"
 
-// RunnerHandoffContinuation adapts a shipped handoff continuation for a
-// runner-claimed session: the waiting reference becomes the brief's own rule and
-// the runner's prohibition - including the write ban - is appended.
+// RunnerHandoffContinuation adapts a shipped handoff continuation for a runner-claimed session: the
+// waiting reference becomes the brief's own rule and the runner's prohibition - including the write
+// ban - is appended.
 func RunnerHandoffContinuation(continuation string) string {
 	if continuation == "" {
 		return ""
@@ -335,26 +291,22 @@ func RunnerHandoffContinuation(continuation string) string {
 	return strings.Replace(continuation, rerunGuidance, runnerRerunGuidance, -1) + runnerForbidden
 }
 
-// RunnerImplementBrief returns the implement phase's brief for a runner-claimed
-// session.
+// RunnerImplementBrief returns the implement phase's brief for a runner-claimed session.
 func RunnerImplementBrief() string { return runnerImplementBrief }
 
-// RunnerCloseOutBrief returns the close-out brief for a runner-claimed
-// approved-awaiting-merge task.
+// RunnerCloseOutBrief returns the close-out brief for a runner-claimed approved-awaiting-merge
+// task.
 func RunnerCloseOutBrief() string { return runnerCloseOutBrief }
 
-// RunnerReviewOnlyBrief returns the review-only gate's brief for a
-// runner-claimed session.
+// RunnerReviewOnlyBrief returns the review-only gate's brief for a runner-claimed session.
 func RunnerReviewOnlyBrief() string { return runnerReviewOnlyBrief }
 
-// RunnerFixBrief returns the final fix phase's brief for a runner-claimed
-// session.
+// RunnerFixBrief returns the final fix phase's brief for a runner-claimed session.
 func RunnerFixBrief() string { return runnerFixBrief }
 
-// RunnerFixVerifyBrief returns the fix phase's brief when a verification round
-// follows, for a runner-claimed session.
+// RunnerFixVerifyBrief returns the fix phase's brief when a verification round follows, for a
+// runner-claimed session.
 func RunnerFixVerifyBrief() string { return runnerFixVerifyBrief }
 
-// RunnerVerifyBrief returns the verification round's brief for a
-// runner-claimed session.
+// RunnerVerifyBrief returns the verification round's brief for a runner-claimed session.
 func RunnerVerifyBrief() string { return runnerVerifyBrief }

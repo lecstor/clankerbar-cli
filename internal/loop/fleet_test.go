@@ -50,7 +50,7 @@ func (f *fakeFleet) Send(r fleet.Report) {
 	f.sent = append(f.sent, r)
 }
 
-func (f *fakeFleet) Close(r fleet.Report) {
+func (f *fakeFleet) Close(_ context.Context, r fleet.Report) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed = append(f.closed, r)
@@ -1913,5 +1913,118 @@ func TestFleetIdentityToleratesNilConfig(t *testing.T) {
 	d := &Driver{}
 	if id := d.fleetIdentity(0); id.Host != "" && id.Instance != id.Host {
 		t.Errorf("want a host-derived instance name, got %+v", id)
+	}
+}
+
+// --- CLA-484: one shutdown budget for the whole fleet -------------------------
+
+// blockingFleet is a Reporter whose Close never returns until released, and
+// ignores its context: the shape a reporter must not be able to use to hold
+// process exit.
+type blockingFleet struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingFleet() *blockingFleet {
+	return &blockingFleet{entered: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (b *blockingFleet) Send(fleet.Report) {}
+
+func (b *blockingFleet) Close(context.Context, fleet.Report) {
+	b.entered <- struct{}{}
+	<-b.release
+}
+
+// A hanging plane must cost the whole fleet ONE shutdown budget, not one per
+// target. Each serial Close used to be able to spend its own timeouts on the
+// pump wait, the flush and the stopping POST — so the operator's Ctrl-C and the
+// ctl restart re-exec waited N times that.
+func TestFleetShutdownIsBoundedByOneBudgetAcrossTargets(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	var mu sync.Mutex
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		posts++
+		mu.Unlock()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { unblock(); srv.Close() })
+
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{
+		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
+		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
+		{Poller: busyPoller(), Fleet: fleet.New(srv.URL, "k")},
+	})
+	openTestStateDir(t, d)
+	d.shutdownBudget = 200 * time.Millisecond
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		d.fleetShutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("fleetShutdown had not returned 1s into a hanging plane with 3 targets (budget %s) — total shutdown must be one budget, not one per target", d.shutdownBudget)
+	}
+	if elapsed := time.Since(start); elapsed > d.shutdownBudget+500*time.Millisecond {
+		t.Errorf("fleetShutdown took %s with a %s budget — total shutdown must be one budget, not one per target", elapsed, d.shutdownBudget)
+	}
+
+	// Every target must have REACHED the plane while the others were still
+	// waiting: a serial loop sharing the already-expired ctx posts only the
+	// first target's beacon, because the rest see the deadline before sending.
+	mu.Lock()
+	got := posts
+	mu.Unlock()
+	if got != 3 {
+		t.Errorf("the plane received %d stopping beacon(s), want one per target (3) — the targets were not closed concurrently under a shared deadline", got)
+	}
+}
+
+// The budget is the guarantee, not the wait: a Reporter that ignores its
+// context must not keep fleetShutdown from returning at the deadline.
+func TestFleetShutdownAbandonsAReporterThatIgnoresTheDeadline(t *testing.T) {
+	a, b := newBlockingFleet(), newBlockingFleet()
+	t.Cleanup(func() { close(a.release) })
+	t.Cleanup(func() { close(b.release) })
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{
+		{Poller: busyPoller(), Fleet: a},
+		{Poller: busyPoller(), Fleet: b},
+	})
+	openTestStateDir(t, d)
+	d.shutdownBudget = 50 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		d.fleetShutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("fleetShutdown never returned against a Reporter that ignores its context (budget %s)", d.shutdownBudget)
+	}
+	// Bounded waits: the spawned Close goroutines may not have been scheduled
+	// the instant fleetShutdown abandoned the wait.
+	select {
+	case <-a.entered:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("target 0's Close was never entered")
+	}
+	select {
+	case <-b.entered:
+	case <-time.After(100 * time.Millisecond):
+		t.Error("target 1's Close was never entered")
 	}
 }

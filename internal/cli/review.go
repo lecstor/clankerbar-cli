@@ -53,7 +53,8 @@ func newReviewRunFlagSet(f *reviewRunFlags) *pflag.FlagSet {
 	return fs
 }
 
-// Review is the `clankerbar review` entry point. `run` is its only subcommand.
+// Review is the `clankerbar review` entry point. `run` and `map` are its
+// subcommands.
 func Review(ctx context.Context, args []string) error {
 	return reviewRun(ctx, args, os.Stdout, os.Stderr)
 }
@@ -65,13 +66,15 @@ func reviewRun(ctx context.Context, args []string, stdout, stderr io.Writer) err
 			reviewUsage(stdout)
 			return nil
 		case "run":
+		case "map":
+			return reviewMap(args[1:], stdout, stderr)
 		default:
 			reviewUsage(stderr)
-			return fmt.Errorf("unknown review subcommand %q: the command is `clankerbar review run`", args[0])
+			return fmt.Errorf("unknown review subcommand %q: the commands are `clankerbar review run` and `clankerbar review map`", args[0])
 		}
 	} else {
 		reviewUsage(stderr)
-		return errors.New("clankerbar review needs a subcommand: `clankerbar review run --base <commit>`")
+		return errors.New("clankerbar review needs a subcommand: `clankerbar review run --base <commit>` or `clankerbar review map --base <commit>`")
 	}
 
 	var f reviewRunFlags
@@ -195,12 +198,16 @@ func reviewUsage(w io.Writer) {
 
 Usage:
   clankerbar review run [flags]
+  clankerbar review map [flags]
 
 "review run" reviews one local base..head in a temporary detached worktree and
 prints the findings as JSON. It claims no task, writes no plane record and
-connects no MCP config: the change itself is the whole subject, and the JSON is
-the whole deliverable. The reviewed repository is only read from; nothing is
-edited, committed or pushed.
+connects no MCP config. On the opencode adapter a clankerbar MCP server the
+reviewed checkout (or the global opencode config) declares is switched off, so
+the session cannot reach your backlog; a harness whose adapter does not
+implement that switch is refused. The change itself is
+the whole subject, and the JSON is the whole deliverable. The reviewed
+repository is only read from; nothing is edited, committed or pushed.
 
   --repo <path>             local git checkout (default: .)
   --base <commit>           commit the review diffs from (required)
@@ -223,5 +230,25 @@ The JSON carries the resolved base/head commits, the method, the model per
 stage, the findings, the omitted count, the maps-session notes and the session's
 usage. A session that ends without a usable done report fails the command
 (non-zero), after the harness's one re-emit.
+
+"review map" prints the maps-session plan "review run --method maps-session"
+would send — the brief-plus-first-chunk prompt and every follow-up turn — for
+an agent that sends the turns itself. It starts no session, spends nothing and
+loads no clankerbar config. Unlike "review run" it reads --repo as given, so
+that checkout must be at --head. The plan always has embedding off.
+
+  --repo <path>             local git checkout, or any directory in it
+                            (default: .; must be at --head)
+  --base <commit>           commit the review diffs from (required)
+  --head <commit>           commit the review diffs to (default: HEAD)
+  --chunk-size <n>          map items per notes turn (default: 25)
+  --flow-max <n>            flow-map item cap (default: 40)
+  --title <text>            optional title of the change
+  --description-file <f>    optional file describing the change
+  --json <file>             write the JSON to a file (default: stdout)
+
+The JSON carries the resolved base/head commits, the numbered change and flow
+item counts, the notes chunk count, and the turns: each notes turn with its
+chunk number and count, then the single findings turn, last.
 `)
 }

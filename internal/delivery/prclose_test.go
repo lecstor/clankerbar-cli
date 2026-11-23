@@ -107,6 +107,36 @@ func TestConflictPathsOnACleanPairNamesNothing(t *testing.T) {
 	}
 }
 
+// The failure error quotes merge-tree's output for diagnosis, so that output
+// must go through the same redactor as git stderr. merge-tree never contacts a
+// remote, so this is defence in depth for the quoted output - not a scoped
+// invocation's URL.
+func TestConflictPathsRedactsCredentialsInQuotedOutput(t *testing.T) {
+	const secret = "gho_super_secret_token_966"
+	dir := t.TempDir()
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	writeFile(t, fakeGit, `#!/bin/sh
+echo "fatal: fetching https://x-access-token:`+secret+`@github.com/lecstor/private.git/"
+exit 128
+`)
+	if err := os.Chmod(fakeGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	v := New(dir, "")
+	v.gitBin = fakeGit
+	_, err := v.ConflictPaths(context.Background(), dir, "main", "clanker/feature")
+	if err == nil {
+		t.Fatal("expected merge-tree to fail")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "x-access-token:") {
+		t.Fatalf("ConflictPaths leaked the credential from git output: %q", err)
+	}
+	if !strings.Contains(err.Error(), "https://redacted@github.com/lecstor/private.git/") {
+		t.Fatalf("ConflictPaths should keep the redacted URL for diagnosis, got %q", err)
+	}
+}
+
 func TestMergedOnRemoteAnswersAncestry(t *testing.T) {
 	e := newEnv(t)
 	e.commit("main", "base.txt", "base")
@@ -187,6 +217,44 @@ func TestOpenPRsNamesNoBranchOrSlug(t *testing.T) {
 	}
 	if _, err := v.OpenPRs(context.Background(), t.TempDir(), "acme/widgets", ""); err == nil {
 		t.Error("OpenPRs with no head should refuse")
+	}
+}
+
+// The re-read after an ambiguous merge error must bring back both facts the
+// release decision needs in one answer: what the PR is now, and the commit GitHub
+// made when it is MERGED.
+func TestReadPRMergeStateNamesTheMergeCommit(t *testing.T) {
+	root := prEnv(t)
+	repo := filepath.Join(root, "repo")
+	const view = `{"number":7,"state":"MERGED","baseRefName":"staging",` +
+		`"headRefOid":"abc1234def5678","mergeCommit":{"oid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}}`
+	v := New(root, "").WithGHBin(fakeGH(t, view))
+
+	st, err := v.ReadPRMergeState(context.Background(), repo, "acme/widgets", 7)
+	if err != nil {
+		t.Fatalf("ReadPRMergeState: %v", err)
+	}
+	if st.Number != 7 || st.State != "MERGED" || st.Base != "staging" || st.HeadOID != "abc1234def5678" {
+		t.Errorf("state = %+v, want #7 MERGED onto staging at abc1234def5678", st)
+	}
+	if st.MergeCommit != "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" {
+		t.Errorf("merge commit = %q, want the oid GitHub reported", st.MergeCommit)
+	}
+}
+
+// A decorated answer is the same fault the gate classifies as a refusal, so this
+// reader must classify it identically rather than as a generic error.
+func TestReadPRMergeStateClassifiesDecoratedOutputAsAParseError(t *testing.T) {
+	root := prEnv(t)
+	repo := filepath.Join(root, "repo")
+	v := New(root, "").WithGHBin(fakeGH(t, "\x1b[1;37m{\x1b[m"))
+
+	_, err := v.ReadPRMergeState(context.Background(), repo, "acme/widgets", 7)
+	if err == nil {
+		t.Fatal("decorated `gh pr view` output parsed")
+	}
+	if !IsGHParseError(err) {
+		t.Fatalf("got %v (%T), want a ghParseError", err, err)
 	}
 }
 

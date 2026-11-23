@@ -1,16 +1,6 @@
 package cli
 
 // doctor_planner.go — the planner role's preflight (studio-chat.md §2).
-//
-// D23's "reports that and does not fall back" is enforced here, at the machine
-// boundary: the stored document says WHICH harness and model, and this machine
-// says whether it can run them. A planner whose harness is missing or
-// unconfigured is a FAIL — never a silent substitution of the local default.
-//
-// The role check is REPORTING plus one aggregate refusal, exactly as the design
-// words it: every project whose resolved document has no `roles.planner` is
-// named, but the instance is refused only when NONE of them does. One project
-// that opted out must not stop the instance serving the others.
 
 import (
 	"context"
@@ -50,16 +40,14 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 
 	anyConfigured := false
 	anyResolved := false
-	// unverified counts projects whose role could not be READ. The aggregate
-	// refusal below may only fire when every project was resolved: a transient
-	// plane error is a WARN in checkRunConfigs, and it must not become a doctor
-	// rejection here.
+	// unverified counts projects whose role could not be READ. The aggregate refusal below may only
+	// fire when every project was resolved: a transient plane error is a WARN in checkRunConfigs, and
+	// it must not become a doctor rejection here.
 	unverified := 0
 	usable := 0
 	for _, t := range targets {
-		// The per-project line is always qualified; the bare `planner` name is
-		// the INSTANCE-level verdict appended last, so the two can never be
-		// confused in the output or in a test.
+		// The per-project line is always qualified; the bare `planner` name is the INSTANCE-level verdict
+		// appended last, so the two can never be confused in the output or in a test.
 		name := t.name
 		if name == "" {
 			name = cfg.Slug()
@@ -120,8 +108,8 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 			})
 			continue
 		}
-		// Apply to a clone so the role is resolved exactly as the loop will see
-		// it (including a harness-swap refusal), without touching the base.
+		// Apply to a clone so the role is resolved exactly as the loop will see it (including a
+		// harness-swap refusal), without touching the base.
 		eff := cfg.Clone()
 		if err := eff.ApplyRunConfig(&doc); err != nil {
 			unverified++
@@ -155,8 +143,8 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 
 	if anyResolved && !anyConfigured {
 		if unverified > 0 {
-			// Some projects could not be read: one of them may carry the planner,
-			// so this stays the WARN the per-project lines are, never a refusal.
+			// Some projects could not be read: one of them may carry the planner, so this stays the WARN the
+			// per-project lines are, never a refusal.
 			checks = append(checks, check{
 				name:   "planner",
 				status: warn,
@@ -180,10 +168,8 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 			remedy: "check the plane is reachable, then run doctor again",
 		})
 	} else if anyConfigured && usable == 0 {
-		// Every configured project's role failed its machine check; the
-		// per-project FAILs already say why. An unreadable project may still
-		// carry a servable role, so that case stays the WARN the per-project
-		// lines are rather than turning a plane error into a refusal.
+		// Every configured project's role failed its machine check; the per-project FAILs already say
+		// why.
 		if unverified > 0 {
 			checks = append(checks, check{
 				name:   "planner",
@@ -203,10 +189,10 @@ func checkPlanner(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	return checks
 }
 
-// checkPlannerRole is the machine half of one project's assigned role: the
-// harness must exist here, carry its own wiring, and be runnable with the MCP
-// config that lets the session reply. The model is policy this machine cannot
-// verify, so it is reported as model_unverified and never substituted.
+// checkPlannerRole is the machine half of one project's assigned role: the harness must exist here,
+// carry its own wiring, and be runnable with the MCP config that lets the session reply. The model
+// is policy this machine cannot verify, so it is reported as model_unverified and never
+// substituted.
 func checkPlannerRole(ctx context.Context, cfg, eff *config.Config, t plannerTarget, e doctorEnv) check {
 	c := check{status: pass}
 	sess, err := eff.ResolvePlanner()
@@ -221,8 +207,8 @@ func checkPlannerRole(ctx context.Context, cfg, eff *config.Config, t plannerTar
 		where = fmt.Sprintf("project %q: ", t.name)
 	}
 	h := sess.Harness
-	// A harness other than the run-wide one inherits none of its machine wiring;
-	// the same rule Validate applies to a phase on another harness.
+	// A harness other than the run-wide one inherits none of its machine wiring; the same rule
+	// Validate applies to a phase on another harness.
 	if h != cfg.Harness {
 		hc, ok := cfg.Harnesses[h]
 		if !ok || hc.Empty() {
@@ -256,9 +242,8 @@ func checkPlannerRole(ctx context.Context, cfg, eff *config.Config, t plannerTar
 		c.detail = fmt.Sprintf("%sharness %q", where, h)
 	}
 	hc := eff.SessionFor(h)
-	// Without an MCP config the session has no clankerbar tools, so it can
-	// neither read the turn's subjects nor call reply_conversation. This is the
-	// one wiring gap that makes the whole turn impossible, so it FAILs.
+	// Without an MCP config the session has no clankerbar tools, so it can neither read the turn's
+	// subjects nor call reply_conversation.
 	if mcp := eff.ResolveMCPConfig(h, t.mcpConfigPath, t.perHarnessPaths); mcp == "" {
 		c.status = fail
 		c.detail += fmt.Sprintf("; no clankerbar MCP config resolves for it, so a session could not call reply_conversation")
@@ -291,9 +276,9 @@ func checkPlannerRole(ctx context.Context, cfg, eff *config.Config, t plannerTar
 		}
 		c.detail += "; no config_dir pinned (ambient credentials - an unattended environment may have none)"
 	} else {
-		// The same credential/config-dir check every other harness gets: an
-		// absent, empty or unreadable dir is a real planner outage, and its
-		// marker heuristic already words the "may be in the keychain" caveat.
+		// The same credential/config-dir check every other harness gets: an absent, empty or unreadable
+		// dir is a real planner outage, and its marker heuristic already words the "may be in the
+		// keychain" caveat.
 		cd := checkConfigDirNamed("config_dir", h, hc.ConfigDir)
 		switch cd.status {
 		case fail:
@@ -313,8 +298,8 @@ func checkPlannerRole(ctx context.Context, cfg, eff *config.Config, t plannerTar
 	return c
 }
 
-// plannerTargets mirrors checkRunConfigs' target list: every configured project,
-// or the single unnamed target.
+// plannerTargets mirrors checkRunConfigs' target list: every configured project, or the single
+// unnamed target.
 func plannerTargets(cfg *config.Config) []plannerTarget {
 	var targets []plannerTarget
 	for _, p := range cfg.Projects {

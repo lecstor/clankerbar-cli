@@ -1,25 +1,7 @@
 package loop
 
-// task_worktree.go — the runner prepares the task's worktree before the session
-// starts (runner-owned mechanics A4, docs/runner-owned-mechanics.md).
-//
-// The session is handed a branch that is already checked out at a deterministic
-// path, based on the PR base, and — when resuming — already merged with the
-// current base where git can merge it. Everything mechanical that used to be a
-// prompt instruction and a full-context turn happens here instead.
-//
-// Two rules the code below keeps:
-//   - never discard work. A reused worktree that is detached, on another
-//     branch, or holds tracked changes or commits origin lacks is REFUSED with
-//     a reason. Untracked files are not committed work: when HEAD is at or
-//     behind a ref origin has, they are moved aside to a logged directory
-//     OUTSIDE the tree (nothing deleted) and the tree is reused. Only a
-//     fast-forward is applied to a clean, matching tree.
-//   - a conflict is not a failure. The merge is aborted, the conflicting paths
-//     are returned, and the session starts clean at the pre-merge tip with the
-//     conflict to resolve itself.
-//
-// Nothing here pushes or opens a PR; that is the close-out's job (B7).
+// task_worktree.go — the runner prepares the task's worktree before the session starts
+// (runner-owned mechanics A4; the reasoning is in docs/loop-rationale.md).
 
 import (
 	"context"
@@ -32,11 +14,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
-// worktreeRequest is one task's worktree to prepare. CloseOut marks an approved
-// close-out: the branch is checked out but the PR base is NEVER merged into it,
-// because a close-out publishes work that was already reviewed.
+// worktreeRequest is one task's worktree to prepare. CloseOut marks an approved close-out: the
+// branch is checked out but the PR base is NEVER merged into it, because a close-out publishes work
+// that was already reviewed.
 type worktreeRequest struct {
 	Checkout string // the repo's main checkout (config.ResolveCheckout result)
 	TaskID   string // UUID; dir name = first 8 chars
@@ -46,9 +33,8 @@ type worktreeRequest struct {
 	CloseOut bool   // approved close-out: check out, never merge PRBase
 	NoMerge  bool   // resume without merging PRBase: a review/fix/verify start must keep origin's tip
 	Fetched  bool   // the caller already fetched origin in Checkout
-	// ScratchRoot is where untracked files cleared for a reuse are moved, from
-	// the caller's point of view: the runner passes its state dir, outside every
-	// tree a session may edit. Empty falls back beside the task-worktree root.
+	// ScratchRoot is where untracked files cleared for a reuse are moved, from the caller's point of
+	// view: the runner passes its state dir, outside every tree a session may edit.
 	ScratchRoot string
 }
 
@@ -64,8 +50,8 @@ type worktreePrep struct {
 	Merged         bool     // PRBase merged into a resumed branch, moving HEAD
 	UpToDate       bool     // merge was a no-op
 	Conflicts      []string // merge stopped: conflicting paths; aborted, tree clean at the pre-merge tip
-	// ScratchAside is where untracked files were moved so the tree could be
-	// reused; empty when nothing was moved.
+	// ScratchAside is where untracked files were moved so the tree could be reused; empty when nothing
+	// was moved.
 	ScratchAside string
 }
 
@@ -74,18 +60,18 @@ type registeredWorktree struct {
 	path     string
 	branch   string // short name; empty when detached
 	detached bool
-	// prunable marks an entry whose directory is gone but whose registration
-	// remains: git still refuses to add that path or branch until it is pruned.
+	// prunable marks an entry whose directory is gone but whose registration remains: git still
+	// refuses to add that path or branch until it is pruned.
 	prunable bool
 }
 
-// errWorktreeFetch marks a prep whose fetch failed: that is transient, so it
-// never counts against a task the way a deterministic refusal does.
+// errWorktreeFetch marks a prep whose fetch failed: that is transient, so it never counts against a
+// task the way a deterministic refusal does.
 var errWorktreeFetch = errors.New("fetching origin")
 
-// prepareTaskWorktree makes the task's worktree ready for a session and reports
-// where it is and what happened to it. An error from the fetch is transient: the
-// caller should retry rather than treat the task as failed.
+// prepareTaskWorktree makes the task's worktree ready for a session and reports where it is and
+// what happened to it. An error from the fetch is transient: the caller should retry rather than
+// treat the task as failed.
 func prepareTaskWorktree(ctx context.Context, req worktreeRequest) (worktreePrep, error) {
 	if err := validateWorktreeRequest(req); err != nil {
 		return worktreePrep{}, err
@@ -100,8 +86,8 @@ func prepareTaskWorktree(ctx context.Context, req worktreeRequest) (worktreePrep
 	if err != nil {
 		return prep, err
 	}
-	// A stale registration (directory gone, entry still listed) makes git refuse
-	// the very add or checkout this session needs, so clear those first.
+	// A stale registration (directory gone, entry still listed) makes git refuse the very add or
+	// checkout this session needs, so clear those first.
 	prunable := false
 	for _, wt := range registered {
 		prunable = prunable || wt.prunable
@@ -125,28 +111,24 @@ func prepareTaskWorktree(ctx context.Context, req worktreeRequest) (worktreePrep
 			return reuseTaskWorktree(ctx, req, prep, wt)
 		}
 	}
-	// The branch may already be checked out elsewhere — a session can cut its
-	// own `<repo>/.worktrees/<name>` for it, and git refuses to add it twice.
+	// The branch may already be checked out elsewhere — a session can cut its own
+	// `<repo>/.worktrees/<name>` for it, and git refuses to add it twice.
 	if wt, ok := taskWorktreeOnBranch(registered, req.Branch); ok {
 		return adoptBranchWorktree(ctx, req, prep, wt, main)
 	}
 	return createTaskWorktree(ctx, req, prep)
 }
 
-// adoptBranchWorktree takes over the tree the task's branch is already checked
-// out in, or refuses it by name. A tree under the task-worktree roots is this
-// task's own; one elsewhere is adopted only when it holds nothing origin does
-// not, because another cut of the same branch would otherwise be refused here
-// and burn the task's claim. Getting here means this run holds the task's claim,
-// so the previous holder's lease has ended, and nothing in the tree is moved
-// until the check below proved it holds nothing origin lacks.
+// adoptBranchWorktree takes over the tree the task's branch is already checked out in, or refuses
+// it by name. A tree under the task-worktree roots is this task's own; one elsewhere is adopted
+// only when it holds nothing origin does not, because another cut of the same branch would
+// otherwise be refused here and burn the task's claim.
 func adoptBranchWorktree(ctx context.Context, req worktreeRequest, prep worktreePrep, wt registeredWorktree, main string) (worktreePrep, error) {
 	// The main worktree is the operator's checkout, never a session's.
-	// req.Checkout itself may be a LINKED worktree (the fleet layout), so it is
-	// another run's tree too.
 	if main != "" && taskWorktreeSamePath(wt.path, main) {
 		return prep, fmt.Errorf("the branch %s is checked out in the main checkout %s — refusing to run a session there", req.Branch, wt.path)
 	}
+	// req.Checkout may itself be a linked worktree (the fleet layout), so it is another run's tree too.
 	if taskWorktreeSamePath(wt.path, req.Checkout) {
 		return prep, fmt.Errorf("the branch %s is checked out in %s — refusing to run a session there", req.Branch, wt.path)
 	}
@@ -172,11 +154,10 @@ func adoptBranchWorktree(ctx context.Context, req worktreeRequest, prep worktree
 	return reuseTaskWorktree(ctx, req, prep, wt)
 }
 
-// taskWorktreeUnsafeToAdopt names what a tree outside the task-worktree roots
-// holds that origin does not, or "" when adopting it would discard nothing: a
-// tree at or behind origin (or the PR base, for a branch never pushed) carries
-// no unpushed work, and this run holds the task's claim. Untracked files are
-// cleared by reuse, so they are unsafe only when HEAD could hold work origin
+// taskWorktreeUnsafeToAdopt names what a tree outside the task-worktree roots holds that origin
+// does not, or "" when adopting it would discard nothing: a tree at or behind origin (or the PR
+// base, for a branch never pushed) carries no unpushed work, and this run holds the task's claim.
+// Untracked files are cleared by reuse, so they are unsafe only when HEAD could hold work origin
 // lacks.
 func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt registeredWorktree) (string, error) {
 	tracked, err := taskWorktreeTrackedSummary(ctx, wt.path)
@@ -202,7 +183,7 @@ func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt regi
 	}
 	remote := "origin/" + req.Branch
 	if taskWorktreeCommitishExists(ctx, wt.path, remote) {
-		if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", remote); err != nil {
+		if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "--", "HEAD", remote); err != nil {
 			if !negativeFact(err) {
 				return "", err
 			}
@@ -210,12 +191,12 @@ func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt regi
 		}
 		return "", nil
 	}
-	// A fresh task that pushed nothing yet: a tree at or behind the PR base is
-	// exactly what taskWorktreeAddNew would cut, so it holds nothing to lose.
+	// A fresh task that pushed nothing yet: a tree at or behind the PR base is exactly what
+	// taskWorktreeAddNew would cut, so it holds nothing to lose.
 	if !req.Resume && req.PRBase != "" {
 		base := "origin/" + req.PRBase
 		if taskWorktreeCommitishExists(ctx, wt.path, base) {
-			if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "HEAD", base); err == nil {
+			if _, err := taskWorktreeGit(ctx, wt.path, "merge-base", "--is-ancestor", "--", "HEAD", base); err == nil {
 				return "", nil
 			} else if !negativeFact(err) {
 				return "", err
@@ -226,16 +207,16 @@ func taskWorktreeUnsafeToAdopt(ctx context.Context, req worktreeRequest, wt regi
 	return "the branch is not on origin", nil
 }
 
-// taskWorktreeDir is the deterministic path for one task's worktree. The request
-// must be validated first; only then is the id long enough to cut.
+// taskWorktreeDir is the deterministic path for one task's worktree. The request must be validated
+// first; only then is the id long enough to cut.
 func taskWorktreeDir(req worktreeRequest, mainCheckout string) string {
 	id := strings.TrimSpace(req.TaskID)
 	return filepath.Join(taskWorktreeRoot(req.Checkout, mainCheckout), id[:8])
 }
 
-// taskWorktreeRoot picks where a task's worktree lives. Unlike a panel tree it
-// outlives the session and holds installed dependencies, so it must never sit on
-// the OS temp directory, which is a tmpfs on many hosts.
+// taskWorktreeRoot picks where a task's worktree lives. Unlike a panel tree it outlives the session
+// and holds installed dependencies, so it must never sit on the OS temp directory, which is a tmpfs
+// on many hosts.
 func taskWorktreeRoot(checkout, mainCheckout string) string {
 	if root, ok := fleetWorktreeRoot(checkout); ok {
 		return root
@@ -252,8 +233,7 @@ func taskWorktreeRoot(checkout, mainCheckout string) string {
 	return abs + "-wt"
 }
 
-// validateWorktreeRequest rejects a request that cannot be prepared at all. It
-// runs before anything touches git, so a bad request costs no network.
+// validateWorktreeRequest rejects a request that cannot be prepared at all.
 func validateWorktreeRequest(req worktreeRequest) error {
 	if strings.TrimSpace(req.Checkout) == "" {
 		return fmt.Errorf("no checkout to prepare a task worktree from")
@@ -265,10 +245,61 @@ func validateWorktreeRequest(req worktreeRequest) error {
 	if strings.TrimSpace(req.Branch) == "" {
 		return fmt.Errorf("task %s has no branch to prepare", id[:8])
 	}
-	// A close-out checks out an existing branch and never branches from or
-	// merges the base, so it is the one shape that needs no PR base.
+	if err := validateGitBranchRef(req.Branch); err != nil {
+		return fmt.Errorf("task %s has invalid branch %q: %w", id[:8], req.Branch, err)
+	}
+	// A close-out checks out an existing branch and never branches from or merges the base, so it is
+	// the one shape that needs no PR base. If one IS supplied, still validate it because
+	// finishTaskWorktreePrep resolves it.
 	if !req.CloseOut && strings.TrimSpace(req.PRBase) == "" {
 		return fmt.Errorf("task %s has no PR base to branch from", id[:8])
+	}
+	if req.PRBase != "" {
+		if err := validateGitBranchRef(req.PRBase); err != nil {
+			return fmt.Errorf("task %s has invalid PR base %q: %w", id[:8], req.PRBase, err)
+		}
+	}
+	return nil
+}
+
+// validateGitBranchRef enforces git-check-ref-format(1) branch-name rules in
+// pure Go so untrusted plane/config ref names can never be parsed as git flags
+// or revision-range expressions.
+func validateGitBranchRef(ref string) error {
+	if ref == "" {
+		return errors.New("empty ref")
+	}
+	if !utf8.ValidString(ref) {
+		return errors.New("ref contains invalid UTF-8")
+	}
+	if strings.HasPrefix(ref, "-") {
+		return errors.New("ref must not start with '-'")
+	}
+	if ref == "@" || ref == "HEAD" {
+		return fmt.Errorf("ref must not be %q", ref)
+	}
+	if strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") || strings.Contains(ref, "//") {
+		return errors.New("ref has empty path component")
+	}
+	if strings.HasSuffix(ref, ".") {
+		return errors.New("ref must not end with '.'")
+	}
+	if strings.Contains(ref, "..") || strings.Contains(ref, "@{") {
+		return errors.New("ref contains forbidden revision sequence")
+	}
+	for _, r := range ref {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return errors.New("ref contains whitespace or control character")
+		}
+		switch r {
+		case '~', '^', ':', '?', '*', '[', '\\':
+			return fmt.Errorf("ref contains forbidden character %q", r)
+		}
+	}
+	for _, part := range strings.Split(ref, "/") {
+		if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return errors.New("ref path component starts with '.' or ends with '.lock'")
+		}
 	}
 	return nil
 }
@@ -284,12 +315,9 @@ func isHex(s string) bool {
 	return true
 }
 
-// reuseTaskWorktree takes over a worktree that is already registered for this
-// repo. It only adopts one that is demonstrably the task's own tree; anything
-// that could hold committed work is refused by name, because the alternative is
-// discarding work. Untracked files cannot hold committed work once HEAD is
-// proven to be at or behind origin: they are moved aside, never deleted, and
-// the tree is reused.
+// reuseTaskWorktree takes over a worktree that is already registered for this repo. Untracked files
+// cannot hold committed work once HEAD is proven to be at or behind origin: they are moved aside,
+// never deleted, and the tree is reused.
 func reuseTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreePrep, wt registeredWorktree) (worktreePrep, error) {
 	switch {
 	case wt.detached:
@@ -339,10 +367,9 @@ func reuseTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreePr
 	return finishTaskWorktreePrep(ctx, req, prep)
 }
 
-// createTaskWorktree adds the task's worktree at the deterministic path. A path
-// that exists without being a registered worktree is refused, never adopted:
-// git itself refuses an existing path, and a directory nobody registered is
-// somebody else's.
+// createTaskWorktree adds the task's worktree at the deterministic path. A path that exists without
+// being a registered worktree is refused, never adopted: git itself refuses an existing path, and a
+// directory nobody registered is somebody else's.
 func createTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreePrep) (worktreePrep, error) {
 	if _, err := os.Stat(prep.Dir); err == nil {
 		return prep, fmt.Errorf("%s already exists but is not a worktree of %s — refusing to reuse it", prep.Dir, req.Checkout)
@@ -372,54 +399,51 @@ func createTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreeP
 	return finishTaskWorktreePrep(ctx, req, prep)
 }
 
-// taskWorktreeAddExisting cuts a NEW worktree for a branch that is on origin.
-// -B puts the local branch at the remote tip, which resets it, so an existing
-// local branch may only be fast-forwarded: anything else is unpushed work.
+// taskWorktreeAddExisting cuts a NEW worktree for a branch that is on origin. -B puts the local
+// branch at the remote tip, which resets it, so an existing local branch may only be
+// fast-forwarded: anything else is unpushed work.
 func taskWorktreeAddExisting(ctx context.Context, req worktreeRequest, dir string) error {
 	remote := "origin/" + req.Branch
 	if !taskWorktreeCommitishExists(ctx, req.Checkout, remote) {
 		return fmt.Errorf("the branch %s is not on origin", req.Branch)
 	}
 	if taskWorktreeCommitishExists(ctx, req.Checkout, "refs/heads/"+req.Branch) {
-		if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "refs/heads/"+req.Branch, remote); err != nil {
+		if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "--", "refs/heads/"+req.Branch, remote); err != nil {
 			return fmt.Errorf("the local branch %s has commits origin/%s does not have — refusing to reset it", req.Branch, req.Branch)
 		}
 	}
-	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-B", req.Branch, dir, remote)
+	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-B", req.Branch, "--", dir, remote)
 	return err
 }
 
-// taskWorktreeAddNew cuts the first worktree for a task with no work yet. A
-// local branch of the same name may only be reused when it carries nothing the
-// PR base does not already have; otherwise it is somebody's commits and the
-// request is refused rather than reset.
+// taskWorktreeAddNew cuts the first worktree for a task with no work yet. A local branch of the
+// same name may only be reused when it carries nothing the PR base does not already have; otherwise
+// it is somebody's commits and the request is refused rather than reset.
 func taskWorktreeAddNew(ctx context.Context, req worktreeRequest, dir string) error {
 	base := "origin/" + req.PRBase
 	if !taskWorktreeCommitishExists(ctx, req.Checkout, base) {
 		return fmt.Errorf("the PR base %s is not on origin", req.PRBase)
 	}
 	if !taskWorktreeCommitishExists(ctx, req.Checkout, "refs/heads/"+req.Branch) {
-		_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-b", req.Branch, dir, base)
+		_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "-b", req.Branch, "--", dir, base)
 		return err
 	}
-	if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "refs/heads/"+req.Branch, base); err != nil {
+	if _, err := taskWorktreeGit(ctx, req.Checkout, "merge-base", "--is-ancestor", "--", "refs/heads/"+req.Branch, base); err != nil {
 		return fmt.Errorf("the local branch %s already exists with commits %s does not have — refusing to reuse it", req.Branch, base)
 	}
-	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", dir, req.Branch)
+	_, err := taskWorktreeGit(ctx, req.Checkout, "worktree", "add", "--", dir, req.Branch)
 	return err
 }
 
-// taskWorktreeSyncBranch fast-forwards a reused worktree's branch to
-// origin/<branch>. A branch that has DIVERGED is refused: it holds commits of
-// its own AND origin moved, and deciding which side wins is not this function's
-// call. Ahead-only is left alone — those are unpushed local commits, not a
-// conflict with origin.
+// taskWorktreeSyncBranch fast-forwards a reused worktree's branch to origin/<branch>. An ahead-only
+// branch is left alone — unpushed local commits, not a conflict with origin — while a DIVERGED one is
+// refused: deciding which side wins is not this function's call.
 func taskWorktreeSyncBranch(ctx context.Context, dir, branch string) error {
 	remote := "origin/" + branch
 	if !taskWorktreeCommitishExists(ctx, dir, remote) {
 		return fmt.Errorf("the branch %s is not on origin", branch)
 	}
-	out, err := taskWorktreeGit(ctx, dir, "rev-list", "--left-right", "--count", "HEAD..."+remote)
+	out, err := taskWorktreeGit(ctx, dir, "rev-list", "--left-right", "--count", "--end-of-options", "HEAD..."+remote, "--")
 	if err != nil {
 		return err
 	}
@@ -434,7 +458,7 @@ func taskWorktreeSyncBranch(ctx context.Context, dir, branch string) error {
 		return fmt.Errorf("worktree %s has diverged from %s (%d local and %d remote commit(s)) — refusing to reset it",
 			dir, remote, ahead, behind)
 	}
-	if _, err := taskWorktreeGit(ctx, dir, "merge", "--ff-only", remote); err != nil {
+	if _, err := taskWorktreeGit(ctx, dir, "merge", "--ff-only", "--", remote); err != nil {
 		return fmt.Errorf("fast-forwarding %s to %s: %w", dir, remote, err)
 	}
 	return nil
@@ -454,15 +478,14 @@ func taskWorktreeCounts(out string) (ahead, behind int, err error) {
 	return ahead, behind, nil
 }
 
-// taskWorktreeMerge merges base into HEAD with a merge commit, never a rebase.
-// A conflict is reported as paths with a nil error, after aborting: the session
-// starts clean at the pre-merge tip and does the merge itself.
+// taskWorktreeMerge merges base into HEAD with a merge commit, never a rebase. A conflict is returned
+// as its paths with a nil error, after aborting the merge so the tree is left clean.
 func taskWorktreeMerge(ctx context.Context, dir, base string) (merged, upToDate bool, conflicts []string, err error) {
 	before, err := taskWorktreeHead(ctx, dir)
 	if err != nil {
 		return false, false, nil, err
 	}
-	if _, merr := taskWorktreeGit(ctx, dir, "merge", "--no-edit", base); merr != nil {
+	if _, merr := taskWorktreeGit(ctx, dir, "merge", "--no-edit", "--", base); merr != nil {
 		out, derr := taskWorktreeGit(ctx, dir, "diff", "--name-only", "--diff-filter=U")
 		if derr == nil {
 			if paths := taskWorktreeLines(out); len(paths) > 0 {
@@ -472,8 +495,8 @@ func taskWorktreeMerge(ctx context.Context, dir, base string) (merged, upToDate 
 				return false, false, paths, nil
 			}
 		}
-		// Nothing conflicted: a real failure. Abort anything half-started so the
-		// tree is not left mid-merge, then surface the error.
+		// Nothing conflicted: a real failure. Abort anything half-started so the tree is not left
+		// mid-merge, then surface the error.
 		_, _ = taskWorktreeGit(ctx, dir, "merge", "--abort")
 		return false, false, nil, merr
 	}
@@ -484,15 +507,9 @@ func taskWorktreeMerge(ctx context.Context, dir, base string) (merged, upToDate 
 	return after != before, after == before, nil, nil
 }
 
-// finishTaskWorktreePrep records the tip HEAD afterwards, plus where origin's
-// branch is: a reused tree ahead of origin keeps its unpushed commits, so its
-// Tip is not "the tip on origin" and the caller must be able to tell.
-//
-// BaseSHA is the commit a later review's `git diff` starts from. It is computed
-// here, after any prep merge, because that is the only place the runner already
-// has the prepared tree: a review that re-derived it could not know the tip the
-// prep merged to. A missing merge-base (unrelated histories) leaves it empty and
-// the briefs fall back to origin/<PRBase>, which computes the same thing itself.
+// finishTaskWorktreePrep records the tip HEAD afterwards, plus where origin's branch is: a reused
+// tree ahead of origin keeps its unpushed commits, so its Tip is not "the tip on origin" and the
+// caller must be able to tell.
 func finishTaskWorktreePrep(ctx context.Context, req worktreeRequest, prep worktreePrep) (worktreePrep, error) {
 	tip, err := taskWorktreeHead(ctx, prep.Dir)
 	if err != nil {
@@ -502,7 +519,7 @@ func finishTaskWorktreePrep(ctx context.Context, req worktreeRequest, prep workt
 	if req.PRBase != "" {
 		base := "origin/" + req.PRBase
 		if taskWorktreeCommitishExists(ctx, prep.Dir, base) {
-			if out, merr := taskWorktreeGit(ctx, prep.Dir, "merge-base", base, tip); merr == nil {
+			if out, merr := taskWorktreeGit(ctx, prep.Dir, "merge-base", "--", base, tip); merr == nil {
 				prep.BaseSHA = out
 			}
 		}
@@ -511,10 +528,10 @@ func finishTaskWorktreePrep(ctx context.Context, req worktreeRequest, prep workt
 	if !taskWorktreeCommitishExists(ctx, prep.Dir, remote) {
 		return prep, nil
 	}
-	if prep.OriginTip, err = taskWorktreeGit(ctx, prep.Dir, "rev-parse", remote); err != nil {
+	if prep.OriginTip, err = taskWorktreeGit(ctx, prep.Dir, "rev-parse", "--verify", "--end-of-options", remote); err != nil {
 		return prep, err
 	}
-	out, err := taskWorktreeGit(ctx, prep.Dir, "rev-list", "--count", remote+"..HEAD")
+	out, err := taskWorktreeGit(ctx, prep.Dir, "rev-list", "--count", "--end-of-options", remote+"..HEAD", "--")
 	if err != nil {
 		return prep, err
 	}
@@ -577,8 +594,8 @@ func taskWorktreeOnBranch(list []registeredWorktree, branch string) (registeredW
 	return registeredWorktree{}, false
 }
 
-// taskWorktreeSamePath compares two paths that may differ only in how a symlink
-// (macOS /var) was spelled by git versus by us.
+// taskWorktreeSamePath compares two paths that may differ only in how a symlink (macOS /var) was
+// spelled by git versus by us.
 func taskWorktreeSamePath(a, b string) bool {
 	if filepath.Clean(a) == filepath.Clean(b) {
 		return true
@@ -588,8 +605,8 @@ func taskWorktreeSamePath(a, b string) bool {
 	return aerr == nil && berr == nil && ra == rb
 }
 
-// taskWorktreeUnder reports whether path sits inside root, comparing paths the
-// way taskWorktreeSamePath does: git may hand back a symlink-resolved spelling.
+// taskWorktreeUnder reports whether path sits inside root, comparing paths the way
+// taskWorktreeSamePath does: git may hand back a symlink-resolved spelling.
 func taskWorktreeUnder(path, root string) bool {
 	resolve := func(p string) string {
 		clean := filepath.Clean(p)
@@ -606,7 +623,7 @@ func taskWorktreeUnder(path, root string) bool {
 }
 
 func taskWorktreeCommitishExists(ctx context.Context, dir, commitish string) bool {
-	_, err := taskWorktreeGit(ctx, dir, "rev-parse", "--verify", "--quiet", commitish+"^{commit}")
+	_, err := taskWorktreeGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", commitish+"^{commit}")
 	return err == nil
 }
 
@@ -620,29 +637,81 @@ func taskWorktreeLines(out string) []string {
 	return lines
 }
 
-// taskWorktreeGit runs one git command in dir. The environment is the caller's
-// minus the GIT_* variables that ADDRESS a repository: a driver started from a
-// hook or a rebase can carry GIT_DIR/GIT_WORK_TREE, and `-C` would then address
-// the wrong repository. The non-interactive settings mirror panelGit: an
+// taskWorktreeGit runs one git command in dir. The non-interactive settings mirror panelGit: an
 // unattended run has no terminal, and git must fail rather than wait.
+//
+// A NETWORK subcommand is scoped to the account owning origin
+// (taskWorktreeRemoteCredEnv): `gh auth git-credential` otherwise answers as
+// whichever account is ACTIVE, which need not see a private repo owned by
+// somebody else, so the fetch this prep depends on fails with "Repository not
+// found".
 func taskWorktreeGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return taskWorktreeGitWithEnv(ctx, dir, taskWorktreeRemoteCredEnv(ctx, dir, args), args...)
+}
+
+// taskWorktreeGitWithEnv is taskWorktreeGit's engine, with environment additions
+// for THIS invocation. Local commands pass nil additions and stay unscoped.
+func taskWorktreeGitWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = taskWorktreeGitEnv()
+	cmd.Env = taskWorktreeGitEnv(extraEnv)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, firstLineOf(msg))
+			// A scoped network command's token rides the URL git echoes on failure,
+			// and prep errors are logged and reported to the plane.
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, secureurl.RedactUserinfo(firstLineOf(msg)))
 		}
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// taskWorktreeRepoEnvVars name a repository rather than configure git; an
-// inherited one would override the -C that taskWorktreeGit passes.
+// taskWorktreeRemoteCredEnv returns the credential scoping one NETWORK
+// subcommand needs (delivery.ScopeRemoteEnv, CLA-458/CLA-970), or nil for a
+// local one. `fetch` and `ls-remote` are the subcommands that reach the remote -
+// taskWorktreeGit's fetch and the review panel's both come through here - and
+// scoping costs a `gh auth token` spawn, so a local command must not take it.
+//
+// nil is "run unscoped": a non-github host, an ssh remote, an owner gh cannot
+// serve a token for, or a remote whose URL cannot be read. Only the credentials
+// of the network invocation change; every fallback stays fail-open to the
+// pre-CLA-970 behavior. The resolution is bounded so a wedged gh degrades to
+// unscoped rather than holding the call past the command it scopes.
+func taskWorktreeRemoteCredEnv(ctx context.Context, dir string, args []string) []string {
+	if len(args) == 0 || (args[0] != "fetch" && args[0] != "ls-remote") {
+		return nil
+	}
+	remote := "origin"
+	for _, arg := range args[1:] {
+		// Leading flags are not the remote: `fetch --prune upstream` names
+		// upstream, and scoping it with origin's owner would send the wrong token.
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		remote = arg
+		break
+	}
+	// The URL read is local and must not re-enter the scoping decision above,
+	// so it goes through the engine directly rather than taskWorktreeGit.
+	raw, err := taskWorktreeGitWithEnv(ctx, dir, nil, "remote", "get-url", remote)
+	if err != nil || raw == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, taskWorktreeCredTimeout)
+	defer cancel()
+	return delivery.ScopeRemoteEnv(ctx, dir, "gh", raw)
+}
+
+// taskWorktreeCredTimeout bounds the credential resolution one network command
+// pays for. A var, like prBaseProbeTimeout, so a test can shorten it.
+var taskWorktreeCredTimeout = 30 * time.Second
+
+// taskWorktreeRepoEnvVars name a repository rather than configure git; an inherited one would
+// override the -C that taskWorktreeGit passes. A driver started from a hook or a rebase can carry
+// GIT_DIR/GIT_WORK_TREE, and `-C` would then address the wrong repository.
 var taskWorktreeRepoEnvVars = []string{
 	"GIT_DIR",
 	"GIT_WORK_TREE",
@@ -654,26 +723,26 @@ var taskWorktreeRepoEnvVars = []string{
 	"GIT_PREFIX",
 }
 
-// taskWorktreeGitEnvDefaults make git fail fast instead of prompting, but an
-// inherited value wins: GIT_SSH_COMMAND, GIT_ASKPASS and SSH_ASKPASS may carry
-// the operator's own auth.
+// taskWorktreeGitEnvDefaults make git fail fast instead of prompting, but an inherited value wins:
+// GIT_SSH_COMMAND, GIT_ASKPASS and SSH_ASKPASS may carry the operator's own auth.
 var taskWorktreeGitEnvDefaults = []string{
 	"GIT_ASKPASS=echo",
 	"SSH_ASKPASS=echo",
 	"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
 }
 
-// taskWorktreeGitEnv is the caller's environment with the repository-addressing
-// variables dropped, the two prompt settings forced off, and defaults for the
-// rest.
-func taskWorktreeGitEnv() []string {
+// taskWorktreeGitEnv strips repository-addressing variables and inherited
+// GIT_CONFIG_*, then appends extraEnv last. GIT_CONFIG_* must go first: duplicate
+// keys have unspecified precedence, so a stray GIT_CONFIG_COUNT could shadow the
+// credential rewrite a scoped command carries.
+func taskWorktreeGitEnv(extraEnv []string) []string {
 	env := os.Environ()
-	kept := make([]string, 0, len(env)+5)
+	kept := make([]string, 0, len(env)+5+len(extraEnv))
 	present := make(map[string]bool, len(env))
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
 		// These two must never prompt whatever the caller set.
-		if name == "GIT_TERMINAL_PROMPT" || name == "GCM_INTERACTIVE" || taskWorktreeAddressesRepo(name) {
+		if name == "GIT_TERMINAL_PROMPT" || name == "GCM_INTERACTIVE" || taskWorktreeAddressesRepo(name) || delivery.IsGitConfigEnv(name) {
 			continue
 		}
 		kept = append(kept, kv)
@@ -684,9 +753,12 @@ func taskWorktreeGitEnv() []string {
 			kept = append(kept, kv)
 		}
 	}
-	return append(kept, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	kept = append(kept, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	return append(kept, extraEnv...)
 }
 
+// taskWorktreeAddressesRepo reports whether name addresses a repository rather
+// than configuring git.
 func taskWorktreeAddressesRepo(name string) bool {
 	for _, repoVar := range taskWorktreeRepoEnvVars {
 		if name == repoVar {

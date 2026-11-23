@@ -598,7 +598,11 @@ the driver's own review over one local change and prints the findings as JSON.
 It is the same review the `review` phase runs — the same brief substance, gate
 scope and MUST bar, the maps-session planner when asked for it, and the same
 done report read by the same validator — with the task removed: no claim, no
-plane record and no MCP config, so the session cannot touch your backlog. The
+plane record and no MCP config. On the opencode adapter, a clankerbar MCP
+server the reviewed checkout checks in (or the global opencode config declares)
+is switched off in the adapter's own config layer, so the session cannot touch
+your backlog with or without `CLANKERBAR_API_KEY` in the environment; a harness
+whose adapter does not implement that switch is refused. The
 reviewed repository is only read from: the session runs in a temporary detached
 worktree at `--head`, and that worktree is removed on success and on failure.
 
@@ -663,6 +667,29 @@ command, after the harness's one re-emit, with the parse error named. The JSON
 the run did produce is still written when there is one, so a failed eval keeps
 its evidence. A failed `git worktree remove` also exits non-zero, with the
 report.
+
+#### The plan without the session: `clankerbar review map`
+
+`clankerbar review map --repo <checkout> --base <commit> [--head <commit>]`
+prints the plan `review run --method maps-session` would send, as JSON, and
+starts no session: it spends nothing, loads no clankerbar config and touches no
+network, so it works on a machine that has none. It takes the same `--repo`,
+`--base`, `--head`, `--title`, `--description-file`, `--chunk-size`,
+`--flow-max` and `--json` flags as `review run`; the plan is always the
+maps-session one, with hunk embedding off. Unlike `review run` it reads `--repo`
+as given rather than checking out a temporary worktree — the reviewer must work
+in the checkout the map came from, and any directory in it resolves to that
+checkout's root — so the checkout must be at `--head`
+(resolved to a full SHA), and the command exits non-zero naming both commits
+when it is not. A dirty tree is allowed and the repository is never modified.
+The JSON carries the resolved `base` and `head`, `items` (`change` and `flow`
+count the numbered `M` and `F` items — the flow map's unnumbered overflow note
+is not an item — and `chunks` the notes turns), and `turns`: each notes turn with
+its `kind` `notes`, `chunk` and `of`, then exactly one `kind` `findings` turn,
+last. Turn 1's prompt is the standalone brief plus the first chunk, so an agent
+driving the sequence itself sends that verbatim to a fresh reviewer session and
+each later prompt to the same session; the prompts are byte for byte the ones
+`review run` puts on its invocation.
 
 ### Session-initiated handoff: a boundary the session chooses
 
@@ -1093,9 +1120,14 @@ somewhere instead of just leaving the task alone: the conflicting paths are
 logged once per head/base pair, and a conflict-only session is started for it.
 Anything after a
 successful claim that cannot be finished releases it, so the task goes back to
-`approved` rather than being left held — with one exception: a merge that LANDED
-but whose ancestry could not be verified is closed `done` with `mergeVerified:
-false`, because the PR is no longer open and a release would strand the task.
+`approved` rather than being left held — with one exception: a merge. A failed
+merge request is released only once a re-read shows the PR still OPEN, because
+GitHub can complete the merge and lose the response. A close that fails
+transiently is retried; if it still fails, the delivery (merge SHA and PR) is
+recorded on the task and the claim is left to its lease, never returned to
+`approved`, because a merged PR is no longer open and a release would strand the
+task. A merge that LANDED but whose ancestry could not be verified is closed
+`done` with `mergeVerified: false`, the other post-merge outcome.
 The merge itself names the resolved base and the judged head revision, so a
 PR retargeted after the judgement cannot be merged into `main`; its verification
 and conflict reads run in a throwaway clone, never in the checkout the fleet's
@@ -1436,8 +1468,10 @@ repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), **deploy_lag** (how far the deployed build lags the
 project's integration branch), **pr_gate** (gh is on PATH *and* a real
 `gh pr view --json` parses — decorated output is a FAIL, an unreachable GitHub a
-WARN, and "no PR to read" says the probe was not exercised), and **budget**
-(ceilings parse and are sane).
+WARN, and "no PR to read" says the probe was not exercised), **delivery** (per
+project: git is on PATH, a non-bare repository is found under the workdir, and
+it has a remote the delivery check can read — a WARN, never a FAIL), and
+**budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
@@ -1462,6 +1496,16 @@ clone. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
 is discoverable without nagging anyone who opted out; in a mixed multi-project
 config the unmonitored projects still get their own quiet PASS rather than
 disappearing from doctor's output.
+
+`delivery` answers whether the CLA-253 delivery check will be able to verify
+anything from a project's workdir: git on PATH, at least one non-bare
+repository at or below it (or in one of the project's declared checkouts,
+where a session actually starts), and a remote that repository's claims can be
+judged against. It names every repository it found and the remote it will read.
+It never FAILs — a verifier that resolves nothing degrades to "could not
+verify" and the run still drains a backlog — but that silent degradation is
+exactly what an operator should learn before the night, not after it. It sits
+beside `stranded`: the same repositories, a different question.
 
 The `toolchains` audit reads every settings file Claude merges — the `--settings`
 policy, the config dir's `settings.json`/`settings.local.json`, and each session
@@ -3132,6 +3176,10 @@ the catch-all matches last, denying every read.
 - [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 - [`docs/copilot-cli.md`](./docs/copilot-cli.md) - how the Copilot CLI adapter drives `copilot -p`: flags, fail-closed permissions, MCP config, usage/credit accounting, and the limit signals.
 - [`docs/agent-events.md`](./docs/agent-events.md) - the agent event channel the CLI feeds: what the claude and opencode adapters emit in the activity and transcript tiers, the project dials and the machine-local opt-out, batching, sequence numbering, the 50 MB transcript cap and CLI-side redaction.
+- [`docs/loop-rationale.md`](./docs/loop-rationale.md) - the design and process reasoning behind the loop: polling and drains, phase sequencing, claims and checkpoints, budgets, dead-phase bounds, worktrees, routes and waits.
+- [`docs/config-rationale.md`](./docs/config-rationale.md) - the reasoning behind the configuration surface: defaults and their calibration, layering and precedence, validation, prompts, budgets, endpoints and trust.
+- [`docs/harness-rationale.md`](./docs/harness-rationale.md) - the adapter contract and per-CLI behaviour: invocation, permissions, stream/event parsing, usage and limits, resumes and session hand-offs.
+- [`docs/doctor-rationale.md`](./docs/doctor-rationale.md) - what each doctor check reads, what it refuses, and the failure each warning is meant to catch.
 
 ## License
 

@@ -272,6 +272,49 @@ esac
 	}
 }
 
+// A session offered ONE route has no route to switch to, but its limit is still
+// reported against that route, so the driver can mark it; no continuation runs.
+func TestOpencodeOneRouteLimitIsReported(t *testing.T) {
+	const reset = "2030-01-02T03:04:05Z"
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+echo '{"type":"error","sessionID":"ses_live","error":{"type":"provider.quota","message":"Usage limit reached. Resets at `+reset+`"}}'
+exit 1
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Model: routePaid, Routes: []string{routePaid}})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 1 {
+		t.Fatalf("the stub ran %d times, want 1 (no route to switch to):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !(opencode{}).DetectLimit(res).Limited {
+		t.Fatal("the one route's limit was swallowed")
+	}
+	started, finished, fallbacks := RouteFallbacks(res)
+	if started != routePaid || finished != routePaid {
+		t.Errorf("route report %q -> %q, want %q on both ends", started, finished, routePaid)
+	}
+	if len(fallbacks) != 1 || fallbacks[0].Route != routePaid || fallbacks[0].Next != "" {
+		t.Fatalf("fallbacks = %+v, want the one route with no Next", fallbacks)
+	}
+	if got := fallbacks[0].ResetAt.UTC().Format("2006-01-02T15:04:05Z"); got != reset {
+		t.Errorf("ResetAt = %s, want the stated reset %s", got, reset)
+	}
+
+	// The same limit on an invocation with no route list reports nothing.
+	res, err = (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Model: routePaid})
+	if err != nil {
+		t.Fatalf("Invoke (no route list): %v", err)
+	}
+	if s, f, fb := RouteFallbacks(res); s != "" || f != "" || len(fb) != 0 {
+		t.Errorf("no route list reported routes: %q -> %q %+v", s, f, fb)
+	}
+}
+
 // The single-route pin: adding Routes must not move one byte of the argv a
 // config that names one route (or a plain string) produced before.
 func TestOpencodeSingleRouteArgvIsUnchanged(t *testing.T) {

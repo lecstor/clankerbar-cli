@@ -8,15 +8,15 @@ import (
 	"strings"
 )
 
-// DoneReportMax caps the done report body. The runner writes the task's records
-// from it, so an over-size body is refused rather than truncated: a truncated
-// report is a confident write of half a review.
+// DoneReportMax caps the done report body. The runner writes the task's records from it, so an
+// over-size body is refused rather than truncated: a truncated report is a confident write of half
+// a review.
 const DoneReportMax = 32 << 10
 
-// DoneReport is the one JSON object a runner-claimed session emits after
-// DoneMarker. The runner turns it into the task's records itself (record_progress
-// outcome, record_review findings and findingUpdates, submit_for_review), so the
-// fields here are an interface with the served briefs, not a convenience.
+// DoneReport is the one JSON object a runner-claimed session emits after DoneMarker. The runner
+// turns it into the task's records itself (record_progress outcome, record_review findings and
+// findingUpdates, submit_for_review), so the fields here are an interface with the served briefs,
+// not a convenience.
 type DoneReport struct {
 	Summary        string              `json:"summary,omitempty"`
 	Tests          string              `json:"tests,omitempty"`
@@ -30,9 +30,9 @@ type DoneReport struct {
 	Notes          string              `json:"notes,omitempty"`
 }
 
-// DoneCount is a non-negative count that also accepts the shapes a model writes
-// for "none": [] and null decode as 0. A non-empty array is refused - its
-// elements are not counts, and guessing would misreport the record.
+// DoneCount is a non-negative count that also accepts the shapes a model writes for "none": [] and
+// null decode as 0. A non-empty array is refused - its elements are not counts, and guessing would
+// misreport the record.
 type DoneCount int
 
 func (c *DoneCount) UnmarshalJSON(b []byte) error {
@@ -60,16 +60,15 @@ func (c *DoneCount) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// DoneRisk is the session's risk declaration for submit_for_review. A nil Risk
-// is UNDECLARED and buys no per-batch auto-approval, which is why RiskDeclared
-// exists: an empty touches list is a declaration, a missing risk is not.
+// DoneRisk is the session's risk declaration for submit_for_review. A nil Risk is UNDECLARED and
+// buys no per-batch auto-approval, which is why RiskDeclared exists: an empty touches list is a
+// declaration, a missing risk is not.
 type DoneRisk struct {
 	Touches []string `json:"touches"`
 }
 
-// DoneFinding is one review finding. The plane caps a durable record at 20
-// findings; the session keeps every MUST, the most important of the rest, and
-// reports the remainder as Omitted.
+// DoneFinding is one review finding. The plane caps a durable record at 20 findings; the session
+// keeps every MUST, the most important of the rest, and reports the remainder as Omitted.
 type DoneFinding struct {
 	Severity     string `json:"severity"`
 	Summary      string `json:"summary"`
@@ -81,8 +80,8 @@ type DoneFinding struct {
 	RequiredFix  string `json:"requiredFix,omitempty"`
 }
 
-// DoneFindingUpdate is one entry of the durable record's findingUpdates batch:
-// the fix or verify phase's disposition of a finding, by plane-assigned id.
+// DoneFindingUpdate is one entry of the durable record's findingUpdates batch: the fix or verify
+// phase's disposition of a finding, by plane-assigned id.
 type DoneFindingUpdate struct {
 	FindingID     string `json:"findingId"`
 	Status        string `json:"status"`
@@ -91,18 +90,11 @@ type DoneFindingUpdate struct {
 	FiledTaskRef  string `json:"filedTaskRef,omitempty"`
 }
 
-// ParseDone finds and decodes the done report in a session's final message.
-//
-// The scan mirrors loop.parseHandoff deliberately (the two markers are read out
-// of the same message shape): the LAST marker line wins because the block is
-// defined as ending the message, the marker must be UNINDENTED, and it must not
-// sit inside a ``` fence - both are the natural shapes of a session quoting the
-// mechanism rather than emitting a report.
-//
-// found is separate from err so a marker with an unreadable body is logged as
-// what it is (a report the runner could not use) rather than as "no marker".
-// Unknown fields are ignored: the briefs and the runner may drift by a field
-// without a session's whole report becoming unreadable.
+// ParseDone finds and decodes the done report in a session's final message. The scan mirrors
+// loop.parseHandoff deliberately (the two markers are read out of the same message shape): the LAST
+// marker line wins because the block is defined as ending the message, the marker must be
+// UNINDENTED, and it must not sit inside a ``` fence - both are the natural shapes of a session
+// quoting the mechanism rather than emitting a report.
 func ParseDone(final string) (rep DoneReport, found bool, err error) {
 	body, ok := doneBody(final)
 	if !ok {
@@ -120,8 +112,8 @@ func ParseDone(final string) (rep DoneReport, found bool, err error) {
 	if err = dec.Decode(&rep); err != nil {
 		return DoneReport{}, true, fmt.Errorf("the done report does not decode as one JSON object: %v", err)
 	}
-	// Anything but end-of-input after the object means the block is not exactly
-	// the one value the marker promises.
+	// Anything but end-of-input after the object means the block is not exactly the one value the
+	// marker promises.
 	var trailing json.RawMessage
 	if err = dec.Decode(&trailing); err == nil {
 		return DoneReport{}, true, errors.New("the done report carries a second JSON value after the report object")
@@ -151,9 +143,9 @@ func doneBody(final string) (string, bool) {
 	return strings.TrimSpace(strings.Join(lines[at+1:], "\n")), true
 }
 
-// stripDoneFence unwraps a body the session fenced, which is a common shape for
-// showing JSON. A fence with any other language tag is not a wrapper around
-// this object and is left for the decoder to reject.
+// stripDoneFence unwraps a body the session fenced, which is a common shape for showing JSON. A
+// fence with any other language tag is not a wrapper around this object and is left for the decoder
+// to reject.
 func stripDoneFence(body string) string {
 	lines := strings.Split(body, "\n")
 	if !strings.HasPrefix(strings.TrimSpace(lines[0]), "```") {
@@ -163,8 +155,8 @@ func stripDoneFence(body string) string {
 	if lang != "" && !strings.EqualFold(lang, "json") {
 		return body
 	}
-	// The object ends at the FIRST closing fence: a courtesy line after it is
-	// prose about the report, not part of it.
+	// The object ends at the FIRST closing fence: a courtesy line after it is prose about the report,
+	// not part of it.
 	rest := lines[1:]
 	for i, l := range rest {
 		if strings.HasPrefix(strings.TrimSpace(l), "```") {
@@ -175,14 +167,11 @@ func stripDoneFence(body string) string {
 	return strings.TrimSpace(strings.Join(rest, "\n"))
 }
 
-// ValidateReview holds a review-shaped done report to the record the runner
-// writes: the verdict and its findings agree, the reviewed tip is a commit, no
-// finding string is over the plane's bound, and a verify report's findingUpdates
-// are shippable. tip is the checkpoint tip the runner verified, "" when it had
-// none to verify against.
-//
-// The errors name the offending field or finding index because they go to the
-// log, where "invalid report" is worth nothing to whoever reads it.
+// ValidateReview holds a review-shaped done report to the record the runner writes: the verdict and
+// its findings agree, the reviewed tip is a commit, no finding string is over the plane's bound,
+// and a verify report's findingUpdates are shippable. The errors name the offending field or
+// finding index because they go to the log, where "invalid report" is worth nothing to whoever
+// reads it.
 func (r DoneReport) ValidateReview(tip string) error {
 	switch r.Verdict {
 	case "pass":
@@ -214,8 +203,8 @@ func (r DoneReport) ValidateReview(tip string) error {
 		if strings.TrimSpace(f.Summary) == "" {
 			return fmt.Errorf("findings[%d] (%s): summary is empty", i, f.Severity)
 		}
-		// The plane refuses an over-bound record whole, so the same refusal
-		// here is the difference between a re-report and a lost review.
+		// The plane refuses an over-bound record whole, so the same refusal here is the difference
+		// between a re-report and a lost review.
 		if err := checkBounds(fmt.Sprintf("findings[%d]", i), []boundedField{
 			{"summary", f.Summary, boundFindingSummary},
 			{"evidence", f.Evidence, boundFindingEvidence},
@@ -230,10 +219,10 @@ func (r DoneReport) ValidateReview(tip string) error {
 	return ValidateFindingUpdates(r.FindingUpdates)
 }
 
-// ValidateFindingUpdates holds the durable record's findingUpdates batch to the
-// shape the plane accepts, bounds included. Each status requires the field that
-// carries its evidence, and a batch is all-or-nothing, so a duplicate id is
-// refused here rather than discovered by the plane's refusal.
+// ValidateFindingUpdates holds the durable record's findingUpdates batch to the shape the plane
+// accepts, bounds included. Each status requires the field that carries its evidence, and a batch
+// is all-or-nothing, so a duplicate id is refused here rather than discovered by the plane's
+// refusal.
 func ValidateFindingUpdates(us []DoneFindingUpdate) error {
 	seen := make(map[string]bool, len(us))
 	for i, u := range us {
@@ -244,8 +233,8 @@ func ValidateFindingUpdates(us []DoneFindingUpdate) error {
 			return fmt.Errorf("findingUpdates[%d]: duplicate findingId %q", i, u.FindingID)
 		}
 		seen[u.FindingID] = true
-		// Bounds first, so an over-limit field is named as the plane names it
-		// rather than as a shape violation.
+		// Bounds first, so an over-limit field is named as the plane names it rather than as a shape
+		// violation.
 		if err := checkBounds(fmt.Sprintf("findingUpdates[%d]", i), []boundedField{
 			{"refutedReason", u.RefutedReason, boundFindingRefutedReason},
 			{"fixCommit", u.FixCommit, boundFindingFixCommit},
@@ -274,12 +263,12 @@ func ValidateFindingUpdates(us []DoneFindingUpdate) error {
 	return nil
 }
 
-// RiskDeclared reports whether the report declares risk at all: touches: [] is a
-// declaration, an absent risk object is UNDECLARED.
+// RiskDeclared reports whether the report declares risk at all: touches: [] is a declaration, an
+// absent risk object is UNDECLARED.
 func (r DoneReport) RiskDeclared() bool { return r.Risk != nil }
 
-// validLowerHex reports whether s is lowercase hex of a plausible commit-id
-// length. Abbreviated ids are accepted because a session reads them from git.
+// validLowerHex reports whether s is lowercase hex of a plausible commit-id length. Abbreviated ids
+// are accepted because a session reads them from git.
 func validLowerHex(s string, min, max int) bool {
 	if len(s) < min || len(s) > max {
 		return false
@@ -292,8 +281,8 @@ func validLowerHex(s string, min, max int) bool {
 	return true
 }
 
-// tipsAgree reports whether two commits name the same revision: either literally
-// equal, or one an abbreviation of the other long enough to identify it.
+// tipsAgree reports whether two commits name the same revision: either literally equal, or one an
+// abbreviation of the other long enough to identify it.
 func tipsAgree(a, b string) bool {
 	if a == b {
 		return true

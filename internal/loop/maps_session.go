@@ -1,13 +1,6 @@
 package loop
 
-// maps_session.go — the review phase's maps-session method (CLA-869).
-//
-// The method is the runner's, not the model's: the driver maps the change into
-// items (CLA-866/CLA-868), sends them in chunks, and the SAME opencode session
-// writes notes per item before a final findings turn turns those notes into the
-// review record (CLA-864). The brief is unchanged — the maps section is appended
-// to it — so the single-pass review is untouched and only a phase that names
-// the method takes this path.
+// maps_session.go — the review phase's maps-session method.
 
 import (
 	"errors"
@@ -21,32 +14,33 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/reviewmap"
 )
 
-// mapsSessionPlan is everything one maps-session review adds to an attempt's
-// invocation: the section appended to the first turn's brief, the follow-up
-// turns (the remaining chunks, then the findings turn), and the model the
-// findings turn runs on (the record's attribution).
+// mapsSessionPlan is everything one maps-session review adds to an attempt's invocation: the
+// section appended to the first turn's brief, the follow-up turns (the remaining chunks, then the
+// findings turn), and the model the findings turn runs on (the record's attribution).
 type mapsSessionPlan struct {
-	// notesTurns counts the NOTES turns, including the first. TurnMessages
-	// before this index are notes and go to the iteration log.
+	// notesTurns counts the NOTES turns, including the first. TurnMessages before this index are notes
+	// and go to the iteration log.
 	notesTurns int
+	// changeItems and flowItems are how many numbered M and F items the plan carries. The flow map's
+	// overflow note is not an item.
+	changeItems int
+	flowItems   int
 	// section is appended to the first turn's prompt, after the brief.
 	section string
 	// turns are the follow-up turns: notes turns 2..notesTurns, then findings.
 	turns []harness.Turn
-	// notesModel is the model the notes turns run on (resolved: the configured
-	// stage model, else the phase's).
+	// notesModel is the model the notes turns run on (resolved: the configured stage model, else the
+	// phase's).
 	notesModel string
-	// reportModel is the model the findings turn runs on: what the review record
-	// must name, since it is the turn that wrote the findings.
+	// reportModel is the model the findings turn runs on: what the review record must name, since it
+	// is the turn that wrote the findings.
 	reportModel string
 }
 
-// mapsSessionRequested reports whether this attempt is a review phase that asked
-// for the maps-session method.
-//
-// The identity comes from the CAPTURED prompt: a handoff respawn replaces
-// ph.Prompt with the predecessor's continuation, and that successor is not the
-// phase that maps a diff — it continues work the predecessor already read.
+// mapsSessionRequested reports whether this attempt is a review phase that asked for the
+// maps-session method. The identity comes from the CAPTURED prompt: a handoff respawn replaces
+// ph.Prompt with the predecessor's continuation, and that successor is not the phase that maps a
+// diff — it continues work the predecessor already read.
 func (r *phaseRun) mapsSessionRequested() bool {
 	if !r.ph.UsesMapsSession() {
 		return false
@@ -54,15 +48,15 @@ func (r *phaseRun) mapsSessionRequested() bool {
 	if r.shape.captured.Prompt != r.ph.Prompt {
 		return false
 	}
-	// A verification round is review-SHAPED but adjudicates a fix delta; the
-	// method is the review phase's, and VerifyShaped is the same exclusion the
-	// driver uses to keep the two reports apart (config.Validate refuses it too).
+	// A verification round is review-SHAPED but adjudicates a fix delta; the method is the review
+	// phase's, and VerifyShaped is the same exclusion the driver uses to keep the two reports apart
+	// (config.Validate refuses it too).
 	return config.ReviewShaped(r.shape.captured.Prompt) && !config.VerifyShaped(r.shape.captured.Prompt)
 }
 
-// mapsSessionEnding is the last sentence of the findings turn: the record the
-// phase's own brief asks for. A runner-claimed review ends with a done report;
-// a panel member writes the durable record itself.
+// mapsSessionEnding is the last sentence of the findings turn: the record the phase's own brief
+// asks for. A runner-claimed review ends with a done report; a panel member writes the durable
+// record itself.
 func (r *phaseRun) mapsSessionEnding() string {
 	if r.kind == reportNone {
 		return config.MapsSessionRecordEnding
@@ -70,10 +64,10 @@ func (r *phaseRun) mapsSessionEnding() string {
 	return config.MapsSessionDoneReportEnding
 }
 
-// mapsSessionPlanFor builds this attempt's maps-session plan, or returns nil
-// when the phase did not ask for the method. Every failure is a refusal to have
-// the phase run at all: a half-built map would make the reviewer's checklist
-// silently wrong, which is the one thing this method must not do.
+// mapsSessionPlanFor builds this attempt's maps-session plan, or returns nil when the phase did not
+// ask for the method. Every failure is a refusal to have the phase run at all: a half-built map
+// would make the reviewer's checklist silently wrong, which is the one thing this method must not
+// do.
 func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error) {
 	if !r.ph.UsesMapsSession() {
 		return nil, nil
@@ -83,11 +77,8 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 			labelOf(r.t), r.drainNum, r.phaseLabel())
 		return nil, nil
 	}
-	// The maps are built from the tree the session will read, and that tree has
-	// to be the reviewed tip. Only the runner's prepared worktree (or a parallel
-	// panel member's detached checkout) is: a session-claimed review starts in
-	// the repo's own checkout, which may sit on any branch — a map from it would
-	// be a map of the wrong diff, presented as the change's checklist.
+	// The maps are built from the tree the session will read, and that tree has to be the reviewed
+	// tip.
 	if r.opts.taskDir == "" && r.opts.worktree == "" {
 		return nil, errors.New("review_method maps-session builds its maps in the task worktree the runner prepares, and this phase has none: it is a session-claimed run (no runner-owned worktree) or a branchless checkpoint (nothing to map)")
 	}
@@ -95,9 +86,9 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 	if repo == "" {
 		repo = r.spawnDir
 	}
-	// The merge-base the brief diffs from, resolved exactly as invocationFor
-	// resolves it: a runner briefing is authoritative when there is one (even
-	// with an empty SHA), and a parallel panel member carries it in opts.
+	// The merge-base the brief diffs from, resolved exactly as invocationFor resolves it: a runner
+	// briefing is authoritative when there is one (even with an empty SHA), and a parallel panel
+	// member carries it in opts.
 	baseSHA := r.opts.baseSHA
 	if r.opts.runner != nil {
 		baseSHA = r.opts.runner.baseSHA
@@ -108,14 +99,11 @@ func (r *phaseRun) mapsSessionPlanFor(at *phaseAttempt) (*mapsSessionPlan, error
 	}
 	head := r.checkpointTip()
 	if head == "" {
-		// A checkpoint with no verified tip still has a tree: the runner's prep
-		// left the worktree at the branch's origin tip, and HEAD is that tree.
+		// A checkpoint with no verified tip still has a tree: the runner's prep left the worktree at the
+		// branch's origin tip, and HEAD is that tree.
 		head = "HEAD"
 	}
-	// The diff is revision-exact, but the flow map's `git grep` reads the
-	// CHECKED-OUT tree. A worktree parked on another revision would list uses
-	// from code the review is not of, so refuse rather than present that as the
-	// change's checklist.
+	// The diff is revision-exact, but the flow map's `git grep` reads the CHECKED-OUT tree.
 	if head != "HEAD" {
 		if at, err := gitHeadSHA(repo); err != nil {
 			return nil, fmt.Errorf("review_method maps-session could not read the worktree's HEAD: %w", err)
@@ -147,12 +135,15 @@ func gitHeadSHA(repo string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// planMapsSession turns a diff and its flow items into the plan: numbered items,
-// chunks, the first-turn section and the follow-up turns. Pure, so the
-// numbering, chunking and per-stage models are testable without a repository.
+// planMapsSession turns a diff and its flow items into the plan: numbered items, chunks, the
+// first-turn section and the follow-up turns.
 func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff string, flow []string, severity, ending string) *mapsSessionPlan {
 	entries := reviewmap.ChangeEntries(diff, reviewmap.Unlimited)
 	items, overflow := mapsSessionItems(entries, flow)
+	// mapsSessionItems numbers every change item and every non-overflow flow item, so the two counts
+	// are exact rather than re-derived.
+	changeItems := len(entries)
+	flowItems := len(items) - changeItems
 	items, hunkCutoff := config.EmbedMapsSessionHunks(items, mapsSessionHunks(entries), base, opts.EmbedHunks)
 	size := opts.ChunkSize
 	if size < 1 {
@@ -160,8 +151,8 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 	}
 	chunks := mapsSessionChunks(items, size)
 	bodies := mapsSessionBodies(chunks, size, hunkCutoff, base, opts.EmbedHunks)
-	// The cap's note is not an item: it is context for the reviewer, so it rides
-	// the last chunk unnumbered rather than getting an id to note.
+	// The cap's note is not an item: it is context for the reviewer, so it rides the last chunk
+	// unnumbered rather than getting an id to note.
 	if overflow != "" && len(bodies) > 0 {
 		bodies[len(bodies)-1] += "\n" + overflow
 	}
@@ -171,6 +162,8 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 
 	plan := &mapsSessionPlan{
 		notesTurns:  len(chunks),
+		changeItems: changeItems,
+		flowItems:   flowItems,
 		section:     config.MapsSessionFirstTurn(base, 1, len(chunks), bodies[0], hunksEmbedded),
 		notesModel:  notesModel,
 		reportModel: reportModel,
@@ -179,20 +172,14 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 		plan.turns = append(plan.turns, harness.Turn{Prompt: config.MapsSessionNotesTurn(i+1, len(chunks), bodies[i])})
 	}
 	findingsPrompt := config.MapsSessionFindingsTurn(severity, ending)
-	// A phase that writes its own record had the brief's model placeholders
-	// filled from the PHASE's attribution before the stage models were resolved.
-	// When the findings stage runs elsewhere, say so here or the member records
-	// findings under a model that did not produce them.
+	// A phase that writes its own record had the brief's model placeholders filled from the PHASE's
+	// attribution before the stage models were resolved.
 	if ending == config.MapsSessionRecordEnding {
 		findingsPrompt += mapsSessionRecordModelNote(phaseModel, reportModel)
 	}
 	findings := harness.Turn{Prompt: findingsPrompt}
-	// A blank Turn.Model means "inherit the session's current model", which after
-	// the notes turns is the notes model. Name the findings model whenever that
-	// inheritance would land somewhere else — including when the phase names no
-	// model and only the notes stage did. There is no per-turn way back to a
-	// harness default inside a live session, so that one combination runs the
-	// findings turn on the notes model; the README says so.
+	// A blank Turn.Model means "inherit the session's current model", which after the notes turns is
+	// the notes model.
 	if opts.FindingsModel != "" || reportModel != notesModel {
 		findings.Model = reportModel
 	}
@@ -200,11 +187,10 @@ func planMapsSession(opts config.MapsSessionOptions, phaseModel, base, diff stri
 	return plan
 }
 
-// mapsSessionRecordModelNote names the model the findings turn actually runs on
-// when it is not the one the phase's own record contract names. The contract's
-// placeholders were substituted with the phase's model (or "harness default"),
-// so a panel member whose findings stage runs elsewhere would otherwise sign its
-// durable record — and every finding's raisedByModel — with the wrong model.
+// mapsSessionRecordModelNote names the model the findings turn actually runs on when it is not the
+// one the phase's own record contract names. The contract's placeholders were substituted with the
+// phase's model (or "harness default"), so a panel member whose findings stage runs elsewhere would
+// otherwise sign its durable record — and every finding's raisedByModel — with the wrong model.
 func mapsSessionRecordModelNote(phaseModel, reportModel string) string {
 	named := phaseModel
 	if named == "" {
@@ -220,9 +206,8 @@ func mapsSessionRecordModelNote(phaseModel, reportModel string) string {
 	return fmt.Sprintf(" Write the record's `model` and every finding's `raisedByModel` as %q: the findings were produced by that model, not the one named above.", actual)
 }
 
-// mapsSessionItems numbers the change map M1.. and the flow map F1.. in that
-// order. The flow map's cap note is returned apart, because it is not an item to
-// note.
+// mapsSessionItems numbers the change map M1.. The flow map's cap note is returned apart, because
+// it is not an item to note.
 func mapsSessionItems(changes []reviewmap.ChangeEntry, flow []string) (items []string, overflow string) {
 	items = make([]string, 0, len(changes)+len(flow))
 	for i, item := range changes {
@@ -240,8 +225,8 @@ func mapsSessionItems(changes []reviewmap.ChangeEntry, flow []string) (items []s
 	return items, overflow
 }
 
-// mapsSessionHunks pairs the change map's entries with the hunk type the
-// embedding helper takes, in the same order as the M items.
+// mapsSessionHunks pairs the change map's entries with the hunk type the embedding helper takes, in
+// the same order as the M items.
 func mapsSessionHunks(entries []reviewmap.ChangeEntry) []config.MapsSessionHunk {
 	hunks := make([]config.MapsSessionHunk, len(entries))
 	for i, e := range entries {
@@ -250,9 +235,9 @@ func mapsSessionHunks(entries []reviewmap.ChangeEntry) []config.MapsSessionHunk 
 	return hunks
 }
 
-// mapsSessionBodies renders the chunks' bodies and, when the total hunk budget
-// stopped embedding mid-map, inserts the one-time note at that item so the
-// items above it keep their diffs and the ones below stay plain.
+// mapsSessionBodies renders the chunks' bodies and, when the total hunk budget stopped embedding
+// mid-map, inserts the one-time note at that item so the items above it keep their diffs and the
+// ones below stay plain.
 func mapsSessionBodies(chunks [][]string, size, cutoff int, base string, embed *config.EmbedHunksOptions) []string {
 	bodies := make([]string, len(chunks))
 	for i, chunk := range chunks {
@@ -278,10 +263,9 @@ func mapsSessionBodies(chunks [][]string, size, cutoff int, base string, embed *
 	return bodies
 }
 
-// mapsSessionChunks splits items into chunks of size. A change with no map items
-// still gets ONE chunk, carrying the sentence the model is told about it —
-// otherwise there would be no notes turns at all and the findings turn would ask
-// it to turn notes it never wrote into findings.
+// mapsSessionChunks splits items into chunks of size. A change with no map items still gets ONE
+// chunk, carrying the sentence the model is told about it — otherwise there would be no notes
+// turns at all and the findings turn would ask it to turn notes it never wrote into findings.
 func mapsSessionChunks(items []string, size int) [][]string {
 	if len(items) == 0 {
 		return [][]string{{"(no changed regions found)"}}
@@ -297,14 +281,13 @@ func mapsSessionChunks(items []string, size int) [][]string {
 	return chunks
 }
 
-// wireMapsPlan applies a plan to an invocation: the turn-1 notes model, the
-// first-turn section and the follow-up turns, returning the invocation and the
-// model whose output the findings turn is. The phase and the standalone review
-// share this so their application paths cannot drift.
+// wireMapsPlan applies a plan to an invocation: the turn-1 notes model, the first-turn section and
+// the follow-up turns, returning the invocation and the model whose output the findings turn is.
+// The phase and the standalone review share this so their application paths cannot drift.
 func wireMapsPlan(inv harness.Invocation, plan *mapsSessionPlan) (harness.Invocation, string) {
-	// Turn 1 is the phase's own invocation, so a notes-stage model has to be
-	// pinned here, by the same rule a follow-up turn's own model follows: an
-	// explicit stage model is a single route, never a fallback list.
+	// Turn 1 is the phase's own invocation, so a notes-stage model has to be pinned here, by the same
+	// rule a follow-up turn's own model follows: an explicit stage model is a single route, never a
+	// fallback list.
 	if plan.notesModel != inv.Model {
 		inv = inv.OnTurn(harness.Turn{Model: plan.notesModel})
 	}
@@ -313,8 +296,8 @@ func wireMapsPlan(inv harness.Invocation, plan *mapsSessionPlan) (harness.Invoca
 	return inv, plan.reportModel
 }
 
-// applyMapsSession wires a plan onto the attempt's invocation and records how
-// many notes turns the log has to capture.
+// applyMapsSession wires a plan onto the attempt's invocation and records how many notes turns the
+// log has to capture.
 func (r *phaseRun) applyMapsSession(at *phaseAttempt, plan *mapsSessionPlan) {
 	if plan == nil {
 		return
@@ -322,15 +305,14 @@ func (r *phaseRun) applyMapsSession(at *phaseAttempt, plan *mapsSessionPlan) {
 	at.mapsNotes = plan.notesTurns
 	var reportModel string
 	at.inv, reportModel = wireMapsPlan(at.inv, plan)
-	// The record is the findings turn's work, so the attribution the runner
-	// writes names that stage's model — the one whose output it is.
+	// The record is the findings turn's work, so the attribution the runner writes names that stage's
+	// model — the one whose output it is.
 	at.attr.Model = reportModel
 }
 
-// writeMapsNotes puts every notes turn's reply in the iteration log under a
-// heading naming the turn and chunk. The notes are the evidence a later
-// missed-finding analysis reads; they are never sent to the plane, where they
-// would be mistaken for findings.
+// writeMapsNotes puts every notes turn's reply in the iteration log under a heading naming the turn
+// and chunk. The notes are the evidence a later missed-finding analysis reads; they are never sent
+// to the plane, where they would be mistaken for findings.
 func (r *phaseRun) writeMapsNotes(at *phaseAttempt) {
 	if at.mapsNotes == 0 || at.inv.Console == nil {
 		return

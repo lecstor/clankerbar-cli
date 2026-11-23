@@ -148,7 +148,7 @@ func TestPutUpload_NoKeyAndDeclaredLength(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	body := "the file's bytes"
-	err := NewUploadAPI("https://plane.example/mcp/demo", "k-1").PutUpload(
+	err := NewUploadAPI(srv.URL+"/mcp/demo", "k-1").PutUpload(
 		context.Background(), srv.URL+"/uploads/tok-1", strings.NewReader(body), int64(len(body)), "text/html")
 	if err != nil {
 		t.Fatalf("PutUpload: %v", err)
@@ -195,7 +195,7 @@ func TestPutUpload_RefusalNamesTheCode(t *testing.T) {
 			w.WriteHeader(tc.status)
 			_, _ = io.WriteString(w, tc.body)
 		}))
-		err := NewUploadAPI("https://plane.example/mcp/demo", "k-1").PutUpload(
+		err := NewUploadAPI(srv.URL+"/mcp/demo", "k-1").PutUpload(
 			context.Background(), srv.URL+"/uploads/tok", strings.NewReader("x"), 1, "image/png")
 		srv.Close()
 		if err == nil {
@@ -244,5 +244,205 @@ func TestUploadAPI_NotWired(t *testing.T) {
 	}
 	if _, err := api.UploadReviewDeck(context.Background(), "t", "a"); err != ErrNotWired {
 		t.Errorf("UploadReviewDeck err = %v, want ErrNotWired", err)
+	}
+}
+
+type countingRoundTripper struct {
+	calls int
+}
+
+func (c *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.calls++
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+// TestPutUpload_RefusesUnsafeAndMismatchedURLs verifies PutUpload validates
+// uploadURL through secureurl.Origin and pins it to the plane's origin before
+// sending any HTTP request, file bytes, or URL capability token.
+func TestPutUpload_RefusesUnsafeAndMismatchedURLs(t *testing.T) {
+	otherSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(otherSrv.Close)
+
+	cases := []struct {
+		name      string
+		endpoint  string
+		uploadURL string
+		wantSub   string
+	}{
+		{
+			name:      "cleartext non-loopback http",
+			endpoint:  "https://plane.example/mcp/demo",
+			uploadURL: "http://plane.example/uploads/tok",
+			wantSub:   "plain http",
+		},
+		{
+			name:      "cloud metadata http",
+			endpoint:  "https://plane.example/mcp/demo",
+			uploadURL: "http://169.254.169.254/latest/meta-data",
+			wantSub:   "plain http",
+		},
+		{
+			name:      "non-http scheme file",
+			endpoint:  "https://plane.example/mcp/demo",
+			uploadURL: "file:///etc/passwd",
+			wantSub:   "no scheme and host",
+		},
+		{
+			name:      "non-http scheme ftp",
+			endpoint:  "https://plane.example/mcp/demo",
+			uploadURL: "ftp://plane.example/uploads/tok",
+			wantSub:   `scheme "ftp"`,
+		},
+		{
+			name:      "mismatched https origin",
+			endpoint:  "https://plane.example/mcp/demo",
+			uploadURL: "https://evil.example/uploads/tok",
+			wantSub:   "does not match plane endpoint origin",
+		},
+		{
+			name:      "mismatched loopback port",
+			endpoint:  "http://127.0.0.1:1/mcp/demo",
+			uploadURL: otherSrv.URL + "/uploads/tok",
+			wantSub:   "does not match plane endpoint origin",
+		},
+		{
+			name:      "https endpoint rejects loopback http upload",
+			endpoint:  "https://plane.example/mcp/demo",
+			uploadURL: otherSrv.URL + "/uploads/tok",
+			wantSub:   "does not match plane endpoint origin",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &countingRoundTripper{}
+			r := wiredClient(tc.endpoint, "k-1")
+			r.upload.Transport = rt
+
+			err := r.PutUpload(context.Background(), tc.uploadURL, strings.NewReader("secret-bytes"), 12, "image/png")
+			if err == nil {
+				t.Fatalf("PutUpload(%q) = nil, want refusal", tc.uploadURL)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSub)
+			}
+			if rt.calls != 0 {
+				t.Errorf("RoundTrip calls = %d, want 0 (no HTTP request must be sent)", rt.calls)
+			}
+		})
+	}
+}
+
+// TestPutUpload_RefusalDoesNotEchoTheUploadToken: the refusal reaches stderr and
+// the logs, so it must name the origin without the token-bearing path.
+func TestPutUpload_RefusalDoesNotEchoTheUploadToken(t *testing.T) {
+	r := wiredClient("https://plane.example/mcp/demo", "k-1")
+	r.upload.Transport = &countingRoundTripper{}
+
+	const token = "cap-token-9b2f"
+	err := r.PutUpload(context.Background(), "http://plane.example/uploads/"+token, strings.NewReader("x"), 1, "image/png")
+	if err == nil {
+		t.Fatal("PutUpload = nil, want refusal")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("err = %v must not echo the upload token", err)
+	}
+	if !strings.Contains(err.Error(), "http://plane.example") {
+		t.Errorf("err = %v, want the origin named", err)
+	}
+}
+
+// TestPutUpload_AllowsValidHTTPSAndLoopbackOrigins verifies legitimate HTTPS
+// uploads (including normalized default port 443) and local loopback dev URLs
+// pass validation and reach the target.
+func TestPutUpload_AllowsValidHTTPSAndLoopbackOrigins(t *testing.T) {
+	t.Run("https same origin", func(t *testing.T) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPut {
+				t.Errorf("method = %s, want PUT", r.Method)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}))
+		t.Cleanup(srv.Close)
+
+		r := wiredClient(srv.URL+"/mcp/demo", "k-1")
+		r.upload.Transport = srv.Client().Transport
+		if err := r.PutUpload(context.Background(), srv.URL+"/uploads/tok", strings.NewReader("ok"), 2, "image/png"); err != nil {
+			t.Fatalf("PutUpload(https): %v", err)
+		}
+	})
+
+	t.Run("https default port 443 matches bare host", func(t *testing.T) {
+		rt := &countingRoundTripper{}
+		r := wiredClient("https://plane.example/mcp/demo", "k-1")
+		r.upload.Transport = rt
+		if err := r.PutUpload(context.Background(), "https://plane.example:443/uploads/tok", strings.NewReader("ok"), 2, "image/png"); err != nil {
+			t.Fatalf("PutUpload(https:443): %v", err)
+		}
+		if rt.calls != 1 {
+			t.Errorf("RoundTrip calls = %d, want 1", rt.calls)
+		}
+	})
+
+	t.Run("loopback http same origin", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+
+		if err := NewUploadAPI(srv.URL+"/mcp/demo", "k-1").PutUpload(
+			context.Background(), srv.URL+"/uploads/tok", strings.NewReader("ok"), 2, "image/png"); err != nil {
+			t.Fatalf("PutUpload(loopback): %v", err)
+		}
+	})
+}
+
+// TestPutUpload_RefusesCrossOriginAndDowngradeRedirects verifies a redirect
+// from a valid same-origin upload URL to a different origin or cleartext host
+// is refused without sending the body to the redirect target.
+func TestPutUpload_RefusesCrossOriginAndDowngradeRedirects(t *testing.T) {
+	var targetHits int
+	otherSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(otherSrv.Close)
+
+	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/uploads/cross":
+			http.Redirect(w, r, otherSrv.URL+"/steal", http.StatusTemporaryRedirect)
+		case "/uploads/downgrade":
+			http.Redirect(w, r, "http://plane.example/steal", http.StatusTemporaryRedirect)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(redirectSrv.Close)
+
+	api := NewUploadAPI(redirectSrv.URL+"/mcp/demo", "k-1")
+	if err := api.PutUpload(context.Background(), redirectSrv.URL+"/uploads/cross", strings.NewReader("secret"), 6, "image/png"); err == nil {
+		t.Fatal("cross-origin redirect = nil, want refusal")
+	}
+	if targetHits != 0 {
+		t.Errorf("cross-origin redirect target received %d hits, want 0", targetHits)
+	}
+	err := api.PutUpload(context.Background(), redirectSrv.URL+"/uploads/downgrade", strings.NewReader("secret"), 6, "image/png")
+	if err == nil {
+		t.Fatal("cleartext downgrade redirect = nil, want refusal")
+	}
+	// The refusal itself, not just any error: without the guard the client would
+	// attempt the cleartext host and fail in DNS, which an err != nil check
+	// could not tell apart from the guard doing its job.
+	if !strings.Contains(err.Error(), "refusing redirect") || !strings.Contains(err.Error(), "plain http") {
+		t.Fatalf("cleartext downgrade redirect err = %v, want the redirect guard's refusal (refusing redirect / plain http)", err)
 	}
 }
