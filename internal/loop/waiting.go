@@ -97,7 +97,7 @@ func (d *Driver) clearAnsweredWaiting(ti int, sum backlog.Summary) {
 	ref := d.waiting[ti].ref
 	d.waiting[ti] = waitState{}
 	d.iterMu.Unlock()
-	log.Printf("the answer to the question on %s landed — back to idle", ref)
+	log.Printf("the answer to the question on %s landed — dropping the waiting state", ref)
 	d.persistWaiting()
 }
 
