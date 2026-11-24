@@ -5750,6 +5750,29 @@ section note.
 > all, and after CLA-258 claude parses one only from typed sources, so an
 > unknown reset is normal rather than exceptional.
 
+### routeWakeHint
+
+> routeWakeHint is how long a still-limited wait should sleep when a route the
+> walk left blocked clears sooner than the poll interval: the soonest instant any
+> of the phase's routes is outside BOTH its usage mark and its pricing window.
+>
+> The deadline after a wake used to be the interval measured from the last
+> attempt, always. When the walk ended with every remaining route window-blocked,
+> that overran the window's end by up to a full interval: on 2026-11-24 a daemon
+> waiting on Synthetic stopped its 12:23-13:59 wakes on two routes that were
+> inside the deepseek-peak window, then slept through 14:00 and probed again at
+> 14:29, leaving a usable route idle for 29 minutes. The walk knew the window's
+> end (the refusal carries it); the wait now uses it.
+>
+> A route's two blockers are not alternatives: the route is probeable only when
+> BOTH are clear, so the per-route answer is the later of the two, and the wake
+> is the earliest of those across the list. The same grace a stated-reset wake
+> takes is added, for the same reason: a probe that lands a hair before the edge
+> pays a whole interval for its timing. Any route already clear returns no hint:
+> the walk would have probed it, and the interval is then the honest cadence.
+> When every route is marked with the fallback interval (no stated reset), the
+> hint is at or past the interval and the caller keeps the interval unchanged.
+
 ### supervisedWait
 
 > supervisedWait pauses on a usage limit, then polls for an early reset rather

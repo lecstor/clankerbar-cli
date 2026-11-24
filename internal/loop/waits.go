@@ -55,6 +55,39 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
+// routeWakeHint is how long a still-limited wait should sleep when a route the walk left blocked
+// clears sooner than the poll interval: the soonest instant any of the phase's routes is outside
+// both its usage mark and a withholding pricing window (CLA-986). ok=false keeps the caller on the
+// interval: a phase with no route list, or one with a route already clear, has nothing to offer.
+func (d *Driver) routeWakeHint(tc *config.Config, ph config.Phase) (time.Duration, bool) {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		return 0, false
+	}
+	now := d.clock()
+	var earliest time.Time
+	for _, route := range routes {
+		at := now
+		// Ask the filter rather than RouteWindowAt: a "run" schedule offers its route back at peak,
+		// so its window never withholds anything and its mark is the only real wait.
+		if choice := tc.RouteChoiceAt(now, []string{route}); len(choice.Routes) == 0 && !choice.WaitUntil.IsZero() {
+			at = choice.WaitUntil
+		}
+		if until, marked := d.routeMarkExpiry(route); marked && until.After(at) {
+			at = until
+		}
+		if !at.After(now) {
+			return 0, false
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	// The same grace a stated-reset wake takes: a probe that lands a hair before the edge pays a
+	// whole interval for its timing.
+	return earliest.Sub(now) + d.waitGrace, true
+}
+
 // supervisedWait pauses on a usage limit, then polls for an early reset rather than sleeping
 // blindly to the stated reset. The breaker is consulted HERE and not only by the caller, because
 // this loop does not return to the caller while the limit persists: it waits, probes, and waits
@@ -159,15 +192,20 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		got, cst, verdict := d.probeWake(ctx, a, t, tc, ph, sofar)
 		tokens += got
 		cost += cst
-		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only here.
-		// A refused spawn is still an attempt: the next one is a full probeWait away, never sooner.
-		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 		switch verdict {
 		case wakeStop:
 			return tokens, cost, true
 		case wakeLifted:
 			return tokens, cost, false
 		}
+		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only
+		// here. A refused spawn is still an attempt, so the next is a full probeWait away — unless a
+		// blocked route clears before that, which is the instant to wake at (CLA-986).
+		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
+			delay = hint
+		}
+		nextProbe = time.Now().Add(delay)
 	}
 }
 
@@ -200,8 +238,14 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 		inv, ierr := d.probeInvocation(t, tc, ph)
 		if ierr != nil {
 			var blocked *routeWindowBlocked
-			if len(tried) > 0 && errors.As(ierr, &blocked) {
-				log.Printf("still limited on %s, and every other route is window-blocked (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
+			if errors.As(ierr, &blocked) {
+				// A window is a scheduled condition, not a probe error: nothing spawned, and the next
+				// wake is aimed at the window's end (routeWakeHint) — so name the routes it holds.
+				if len(tried) > 0 {
+					log.Printf("still limited on %s, and every other route is window-blocked (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
+				} else {
+					log.Printf("every route for the phase is window-blocked (%v) — continuing to wait", ierr)
+				}
 				return tokens, cost, wakeStillLimited
 			}
 			// A refused probe spawn spends nothing and learns nothing about the limit, so it reads exactly

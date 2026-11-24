@@ -95,6 +95,11 @@ type RouteChoice struct {
 	// WaitUntil is set only when Routes is empty because every route is inside a window under a "wait"
 	// schedule: the instant the earliest window ends.
 	WaitUntil time.Time
+	// WindowBlocked names the routes withheld by an active pricing window, in configured order. It is
+	// set only alongside WaitUntil, and it is what a refusal may name: a route held back by something
+	// else (its usage mark) is not window-blocked, and reporting it as one points the operator at the
+	// wrong schedule.
+	WindowBlocked []string
 }
 
 // RouteChoiceAt is the pricing-window filter over an ordered route list.
@@ -103,6 +108,7 @@ func (c *Config) RouteChoiceAt(now time.Time, routes []string) RouteChoice {
 		return RouteChoice{}
 	}
 	open := make([]string, 0, len(routes))
+	blocked := make([]string, 0, len(routes))
 	var earliest time.Time
 	for _, route := range routes {
 		active, until := c.RouteWindowAt(route, now)
@@ -110,6 +116,7 @@ func (c *Config) RouteChoiceAt(now time.Time, routes []string) RouteChoice {
 			open = append(open, route)
 			continue
 		}
+		blocked = append(blocked, route)
 		if earliest.IsZero() || until.Before(earliest) {
 			earliest = until
 		}
@@ -128,7 +135,7 @@ func (c *Config) RouteChoiceAt(now time.Time, routes []string) RouteChoice {
 	if len(runnable) > 0 {
 		return RouteChoice{Routes: runnable}
 	}
-	return RouteChoice{WaitUntil: earliest}
+	return RouteChoice{WaitUntil: earliest, WindowBlocked: blocked}
 }
 
 // validateRouteWindows refuses a schedule that cannot be read and a route attachment naming a
