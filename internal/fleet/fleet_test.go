@@ -832,6 +832,68 @@ func TestCloseStopsThePumpFromPostingAfterItReturns(t *testing.T) {
 	}
 }
 
+// Send racing Close must still leave the stopping beacon as the last POST. A
+// Send that has not enqueued when Close begins is refused, and the pump checks
+// done with priority, so no stale report can slip past the goodbye.
+func TestSendRacingCloseLeavesTheBeaconLast(t *testing.T) {
+	var mu sync.Mutex
+	var states []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var wire struct {
+			State struct {
+				Kind string `json:"kind"`
+			} `json:"state"`
+		}
+		_ = json.Unmarshal(body, &wire)
+		mu.Lock()
+		states = append(states, wire.State.Kind)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := New(srv.URL, "k")
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+				}
+			}
+		}()
+	}
+	// Let the pump go live, then race the goodbye against the senders.
+	time.Sleep(5 * time.Millisecond)
+	rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	close(stop)
+	wg.Wait()
+
+	// A send that lost the race must not have started a delayed POST either.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(states) == 0 {
+		t.Fatal("the plane received nothing")
+	}
+	if last := states[len(states)-1]; last != StateStopping {
+		t.Fatalf("posts = %v, want the stopping beacon last", states)
+	}
+	for i, s := range states {
+		if s == StateStopping && i != len(states)-1 {
+			t.Fatalf("posts = %v: the stopping beacon was not last", states)
+		}
+	}
+}
+
 // gatedReporter is a Reporter whose Close can be held open, to observe when
 // each target's Close starts and finishes.
 type gatedReporter struct {

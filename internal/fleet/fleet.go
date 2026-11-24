@@ -428,13 +428,17 @@ type httpReporter struct {
 	client   *http.Client
 	queue    chan Report
 
-	// done is closed by Close; the pump's select on queue-vs-done then parks
-	// it for good. postMu serialises every POST so that after Close takes the
-	// lock nothing can land after the `stopping` beacon. closed makes Send a
-	// no-op once Close has run, guards Close's own idempotence, and guarantees
-	// the pump starts no POST after Close returns.
+	// done is closed by Close; the pump's select on queue-vs-done then parks it
+	// for good. postMu serialises every POST so that after Close takes the lock
+	// nothing can land after the `stopping` beacon. stateMu orders Send's
+	// enqueue against Close's transition: a Send that has not enqueued when
+	// Close takes it is refused, so the queue Close drains is final and a late
+	// Send cannot start the pump behind Close's back. closed is read by the
+	// pump under postMu, which is what guarantees it starts no POST after Close
+	// holds that lock.
 	done       chan struct{}
 	postMu     *ctxMutex
+	stateMu    sync.Mutex
 	closed     atomic.Bool
 	startOnce  sync.Once
 	dropped    atomic.Int64
@@ -442,6 +446,8 @@ type httpReporter struct {
 }
 
 func (r *httpReporter) Send(rep Report) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 	if r.closed.Load() {
 		return // Close has ended reporting — the stopping beacon already went out
 	}
@@ -467,10 +473,13 @@ func (r *httpReporter) Send(rep Report) {
 // POST, and the final beacon all draw on what the deadline leaves, so a hanging
 // plane cannot stretch one target past it. See Reporter.Close.
 func (r *httpReporter) Close(ctx context.Context, rep Report) {
+	r.stateMu.Lock()
 	if !r.closed.CompareAndSwap(false, true) {
+		r.stateMu.Unlock()
 		return // idempotent: only the first Close speaks
 	}
 	close(r.done) // the pump delivers nothing further — its in-flight one first
+	r.stateMu.Unlock()
 
 	// A caller passing an unbounded context (a direct Close outside Shutdown)
 	// still gets the ceiling; a caller sharing a tighter deadline keeps it.
@@ -530,6 +539,13 @@ drain:
 // the RECEIVE, not just the POST, so Close can park the pump: once Close holds
 // postMu the pump can no longer take a report, and any report it already holds
 // has been delivered before Close's critical section starts.
+//
+// done is checked with priority before queue: a pump that took a queued report
+// after Close was already waiting on postMu would deliver it before the
+// beacon, which is ordered safely, but it would be a POST nobody needed. The
+// select below cannot guarantee priority on its own — Go picks randomly when
+// both are ready — so the pre-check does, and the closed check under postMu
+// backstops the rest.
 func (r *httpReporter) pump() {
 	for {
 		r.postMu.Lock()
@@ -541,6 +557,12 @@ func (r *httpReporter) pump() {
 		if r.closed.Load() {
 			r.postMu.Unlock()
 			return
+		}
+		select {
+		case <-r.done:
+			r.postMu.Unlock()
+			return
+		default:
 		}
 		select {
 		case rep := <-r.queue:
