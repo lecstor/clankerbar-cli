@@ -2,6 +2,7 @@ package events
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -511,6 +512,101 @@ func TestEmitterAddNeverBlocksOnSlowSend(t *testing.T) {
 	e.Close()
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("Close blocked for %s", elapsed)
+	}
+}
+
+// A close must drain EVERY buffered batch, not just the first: a phase boundary
+// must not leave events the plane would have accepted. The ticker is an hour
+// away, so the done branch is the only sender here.
+func TestCloseDrainsEveryBufferedBatch(t *testing.T) {
+	c := newCapture()
+	srv := httptest.NewServer(c.handler(http.StatusOK, `{"accepted":50}`))
+	defer srv.Close()
+	e := newTestEmitterEvery(srv, nil, nil, time.Hour)
+	e.SetRunID("run-1")
+
+	const total = MaxBatchEvents + 20
+	e.mu.Lock()
+	for i := 0; i < total; i++ {
+		e.pending = append(e.pending, event{
+			kind: TypeToolCall, at: "2026-01-01T00:00:00.000Z",
+			tool: "Bash", callID: fmt.Sprintf("call-%d", i),
+		})
+	}
+	e.started = true
+	e.mu.Unlock()
+	go e.run()
+
+	e.Close()
+
+	bodies, _, _ := c.snapshot()
+	got := 0
+	for _, body := range bodies {
+		got += len(decodeBatch(t, body).Events)
+	}
+	if got != total {
+		t.Fatalf("sent %d of %d buffered events in %d batch(es) — the final flush stopped short", got, total, len(bodies))
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2 (%d events at %d per batch)", len(bodies), total, MaxBatchEvents)
+	}
+}
+
+// Close must bound an in-flight POST by CloseGrace and release the run's send
+// slot promptly. The sender cannot see done while it is inside Do, so the grace
+// cancels its context: leaving the POST to its own timeout would stall the next
+// phase's emitter on Seq.SendLock for that whole timeout.
+func TestCloseBoundsAnInFlightSendAndReleasesTheRunLock(t *testing.T) {
+	seq := NewSeqCounter(NewMemorySeqStore(), nil)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
+	entered := make(chan struct{}, 1)
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-release:
+			return nil, errors.New("test transport released")
+		}
+	})}
+	e := New(Config{
+		Origin: "https://plane.example", APIKey: "k", Harness: "claude", Seq: seq,
+		Client: client, FlushEvery: time.Hour,
+		SendTimeout: 30 * time.Second, CloseGrace: 100 * time.Millisecond,
+	})
+	e.SetRunID("run-1")
+	e.ToolCall("Bash", "call-1", "ls")
+	e.signal() // the ticker is an hour away; put one POST in flight
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the sender never reached the plane")
+	}
+
+	start := time.Now()
+	e.Close()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %s with a %s grace — it waited out the in-flight POST", elapsed, e.cfg.CloseGrace)
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		unlock := seq.SendLock("run-1")
+		unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("the run's send lock is still held after Close — the cancelled POST never released it")
 	}
 }
 
