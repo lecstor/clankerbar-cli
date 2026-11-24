@@ -55,6 +55,40 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
+// routeWakeHint is how long a still-limited wait should sleep before its next probe when a route
+// the walk left blocked clears sooner than the poll interval: the soonest instant any of the
+// phase's routes is outside BOTH its usage mark and its pricing window. Without it the deadline is
+// always the interval measured from the last attempt, so a route whose window (or stated reset)
+// ends mid-interval sits usable while the loop sleeps out the rest of it (CLA-986). ok=false keeps
+// the caller on the interval: a phase with no route list, or one with a route already clear (which
+// the walk would have probed), has no earlier instant to offer.
+func (d *Driver) routeWakeHint(tc *config.Config, ph config.Phase) (time.Duration, bool) {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		return 0, false
+	}
+	now := d.clock()
+	var earliest time.Time
+	for _, route := range routes {
+		at := now
+		if active, until := tc.RouteWindowAt(route, now); active && until.After(at) {
+			at = until
+		}
+		if until, marked := d.routeMarkExpiry(route); marked && until.After(at) {
+			at = until
+		}
+		if !at.After(now) {
+			return 0, false
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	// The same grace a stated-reset wake takes: a probe that lands a hair before the edge pays a
+	// whole interval for its timing.
+	return earliest.Sub(now) + d.waitGrace, true
+}
+
 // supervisedWait pauses on a usage limit, then polls for an early reset rather than sleeping
 // blindly to the stated reset. The breaker is consulted HERE and not only by the caller, because
 // this loop does not return to the caller while the limit persists: it waits, probes, and waits
@@ -160,8 +194,15 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		tokens += got
 		cost += cst
 		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only here.
-		// A refused spawn is still an attempt: the next one is a full probeWait away, never sooner.
-		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
+		// A refused spawn is still an attempt: the next one is a full probeWait away, never sooner —
+		// unless a route the walk left blocked clears before that deadline (a pricing window end, or a
+		// mark's own reset): then waking at that instant is the difference between resuming when the
+		// route opens and idling out the rest of the interval (CLA-986).
+		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
+			delay = hint
+		}
+		nextProbe = time.Now().Add(delay)
 		switch verdict {
 		case wakeStop:
 			return tokens, cost, true

@@ -268,7 +268,7 @@ func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (
 	case len(choice.Routes) > 0:
 		inv.Model = choice.Routes[0]
 	case !choice.WaitUntil.IsZero():
-		return inv, &routeWindowBlocked{phase: ph.Label(0), until: choice.WaitUntil, routes: routes}
+		return inv, &routeWindowBlocked{phase: ph.Label(0), until: choice.WaitUntil, routes: choice.WindowBlocked}
 	}
 	return inv, nil
 }

@@ -109,8 +109,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		inv.Model = choice.Routes[0]
 		inv.Routes = choice.Routes
 	case !choice.WaitUntil.IsZero():
-		configured, _ := tc.ModelRoutesForPhase(ph)
-		return inv, &routeWindowBlocked{phase: ph.Label(phaseIdx), until: choice.WaitUntil, routes: configured}
+		return inv, &routeWindowBlocked{phase: ph.Label(phaseIdx), until: choice.WaitUntil, routes: choice.WindowBlocked}
 	default:
 		inv.Model = model
 		inv.Routes = nil

@@ -345,6 +345,34 @@ func TestRouteChoiceAt(t *testing.T) {
 	}
 }
 
+// A refusal names the routes the filter actually withheld: WindowBlocked rides
+// with WaitUntil, and the loop hands the filter only the routes that are not
+// usage-marked, so a marked route never appears in it (CLA-986).
+func TestRouteChoiceAt_WindowBlockedRidesWithTheWait(t *testing.T) {
+	bne := mustZone(t, "Australia/Brisbane")
+	inside := wall(bne, 2026, time.November, 9, 12, 0)
+	outside := wall(bne, 2026, time.November, 9, 9, 0)
+	c := scheduledConfig(RouteWhenAllBlockedWait, "go/route", "cc/route")
+
+	choice := c.RouteChoiceAt(inside, []string{"go/route", "cc/route"})
+	if len(choice.Routes) != 0 || choice.WaitUntil.IsZero() {
+		t.Fatalf("choice = %+v, want a wait", choice)
+	}
+	if len(choice.WindowBlocked) != 2 || choice.WindowBlocked[0] != "go/route" || choice.WindowBlocked[1] != "cc/route" {
+		t.Errorf("WindowBlocked = %v, want both windowed routes in configured order", choice.WindowBlocked)
+	}
+	if got := c.RouteChoiceAt(outside, []string{"go/route", "cc/route"}); len(got.WindowBlocked) != 0 {
+		t.Errorf("WindowBlocked = %v outside the window, want none", got.WindowBlocked)
+	}
+	if got := c.RouteChoiceAt(inside, nil); len(got.WindowBlocked) != 0 {
+		t.Errorf("WindowBlocked = %v with no routes, want none", got.WindowBlocked)
+	}
+	// One open route means no refusal at all, so there is nothing for WindowBlocked to name.
+	if got := c.RouteChoiceAt(inside, []string{"go/route", "free/route"}); len(got.Routes) != 1 || len(got.WindowBlocked) != 0 {
+		t.Errorf("mixed choice = %+v, want the open route and no window-blocked list", got)
+	}
+}
+
 // An overnight window is `from > to`, and the route must stay blocked past
 // midnight — the trap a naive hour bound gets wrong.
 func TestRouteWindowAt_OvernightWindow(t *testing.T) {
