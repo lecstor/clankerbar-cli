@@ -473,15 +473,16 @@ func (e *Emitter) run() {
 	}
 }
 
-// finalBatches is how many batches a final flush needs to empty a full bounded
-// buffer: a phase boundary must not silently leave events the plane would have
-// accepted.
+// finalBatches bounds the final drain. One batch per buffered event is the
+// pessimistic shape: a body-cap-sized transcript event makes a batch carry a
+// single event, so counting from MaxBatchEvents would stop short and leave
+// events the plane would have accepted. A flush that empties the buffer returns
+// on its own, and the close grace bounds the whole drain.
 func (e *Emitter) finalBatches() int {
-	n := (e.cfg.MaxBuffered + MaxBatchEvents - 1) / MaxBatchEvents
-	if n < 1 {
-		n = 1
+	if e.cfg.MaxBuffered < 1 {
+		return 1
 	}
-	return n
+	return e.cfg.MaxBuffered
 }
 
 // maxSendAttempts bounds a rate-limited batch: the first try plus two retries.
