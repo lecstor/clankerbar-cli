@@ -769,6 +769,17 @@ func TestFixDoneAtTip(t *testing.T) {
 			want:    true,
 		},
 		{
+			// One unusable timestamp leaves the record order unknowable, so tip equality decides.
+			name: "an unparseable review timestamp falls back to tip equality",
+			records: []plane.ReviewRecordState{
+				review("tipA", "2026-11-20T10:00:00.000Z"),
+				review("tipA", "not a time"),
+			},
+			done: done("tipA", "2026-11-20T09:00:00.000Z"),
+			tip:  "tipA",
+			want: true,
+		},
+		{
 			// A panel writes several records at one tip: the fix must answer the newest of them.
 			name: "the newest released record at the tip decides",
 			records: []plane.ReviewRecordState{

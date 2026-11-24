@@ -288,7 +288,9 @@ func fixDoneAtTip(records []plane.ReviewRecordState, done plane.PhaseDone, tip s
 	return !doneAt.Before(reviewAt)
 }
 
-// newestReleasedReviewTime is the latest parseable At among released records that reviewed tip.
+// newestReleasedReviewTime is the latest released record's At among those that reviewed tip. It
+// reports false when any such record has no usable timestamp: without one the ordering cannot be
+// established, so the caller falls back to tip equality.
 func newestReleasedReviewTime(records []plane.ReviewRecordState, tip string) (time.Time, bool) {
 	var newest time.Time
 	found := false
@@ -298,7 +300,7 @@ func newestReleasedReviewTime(records []plane.ReviewRecordState, tip string) (ti
 		}
 		at, ok := parseRFCTime(r.At)
 		if !ok {
-			continue
+			return time.Time{}, false
 		}
 		if !found || at.After(newest) {
 			newest, found = at, true
