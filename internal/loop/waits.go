@@ -230,8 +230,13 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
 		if verdict == wakeStillLimited && end == wakeExhausted && d.routeClearNow(tc, ph) {
 			// Never lengthen the deadline: a stated reset or a short poll interval may already be
-			// sooner than one grace.
-			delay = min(delay, d.waitGrace)
+			// sooner than one grace. A Driver built by hand in a test carries the zero value, and a
+			// zero grace would schedule the next paid probe with no sleep at all.
+			grace := d.waitGrace
+			if grace <= 0 {
+				grace = time.Minute
+			}
+			delay = min(delay, grace)
 		}
 		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
 			delay = hint

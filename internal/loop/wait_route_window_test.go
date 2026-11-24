@@ -17,6 +17,17 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
+// logLineContaining returns the first log line carrying want, or "" when none does. The log
+// assertions below read one line each out of a captured stream.
+func logLineContaining(logs, want string) string {
+	for _, l := range strings.Split(logs, "\n") {
+		if strings.Contains(l, want) {
+			return l
+		}
+	}
+	return ""
+}
+
 // The incident (headless clanker2, 2026-11-24): Synthetic hit a limit, Command Code and Go were
 // inside the deepseek-peak window until 14:00, and the wake that found them windowed slept a full
 // 30-minute interval. The window ended at 14:00 and the next probe was 14:29, so a usable route
@@ -127,16 +138,21 @@ func TestSupervisedWait_WakesAtGraceWhenTheWalkLeavesARouteClear(t *testing.T) {
 			h.probeModels, want, logs.String())
 	}
 	// The successor deadline is one grace after the wake's last attempt (B's probe) — not the
-	// interval. 250ms of scheduling headroom; the buggy interval is 3s away.
+	// interval. 250ms of scheduling headroom above; the lower bound catches a re-probe that fires
+	// before the grace sleep has elapsed. The buggy interval is 3s away.
 	gap := h.probeStarts[2].Sub(h.probeStarts[1])
 	want := probeDelay + grace
 	if gap > want+250*time.Millisecond {
 		t.Errorf("the probe after a cleared route began %s after the wake's last attempt started, want ~%s — a route clear NOW must not wait the %s interval\n%s",
 			gap.Round(time.Millisecond), want.Round(time.Millisecond), interval, logs.String())
 	}
+	if gap < want-50*time.Millisecond {
+		t.Errorf("the probe after a cleared route began %s after the wake's last attempt started, want ~%s — it re-probed before the grace sleep elapsed\n%s",
+			gap.Round(time.Millisecond), want.Round(time.Millisecond), logs.String())
+	}
 	if elapsed >= interval {
 		t.Errorf("the wait took %s, want ~%s — the cleared route must be re-probed one grace out, not an interval later\n%s",
-			elapsed.Round(time.Millisecond), (firstWake + 3*probeDelay + 2*grace).Round(time.Millisecond), logs.String())
+			elapsed.Round(time.Millisecond), (firstWake + 3*probeDelay + grace).Round(time.Millisecond), logs.String())
 	}
 }
 
@@ -197,13 +213,7 @@ func TestProbeWake_WindowBlockedLogNamesOnlyWindowBlockedRoutes(t *testing.T) {
 			h.probeModels, h.probeCalls, routeFreeAlias)
 	}
 
-	var line string
-	for _, l := range strings.Split(logs.String(), "\n") {
-		if strings.Contains(l, "window-blocked") {
-			line = l
-			break
-		}
-	}
+	line := logLineContaining(logs.String(), "window-blocked")
 	if line == "" {
 		t.Fatalf("no window-blocked line in the wake's log:\n%s", logs.String())
 	}
@@ -289,13 +299,7 @@ func TestProbeWake_WindowBlockedLogDoesNotClaimEveryHeldRouteIsWindowed(t *testi
 		t.Fatalf("got %d probes, want 0: the only unmarked route is inside its window", h.probeCalls)
 	}
 
-	var line string
-	for _, l := range strings.Split(logs.String(), "\n") {
-		if strings.Contains(l, "window-blocked") {
-			line = l
-			break
-		}
-	}
+	line := logLineContaining(logs.String(), "window-blocked")
 	if line == "" {
 		t.Fatalf("no window-blocked line in the wake's log:\n%s", logs.String())
 	}
@@ -316,6 +320,61 @@ func TestProbeWake_WindowBlockedLogDoesNotClaimEveryHeldRouteIsWindowed(t *testi
 	}
 	if strings.Contains(detail, routeFreeAlias) {
 		t.Errorf("the refusal detail names %s, which a usage mark holds, not a window: %q", routeFreeAlias, line)
+	}
+}
+
+// The other shape of the same claim: a walk that probed a route LIMITED and then met a window
+// refusal names the tried route and the disjunction, never "every other route is window-blocked".
+// A third route held by a mark from an earlier wake makes the over-claim reachable, so a revert of
+// the tried>0 line to the old wording fails here (CLA-988 review 1.review-1.1).
+func TestProbeWake_WindowBlockedLogAfterALimitedProbeDoesNotClaimEveryHeldRouteIsWindowed(t *testing.T) {
+	inside := brisbaneAt(t, 9, 12, 0) // inside the peak schedule's first window
+	h := &fakeAdapter{probeLimitFor: func(_ int, model string) harness.Limit {
+		if model == routeFreeAlias {
+			return harness.Limit{Limited: true}
+		}
+		return harness.Limit{Limited: false}
+	}}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routePaidAlias, routeGo)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return inside }
+	// A mark from an earlier wake holds the paid route, so the walk never probes it; only the Go
+	// route's window refuses the rest.
+	d.markRouteLimited(routePaidAlias, inside.Add(5*time.Minute))
+
+	logs := captureLogs(t)
+	_, _, verdict, end := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	if verdict != wakeStillLimited || end != wakeExhausted {
+		t.Fatalf("verdict, end = %v, %v, want wakeStillLimited, wakeExhausted", verdict, end)
+	}
+	if h.probeCalls != 1 || h.probeModels[0] != routeFreeAlias {
+		t.Fatalf("probes = %v (%d calls), want the one limited probe on %s before the walk hits the window",
+			h.probeModels, h.probeCalls, routeFreeAlias)
+	}
+
+	line := logLineContaining(logs.String(), "still limited on "+routeFreeAlias)
+	if line == "" {
+		t.Fatalf("no line naming the route the walk probed limited:\n%s", logs.String())
+	}
+	if !strings.Contains(line, "usage-marked or window-blocked") {
+		t.Errorf("the line claims every other route is windowed while %s carries a usage mark: %q", routePaidAlias, line)
+	}
+	if strings.Contains(line, "every other route is window-blocked") {
+		t.Errorf("the line still carries the old over-claim: %q", line)
+	}
+	// The parenthetical is the refusal's own text: only the routes a window withheld may appear.
+	at := strings.Index(line, "window-blocked (")
+	if at < 0 {
+		t.Fatalf("the window-blocked line carries no refusal detail: %q", line)
+	}
+	detail := line[at:]
+	if !strings.Contains(detail, routeGo) {
+		t.Errorf("the refusal detail does not name the windowed route %s: %q", routeGo, line)
+	}
+	for _, held := range []string{routeFreeAlias, routePaidAlias} {
+		if strings.Contains(detail, held) {
+			t.Errorf("the refusal detail names %s, which is not windowed here: %q", held, line)
+		}
 	}
 }
 

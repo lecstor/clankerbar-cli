@@ -79,8 +79,10 @@ usable route sitting idle until the next interval tick (CLA-986: a wake at 13:59
 held the probe to 14:29 when the window ended at 14:00). If the walk itself ends
 with a route already clear — its usage mark expired while a later route was
 being probed — the next probe is one grace away rather than the whole interval.
-A wake that ended on a probe error keeps the full interval, so a failing probe
-cannot tight-loop (CLA-988).
+A wake that ended on a probe error takes no one-grace shortcut: it keeps the
+ordinary deadline above — the poll interval, a nearer stated reset plus grace, or
+a route's clear instant plus grace — so a failing probe cannot be re-spawned at
+once (CLA-988).
 
 A usage MARK and a window are different answers to different questions, so both
 apply: a mark only ORDERs the candidates (a phase still starts, on the route whose
