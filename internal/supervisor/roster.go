@@ -302,18 +302,15 @@ func writeCachedRoster(dir string, entries []RosterEntry) {
 	// old file first would leave a window where a cold start (or a crash
 	// between the two calls) sees no roster at all; rename replaces the name in
 	// one step, so a reader sees either the old roster or the new one. The
-	// temp's O_EXCL removes a planted symlink rather than following it, and
-	// rename swaps the destination entry itself, never its target.
-	tmp := path + ".tmp"
-	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("roster: cannot replace %s (%v)", path, err)
-		return
-	}
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// unique temp name keeps two supervisors sharing one cache dir from
+	// publishing each other's partial write, and the rename swaps the
+	// destination entry itself, never a symlink's target.
+	f, err := os.CreateTemp(dir, rosterCacheName+".*.tmp")
 	if err != nil {
 		log.Printf("roster: cannot write %s (%v)", path, err)
 		return
 	}
+	tmp := f.Name()
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		_ = os.Remove(tmp)

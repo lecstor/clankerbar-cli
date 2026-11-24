@@ -540,12 +540,13 @@ drain:
 // postMu the pump can no longer take a report, and any report it already holds
 // has been delivered before Close's critical section starts.
 //
-// done is checked with priority before queue: a pump that took a queued report
-// after Close was already waiting on postMu would deliver it before the
-// beacon, which is ordered safely, but it would be a POST nobody needed. The
-// select below cannot guarantee priority on its own — Go picks randomly when
-// both are ready — so the pre-check does, and the closed check under postMu
-// backstops the rest.
+// The done pre-check before the select narrows the window: a pump that took a
+// queued report after Close was already waiting on postMu would deliver it
+// before the beacon, which is ordered safely, but it would be a POST nobody
+// needed. A non-blocking select cannot promise priority — Go picks randomly
+// when both are ready — so what actually keeps the beacon last is postMu: the
+// closed check and the deliver both happen under it, and Close holds it across
+// its drain and the beacon.
 func (r *httpReporter) pump() {
 	for {
 		r.postMu.Lock()

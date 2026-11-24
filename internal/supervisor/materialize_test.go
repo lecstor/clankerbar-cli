@@ -543,3 +543,84 @@ func TestMaterializedConfigCarriesPauseWindows(t *testing.T) {
 		t.Errorf("materialized pause windows = %q, want %q", got, want)
 	}
 }
+
+// The materialized config is REPLACED through a same-directory rename, like the
+// roster cache: a rewrite must never leave the name absent or half-written, and
+// a symlink planted at it must be swapped for our file, not followed. Pinned
+// because every other test here would still pass if materializeConfig went back
+// to remove-then-create.
+func TestMaterializeConfigReplacesTheFileAndAPlantedSymlink(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	workdir := t.TempDir()
+	src := filepath.Join(t.TempDir(), "source.json")
+	body := `{
+		"harness": "claude",
+		"workdir": "` + workdir + `",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
+	}`
+	if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	cfg, err := config.Load(src)
+	if err != nil {
+		t.Fatalf("Load(source): %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	stateDir := t.TempDir()
+	d := &Supervisor{o: materializeOptions(t, cacheDir, ""), hostname: "testhost", cacheDir: cacheDir}
+	inst := &Instance{name: "replace", cfg: cfg, stateDir: stateDir}
+	path := filepath.Join(stateDir, statedir.MaterializedConfigName)
+
+	first, err := d.materializeConfig(inst)
+	if err != nil {
+		t.Fatalf("first materializeConfig: %v", err)
+	}
+	firstBody, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatalf("read the first materialization: %v", err)
+	}
+
+	// Over an existing file: the name must still hold the config afterwards.
+	if _, err := d.materializeConfig(inst); err != nil {
+		t.Fatalf("replace materializeConfig: %v", err)
+	}
+	replaced, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the config is absent after a rewrite: %v", err)
+	}
+	if string(replaced) != string(firstBody) {
+		t.Fatalf("the rewrite changed the bytes for an unchanged config")
+	}
+
+	// Over a planted symlink: the rename replaces the entry, never the target.
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.materializeConfig(inst); err != nil {
+		t.Fatalf("materializeConfig over a symlink: %v", err)
+	}
+	if b, err := os.ReadFile(victim); err != nil || string(b) != "untouched" {
+		t.Fatalf("the symlink target was written through (body = %q, err = %v)", b, err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("the config is missing after replacing a symlink: %v", err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("the config is %v after replacing a symlink, want a regular file", fi.Mode())
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 0600", fi.Mode().Perm())
+	}
+	if _, err := config.Load(path); err != nil {
+		t.Fatalf("the replaced config does not load: %v", err)
+	}
+}

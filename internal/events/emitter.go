@@ -518,6 +518,13 @@ func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 			return
 		}
 		unlock := e.cfg.Seq.SendLock(runID)
+		if e.sendCtx.Err() != nil {
+			// The grace expired while this flush waited for the run's send slot.
+			// Taking a batch now would remove events that can never be posted,
+			// so finish would under-report them as sent.
+			unlock()
+			return
+		}
 		body, sentRun, maxSeq, n := e.takeBatch()
 		if n == 0 {
 			unlock()
@@ -804,8 +811,9 @@ func (e *Emitter) noteSuccess() {
 	}
 }
 
-// Close stops the sender after one bounded final flush. It never fails and never
-// blocks longer than CloseGrace; the session's own result does not depend on it.
+// Close stops the sender and drains the buffer within CloseGrace. It never fails
+// and never blocks longer than CloseGrace; the session's own result does not
+// depend on it.
 // Events that never learned a run id are dropped here, with one line when there
 // were any: a fresh session that never claimed has nothing to report against.
 //

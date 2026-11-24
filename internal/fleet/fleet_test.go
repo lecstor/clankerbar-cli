@@ -894,6 +894,92 @@ func TestSendRacingCloseLeavesTheBeaconLast(t *testing.T) {
 	}
 }
 
+// The Send/Close guard, pinned deterministically. startOnce.Do sits exactly
+// between Send's closed check and its enqueue, so a test-owned Do can hold a
+// Send open in that window while Close is called. With stateMu, Close is parked
+// until the Send has enqueued, so the report is drained before the beacon;
+// without it, Close runs the empty-queue goodbye straight past the blocked Send
+// and the report is never posted. TestSendRacingCloseLeavesTheBeaconLast cannot
+// pin this: losing that race is timing-dependent, and beacon-last holds without
+// the guard.
+func TestSendInsideStartOnceIsDeliveredBeforeTheBeacon(t *testing.T) {
+	var mu sync.Mutex
+	var kinds []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var wire struct {
+			State struct {
+				Kind string `json:"kind"`
+			} `json:"state"`
+		}
+		_ = json.Unmarshal(body, &wire)
+		mu.Lock()
+		kinds = append(kinds, wire.State.Kind)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := New(srv.URL, "k").(*httpReporter)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
+	// Pre-arm the once, holding Send's closed-check-to-enqueue window open.
+	armed := make(chan struct{})
+	go rep.startOnce.Do(func() {
+		close(armed)
+		<-release
+		go rep.pump() // what Send's own Do would have started
+	})
+	<-armed
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+	}()
+
+	// Let the Send reach the held-open once. Do not probe the guard field here:
+	// the test must compile and fail behaviourally when the guard is reverted.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-sendDone:
+		t.Fatal("the Send returned while the once was still held open")
+	default:
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	}()
+
+	// With the guard Close cannot get past the Send until it enqueues, so it
+	// cannot return here. Without it, Close drains the still-empty queue, sends
+	// the beacon and returns while the Send is blocked — only then is the Send
+	// released, so its report can never be drained.
+	select {
+	case <-closeDone:
+		// The goodbye ran past a Send that was still mid-enqueue: release so
+		// the assertions below can report the missing report.
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	unblock()
+	<-sendDone
+	<-closeDone
+
+	mu.Lock()
+	got := append([]string(nil), kinds...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != StateIdle || got[1] != StateStopping {
+		t.Fatalf("plane received %v, want the blocked Send's report then the stopping beacon", got)
+	}
+}
+
 // gatedReporter is a Reporter whose Close can be held open, to observe when
 // each target's Close starts and finishes.
 type gatedReporter struct {

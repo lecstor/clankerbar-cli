@@ -209,7 +209,7 @@ func TestRosterCacheCorruptOrMissingReadsAsNothing(t *testing.T) {
 }
 
 // The cache write replaces a previous one through a same-directory temp and a
-// rename, so a symlink planted at the name is replaced, never followed.
+// rename, so a reader never sees the name missing and no temp is left behind.
 func TestRosterCacheReplacesSafely(t *testing.T) {
 	dir := t.TempDir()
 	writeCachedRoster(dir, testRosterEntries())
@@ -218,8 +218,10 @@ func TestRosterCacheReplacesSafely(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("loaded %d entries after a replacement write, want 1", len(got))
 	}
-	if _, err := os.Lstat(filepath.Join(dir, rosterCacheName+".tmp")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the atomic write left its temp file behind (err = %v)", err)
+	if temps, err := filepath.Glob(filepath.Join(dir, rosterCacheName+"*.tmp")); err != nil {
+		t.Fatal(err)
+	} else if len(temps) != 0 {
+		t.Fatalf("the atomic write left temp file(s) behind: %v", temps)
 	}
 }
 
