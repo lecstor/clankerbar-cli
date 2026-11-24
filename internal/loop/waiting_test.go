@@ -190,7 +190,7 @@ func TestRun_AnOpenQuestionNeverGatesTheNextDrain(t *testing.T) {
 			t.Fatalf("beacon states = %v, want %v", got, want)
 		}
 	}
-	if w := d.waitingAt(0); !w.on || w.ref != "CLA-535" {
+	if w := d.waitingAt(0); !w.on || w.ref() != "CLA-535" {
 		t.Errorf("waiting marker = %+v after a drain of another task, want it kept for CLA-535 — that drain answered nothing", w)
 	}
 }
@@ -220,6 +220,69 @@ func TestWaiting_OwnAsksShareTheEarliestBaseline(t *testing.T) {
 	d.clearAnsweredWaiting(0, backlog.Summary{OpenQuestions: 0})
 	if got := d.fleetState(0); got.Kind != fleet.StateIdle {
 		t.Fatalf("both answers landed, state = %+v, want idle", got)
+	}
+}
+
+// TestWaiting_ReclaimingOneOfTwoOwnAsksKeepsTheOther is the residual-ask case (2.review-2.1): the
+// NEWEST of two own asks is answered and its task reclaimed, and the marker must keep standing for
+// the older question instead of clearing with it. The tracked refs are what make that expressible,
+// so they must survive a restart without the answered one too.
+func TestWaiting_ReclaimingOneOfTwoOwnAsksKeepsTheOther(t *testing.T) {
+	st, err := statedir.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("statedir.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ff := &fakeFleet{}
+	targets := func() []Target {
+		return []Target{{Name: "alpha", Poller: busyPoller(), Fleet: ff}}
+	}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, targets())
+	d.state = st
+	d.noteWaiting(0, "CLA-1") // the project had no open question before this ask
+	d.openQs[0] = 1           // the next poll sees the first question open
+	d.noteWaiting(0, "CLA-2") // a second drain asks while the first still stands
+	if got := d.fleetState(0); got.Kind != fleet.StateWaiting || got.TaskRef != "CLA-2" {
+		t.Fatalf("two own asks = %+v, want waiting on the newest ref CLA-2", got)
+	}
+
+	// The newest ask is answered and the poll sees the count fall 2 -> 1 (above the pre-FIRST-ask
+	// baseline, so the marker stays on the newest); its task then returns to ready and the same daemon
+	// reclaims it. That is evidence for CLA-2 alone; CLA-1's question still stands.
+	d.clearAnsweredWaiting(0, backlog.Summary{OpenQuestions: 1})
+	if got := d.fleetState(0); got.Kind != fleet.StateWaiting || got.TaskRef != "CLA-2" {
+		t.Fatalf("after the newest answer landed = %+v, want waiting on CLA-2 until the reclaim", got)
+	}
+	d.beginIteration(0, d.targets[0], 2, "CLA-2", "implement")
+	if got := d.fleetState(0); got.Kind != fleet.StateIteration {
+		t.Fatalf("state while the reclaimed task runs = %+v, want iteration over waiting", got)
+	}
+	d.endIteration(0, d.targets[0], fleet.Iteration{Outcome: fleet.OutcomeReleased})
+	if got := d.fleetState(0); got.Kind != fleet.StateWaiting || got.TaskRef != "CLA-1" {
+		t.Fatalf("after reclaiming the newest ask = %+v, want waiting on the still-open CLA-1", got)
+	}
+	if refs := d.waitingAt(0).refs; len(refs) != 1 || refs[0] != "CLA-1" {
+		t.Fatalf("tracked refs = %v, want only the still-open CLA-1", refs)
+	}
+	if reports := mustReports(t, ff); len(reports) == 0 ||
+		reports[len(reports)-1].State.Kind != fleet.StateWaiting ||
+		reports[len(reports)-1].State.TaskRef != "CLA-1" {
+		t.Fatalf("last beacon = %+v, want waiting on CLA-1", reports[len(reports)-1].State)
+	}
+
+	// A restart must not resurrect the answered ask from the saved record.
+	restarted := NewMulti(fastCfg(), &fakeAdapter{}, targets())
+	restarted.state = st
+	restarted.loadWaiting()
+	if got := restarted.fleetState(0); got.Kind != fleet.StateWaiting || got.TaskRef != "CLA-1" {
+		t.Fatalf("restored state = %+v, want waiting on CLA-1 only", got)
+	}
+
+	// CLA-1's answer takes the count back to the pre-FIRST-ask baseline: now the marker clears.
+	restarted.clearAnsweredWaiting(0, backlog.Summary{OpenQuestions: 0})
+	if got := restarted.fleetState(0); got.Kind != fleet.StateIdle {
+		t.Fatalf("after both answers state = %+v, want idle", got)
 	}
 }
 

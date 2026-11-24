@@ -1972,10 +1972,10 @@ section note.
 >   - console-, fleet-, startup- or budget-paused -> draining naming that cause:
 >     it is the one the operator has to act on, and it outranks the schedule.
 >   - schedule-paused            -> draining naming the window and its end
->   - an own blocking question unanswered -> waiting {taskRef}, ranked below any
->     deliberate pause (draining names why spawns are closed, waiting only what
->     the poll waits on) and above idle: it is the one quiet state that needs
->     the operator rather than reporting
+>   - an own blocking question unanswered -> waiting {taskRef} naming the newest
+>     of its own asks, ranked below any deliberate pause (draining names why
+>     spawns are closed, waiting only what the poll waits on) and above idle: it
+>     is the one quiet state that needs the operator rather than reporting
 >   - otherwise                -> idle
 >
 > A backed-off target (skipUntil still in the future) contributes no presence

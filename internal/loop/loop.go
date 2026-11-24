@@ -254,7 +254,7 @@ type Driver struct {
 
 	hold []holdState
 
-	// waiting is each target's outstanding blocking ask, under iterMu like the presence markers
+	// waiting is each target's outstanding blocking asks, under iterMu like the presence markers
 	// above: fleetState reads it from the beacon paths, which run on the lease-renewer goroutine.
 	waiting []waitState
 

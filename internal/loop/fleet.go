@@ -95,7 +95,7 @@ type holdState struct {
 //   - held at a phase boundary by a pause window -> draining with the schedule reason, the window's
 //     end, and the held task's ref and phase
 //   - schedule-paused -> draining naming the window and its end
-//   - an own blocking question unanswered -> waiting with its task ref
+//   - an own blocking question unanswered -> waiting with the newest such ask's task ref
 //   - otherwise -> idle
 //
 // A backed-off target (skipUntil still in the future) contributes no presence state of its own: it
@@ -126,7 +126,7 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	// operator set deliberately: draining names the reason spawns are closed, waiting only what the
 	// poll is waiting on.
 	if w.on {
-		return fleet.State{Kind: fleet.StateWaiting, TaskRef: w.ref}
+		return fleet.State{Kind: fleet.StateWaiting, TaskRef: w.ref()}
 	}
 	return fleet.State{Kind: fleet.StateIdle}
 }
