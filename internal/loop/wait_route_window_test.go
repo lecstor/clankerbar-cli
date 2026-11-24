@@ -8,6 +8,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,17 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
+
+// logLineContaining returns the first log line carrying want, or "" when none does. The log
+// assertions below read one line each out of a captured stream.
+func logLineContaining(logs, want string) string {
+	for _, l := range strings.Split(logs, "\n") {
+		if strings.Contains(l, want) {
+			return l
+		}
+	}
+	return ""
+}
 
 // The incident (headless clanker2, 2026-11-24): Synthetic hit a limit, Command Code and Go were
 // inside the deepseek-peak window until 14:00, and the wake that found them windowed slept a full
@@ -64,12 +76,13 @@ func TestSupervisedWait_WakesAtTheRouteWindowEndNotTheProbeInterval(t *testing.T
 			h.probeModels, routeFreeAlias, routeGo, logs.String())
 	}
 	// The successor deadline is the window's end, not the interval measured from the last attempt.
-	// The gap is T minus the first wake plus grace, minus a few ms of fixture setup; 250ms either
-	// side is scheduling headroom on a loaded -race machine, and the buggy interval is 2.5s away.
+	// Probe 1 lands at ~firstWake+grace and probe 2 at ~windowEnd+grace, so the gap between the two
+	// is windowEnd - firstWake; 250ms either side is scheduling headroom on a loaded -race machine,
+	// and the buggy interval is 2.5s away.
 	gap := h.probeStarts[1].Sub(h.probeStarts[0])
-	want := windowEnd - firstWake + grace
+	want := windowEnd - firstWake
 	if gap > want+250*time.Millisecond {
-		t.Errorf("the second probe began %s after the first, want ~%s (the window's end, T=%s from the start, plus grace) — not the interval deadline at %s\n%s",
+		t.Errorf("the second probe began %s after the first, want ~%s (the window's end, T=%s from the start) — not the interval deadline at %s\n%s",
 			gap.Round(time.Millisecond), want.Round(time.Millisecond), windowEnd, interval, logs.String())
 	}
 	if gap < want-250*time.Millisecond {
@@ -79,6 +92,99 @@ func TestSupervisedWait_WakesAtTheRouteWindowEndNotTheProbeInterval(t *testing.T
 	if elapsed >= interval {
 		t.Errorf("the wait took %s, want the window's end at %s — not the interval deadline at %s\n%s",
 			elapsed.Round(time.Millisecond), (windowEnd + grace).Round(time.Millisecond), interval, logs.String())
+	}
+}
+
+// A walk can end with a route already clear: route A's short mark expires while route B's probe is
+// still running, so the next probeInvocation aims at A again and the walk stops at tried[A]. The
+// wake hint only answers with a FUTURE instant, so the wait used to fall back to the whole interval
+// with A routable now. It must wake one grace out and resume on A (CLA-988, review 1.review-1.1).
+func TestSupervisedWait_WakesAtGraceWhenTheWalkLeavesARouteClear(t *testing.T) {
+	const (
+		interval   = 3 * time.Second
+		grace      = 200 * time.Millisecond
+		firstWake  = 100 * time.Millisecond
+		probeDelay = 150 * time.Millisecond
+	)
+	h := &fakeAdapter{
+		probeDelay: probeDelay,
+		probeLimitFor: func(call int, _ string) harness.Limit {
+			switch call {
+			case 0: // A: a short stated reset, which expires while B is being probed
+				return harness.Limit{Limited: true, ResetAt: time.Now().Add(probeDelay / 2)}
+			case 1: // B: limited with no stated reset
+				return harness.Limit{Limited: true}
+			default: // A again: it cleared while the walk moved on
+				return harness.Limit{Limited: false}
+			}
+		},
+	}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routeGo)
+	d.cfg.PollInterval = config.Duration(interval)
+	d.waitGrace = grace
+
+	logs := captureLogs(t)
+	start := time.Now()
+	_, _, stop := d.supervisedWait(context.Background(),
+		harness.Limit{Limited: true, ResetAt: start.Add(firstWake)},
+		h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+	elapsed := time.Since(start)
+
+	if stop {
+		t.Fatalf("the cleared route probed open; the wait should resume, not stop\n%s", logs.String())
+	}
+	if want := []string{routeFreeAlias, routeGo, routeFreeAlias}; !slices.Equal(h.probeModels, want) {
+		t.Fatalf("probes ran on %v, want %v: once A's mark expired mid-wake the wait must resume on A\n%s",
+			h.probeModels, want, logs.String())
+	}
+	// The successor deadline is one grace after the wake's last attempt (B's probe) — not the
+	// interval. 250ms of scheduling headroom above; the lower bound catches a re-probe that fires
+	// before the grace sleep has elapsed. The buggy interval is 3s away.
+	gap := h.probeStarts[2].Sub(h.probeStarts[1])
+	want := probeDelay + grace
+	if gap > want+250*time.Millisecond {
+		t.Errorf("the probe after a cleared route began %s after the wake's last attempt started, want ~%s — a route clear NOW must not wait the %s interval\n%s",
+			gap.Round(time.Millisecond), want.Round(time.Millisecond), interval, logs.String())
+	}
+	if gap < want-50*time.Millisecond {
+		t.Errorf("the probe after a cleared route began %s after the wake's last attempt started, want ~%s — it re-probed before the grace sleep elapsed\n%s",
+			gap.Round(time.Millisecond), want.Round(time.Millisecond), logs.String())
+	}
+	if elapsed >= interval {
+		t.Errorf("the wait took %s, want ~%s — the cleared route must be re-probed one grace out, not an interval later\n%s",
+			elapsed.Round(time.Millisecond), (firstWake + 3*probeDelay + grace).Round(time.Millisecond), logs.String())
+	}
+}
+
+// A wake ending on a probe error marks nothing, so its route can still be clear NOW. Waking at grace
+// there would re-spawn the failing probe in a tight loop: an error keeps the successor deadline at
+// the full interval (CLA-988).
+func TestSupervisedWait_ProbeErrorKeepsTheFullInterval(t *testing.T) {
+	const (
+		interval = 400 * time.Millisecond
+		grace    = 20 * time.Millisecond
+	)
+	h := &fakeAdapter{probeErrs: []error{errors.New("probe spawn refused")}}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routeGo)
+	d.cfg.PollInterval = config.Duration(interval)
+	d.waitGrace = grace
+
+	logs := captureLogs(t)
+	start := time.Now()
+	_, _, stop := d.supervisedWait(context.Background(),
+		harness.Limit{Limited: true},
+		h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+
+	if stop {
+		t.Fatalf("a probe error falls back to polling; it must not stop the wait\n%s", logs.String())
+	}
+	if h.probeCalls != 2 {
+		t.Fatalf("got %d probes, want 2 (the failed lap, then the lift)\n%s", h.probeCalls, logs.String())
+	}
+	gap := h.probeStarts[1].Sub(h.probeStarts[0])
+	if gap < interval/2 {
+		t.Errorf("the probe after a probe error began %s after the failed one, want the full %s interval — a failing probe must not tight-loop\n%s",
+			gap.Round(time.Millisecond), interval, logs.String())
 	}
 }
 
@@ -98,7 +204,7 @@ func TestProbeWake_WindowBlockedLogNamesOnlyWindowBlockedRoutes(t *testing.T) {
 	d.now = func() time.Time { return inside }
 
 	logs := captureLogs(t)
-	_, _, verdict := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
 	if verdict != wakeStillLimited {
 		t.Fatalf("verdict = %v, want wakeStillLimited: the windowed route cannot lift inside its window", verdict)
 	}
@@ -107,13 +213,7 @@ func TestProbeWake_WindowBlockedLogNamesOnlyWindowBlockedRoutes(t *testing.T) {
 			h.probeModels, h.probeCalls, routeFreeAlias)
 	}
 
-	var line string
-	for _, l := range strings.Split(logs.String(), "\n") {
-		if strings.Contains(l, "window-blocked") {
-			line = l
-			break
-		}
-	}
+	line := logLineContaining(logs.String(), "window-blocked")
 	if line == "" {
 		t.Fatalf("no window-blocked line in the wake's log:\n%s", logs.String())
 	}
@@ -161,7 +261,7 @@ func TestProbeWake_AllRoutesWindowedAtWakeStartIsNotAProbeError(t *testing.T) {
 	d.now = func() time.Time { return inside }
 
 	logs := captureLogs(t)
-	_, _, verdict := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
 	if verdict != wakeStillLimited {
 		t.Fatalf("verdict = %v, want wakeStillLimited", verdict)
 	}
@@ -169,11 +269,112 @@ func TestProbeWake_AllRoutesWindowedAtWakeStartIsNotAProbeError(t *testing.T) {
 		t.Fatalf("got %d probes, want 0: every route is inside its window", h.probeCalls)
 	}
 	out := logs.String()
-	if !strings.Contains(out, "every route for the phase is window-blocked") {
-		t.Errorf("the wake does not name the window as the reason it probed nothing:\n%s", out)
+	if !strings.Contains(out, "each is usage-marked or window-blocked") {
+		t.Errorf("the wake does not say the schedule holds every route it could probe:\n%s", out)
 	}
 	if strings.Contains(out, "probe error") {
 		t.Errorf("a window-blocked wake was booked as a probe error:\n%s", out)
+	}
+}
+
+// A usage mark from an EARLIER wake holds a route too, so "every route for the phase is
+// window-blocked" was false whenever a live mark sat beside a window: routableRoutesAt drops
+// marked routes before the window filter. The line must claim only the disjunction, and the
+// refusal's own text must keep naming just the routes a window withheld (CLA-988).
+func TestProbeWake_WindowBlockedLogDoesNotClaimEveryHeldRouteIsWindowed(t *testing.T) {
+	inside := brisbaneAt(t, 9, 12, 0) // inside the peak schedule's first window
+	h := &fakeAdapter{}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routeGo)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return inside }
+	// A mark from an earlier wake holds the free route; only the Go route's window is refusing now.
+	d.markRouteLimited(routeFreeAlias, inside.Add(5*time.Minute))
+
+	logs := captureLogs(t)
+	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	if verdict != wakeStillLimited {
+		t.Fatalf("verdict = %v, want wakeStillLimited", verdict)
+	}
+	if h.probeCalls != 0 {
+		t.Fatalf("got %d probes, want 0: the only unmarked route is inside its window", h.probeCalls)
+	}
+
+	line := logLineContaining(logs.String(), "window-blocked")
+	if line == "" {
+		t.Fatalf("no window-blocked line in the wake's log:\n%s", logs.String())
+	}
+	if strings.Contains(line, "every route for the phase is window-blocked") {
+		t.Errorf("the line claims every route is windowed while %s carries a usage mark: %q", routeFreeAlias, line)
+	}
+	if !strings.Contains(line, "usage-marked or window-blocked") {
+		t.Errorf("the line does not say a route can be held by a usage mark: %q", line)
+	}
+	// The parenthetical is the refusal's own text: only the routes a window withheld may appear.
+	at := strings.Index(line, "window-blocked (")
+	if at < 0 {
+		t.Fatalf("the window-blocked line carries no refusal detail: %q", line)
+	}
+	detail := line[at:]
+	if !strings.Contains(detail, routeGo) {
+		t.Errorf("the refusal detail does not name the windowed route %s: %q", routeGo, line)
+	}
+	if strings.Contains(detail, routeFreeAlias) {
+		t.Errorf("the refusal detail names %s, which a usage mark holds, not a window: %q", routeFreeAlias, line)
+	}
+}
+
+// The other shape of the same claim: a walk that probed a route LIMITED and then met a window
+// refusal names the tried route and the disjunction, never "every other route is window-blocked".
+// A third route held by a mark from an earlier wake makes the over-claim reachable, so a revert of
+// the tried>0 line to the old wording fails here (CLA-988 review 1.review-1.1).
+func TestProbeWake_WindowBlockedLogAfterALimitedProbeDoesNotClaimEveryHeldRouteIsWindowed(t *testing.T) {
+	inside := brisbaneAt(t, 9, 12, 0) // inside the peak schedule's first window
+	h := &fakeAdapter{probeLimitFor: func(_ int, model string) harness.Limit {
+		if model == routeFreeAlias {
+			return harness.Limit{Limited: true}
+		}
+		return harness.Limit{Limited: false}
+	}}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routePaidAlias, routeGo)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return inside }
+	// A mark from an earlier wake holds the paid route, so the walk never probes it; only the Go
+	// route's window refuses the rest.
+	d.markRouteLimited(routePaidAlias, inside.Add(5*time.Minute))
+
+	logs := captureLogs(t)
+	_, _, verdict, end := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	if verdict != wakeStillLimited || end != wakeExhausted {
+		t.Fatalf("verdict, end = %v, %v, want wakeStillLimited, wakeExhausted", verdict, end)
+	}
+	if h.probeCalls != 1 || h.probeModels[0] != routeFreeAlias {
+		t.Fatalf("probes = %v (%d calls), want the one limited probe on %s before the walk hits the window",
+			h.probeModels, h.probeCalls, routeFreeAlias)
+	}
+
+	line := logLineContaining(logs.String(), "still limited on "+routeFreeAlias)
+	if line == "" {
+		t.Fatalf("no line naming the route the walk probed limited:\n%s", logs.String())
+	}
+	if !strings.Contains(line, "usage-marked or window-blocked") {
+		t.Errorf("the line claims every other route is windowed while %s carries a usage mark: %q", routePaidAlias, line)
+	}
+	if strings.Contains(line, "every other route is window-blocked") {
+		t.Errorf("the line still carries the old over-claim: %q", line)
+	}
+	// The parenthetical is the refusal's own text: only the routes a window withheld may appear.
+	at := strings.Index(line, "window-blocked (")
+	if at < 0 {
+		t.Fatalf("the window-blocked line carries no refusal detail: %q", line)
+	}
+	detail := line[at:]
+	if !strings.Contains(detail, routeGo) {
+		t.Errorf("the refusal detail does not name the windowed route %s: %q", routeGo, line)
+	}
+	for _, held := range []string{routeFreeAlias, routePaidAlias} {
+		if strings.Contains(detail, held) {
+			t.Errorf("the refusal detail names %s, which is not windowed here: %q", held, line)
+		}
 	}
 }
 

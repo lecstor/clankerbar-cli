@@ -5768,10 +5768,33 @@ section note.
 > BOTH are clear, so the per-route answer is the later of the two, and the wake
 > is the earliest of those across the list. The same grace a stated-reset wake
 > takes is added, for the same reason: a probe that lands a hair before the edge
-> pays a whole interval for its timing. Any route already clear returns no hint:
-> the walk would have probed it, and the interval is then the honest cadence.
-> When every route is marked with the fallback interval (no stated reset), the
-> hint is at or past the interval and the caller keeps the interval unchanged.
+> pays a whole interval for its timing. A route already clear returns no hint —
+> there is no future instant to wake at — but that is NOT evidence the walk
+> probed it: a mark can expire while a later route's probe is still running, and
+> the walk then stops at tried[route] without re-probing it. supervisedWait
+> covers that case through routeClearNow (CLA-988). When every route is marked
+> with the fallback interval (no stated reset), the hint is at or past the
+> interval and the caller keeps the interval unchanged.
+
+### routeClearAt
+
+> routeClearAt is the single per-route answer the wake hint and the clear-now
+> check both read: the later of the route's usage mark and a withholding pricing
+> window, or a time not after now when it is already usable. A "run" schedule
+> never withholds its route (it offers it back at peak), so only its mark can
+> hold it.
+
+### routeClearNow
+
+> routeClearNow reports whether one of the phase's routes is usable RIGHT NOW.
+> It exists for a wake that ran out of routes exactly as a route cleared: the
+> walk marked route A at its probe, A's mark expired while route B's probe was
+> still running, and the walk then stopped at "already tried" for A without
+> re-probing it. The hint only answers with a FUTURE instant, so without this
+> check the wait fell back to the whole interval with A sitting idle (CLA-988).
+> One grace out is the same precision a stated-reset wake takes; if the
+> provider's reset was approximate and the probe lands early, it simply marks
+> the route again.
 
 ### supervisedWait
 
@@ -5881,10 +5904,14 @@ section note.
 > The walk ends at the first unlimited probe (resume), at a budget ceiling
 > (stop), or when the next route
 > probeInvocation would aim at is already marked, already tried this wake, or
-> window-blocked; at most one probe per route per wake. Only then does the wait
-> sleep its interval, so walking cannot become a tight loop, and every probe is
-> still charged to the ledger as it lands (CLA-287). The cost is at most one
-> probe per route per wake: routes are few and a probe is minimal.
+> window-blocked; at most one probe per route per wake. It also reports WHICH
+> still-limited ending it reached — the walk exhausted, or a probe/spawn error —
+> because only the first can leave a route clear NOW and earn the one-grace
+> successor deadline; a probe that failed marks nothing, so waking at grace
+> after one would re-spawn it in a tight loop (CLA-988). Otherwise the wait
+> schedules its successor deadline and every probe is still charged to the
+> ledger as it lands (CLA-287). The cost is at most one probe per route per
+> wake: routes are few and a probe is minimal.
 >
 > A wake's first probe may land on a marked route: when every route is marked,
 > probeInvocation aims at the one whose mark lifts first, as before. A
