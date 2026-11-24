@@ -98,10 +98,10 @@ type holdState struct {
 //   - an own blocking question unanswered -> waiting with its task ref
 //   - otherwise -> idle
 //
-// A backed-off target (skipUntil still in the future) reports idle on purpose: the back-off is
-// minutes-long and self-clearing, and flapping the state to draining for every quiet spell would
-// blur the one signal draining exists for — "something is holding spawns closed until an operator
-// acts".
+// A backed-off target (skipUntil still in the future) contributes no presence state of its own: it
+// reports idle, or waiting while its own question stands. The back-off is minutes-long and
+// self-clearing, and flapping the state to draining for every quiet spell would blur the one signal
+// draining exists for — "something is holding spawns closed until an operator acts".
 func (d *Driver) fleetState(ti int) fleet.State {
 	d.iterMu.Lock()
 	s := d.iterAt(ti)
@@ -269,8 +269,8 @@ func (d *Driver) beaconLimited(resetAt time.Time) {
 // beaconSessionTargets is the in-session presence lap: the poll's own per-target beacon, for the
 // window in which the poll does not run. The running target reports what fleetState derives for it
 // (iteration with the current claim's ref and phase); every other target the daemon serves reports
-// its own state, which is idle - or draining while a pause holds its spawns - because no session is
-// running there.
+// its own state — idle, waiting while its own blocking question stands, or draining while a pause
+// holds its spawns — because no session is running there.
 func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
 	d.beacon(running, runningTarget, d.fleetState(running))
 	for i := range d.targets {
@@ -463,10 +463,11 @@ func (d *Driver) fleetShutdown() {
 // beginIteration marks target ti mid-drain and beacons the phase change NOW, so the console does
 // not wait out a poll interval to learn which phase is about to run.
 func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase string) {
-	// A drain starting is a fresh claim: whatever this target was waiting on has been answered or
-	// reclaimed, and the iteration below says what it is doing now. Reporting only — the spawn
-	// decisions have already been made.
-	d.clearWaiting(ti)
+	// A drain of the very task this target was waiting on is evidence its answer landed — the ask
+	// leaves that task blocked, so it cannot be claimed while the question stands. A drain of any
+	// OTHER task says nothing about the open question, so the marker stays until the poll sees the
+	// count fall back. Reporting only — the spawn decisions have already been made.
+	d.clearWaiting(ti, ref)
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{on: true, n: drainNum, ref: ref, phase: phase}

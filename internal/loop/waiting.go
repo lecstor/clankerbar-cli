@@ -51,6 +51,13 @@ func (d *Driver) noteWaiting(ti int, ref string) {
 		d.iterMu.Unlock()
 		return
 	}
+	// A marker already on means another of this target's questions is still outstanding: keep its
+	// pre-FIRST-ask baseline. Taking the later ask's count instead would clear the marker as soon as
+	// EITHER answer lands (the count falls to the other ask's baseline) and beacon idle while one of
+	// the daemon's own questions still stands. The state names the newest ref.
+	if d.waiting[ti].on {
+		base = d.waiting[ti].openQ
+	}
 	changed := !d.waiting[ti].on || d.waiting[ti].ref != ref
 	d.waiting[ti] = waitState{on: true, ref: ref, openQ: base}
 	d.iterMu.Unlock()
@@ -60,28 +67,31 @@ func (d *Driver) noteWaiting(ti int, ref string) {
 	d.persistWaiting()
 }
 
-// clearWaiting drops target ti's marker, reporting whether it held one. A drain that starts is a
-// fresh claim: whatever the daemon was waiting on was either answered or reclaimed, and the new
-// drain's own outcome will say what it is doing now.
-func (d *Driver) clearWaiting(ti int) bool {
-	d.iterMu.Lock()
-	if ti < 0 || ti >= len(d.waiting) || !d.waiting[ti].on {
-		d.iterMu.Unlock()
-		return false
+// clearWaiting drops target ti's marker when a drain is evidenced as the WAITED task reclaimed
+// under ref: a blocking ask leaves its task blocked, so a drain of that task can only start after
+// the answer landed. A drain of any other task says nothing about the open question, so the marker
+// stays — the poll's open-question count is the other clear path (clearAnsweredWaiting).
+func (d *Driver) clearWaiting(ti int, ref string) {
+	if ref == "" {
+		return
 	}
-	ref := d.waiting[ti].ref
+	d.iterMu.Lock()
+	if ti < 0 || ti >= len(d.waiting) || !d.waiting[ti].on || d.waiting[ti].ref != ref {
+		d.iterMu.Unlock()
+		return
+	}
 	d.waiting[ti] = waitState{}
 	d.iterMu.Unlock()
-	log.Printf("no longer waiting on %s — the question was answered or the task reclaimed", ref)
+	log.Printf("reclaimed %s after its blocking question was answered — no longer waiting", ref)
 	d.persistWaiting()
-	return true
 }
 
 // clearAnsweredWaiting clears the marker on a SUCCESSFUL poll once the open-question count is back
-// to (or below) where it stood before the ask: the answer landed. A poll failure must not call this
-// — its zero Summary would read as "every question answered". The summary carries no per-task
+// to (or below) where it stood before the FIRST ask: the answer landed. A poll failure must not call
+// this — its zero Summary would read as "every question answered". The summary carries no per-task
 // attribution, so another writer's question filed after ours can hold the count up and postpone the
-// flip; that is the price of keeping the beacon off a plane read of its own per poll.
+// flip, and with two of the daemon's own asks open the count has to fall past BOTH; that is the
+// price of keeping the beacon off a plane read of its own per poll.
 func (d *Driver) clearAnsweredWaiting(ti int, sum backlog.Summary) {
 	d.iterMu.Lock()
 	if ti < 0 || ti >= len(d.waiting) || !d.waiting[ti].on || sum.OpenQuestions > d.waiting[ti].openQ {
@@ -170,6 +180,8 @@ func (d *Driver) loadWaiting() {
 			continue
 		}
 		d.waiting[ti] = waitState{on: true, ref: rec.TaskRef, openQ: rec.OpenQuestions}
-		log.Printf("restored the waiting state: the question on %s is still unanswered", rec.TaskRef)
+		// Restored, not verified: the first successful poll decides whether the answer landed while
+		// the daemon was down.
+		log.Printf("restored the waiting state for %s from the saved record — the next poll decides whether its answer has landed", rec.TaskRef)
 	}
 }

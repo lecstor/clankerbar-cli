@@ -1960,8 +1960,9 @@ section note.
 ### fleetState
 
 > fleetState derives the presence State for target ti from what the loop already
-> tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases and
-> the hold marker set in holdThroughPause:
+> tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases,
+> the hold marker set in holdThroughPause, and the waiting marker set when a
+> drain ends by asking (CLA-535):
 >
 >   - held at a phase boundary by a pause window -> draining with the schedule
 >     reason, the window's end, and the held task's ref and phase (CLA-908).
@@ -1971,10 +1972,15 @@ section note.
 >   - console-, fleet-, startup- or budget-paused -> draining naming that cause:
 >     it is the one the operator has to act on, and it outranks the schedule.
 >   - schedule-paused            -> draining naming the window and its end
+>   - an own blocking question unanswered -> waiting {taskRef}, ranked below any
+>     deliberate pause (draining names why spawns are closed, waiting only what
+>     the poll waits on) and above idle: it is the one quiet state that needs
+>     the operator rather than reporting
 >   - otherwise                -> idle
 >
-> A backed-off target (skipUntil still in the future) reports idle on purpose:
-> the back-off is minutes-long and self-clearing, and flapping the state to
+> A backed-off target (skipUntil still in the future) contributes no presence
+> state of its own: it reports idle, or waiting while its own question stands.
+> The back-off is minutes-long and self-clearing, and flapping the state to
 > draining for every quiet spell would blur the one signal draining exists for —
 > "something is holding spawns closed until an operator acts".
 
@@ -2010,8 +2016,8 @@ section note.
 > per-target beacon, for the window in which the poll does not run. The running
 > target reports what fleetState derives for it (iteration with the current
 > claim's ref and phase); every other target the daemon serves reports its own
-> state, which is idle - or draining while a pause holds its spawns - because no
-> session is running there.
+> state — idle, waiting while its own blocking question stands, or draining while
+> a pause holds its spawns — because no session is running there.
 >
 > The other targets are not decoration. Each project has its own Fleet reporter
 > and its own project-scoped presence row, so beaconing only the running target

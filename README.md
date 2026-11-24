@@ -1833,10 +1833,12 @@ because the pause is the one time that poll and session cadences both stop:
   that changes what the project runs on moves it — and
   the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `waiting` {taskRef} while
-  a blocking question this instance filed is unanswered — the one quiet state
-  that needs the operator rather than reporting — `draining` while a pause
-  holds spawns, `limited` {resetAt} while the run is parked on a harness usage
-  limit (with the stated reset instant when the harness stated one), `stopping`
+  a blocking question this instance filed is unanswered — a drain of some other
+  task does not clear it; only the answer (or the waited task's reclaim) does —
+  the one quiet state that needs the operator rather than reporting —
+  `draining` while a pause holds spawns, `limited` {resetAt} while the run is
+  parked on a harness usage limit (with the stated reset instant when the
+  harness stated one), `stopping`
   as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
   to learn which phase is running; a session in progress re-beacons the same

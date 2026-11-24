@@ -381,9 +381,10 @@ type Result struct {
 
 	Claim Claim
 
-	// BlockingAsk names the task a SUCCESSFUL blocking ask_question was filed on, exactly as the
-	// session's argument spelled it (a UUID or a qualified ref); "" when the session filed no
-	// blocking ask. A blocking ask sets its task `blocked` and releases the run's claim, so the
+	// BlockingAsk names the task a blocking ask was filed on: a SUCCESSFUL ask_question records the
+	// session's argument exactly as spelled (a UUID or a qualified ref), and a SUCCESSFUL
+	// escalate_question records the held claim's ref/label it escalated; "" when the session filed
+	// no blocking ask. A blocking ask sets its task `blocked` and releases the run's claim, so the
 	// loop reports `waiting` on that task instead of claiming the task was worked (CLA-535).
 	//
 	// It is kept on the Result rather than the Claim because a runner-claimed session files its
