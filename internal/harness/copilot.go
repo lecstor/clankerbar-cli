@@ -562,8 +562,8 @@ func (copilot) WallClockCapped(res Result) bool {
 func (copilot) ZeroUsageUnknown(Result) bool { return false }
 
 // copilot observes the session's clankerbar tool calls through the shared observer
-// (noteToolUse/noteToolResult), so Result.Claim, Reports, Settled and ClankerbarCalls are all
-// populated and a phased config is allowed. ReportsCost is false for a harder reason than "not
+// (noteToolUse/noteToolResult), so Result.Claim, BlockingAsk, Reports, Settled and ClankerbarCalls
+// are all populated and a phased config is allowed. ReportsCost is false for a harder reason than "not
 // implemented": Copilot reports AI CREDITS (and premium requests), never money.
 func (copilot) Capabilities() Capabilities {
 	return Capabilities{

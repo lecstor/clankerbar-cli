@@ -85,7 +85,9 @@ func (d *Driver) clearWaiting(ti int) bool {
 
 // clearAnsweredWaiting clears the marker on a SUCCESSFUL poll once the open-question count is back
 // to (or below) where it stood before the ask: the answer landed. A poll failure must not call this
-// — its zero Summary would read as "every question answered".
+// — its zero Summary would read as "every question answered". The summary carries no per-task
+// attribution, so another writer's question filed after ours can hold the count up and postpone the
+// flip; that is the price of keeping the beacon off a plane read of its own per poll.
 func (d *Driver) clearAnsweredWaiting(ti int, sum backlog.Summary) {
 	d.iterMu.Lock()
 	if ti < 0 || ti >= len(d.waiting) || !d.waiting[ti].on || sum.OpenQuestions > d.waiting[ti].openQ {
