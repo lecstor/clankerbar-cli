@@ -13,20 +13,28 @@ import (
 // the operator's agent fixes it. A remedy for a setup precondition without the section it means is a
 // finding with no instructions, which is the rediscovery loop the skill exists to end.
 
+// The expectations here are literal on purpose: every other test derives its expected pointer from
+// setupSkillSection, so without this one a typo in the URL or the format would move both sides of
+// the comparison and ship a pointer the reader cannot follow.
 func TestSetupSkillSectionNamesTheServedSkill(t *testing.T) {
 	for _, tc := range []struct {
 		section int
 		topic   string
-		want    []string
+		want    string
 	}{
-		{1, "agent-instructions file", []string{"clankerbar-setup section 1", "(agent-instructions file)", setupSkillURL}},
-		{2, "pre-allow every toolchain", []string{"clankerbar-setup section 2", "(pre-allow every toolchain)", setupSkillURL}},
+		{
+			1,
+			"agent-instructions file",
+			"see clankerbar-setup section 1 (agent-instructions file) at clankerbar.com/skills/clankerbar-setup.md",
+		},
+		{
+			2,
+			"pre-allow every toolchain",
+			"see clankerbar-setup section 2 (pre-allow every toolchain) at clankerbar.com/skills/clankerbar-setup.md",
+		},
 	} {
-		got := setupSkillSection(tc.section, tc.topic)
-		for _, want := range tc.want {
-			if !strings.Contains(got, want) {
-				t.Errorf("setupSkillSection(%d, %q) = %q, want it to name %q", tc.section, tc.topic, got, want)
-			}
+		if got := setupSkillSection(tc.section, tc.topic); got != tc.want {
+			t.Errorf("setupSkillSection(%d, %q) = %q, want %q", tc.section, tc.topic, got, tc.want)
 		}
 	}
 }
