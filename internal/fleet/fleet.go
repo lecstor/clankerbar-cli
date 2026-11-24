@@ -36,12 +36,17 @@ import (
 
 // The presence states a daemon can report. They are the plane's vocabulary
 // (@clankerbar/shared INSTANCE_STATES) verbatim — the plane is a pipe, not a
-// judge, so the CLI owns the mapping from what its loop is doing to these four:
+// judge, so the CLI owns the mapping from what its loop is doing to these:
 //
 //   - idle      alive and polling, holding nothing, spawning normally
 //   - iteration mid-drain: n is the 1-based iteration number, taskRef the task
 //     being worked (empty until a claim has been observed), phase the label of
 //     the phase session about to spawn or running
+//   - waiting   alive and polling, with a blocking question OF ITS OWN standing
+//     unanswered (CLA-527/CLA-535): the plane set the task `blocked` and the
+//     operator is the only one who can move it. taskRef names the task whose
+//     answer is outstanding. Distinct from idle on purpose — this is the one
+//     quiet state that needs a human.
 //   - draining  alive but not spawning new sessions (console pause, fleet pause,
 //     startup-failure pause, budget ceiling, scheduled pause window). It carries
 //     the one cause the operator has to act on (State.PauseReason), and the
@@ -56,6 +61,7 @@ import (
 const (
 	StateIdle      = "idle"
 	StateIteration = "iteration"
+	StateWaiting   = "waiting"
 	StateDraining  = "draining"
 	StateStopping  = "stopping"
 	StateLimited   = "limited"
@@ -113,7 +119,7 @@ const (
 type State struct {
 	Kind    string // one of the State* constants
 	N       int    // iteration number, when Kind is iteration
-	TaskRef string // task being worked ("CLA-466"), when known; the HELD task on a schedule pause
+	TaskRef string // task being worked ("CLA-466"), when known; the task whose answer is outstanding on waiting; the HELD task on a schedule pause
 	Phase   string // phase label, when Kind is iteration, or the held phase on a schedule pause
 	// ResetAt is the harness's stated limit-reset instant, only meaningful on
 	// Kind == limited (CLA-728). The zero value means the harness stated no

@@ -673,6 +673,7 @@ func (p *opencodeParse) finish(res *Result) {
 	// What the session did with the backlog. Copied rather than accumulated in place because res does
 	// not exist until the process has exited; see the `observed` field.
 	res.Claim = p.observed.Claim
+	res.BlockingAsk = p.observed.BlockingAsk
 	res.Reports = p.observed.Reports
 	res.ClankerbarCalls = p.observed.ClankerbarCalls
 	res.UsageReported = p.sawUsage

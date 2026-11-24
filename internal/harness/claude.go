@@ -265,6 +265,22 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 	// there is nothing to check and nothing to complain about.
 	res.settleReport(toolUseID, !isError)
 
+	// A blocking ask has its own bookkeeping: the DRIVER needs the task it named even when the
+	// session held no claim (a runner-claimed session asks on the runner's behalf), while a
+	// success must still count as this session's handback when it DOES name the held claim.
+	if ask, waiting := res.pendingAsks[toolUseID]; waiting {
+		delete(res.pendingAsks, toolUseID)
+		if isError {
+			return
+		}
+		res.BlockingAsk = ask.taskID
+		if ask.mine {
+			res.Claim.Settled = true
+			res.notifyClaim()
+		}
+		return
+	}
+
 	kind, waiting := res.pending[toolUseID]
 	if !waiting {
 		return
@@ -390,12 +406,16 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			TaskID   string `json:"taskId"`
 			Blocking bool   `json:"blocking"`
 		}
-		if json.Unmarshal(input, &args) != nil {
+		if json.Unmarshal(input, &args) != nil || !args.Blocking {
 			return
 		}
-		if args.Blocking && res.Claim.Names(args.TaskID) {
-			res.expect(toolUseID, pendingSettle)
+		// Armed for ANY task: the driver compares it with the task IT holds, which a
+		// runner-claimed session never sees as its own claim. `mine` is the narrower
+		// question the session itself needs answered on success.
+		if res.pendingAsks == nil {
+			res.pendingAsks = map[string]askRequest{}
 		}
+		res.pendingAsks[toolUseID] = askRequest{taskID: args.TaskID, mine: res.Claim.Names(args.TaskID)}
 
 	case escalateQuestionTool:
 		// This one takes a questionId, so the held task cannot be confirmed from the arguments.

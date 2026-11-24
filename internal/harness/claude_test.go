@@ -286,6 +286,82 @@ func TestClaudeClaimTracking(t *testing.T) {
 	}
 }
 
+// CLA-535: a successful blocking ask names the task it blocked, which the driver reports as
+// `waiting` on. It is recorded even when the session never claimed that task itself — a
+// runner-claimed session asks on the runner's behalf and sees no claim of its own.
+func TestClaudeBlockingAsk(t *testing.T) {
+	tests := []struct {
+		name      string
+		lines     []string
+		wantClaim Claim
+		wantAsk   string
+	}{
+		{
+			name: "a blocking ask on the held claim is recorded and settles it",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"which?","blocking":true}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			wantClaim: settled(),
+			wantAsk:   claimUUID,
+		},
+		{
+			name: "a blocking ask named by ref is recorded as spelled",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimRef+`","question":"which?","blocking":true}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			wantClaim: settled(),
+			wantAsk:   claimRef,
+		},
+		{
+			name: "a NON-blocking ask is not a wait",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"fyi","blocking":false}`),
+				toolResult("u2", `{"taskBlocked":false}`),
+			),
+			wantClaim: heldClaim(),
+		},
+		{
+			name: "a REFUSED blocking ask changed nothing on the plane",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"which?","blocking":true}`),
+				toolResultErr("u2", "not_held"),
+			),
+			wantClaim: heldClaim(),
+		},
+		{
+			name: "a blocking ask about someone else's task does not settle mine but is recorded",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"other-uuid","question":"q","blocking":true}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			wantClaim: heldClaim(),
+			wantAsk:   "other-uuid",
+		},
+		{
+			name: "a session holding no claim records the ask without inventing a handback",
+			lines: []string{
+				toolUse("u1", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"which?","blocking":true}`),
+				toolResult("u1", `{"taskBlocked":true}`),
+			},
+			wantClaim: Claim{},
+			wantAsk:   claimUUID,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := claimStream(tt.lines...)
+			if got.Claim != tt.wantClaim {
+				t.Errorf("Claim = %+v, want %+v", got.Claim, tt.wantClaim)
+			}
+			if got.BlockingAsk != tt.wantAsk {
+				t.Errorf("BlockingAsk = %q, want %q", got.BlockingAsk, tt.wantAsk)
+			}
+		})
+	}
+}
+
 func TestClaimHeld(t *testing.T) {
 	tests := []struct {
 		name  string
