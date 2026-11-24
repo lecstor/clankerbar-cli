@@ -1820,7 +1820,8 @@ because the pause is the one time that poll and session cadences both stop:
 > the plane — accepting `state.kind: "limited"` and `state.resetAt` — before a
 > CLI that sends it reaches the fleet. Against an older plane every beacon is
 > rejected, not just the `limited` ones, and the instance goes dark in every
-> state.
+> state. `waiting` carries the same constraint and needs the plane's CLA-527
+> (accepting `state.kind: "waiting"` with an optional `taskRef`).
 
 - **Presence** rides each backlog poll: who the instance is (`instance_name`;
   when unset it resolves to the machine's hostname plus the config file's
@@ -1831,9 +1832,14 @@ because the pause is the one time that poll and session cadences both stop:
   document when one is ratified, else the local file), so a ratified document
   that changes what the project runs on moves it — and
   the state — `idle`,
-  `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
-  holds spawns, `limited` {resetAt} while the run is parked on a harness usage
-  limit (with the stated reset instant when the harness stated one), `stopping`
+  `iteration` {n, taskRef, phase} while a session runs, `waiting` {taskRef} while
+  a blocking question this instance filed is unanswered (the newest one when
+  several of its own stand) — a drain of some other task does not clear it; only
+  the answer (or the waited task's reclaim) does —
+  the one quiet state that needs the operator rather than reporting —
+  `draining` while a pause holds spawns, `limited` {resetAt} while the run is
+  parked on a harness usage limit (with the stated reset instant when the
+  harness stated one), `stopping`
   as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
   to learn which phase is running; a session in progress re-beacons the same
@@ -1844,7 +1850,8 @@ because the pause is the one time that poll and session cadences both stop:
   the lease beat, after renewal stands down on a plane that refuses it, since
   the fleet report is a different transport and a healthy instance must not go
   dark mid-session; every other project the daemon serves is re-beaconed its own
-  `idle`/`draining` state on the same tick, for the same reason one project over;
+  `idle`/`waiting`/`draining` state on the same tick, for the same reason one
+  project over;
   and a limit wait re-beacons `limited`
   every five minutes — well inside the plane's liveness window — so hours spent
   waiting out a cap do not read on the console as a dead instance. The plane

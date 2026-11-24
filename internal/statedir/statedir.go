@@ -103,6 +103,12 @@ const RouteMarksName = "ROUTE_MARKS"
 // daemon — from replaying numbers the plane would drop as duplicates.
 const RunEventSeqName = "RUN_EVENT_SEQ"
 
+// WaitingName is the daemon's record of a blocking question it filed and still
+// waits on (CLA-535), keyed by target, so a restarted process keeps beaconing
+// `waiting` with the task ref instead of falling back to `idle`. The task itself
+// is on the plane; this only carries the name the summary cannot give.
+const WaitingName = "WAITING"
+
 // DaemonLogName is the daemon's own log file in its state dir (CLA-701): the
 // process's `log.Printf` lines, rotated at a size bound by internal/logfile.
 // It is named here because this package's adoption check has to recognise it —
@@ -673,6 +679,9 @@ func (d *Dir) isOurArtifact(name string) bool {
 		// The agent event channel's per-run sequence counter (CLA-603). A daemon
 		// restart mid-run must resume after the mark, not replay it.
 		name == RunEventSeqName, name == RunEventSeqName+".tmp",
+		// The outstanding blocking ask (CLA-535). A daemon restarted while waiting
+		// must still know which task the summary's open-question count refers to.
+		name == WaitingName, name == WaitingName+".tmp",
 		// The daemon's own log and its rotated siblings (CLA-701). A pre-sentinel
 		// state dir holding one is still ours, and `doctor` opens the same
 		// directory a daemon writes it into.

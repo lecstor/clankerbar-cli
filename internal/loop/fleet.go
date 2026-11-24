@@ -89,18 +89,24 @@ type holdState struct {
 	zone  string
 }
 
-// fleetState derives the presence State for target ti from what the loop already tracks — no new
-// bookkeeping beyond the mid-drain marker set in drainPhases and the hold marker set in
-// holdThroughPause: - held at a phase boundary by a pause window -> draining with the schedule
-// reason, the window's end, and the held task's ref and phase. - schedule-paused -> draining naming
-// the window and its end - otherwise -> idle A backed-off target (skipUntil still in the future)
-// reports idle on purpose: the back-off is minutes-long and self-clearing, and flapping the state
-// to draining for every quiet spell would blur the one signal draining exists for — "something is
-// holding spawns closed until an operator acts".
+// fleetState derives the presence State for target ti from what the loop already tracks — the
+// mid-drain marker set in drainPhases, the hold marker set in holdThroughPause, and the waiting
+// marker set when a drain ends by asking:
+//   - held at a phase boundary by a pause window -> draining with the schedule reason, the window's
+//     end, and the held task's ref and phase
+//   - schedule-paused -> draining naming the window and its end
+//   - an own blocking question unanswered -> waiting with the newest such ask's task ref
+//   - otherwise -> idle
+//
+// A backed-off target (skipUntil still in the future) contributes no presence state of its own: it
+// reports idle, or waiting while its own question stands. The back-off is minutes-long and
+// self-clearing, and flapping the state to draining for every quiet spell would blur the one signal
+// draining exists for — "something is holding spawns closed until an operator acts".
 func (d *Driver) fleetState(ti int) fleet.State {
 	d.iterMu.Lock()
 	s := d.iterAt(ti)
 	h := d.holdAt(ti)
+	w := d.waitingAt(ti)
 	d.iterMu.Unlock()
 	// A running session outranks every pause flag: the flags only ever hold the NEXT spawn, and the
 	// iteration is what the Fleet page shows while work is in flight.
@@ -114,6 +120,13 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	}
 	if d.schedPaused {
 		return d.scheduleState(h)
+	}
+	// A blocking question of this target's own is the one quiet state that needs the operator, so
+	// it says so rather than reading as a daemon with nothing to do. It ranks below a pause the
+	// operator set deliberately: draining names the reason spawns are closed, waiting only what the
+	// poll is waiting on.
+	if w.on {
+		return fleet.State{Kind: fleet.StateWaiting, TaskRef: w.ref()}
 	}
 	return fleet.State{Kind: fleet.StateIdle}
 }
@@ -256,8 +269,8 @@ func (d *Driver) beaconLimited(resetAt time.Time) {
 // beaconSessionTargets is the in-session presence lap: the poll's own per-target beacon, for the
 // window in which the poll does not run. The running target reports what fleetState derives for it
 // (iteration with the current claim's ref and phase); every other target the daemon serves reports
-// its own state, which is idle - or draining while a pause holds its spawns - because no session is
-// running there.
+// its own state — idle, waiting while its own blocking question stands, or draining while a pause
+// holds its spawns — because no session is running there.
 func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
 	d.beacon(running, runningTarget, d.fleetState(running))
 	for i := range d.targets {
@@ -450,6 +463,11 @@ func (d *Driver) fleetShutdown() {
 // beginIteration marks target ti mid-drain and beacons the phase change NOW, so the console does
 // not wait out a poll interval to learn which phase is about to run.
 func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase string) {
+	// A drain of the very task this target was waiting on is evidence its answer landed — the ask
+	// leaves that task blocked, so it cannot be claimed while the question stands. A drain of any
+	// OTHER task says nothing about the open question, so the marker stays until the poll sees the
+	// count fall back. Reporting only — the spawn decisions have already been made.
+	d.clearWaiting(ti, ref)
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{on: true, n: drainNum, ref: ref, phase: phase}

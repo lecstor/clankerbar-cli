@@ -327,6 +327,39 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 	}
 }
 
+// CLA-535: a daemon waiting on the answer to one of its own blocking questions
+// says `waiting` and names the task as taskRef — the plane renders "waiting on
+// <ref>" and counts the fresh row as blocked on a question. The pause payload
+// belongs to draining and must not ride along.
+func TestMarshalReport_WaitingStateCarriesTheTaskRef(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateWaiting, TaskRef: "CLA-535"},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Kind        string `json:"kind"`
+			TaskRef     string `json:"taskRef"`
+			PauseReason string `json:"pauseReason"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.State.Kind != "waiting" {
+		t.Errorf("state.kind = %q, want waiting (%s)", got.State.Kind, b)
+	}
+	if got.State.TaskRef != "CLA-535" {
+		t.Errorf("state.taskRef = %q, want CLA-535 (%s)", got.State.TaskRef, b)
+	}
+	if got.State.PauseReason != "" {
+		t.Errorf("state.pauseReason = %q on a waiting state, want none", got.State.PauseReason)
+	}
+}
+
 // CLA-677: each iteration carries the drain's dollar spend as `costUsd`. It is
 // always present — deliberately UNLIKE `tokens`, which is omitempty — because a
 // zero here is a figure (the harnesses reported no cost), not an unknown the

@@ -273,6 +273,9 @@ func (r *phaseRun) openPhaseEnd(at *phaseAttempt) {
 	if at.res.Claim.TaskID != "" {
 		r.end.claim = &at.res
 	}
+	// Kept even when the session observed no claim: a runner-claimed session asks about the task
+	// the RUNNER holds, which only the driver can match.
+	r.end.blockingAsk = at.res.BlockingAsk
 	// CLA-630: the session this pass actually spawned, in exactly the words the spawn line above used
 	// — the phase's label, the phase's resolved harness, and the resolved model (empty when the
 	// harness default applied; never guessed).

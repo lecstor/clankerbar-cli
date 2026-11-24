@@ -107,6 +107,10 @@ type drainSeq struct {
 	// read `dead` — see phaseEnd.producedNothing.
 	finalDead           bool
 	lastProducedNothing bool
+	// askedRef is the task this drain ended by filing a blocking question on — s.seen's label at
+	// the phase that asked, "" when no phase did. recordIteration turns it into the target's
+	// waiting marker before the closing beacon (CLA-535).
+	askedRef string
 }
 
 func (s *drainSeq) recordIteration() {
@@ -125,6 +129,12 @@ func (s *drainSeq) recordIteration() {
 		outcome = fleet.OutcomeDead
 	case outcome == "":
 		outcome = fleet.OutcomeReleased
+	}
+	// CLA-535: the drain ended by asking, so the next polls report `waiting` on that task until
+	// its answer lands (the poll's open-question count clears the marker). Reporting only — the
+	// outcome and the record below are unchanged.
+	if s.askedRef != "" {
+		d.noteWaiting(ti, s.askedRef)
 	}
 	d.endIteration(ti, t, fleet.Iteration{
 		TaskID:          s.seen.TaskID,
