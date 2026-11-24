@@ -298,26 +298,36 @@ func writeCachedRoster(dir string, entries []RosterEntry) {
 		log.Printf("roster: cannot create the cache dir %s (%v) - offline starts will have nothing to reconcile from", dir, err)
 		return
 	}
-	// Remove-then-create through O_EXCL, like the materialized-config write: a
-	// symlink planted at the name is removed, never followed.
-	if _, err := os.Lstat(path); err == nil {
-		if err := os.Remove(path); err != nil {
-			log.Printf("roster: cannot replace %s (%v)", path, err)
-			return
-		}
+	// Write a same-directory temp and rename it over the cache. Removing the
+	// old file first would leave a window where a cold start (or a crash
+	// between the two calls) sees no roster at all; rename replaces the name in
+	// one step, so a reader sees either the old roster or the new one. The
+	// temp's O_EXCL removes a planted symlink rather than following it, and
+	// rename swaps the destination entry itself, never its target.
+	tmp := path + ".tmp"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("roster: cannot replace %s (%v)", path, err)
+		return
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		log.Printf("roster: cannot write %s (%v)", path, err)
 		return
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
+		_ = os.Remove(tmp)
 		log.Printf("roster: cannot write %s (%v)", path, err)
 		return
 	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		log.Printf("roster: cannot write %s (%v)", path, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("roster: cannot replace %s (%v)", path, err)
 	}
 }
 
