@@ -232,9 +232,9 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 		c.status = warn
 		c.detail = workdirLabel(dir) + " has no agent-instructions file (" + strings.Join(agentInstructionFiles, " / ") + ")"
 		if parent {
-			c.remedy = "add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it"
+			c.remedy = "add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it — " + setupSkillSection(1, "agent-instructions file")
 		} else {
-			c.remedy = "add one so unattended sessions read the project's conventions instead of inferring them"
+			c.remedy = "add one so unattended sessions read the project's conventions instead of inferring them — " + setupSkillSection(1, "agent-instructions file")
 		}
 		return c
 	}
