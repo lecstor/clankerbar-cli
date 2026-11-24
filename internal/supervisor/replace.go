@@ -125,11 +125,11 @@ func Replace(ctx context.Context, o Options) error {
 }
 
 // writeReplaceMarker writes the REPLACE marker into the supervisor's cache
-// dir. The write is remove-then-create through O_EXCL, like the cached-roster
-// write: a symlink planted at the name is removed, never followed. An
-// existing marker is overwritten — re-running the command refreshes the
-// request (a fresh timestamp is what makes the marker honourable to a
-// supervisor that had already discarded an older one).
+// dir. The write is remove-then-create through O_EXCL: a symlink planted at
+// the name is removed, never followed. An existing marker is overwritten —
+// re-running the command refreshes the request (a fresh timestamp is what
+// makes the marker honourable to a supervisor that had already discarded an
+// older one).
 func writeReplaceMarker(dir, v string) error {
 	path := filepath.Join(dir, replaceMarkerName)
 	body := []byte(fmt.Sprintf("supervisor replace requested at %s by %s\n", time.Now().UTC().Format(time.RFC3339), v))
