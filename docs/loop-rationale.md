@@ -1914,25 +1914,6 @@ section note.
 > marker is still the only evidence the phase ran.
 
 
-## `internal/loop/start_phase.go`
-
-### The SHOULD row
-
-> CLA-987: a review at the tip may close with 0 MUSTs and open SHOULDs. A start
-> that treats that record as a clean hand-over skips the fix phase an
-> uninterrupted implement -> review -> fix -> verify run would have had, so the
-> PR opens without even the cheap SHOULDs being applied or filed. The row sits
-> after the MUST rows — an older open MUST still outlives its tip and belongs to
-> the verifier — and only a released record at this exact tip selects it: a
-> SHOULD raised on an older tip, or one on a sealed/void record, is not evidence
-> this tip needs fixing.
->
-> The row is deliberately bounded to one fix per review. Only a fix phase in the
-> sequence can answer it (a 2-phase implement -> review falls through to the
-> hand-over), and phasesDone.fix at the tip turns the row off, which is what
-> stops a fix that declined the SHOULD from looping.
-
-
 ## `internal/loop/fleet.go`
 
 ### fleet.go
@@ -5506,6 +5487,25 @@ section note.
 > deliberately not read here — it gates new claims and lets the in-flight task
 > finish every phase (decision 6019ea26-1464-43a3-a152-3271510b8b42). RELOAD,
 > RESTART_NOW and HALT keep their existing boundaries.
+
+
+## `internal/loop/start_phase.go`
+
+### The SHOULD row
+
+> CLA-987: a review at the tip may close with 0 MUSTs and open SHOULDs. A start
+> that treats that record as a clean hand-over skips the fix phase an
+> uninterrupted implement -> review -> fix -> verify run would have had, so the
+> PR opens without even the cheap SHOULDs being applied or filed. The row sits
+> after the MUST rows — an older open MUST still outlives its tip and belongs to
+> the verifier — and only a released record at this exact tip selects it: a
+> SHOULD raised on an older tip, or one on a sealed/void record, is not evidence
+> this tip needs fixing.
+>
+> The row is deliberately bounded to one fix per review. Only a fix phase in the
+> sequence can answer it (a 2-phase implement -> review falls through to the
+> hand-over), and phasesDone.fix at the tip turns the row off, which is what
+> stops a fix that declined the SHOULD from looping.
 
 
 ## `internal/loop/task_worktree.go`
