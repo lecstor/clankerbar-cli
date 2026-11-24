@@ -39,6 +39,29 @@ func TestDrainHandsBackAndCountsSpendWhenInvokeDiesInWait(t *testing.T) {
 	}
 }
 
+// The post-fix side of the same seam (CLA-430): once the adapter reads a WaitDelay death as the clean
+// end it is, Invoke returns that parsed Result with a nil error, and the drain must treat the attempt
+// as successful - no invoke failure, spend counted - rather than failing a session that finished.
+func TestDrainTreatsACleanWaitDelayEndAsASuccessfulAttempt(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+
+	h := &fakeAdapter{steps: []invokeStep{{
+		res: held(okResult(1200, 0.5), openClaim()),
+	}}}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller()}})
+	openTestStateDir(t, d)
+
+	tokens, cost, _, err := drainOnce(t, d)
+	if err != nil {
+		t.Fatalf("drain error = %v — a Result the adapter classified as a clean end must not fail the attempt as an invoke error", err)
+	}
+	if tokens != 1200 || cost != 0.5 {
+		t.Errorf("drain returned tokens=%d cost=$%.2f, want 1200/$0.50 — the finished session's spend must reach the accumulators", tokens, cost)
+	}
+}
+
 // The boundary case of the same arm: a LAUNCH failure also arrives as
 // res-alongside-err, but its Result is an honest zero, so counting it changes
 // nothing and releasing it releases nothing.

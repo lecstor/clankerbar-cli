@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -229,6 +230,10 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
+	} else if errors.Is(waitErr, exec.ErrWaitDelay) && !c.TokenCeilingHit(res) && res.ToolLoop == "" && res.IdleKilled == "" {
+		// The session exited 0 and only an inherited pipe outlived it: os/exec guarantees ErrWaitDelay
+		// means a successful exit, so this is the finished session, never an invoke error (CLA-430,
+		// symmetric with opencode's CLA-414 arm). ExitCode stays 0 for the driver's success path.
 	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" && res.IdleKilled == "" {
 		return res, waitErr // couldn't run claude at all
 	} else if waitErr != nil {
