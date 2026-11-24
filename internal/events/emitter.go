@@ -144,6 +144,13 @@ type Emitter struct {
 	// only, and a runaway run must degrade rather than bill unbounded.
 	transcriptStopped bool
 
+	// sendCtx bounds every POST the sender makes. Close cancels it at
+	// CloseGrace: a flush that is mid-request cannot see done until it returns,
+	// so cancellation is what bounds an in-flight send and releases the run's
+	// Seq.SendLock promptly for the next phase's emitter.
+	sendCtx    context.Context
+	cancelSend context.CancelFunc
+
 	wake     chan struct{}
 	done     chan struct{}
 	finished chan struct{}
@@ -155,11 +162,14 @@ type Emitter struct {
 // eventually Close it; adapters do so when the session ends.
 func New(cfg Config) *Emitter {
 	cfg.defaults()
+	sendCtx, cancelSend := context.WithCancel(context.Background())
 	return &Emitter{
-		cfg:      cfg,
-		wake:     make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		finished: make(chan struct{}),
+		cfg:        cfg,
+		sendCtx:    sendCtx,
+		cancelSend: cancelSend,
+		wake:       make(chan struct{}, 1),
+		done:       make(chan struct{}),
+		finished:   make(chan struct{}),
 	}
 }
 
@@ -437,10 +447,11 @@ func (e *Emitter) signal() {
 }
 
 // run is the sender goroutine: timer-driven, woken early when enough events are
-// buffered. It ends on Close, after one bounded final flush.
+// buffered. It ends on Close, after draining the buffer within CloseGrace.
 func (e *Emitter) run() {
 	ticker := time.NewTicker(e.cfg.FlushEvery)
 	defer ticker.Stop()
+	defer e.cancelSend()
 	for {
 		select {
 		case <-ticker.C:
@@ -448,11 +459,30 @@ func (e *Emitter) run() {
 		case <-e.wake:
 			e.flush(4, e.cfg.SendTimeout)
 		case <-e.done:
-			e.flush(1, e.cfg.SendTimeout)
+			// The session is over: drain the whole bounded buffer, all of it
+			// within the close grace. flush draws its deadline from sendCtx,
+			// which Close cancels at that same grace — including a POST that was
+			// already in flight — so the sender can never outlive the goodbye
+			// holding the run's send slot.
+			e.flush(e.finalBatches(), e.cfg.SendTimeout)
+			e.cancelSend()
+			e.finish()
 			close(e.finished)
 			return
 		}
 	}
+}
+
+// finalBatches bounds the final drain. One batch per buffered event is the
+// pessimistic shape: a body-cap-sized transcript event makes a batch carry a
+// single event, so counting from MaxBatchEvents would stop short and leave
+// events the plane would have accepted. A flush that empties the buffer returns
+// on its own, and the close grace bounds the whole drain.
+func (e *Emitter) finalBatches() int {
+	if e.cfg.MaxBuffered < 1 {
+		return 1
+	}
+	return e.cfg.MaxBuffered
 }
 
 // maxSendAttempts bounds a rate-limited batch: the first try plus two retries.
@@ -475,13 +505,26 @@ const (
 // duplicate). A failed batch is dropped, but the sequence numbers are still
 // committed, so the next batch does not collide with a send that may have
 // landed.
+//
+// Every send is bounded by sendCtx as well as its own timeout, so Close's grace
+// cancels a POST in flight instead of letting it run out the sender's slot.
 func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 	for i := 0; i < maxBatches; i++ {
+		if e.sendCtx.Err() != nil {
+			return // closing and out of grace: take no more work
+		}
 		runID := e.currentRunID()
 		if runID == "" {
 			return
 		}
 		unlock := e.cfg.Seq.SendLock(runID)
+		if e.sendCtx.Err() != nil {
+			// The grace expired while this flush waited for the run's send slot.
+			// Taking a batch now would remove events that can never be posted,
+			// so finish would under-report them as sent.
+			unlock()
+			return
+		}
 		body, sentRun, maxSeq, n := e.takeBatch()
 		if n == 0 {
 			unlock()
@@ -491,7 +534,7 @@ func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 		// batch lands but before the commit must leave the next process starting
 		// above this batch, not reusing numbers the plane would drop.
 		e.cfg.Seq.Persist(sentRun)
-		res := e.send(sentRun, body, timeout)
+		res := e.send(e.sendCtx, sentRun, body, timeout)
 		e.cfg.Seq.Commit(sentRun, maxSeq)
 		unlock()
 		if res.transcriptDropped > 0 {
@@ -502,6 +545,11 @@ func (e *Emitter) flush(maxBatches int, timeout time.Duration) {
 		}
 		if res.stop {
 			e.disable()
+			return
+		}
+		if e.sendCtx.Err() != nil {
+			// Shutdown cancelled this batch: it is lost by design, not a plane
+			// failure worth a failure line.
 			return
 		}
 		if res.err != nil {
@@ -528,10 +576,10 @@ type sendResult struct {
 // send posts one batch, retrying a rate limit a bounded number of times. The
 // body carries seq numbers already allocated and is re-sent unchanged: the plane
 // drops any seq it has already accepted, so a retry cannot double a batch.
-func (e *Emitter) send(runID string, body []byte, timeout time.Duration) sendResult {
+func (e *Emitter) send(ctx context.Context, runID string, body []byte, timeout time.Duration) sendResult {
 	var res sendResult
 	for attempt := 1; ; attempt++ {
-		res = e.post(runID, body, timeout)
+		res = e.post(ctx, runID, body, timeout)
 		if !res.retryable || attempt >= maxSendAttempts {
 			return res
 		}
@@ -547,6 +595,8 @@ func (e *Emitter) send(runID string, body []byte, timeout time.Duration) sendRes
 		case <-e.done:
 			// Closing: holding the run's send slot for a retry nobody waits for
 			// would only delay the next session.
+			return res
+		case <-ctx.Done():
 			return res
 		}
 	}
@@ -657,8 +707,8 @@ func buildBatch(pending []event, runID, harness string, seq *SeqCounter) (body [
 // refused it for a reason that will not change (the dial is off, the run ended).
 // retryable means a rate limit, which the caller retries a bounded number of
 // times with the same body.
-func (e *Emitter) post(runID string, body []byte, timeout time.Duration) sendResult {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (e *Emitter) post(ctx context.Context, runID string, body []byte, timeout time.Duration) sendResult {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	endpoint := strings.TrimRight(e.cfg.Origin, "/") + "/api/runs/" + url.PathEscape(runID) + "/events"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -761,10 +811,18 @@ func (e *Emitter) noteSuccess() {
 	}
 }
 
-// Close stops the sender after one bounded final flush. It never fails and never
-// blocks longer than CloseGrace; the session's own result does not depend on it.
+// Close stops the sender and drains the buffer within CloseGrace. It never fails
+// and never blocks longer than CloseGrace; the session's own result does not
+// depend on it.
 // Events that never learned a run id are dropped here, with one line when there
 // were any: a fresh session that never claimed has nothing to report against.
+//
+// The sender owns pending: Close signals and waits, then cancels the sender's
+// context at the grace. That cancellation is what bounds a flush already in
+// flight — the sender cannot see done until it returns — and it releases the
+// run's Seq.SendLock promptly for the next phase's emitter. It also means Close
+// never clears the buffer underneath an active flush: run reports the leftovers
+// itself, after the drain.
 func (e *Emitter) Close() {
 	if e == nil {
 		return
@@ -774,31 +832,46 @@ func (e *Emitter) Close() {
 		e.stopped = true
 		started := e.started
 		e.mu.Unlock()
-		if started {
-			close(e.done)
-			timer := time.NewTimer(e.cfg.CloseGrace)
-			select {
-			case <-e.finished:
-				timer.Stop()
-			case <-timer.C:
-			}
+		if !started {
+			// No sender goroutine exists, so nothing can be in flight and the
+			// buffer is ours to report.
+			e.cancelSend()
+			e.finish()
+			return
 		}
-		e.mu.Lock()
-		orphaned := len(e.pending)
-		noRun := e.runID == ""
-		dropped := e.dropped
-		e.pending = nil
-		e.approxBytes = 0
-		e.mu.Unlock()
-		if orphaned > 0 && e.cfg.Logf != nil {
-			if noRun {
-				e.cfg.Logf("agent events: dropped %d event(s) — this session never claimed a run", orphaned)
-			} else {
-				e.cfg.Logf("agent events: %d event(s) were still unsent when the session ended", orphaned)
-			}
-		}
-		if dropped > 0 && e.cfg.Logf != nil {
-			e.cfg.Logf("agent events: %d event(s) were dropped this session (buffer full or unsendable)", dropped)
+		close(e.done)
+		timer := time.NewTimer(e.cfg.CloseGrace)
+		defer timer.Stop()
+		select {
+		case <-e.finished:
+		case <-timer.C:
+			// The sender is still mid-POST or mid-drain. Cancel its context so
+			// the request returns now; run then exits, releases the send lock,
+			// and reports the leftovers itself.
+			e.cancelSend()
 		}
 	})
+}
+
+// finish reports what the session could not send and releases the buffer. Only
+// the sender goroutine calls it (or Close, when no sender ever started): a Close
+// that returns at its deadline must not clear pending under an active flush.
+func (e *Emitter) finish() {
+	e.mu.Lock()
+	orphaned := len(e.pending)
+	noRun := e.runID == ""
+	dropped := e.dropped
+	e.pending = nil
+	e.approxBytes = 0
+	e.mu.Unlock()
+	if orphaned > 0 && e.cfg.Logf != nil {
+		if noRun {
+			e.cfg.Logf("agent events: dropped %d event(s) — this session never claimed a run", orphaned)
+		} else {
+			e.cfg.Logf("agent events: %d event(s) were still unsent when the session ended", orphaned)
+		}
+	}
+	if dropped > 0 && e.cfg.Logf != nil {
+		e.cfg.Logf("agent events: %d event(s) were dropped this session (buffer full or unsendable)", dropped)
+	}
 }

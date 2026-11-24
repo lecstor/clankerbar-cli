@@ -2059,9 +2059,9 @@ section note.
 > writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
 > plane beacon: telemetry is never control flow, so a write failure is logged
 > (once per streak) and dropped — the daemon's own life never depends on it.
-> The write is remove-then-create, like the roster cache write: a concurrent
-> reader (the roll) sees either the absent name or complete bytes, never a
-> torn file, and a symlink planted at the name is removed, not followed.
+> The write is remove-then-create: a concurrent reader (the roll) sees either
+> the absent name or complete bytes, never a torn file, and a symlink planted
+> at the name is removed, not followed.
 
 ### A concurrent beacon won the remove-then-create race
 

@@ -150,13 +150,13 @@ func (d *Supervisor) refreshMaterialized(inst *Instance) {
 	}
 
 	if changed {
-		// The rewrite is a same-directory rename, NOT the spawn path's
-		// remove-then-create (materializeConfig): a live child may read this
-		// file at the instant of the rewrite — a RESTART already pending means
-		// its re-exec can land at any boundary — and a reader that found the
-		// file missing would die and need a backoff respawn. A rename leaves a
-		// reader the old file or the new one, never an absent one, and replaces
-		// a symlink planted at the name rather than following it.
+		// The rewrite is a same-directory rename, never a create-replace: a live
+		// child may read this file at the instant of the rewrite — a RESTART
+		// already pending means its re-exec can land at any boundary — and a
+		// reader that found the file missing would die and need a backoff
+		// respawn. A rename leaves a reader the old file or the new one, never
+		// an absent one, and replaces a symlink planted at the name rather than
+		// following it.
 		if err := st.WriteFileAtomic(statedir.MaterializedConfigName, want); err != nil {
 			log.Printf("%s: its effective config changed but %s could not be rewritten (%v) - it keeps running on its current file", inst.name, path, err)
 			return
