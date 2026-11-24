@@ -1435,11 +1435,11 @@ WARN  state_dir    /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549 
                    STOP — the loop stops on its first tick
                  -> delete it, or the loop acts on it immediately on start: rm /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP
 WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
-                -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
+                -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it — see clankerbar-setup section 1 (agent-instructions file) at clankerbar.com/skills/clankerbar-setup.md
 PASS  session_nice 0 (default) - sessions run at the daemon's own priority
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
 WARN  toolchains   no grant for: go (/Users/you/dev/acme-cli)
-                -> allow the verbs each one needs in /Users/you/.config/clankerbar/headless.json (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified
+                -> allow the verbs each one needs in /Users/you/.config/clankerbar/headless.json (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified — see clankerbar-setup section 2 (pre-allow every toolchain) at clankerbar.com/skills/clankerbar-setup.md
 PASS  budget       no ceiling configured — the loop stops on a STOP/HALT marker or signal; a dry backlog idle-polls rather than exiting
 ```
 
@@ -1478,6 +1478,18 @@ project** — one queue can be wired wrong while the others are fine. A project
 entry that omits `workdir` or `mcp_config_path` inherits the top-level one, and
 doctor resolves it **exactly the way the loop does**, so it never reports on a
 directory your sessions will not use.
+
+Two of the checks are the machine-checkable half of the served
+**`clankerbar-setup`** skill (`clankerbar.com/skills/clankerbar-setup.md`): the
+`workdir` remedy for a missing agent-instructions file names section 1, and the
+`toolchains` remedy for an ungranted or denied toolchain names section 2. The
+division is deliberate — `doctor` tells the operator *what* is wrong, and the
+skill tells their agent *how* to fix it. The two checks the skill deliberately
+has no section for, because neither is an agent's to fix, are the queue gated
+behind unanswered questions and whether the machine will stay awake; their
+remedies stay in `doctor`'s own words. The remaining checks are machine-wiring
+diagnostics around the loop — harnesses, credentials, state, delivery, budgets —
+with no counterpart among the skill's five structural preconditions.
 
 `deploy_lag` reads the plane's `/health` (`health_url`, top level or per
 project) to learn WHICH commit is deployed, and compares it against the REMOTE

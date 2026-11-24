@@ -102,12 +102,12 @@ func checkToolchains(cfg *config.Config) check {
 	case len(blocked) > 0:
 		c.status = warn
 		c.detail = "denied by policy: " + strings.Join(blocked, ", ")
-		c.remedy = "remove the deny rule in " + settingsPath + ", or accept that tasks in those repos cannot be verified"
+		c.remedy = "remove the deny rule in " + settingsPath + ", or accept that tasks in those repos cannot be verified — " + setupSkillSection(2, "pre-allow every toolchain")
 	case len(missing) > 0:
 		c.status = warn
 		c.detail = "no grant for: " + strings.Join(missing, ", ")
 		c.remedy = "allow the verbs each one needs in " + settingsPath +
-			" (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified"
+			" (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified — " + setupSkillSection(2, "pre-allow every toolchain")
 	default:
 		c.detail = "granted: " + strings.Join(tools, ", ")
 		if len(narrowed) > 0 {
