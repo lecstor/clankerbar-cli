@@ -229,7 +229,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// that marks nothing would tight-loop.
 		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
 		if verdict == wakeStillLimited && end == wakeExhausted && d.routeClearNow(tc, ph) {
-			delay = d.waitGrace
+			// Never lengthen the deadline: a stated reset or a short poll interval may already be
+			// sooner than one grace.
+			delay = min(delay, d.waitGrace)
 		}
 		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
 			delay = hint
@@ -249,7 +251,8 @@ const (
 
 // wakeEnd is why a still-limited wake stopped probing. It decides the successor deadline: only a
 // walk that ran out of routes can leave one usable NOW, and that route is worth re-probing one
-// grace out; a probe error marks nothing, so the full interval must stand or it cannot settle.
+// grace out; a probe error marks nothing, so the full interval must stand or it cannot settle. The
+// value is meaningful only when the verdict is wakeStillLimited.
 type wakeEnd int
 
 const (
