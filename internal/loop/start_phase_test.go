@@ -687,6 +687,32 @@ func TestOpenShouldAtTip(t *testing.T) {
 			want:    false,
 		},
 		{
+			// The read served only part of the block: the open SHOULD may be in the unserved
+			// remainder, so the record's count decides even though no served SHOULD is open.
+			name: "a partially served block falls back to the SHOULD count",
+			records: []plane.ReviewRecordState{{
+				State:         "open",
+				ReviewedTip:   "tipA",
+				FindingsTotal: 4,
+				Counts:        plane.ReviewSeverityCounts{Should: 1, Nit: 3},
+				Findings:      []plane.ReviewFindingState{finding("1.review-1.1", "nit", "open")},
+			}},
+			tip:  "tipA",
+			want: true,
+		},
+		{
+			name: "a partially served block with no SHOULD graded",
+			records: []plane.ReviewRecordState{{
+				State:         "open",
+				ReviewedTip:   "tipA",
+				FindingsTotal: 4,
+				Counts:        plane.ReviewSeverityCounts{Nit: 4},
+				Findings:      []plane.ReviewFindingState{finding("1.review-1.1", "nit", "open")},
+			}},
+			tip:  "tipA",
+			want: false,
+		},
+		{
 			name:    "an empty tip matches nothing",
 			records: released("tipA", openShould...),
 			tip:     "",

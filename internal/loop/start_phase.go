@@ -265,6 +265,12 @@ func openShouldAtTip(records []plane.ReviewRecordState, tip string) bool {
 				return true
 			}
 		}
+		// The read may serve only part of the findings block. When findingsTotal is above the
+		// served count, the open SHOULD may be among the unserved ones: no served SHOULD being
+		// open is not evidence that none is, so the record's count has to decide.
+		if r.FindingsTotal > len(r.Findings) && r.Counts.Should > 0 {
+			return true
+		}
 	}
 	return false
 }

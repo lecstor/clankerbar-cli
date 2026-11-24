@@ -5502,10 +5502,14 @@ section note.
 > SHOULD raised on an older tip, or one on a sealed/void record, is not evidence
 > this tip needs fixing.
 >
-> The row is deliberately bounded to one fix per review. Only a fix phase in the
-> sequence can answer it (a 2-phase implement -> review falls through to the
-> hand-over), and phasesDone.fix at the tip turns the row off, which is what
-> stops a fix that declined the SHOULD from looping.
+> The row is deliberately bounded: a fix phase in the sequence is the only thing
+> that can answer it (a 2-phase implement -> review falls through to the
+> hand-over), and phasesDone.fix at the tip at or after the newest review there
+> turns the row off, so a fix that declined the SHOULD — leaving it open with no
+> commit — is not started twice for the same review. One edge is deliberate and
+> bounded: a verify round writes its own released record at the same tip, so
+> after a failed verify hand-over the marker looks older than the newest record
+> and fix runs once more. That is one extra fix per failed verify, not a loop.
 
 
 ## `internal/loop/task_worktree.go`
