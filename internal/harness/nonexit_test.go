@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -360,5 +361,74 @@ exit 0
 	}
 	if !res.UsageReported {
 		t.Error("UsageReported = false — the result event reported; silence here would feed the zero-spend bound")
+	}
+}
+
+// The ErrWaitDelay arm's driver-kill guards are load-bearing, not defensive: a marker raised in the
+// window where the child has already exited and been reaped makes cmd.Cancel's Process.Kill read
+// os.ErrProcessDone, os/exec injects no error for that, and Wait returns ErrWaitDelay from the
+// inherited pipe exactly as an unkilled clean exit would. No stub can schedule that window, so the
+// classification is driven directly here; each guard must keep the death off the clean-end path,
+// whose ExitCode 0 is what the drain reads as a successful attempt.
+func TestClaudeClassifyWaitKeepsOurOwnKillsOffTheCleanEndPath(t *testing.T) {
+	waitDelay := fmt.Errorf("running %q: %w", "claude", exec.ErrWaitDelay)
+	foreign := errors.New("exec: not started")
+	cases := []struct {
+		name     string
+		waitErr  error
+		res      Result
+		wantErr  error
+		wantExit int
+	}{
+		{
+			name:     "an inherited pipe alone is a clean end",
+			waitErr:  waitDelay,
+			wantExit: 0,
+		},
+		{
+			name:     "no wait error leaves the result alone",
+			wantExit: 0,
+		},
+		{
+			name:     "the token ceiling keeps our kill's exit code",
+			waitErr:  waitDelay,
+			res:      Result{Raw: map[string]any{"terminal_reason": tokenCeilingReason}},
+			wantExit: -1,
+		},
+		{
+			name:     "a tool loop keeps our kill's exit code",
+			waitErr:  waitDelay,
+			res:      Result{ToolLoop: "claim_task"},
+			wantExit: -1,
+		},
+		{
+			name:     "an idle kill keeps our kill's exit code",
+			waitErr:  waitDelay,
+			res:      Result{IdleKilled: "90s"},
+			wantExit: -1,
+		},
+		{
+			name:     "a foreign error beside a marker is our kill, not a launch failure",
+			waitErr:  foreign,
+			res:      Result{IdleKilled: "90s"},
+			wantExit: -1,
+		},
+		{
+			name:    "a foreign error with no marker is returned",
+			waitErr: foreign,
+			wantErr: foreign,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tc.res
+			err := (claude{}).classifyWait(tc.waitErr, &res)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("classifyWait error = %v, want %v — an accounted-for death must return nil, a launch failure the raw error", err, tc.wantErr)
+			}
+			if res.ExitCode != tc.wantExit {
+				t.Errorf("ExitCode = %d, want %d — the drain reads this figure as the attempt's verdict", res.ExitCode, tc.wantExit)
+			}
+		})
 	}
 }

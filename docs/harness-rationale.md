@@ -133,9 +133,20 @@ section note.
 > those were never this session's output. CLA-423 armed WaitDelay to end
 > the hang; without this classification the same force-close failed a
 > completed attempt in drainPhase as an invoke error with no retry class.
-> The driver-kill guards (token ceiling, tool loop, idle) are kept
-> belt-and-braces, though os/exec's own semantics already exclude them: our
-> Cancels produce an *ExitError or a context error, not ErrWaitDelay.
+> The driver-kill guards (token ceiling, tool loop, idle) are load-bearing, not
+> belt-and-braces: a marker raised in the window where the child has already
+> exited and been reaped makes cmd.Cancel's Process.Kill read
+> os.ErrProcessDone, which os/exec treats as nothing to report and injects no
+> error for, so Wait returns ErrWaitDelay from the surviving inherited pipe
+> exactly as an unkilled clean exit would. The guards are what keep that death
+> off the clean-end path — ExitCode goes to -1, not 0.
+>
+> The same holds for a run-wide cancellation landing inside that window: the
+> cancelled sctx injects no error either, so the attempt ends "clean" during
+> teardown. Nothing durable turns on it — salvage, handback and spend are
+> computed from res before any error check either way, and the cancelled driver
+> ctx stops the run one spawn later — so the noise is left standing rather than
+> guarded against.
 >
 > Residual risk, accepted: force-closed pipes cannot distinguish a parent
 > that was killed while pretending to succeed — ExitCode 0 plus a fully

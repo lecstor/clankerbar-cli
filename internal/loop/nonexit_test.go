@@ -39,10 +39,13 @@ func TestDrainHandsBackAndCountsSpendWhenInvokeDiesInWait(t *testing.T) {
 	}
 }
 
-// The post-fix side of the same seam (CLA-430): once the adapter reads a WaitDelay death as the clean
-// end it is, Invoke returns that parsed Result with a nil error, and the drain must treat the attempt
-// as successful - no invoke failure, spend counted - rather than failing a session that finished.
-func TestDrainTreatsACleanWaitDelayEndAsASuccessfulAttempt(t *testing.T) {
+// CLA-430 needed no driver change: the adapter reclassifies the WaitDelay death, so what reaches
+// the drain is an ordinary nil-error Result. This happy-path sibling cannot produce exec.ErrWaitDelay
+// itself (a plain Result with no error is its whole input) and would pass with or without that
+// classification; it pins only the drain's side of the contract — no invoke failure and the spend
+// counted. The seam itself is driven end to end by the harness pin
+// TestClaudeInvokeTreatsAWaitDelayDeathAsACleanEnd.
+func TestDrainCountsACleanAttemptsSpend(t *testing.T) {
 	cfg := fastCfg()
 	cfg.StateDir = t.TempDir()
 	cfg.MaxIterations = 1
