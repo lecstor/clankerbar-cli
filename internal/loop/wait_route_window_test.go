@@ -64,14 +64,17 @@ func TestSupervisedWait_WakesAtTheRouteWindowEndNotTheProbeInterval(t *testing.T
 			h.probeModels, routeFreeAlias, routeGo, logs.String())
 	}
 	// The successor deadline is the window's end, not the interval measured from the last attempt.
+	// The gap is T minus the first wake plus grace, minus a few ms of fixture setup; 250ms either
+	// side is scheduling headroom on a loaded -race machine, and the buggy interval is 2.5s away.
 	gap := h.probeStarts[1].Sub(h.probeStarts[0])
-	if gap >= interval/2 {
-		t.Errorf("the second probe began %s after the first, want ~%s (the window's remaining time plus grace) — a full probe interval (%s) is the overrun this task fixes\n%s",
-			gap.Round(time.Millisecond), (windowEnd - firstWake).Round(time.Millisecond), interval, logs.String())
+	want := windowEnd - firstWake + grace
+	if gap > want+250*time.Millisecond {
+		t.Errorf("the second probe began %s after the first, want ~%s (the window's end, T=%s from the start, plus grace) — not the interval deadline at %s\n%s",
+			gap.Round(time.Millisecond), want.Round(time.Millisecond), windowEnd, interval, logs.String())
 	}
-	if gap < windowEnd/3 {
-		t.Errorf("the second probe began %s after the first; the wait must sleep out the window's remaining time, not re-probe at once\n%s",
-			gap.Round(time.Millisecond), logs.String())
+	if gap < want-250*time.Millisecond {
+		t.Errorf("the second probe began %s after the first, want ~%s: the wait must sleep out the window's remaining time, not re-probe early\n%s",
+			gap.Round(time.Millisecond), want.Round(time.Millisecond), logs.String())
 	}
 	if elapsed >= interval {
 		t.Errorf("the wait took %s, want the window's end at %s — not the interval deadline at %s\n%s",

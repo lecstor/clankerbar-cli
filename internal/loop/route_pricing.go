@@ -22,7 +22,7 @@ type routeWindowBlocked struct {
 func (e *routeWindowBlocked) Error() string {
 	// until carries the schedule's own location, so it is rendered there rather than in the daemon's
 	// zone: the operator reads the clock their config wrote.
-	return fmt.Sprintf("every route open to the %s phase is inside a pricing window until %s (%s) — no session started",
+	return fmt.Sprintf("no route for the %s phase may start before %s — inside a pricing window: %s",
 		e.phase, e.until.Format("Mon 15:04 MST"), strings.Join(e.routes, ", "))
 }
 

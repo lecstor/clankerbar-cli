@@ -192,22 +192,20 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		got, cst, verdict := d.probeWake(ctx, a, t, tc, ph, sofar)
 		tokens += got
 		cost += cst
-		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only here.
-		// A refused spawn is still an attempt: the next one is a full probeWait away, never sooner —
-		// unless a route the walk left blocked clears before that deadline (a pricing window end, or a
-		// mark's own reset): then waking at that instant is the difference between resuming when the
-		// route opens and idling out the rest of the interval (CLA-986).
-		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
-			delay = hint
-		}
-		nextProbe = time.Now().Add(delay)
 		switch verdict {
 		case wakeStop:
 			return tokens, cost, true
 		case wakeLifted:
 			return tokens, cost, false
 		}
+		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only
+		// here. A refused spawn is still an attempt, so the next is a full probeWait away — unless a
+		// blocked route clears before that, which is the instant to wake at (CLA-986).
+		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
+			delay = hint
+		}
+		nextProbe = time.Now().Add(delay)
 	}
 }
 
