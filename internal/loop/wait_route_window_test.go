@@ -147,6 +147,33 @@ func TestProbeWake_WindowBlockedLogNamesOnlyWindowBlockedRoutes(t *testing.T) {
 	}
 }
 
+// A wake that starts with every route windowed probes nothing. That is a schedule condition, not a
+// probe error — the wait is aimed at the window's end, so the line must say the schedule holds the
+// phase rather than reading like a harness failure.
+func TestProbeWake_AllRoutesWindowedAtWakeStartIsNotAProbeError(t *testing.T) {
+	inside := brisbaneAt(t, 9, 12, 0)
+	h := &fakeAdapter{}
+	d := routedDriver(t, h, twoPhases(), routeFreeAlias, routeGo)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeFreeAlias, routeGo)
+	d.now = func() time.Time { return inside }
+
+	logs := captureLogs(t)
+	_, _, verdict := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	if verdict != wakeStillLimited {
+		t.Fatalf("verdict = %v, want wakeStillLimited", verdict)
+	}
+	if h.probeCalls != 0 {
+		t.Fatalf("got %d probes, want 0: every route is inside its window", h.probeCalls)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "every route for the phase is window-blocked") {
+		t.Errorf("the wake does not name the window as the reason it probed nothing:\n%s", out)
+	}
+	if strings.Contains(out, "probe error") {
+		t.Errorf("a window-blocked wake was booked as a probe error:\n%s", out)
+	}
+}
+
 // routeWakeHint is the deadline the wait uses when a route it left blocked clears before the poll
 // interval: the soonest instant ANY route is outside both its usage mark and its pricing window.
 // A route with neither must not pull the wake earlier.
@@ -157,6 +184,7 @@ func TestRouteWakeHint(t *testing.T) {
 		name     string
 		routes   []string
 		windowed []string // routes attached to the 11:00-14:00 peak schedule
+		policy   config.RouteWhenAllBlocked
 		marks    map[string]time.Duration
 		want     time.Duration
 		ok       bool
@@ -199,10 +227,23 @@ func TestRouteWakeHint(t *testing.T) {
 			want:     5*time.Minute + grace,
 			ok:       true,
 		},
+		{
+			name:     "a run-schedule route waits for its mark, not the window's end",
+			routes:   []string{routeGo},
+			windowed: []string{routeGo},
+			policy:   config.RouteWhenAllBlockedRun,
+			marks:    map[string]time.Duration{routeGo: 5 * time.Minute},
+			want:     5*time.Minute + grace,
+			ok:       true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			policy := tc.policy
+			if policy == "" {
+				policy = config.RouteWhenAllBlockedWait
+			}
 			d := routedDriver(t, &fakeAdapter{}, nil, tc.routes...)
-			d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, tc.windowed...)
+			d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, policy, tc.windowed...)
 			d.now = func() time.Time { return at }
 			d.waitGrace = grace
 			for route, in := range tc.marks {

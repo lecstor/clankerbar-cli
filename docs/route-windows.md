@@ -65,6 +65,12 @@ A **running** session is never interrupted; the filter decides only which route 
 new spawn may start on. A mid-session adapter route switch (CLA-782) is inside the
 session unit and is not re-filtered.
 
+A supervised usage-limit wait wakes at the earlier of its poll interval and the
+instant one of the phase's routes clears **both** its usage mark and its window.
+A window that ends mid-interval is therefore probed when it opens, instead of a
+usable route sitting idle until the next interval tick (CLA-986: a wake at 13:59
+held the probe to 14:29 when the window ended at 14:00).
+
 A usage MARK and a window are different answers to different questions, so both
 apply: a mark only ORDERs the candidates (a phase still starts, on the route whose
 mark lifts first), while a window removes them. When every route is marked the
