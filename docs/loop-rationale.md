@@ -1900,10 +1900,18 @@ section note.
 
 > markPhaseDone records the phase marker a later claim's start choice reads: an
 > evidenced, non-handoff checkpoint of implement, fix or review. A review marker
-> says only that the review phase finished — never that the review was clean;
-> only phasesDone.implement is read today. Verify is excluded by name because its
-> checkpoint means open MUSTs remain, so the seam it holds is for another fix
-> round, not a finished phase.
+> says only that the review phase finished — never that the review was clean.
+> Verify is excluded by name because its checkpoint means open MUSTs remain, so
+> the seam it holds is for another fix round, not a finished phase.
+>
+> CLA-987: the start table reads phasesDone.fix as well as phasesDone.implement.
+> A fix may decline a SHOULD without committing and without settling the finding
+> (the statuses are open, fixed, refuted and filed — there is no `declined`), so
+> the finding can stay open at the same tip after fix finished. Tip equality
+> alone would then start fix again on every claim, so the marker's At must also
+> be at or after the newest released review's At at that tip. A missing or
+> unparseable timestamp on either side leaves tip equality as the decision: the
+> marker is still the only evidence the phase ran.
 
 
 ## `internal/loop/fleet.go`
@@ -5479,6 +5487,29 @@ section note.
 > deliberately not read here — it gates new claims and lets the in-flight task
 > finish every phase (decision 6019ea26-1464-43a3-a152-3271510b8b42). RELOAD,
 > RESTART_NOW and HALT keep their existing boundaries.
+
+
+## `internal/loop/start_phase.go`
+
+### The SHOULD row
+
+> CLA-987: a review at the tip may close with 0 MUSTs and open SHOULDs. A start
+> that treats that record as a clean hand-over skips the fix phase an
+> uninterrupted implement -> review -> fix -> verify run would have had, so the
+> PR opens without even the cheap SHOULDs being applied or filed. The row sits
+> after the MUST rows — an older open MUST still outlives its tip and belongs to
+> the verifier — and only a released record at this exact tip selects it: a
+> SHOULD raised on an older tip, or one on a sealed/void record, is not evidence
+> this tip needs fixing.
+>
+> The row is deliberately bounded: a fix phase in the sequence is the only thing
+> that can answer it (a 2-phase implement -> review falls through to the
+> hand-over), and phasesDone.fix at the tip at or after the newest review there
+> turns the row off, so a fix that declined the SHOULD — leaving it open with no
+> commit — is not started twice for the same review. One edge is deliberate and
+> bounded: a verify round writes its own released record at the same tip, so
+> after a failed verify hand-over the marker looks older than the newest record
+> and fix runs once more. That is one extra fix per failed verify, not a loop.
 
 
 ## `internal/loop/task_worktree.go`
