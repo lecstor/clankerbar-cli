@@ -192,6 +192,11 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 		s.seen = st.end.claim.Claim
 		s.finalOutcome = claimDisposition(st.end.claim)
 	}
+	// CLA-535: a blocking ask about the drain's own task is what the closing beacon reports as
+	// waiting. The ref is resolved HERE, while s.seen still names the task the phase asked about.
+	if st.end.blockingAsk != "" && s.seen.Names(st.end.blockingAsk) {
+		s.askedRef = claimLabel(s.seen)
+	}
 	// What, if anything, is still owed a handback. Three cases, and getting any of them wrong is a
 	// task either stranded on a dead lease or posted back to the queue over work already in review: -
 	// the phase handed the claim back itself → nothing is owed; - the phase observed claim state →

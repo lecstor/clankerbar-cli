@@ -90,17 +90,19 @@ type holdState struct {
 }
 
 // fleetState derives the presence State for target ti from what the loop already tracks — no new
-// bookkeeping beyond the mid-drain marker set in drainPhases and the hold marker set in
-// holdThroughPause: - held at a phase boundary by a pause window -> draining with the schedule
-// reason, the window's end, and the held task's ref and phase. - schedule-paused -> draining naming
-// the window and its end - otherwise -> idle A backed-off target (skipUntil still in the future)
-// reports idle on purpose: the back-off is minutes-long and self-clearing, and flapping the state
-// to draining for every quiet spell would blur the one signal draining exists for — "something is
-// holding spawns closed until an operator acts".
+// bookkeeping beyond the mid-drain marker set in drainPhases, the hold marker set in
+// holdThroughPause, and the waiting marker set when a drain ends by asking: - held at a phase
+// boundary by a pause window -> draining with the schedule reason, the window's end, and the held
+// task's ref and phase. - schedule-paused -> draining naming the window and its end - an own
+// blocking question unanswered -> waiting with its task ref - otherwise -> idle A backed-off target
+// (skipUntil still in the future) reports idle on purpose: the back-off is minutes-long and
+// self-clearing, and flapping the state to draining for every quiet spell would blur the one signal
+// draining exists for — "something is holding spawns closed until an operator acts".
 func (d *Driver) fleetState(ti int) fleet.State {
 	d.iterMu.Lock()
 	s := d.iterAt(ti)
 	h := d.holdAt(ti)
+	w := d.waitingAt(ti)
 	d.iterMu.Unlock()
 	// A running session outranks every pause flag: the flags only ever hold the NEXT spawn, and the
 	// iteration is what the Fleet page shows while work is in flight.
@@ -114,6 +116,13 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	}
 	if d.schedPaused {
 		return d.scheduleState(h)
+	}
+	// A blocking question of this target's own is the one quiet state that needs the operator, so
+	// it says so rather than reading as a daemon with nothing to do. It ranks below a pause the
+	// operator set deliberately: draining names the reason spawns are closed, waiting only what the
+	// poll is waiting on.
+	if w.on {
+		return fleet.State{Kind: fleet.StateWaiting, TaskRef: w.ref}
 	}
 	return fleet.State{Kind: fleet.StateIdle}
 }
@@ -450,6 +459,10 @@ func (d *Driver) fleetShutdown() {
 // beginIteration marks target ti mid-drain and beacons the phase change NOW, so the console does
 // not wait out a poll interval to learn which phase is about to run.
 func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase string) {
+	// A drain starting is a fresh claim: whatever this target was waiting on has been answered or
+	// reclaimed, and the iteration below says what it is doing now. Reporting only — the spawn
+	// decisions have already been made.
+	d.clearWaiting(ti)
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{on: true, n: drainNum, ref: ref, phase: phase}

@@ -73,6 +73,10 @@ type panelRunOutcome struct {
 	claim       *harness.Result
 	disposition string
 
+	// blockingAsk is the last member's successful blocking ask, if any: the shared task is now
+	// `blocked`, so the drain reports waiting on it (CLA-535).
+	blockingAsk string
+
 	// finalDead/lastProducedNothing mirror the LAST member's classification for the iteration record,
 	// exactly as the sequential loop's locals do.
 	finalDead           bool
@@ -233,6 +237,9 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		if m.end.claim != nil {
 			out.claim = m.end.claim
 			out.disposition = claimDisposition(m.end.claim)
+		}
+		if m.end.blockingAsk != "" {
+			out.blockingAsk = m.end.blockingAsk
 		}
 		if m.end.runLost {
 			out.runLost = true

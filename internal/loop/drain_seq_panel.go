@@ -96,6 +96,11 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 					s.seen = out.claim.Claim
 					s.finalOutcome = out.disposition
 				}
+				// CLA-535: a member that blocked the panel's own task turns the closing beacon into
+				// waiting. s.seen is the drain's observed task, whichever path set it.
+				if out.blockingAsk != "" && s.seen.Names(out.blockingAsk) {
+					s.askedRef = claimLabel(s.seen)
+				}
 				s.finalDead = out.finalDead
 				s.lastProducedNothing = out.lastProducedNothing
 				s.panelRecorded = s.panelRecorded || out.recorded

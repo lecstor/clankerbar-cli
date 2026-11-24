@@ -168,6 +168,11 @@ func mergeObservation(base *Result, add Result) {
 	if add.Claim.Held() || add.Claim.Settled {
 		base.Claim = add.Claim
 	}
+	// A blocking ask is the observation that stops everything: whatever the dead run left in
+	// flight, the task is `blocked` now, so the continuation's ask must reach the driver.
+	if add.BlockingAsk != "" {
+		base.BlockingAsk = add.BlockingAsk
+	}
 	for _, rep := range add.Reports {
 		dup := false
 		for i, have := range base.Reports {

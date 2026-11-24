@@ -199,6 +199,16 @@ func TestMergeResumeUnobservedContinuationKeepsClaim(t *testing.T) {
 	}
 }
 
+// CLA-535: a continuation that files the blocking ask carries it onto the merged session. The
+// driver reads BlockingAsk off the one Result it is handed, so a resurrection must not lose it.
+func TestMergeResumeCarriesTheBlockingAsk(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	mergeResume(&base, Result{BlockingAsk: "uuid-1"})
+	if base.BlockingAsk != "uuid-1" {
+		t.Errorf("BlockingAsk = %q after the merge, want uuid-1", base.BlockingAsk)
+	}
+}
+
 // CLA-739 / review 1.review-2.1: the ToolLoop verdict is CARRIED by mergeResume,
 // and the carry is load-bearing in both directions: opencode Invoke returns
 // early on a merged cause (`if res.ToolLoop != ""` — no stall resume, no

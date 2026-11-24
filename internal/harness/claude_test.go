@@ -340,6 +340,15 @@ func TestClaudeBlockingAsk(t *testing.T) {
 			wantAsk:   "other-uuid",
 		},
 		{
+			name: "escalating a question is a blocking wait on the held task",
+			lines: withClaim(
+				toolUse("u2", escalateQuestionTool, `{"questionId":"q-1"}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			wantClaim: settled(),
+			wantAsk:   "CLA-242", // the held claim's ref, since the call carries only a questionId
+		},
+		{
 			name: "a session holding no claim records the ask without inventing a handback",
 			lines: []string{
 				toolUse("u1", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"which?","blocking":true}`),

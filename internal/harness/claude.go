@@ -418,7 +418,20 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		res.pendingAsks[toolUseID] = askRequest{taskID: args.TaskID, mine: res.Claim.Names(args.TaskID)}
 
 	case escalateQuestionTool:
-		// This one takes a questionId, so the held task cannot be confirmed from the arguments.
+		// This one takes a questionId, so the held task cannot be confirmed from the arguments. The
+		// call promotes a question the session already asked, and a successful one blocks the task
+		// it holds exactly like a blocking ask — so it is the claim's label the driver waits on.
+		ref := res.Claim.Ref
+		if ref == "" {
+			ref = res.Claim.TaskID
+		}
+		if ref != "" {
+			if res.pendingAsks == nil {
+				res.pendingAsks = map[string]askRequest{}
+			}
+			res.pendingAsks[toolUseID] = askRequest{taskID: ref, mine: true}
+			return
+		}
 		res.expect(toolUseID, pendingSettle)
 	}
 }

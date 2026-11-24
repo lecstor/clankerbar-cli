@@ -254,6 +254,10 @@ type Driver struct {
 
 	hold []holdState
 
+	// waiting is each target's outstanding blocking ask, under iterMu like the presence markers
+	// above: fleetState reads it from the beacon paths, which run on the lease-renewer goroutine.
+	waiting []waitState
+
 	hostname string
 	hostOnce sync.Once
 
@@ -326,6 +330,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		startupOpenQ:        make([]int, n),
 		iter:                make([]iterState, n),
 		hold:                make([]holdState, n),
+		waiting:             make([]waitState, n),
 		rcVersions:          make([]int, n),
 		rcAttempt:           make([]time.Time, n),
 		rcAttemptVer:        make([]int, n),
