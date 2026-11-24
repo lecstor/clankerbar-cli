@@ -116,6 +116,44 @@ section note.
 > the same stream-drain path the scanner already handles: EOF, clean
 > parse, and any bytes past the window counted in OutputDropped.
 
+### The session exited 0 and only an inherited pipe outlived it
+
+> The session exited 0 and only an inherited pipe outlived it: os/exec
+> guarantees ErrWaitDelay means a successful exit, so this is the finished
+> session, never an invoke error (CLA-430, symmetric with opencode's CLA-414
+> arm). ExitCode stays 0 for the driver's success path.
+>
+> Wait only substitutes ErrWaitDelay for a nil error: a non-zero exit is
+> already an *ExitError, and a context cancellation carries the context's
+> own error instead. So the error is os/exec's statement that the direct
+> child finished successfully; a descendant holding the process's stderr is
+> all this death says. consume() has already read stdout to EOF before Wait
+> is even called, and the live parse consumed every event the session
+> emitted — only a descendant's bytes after the parent's exit are lost, and
+> those were never this session's output. CLA-423 armed WaitDelay to end
+> the hang; without this classification the same force-close failed a
+> completed attempt in drainPhase as an invoke error with no retry class.
+> The driver-kill guards (token ceiling, tool loop, idle) are load-bearing, not
+> belt-and-braces: a marker raised in the window where the child has already
+> exited and been reaped makes cmd.Cancel's Process.Kill read
+> os.ErrProcessDone, which os/exec treats as nothing to report and injects no
+> error for, so Wait returns ErrWaitDelay from the surviving inherited pipe
+> exactly as an unkilled clean exit would. The guards are what keep that death
+> off the clean-end path — ExitCode goes to -1, not 0.
+>
+> The same holds for a run-wide cancellation landing inside that window: the
+> cancelled sctx injects no error either, so the attempt ends "clean" during
+> teardown. Nothing durable turns on it — salvage, handback and spend are
+> computed from res before any error check either way, and the cancelled driver
+> ctx stops the run one spawn later — so the noise is left standing rather than
+> guarded against.
+>
+> Residual risk, accepted: force-closed pipes cannot distinguish a parent
+> that was killed while pretending to succeed — ExitCode 0 plus a fully
+> parsed live stream is the strongest evidence available either way. An
+> escapee holding the exec-owned STDOUT end still blocks consume() before
+> Wait, and so before WaitDelay's clock, ever starts (CLA-431).
+
 ### Studio chat (studio-chat.md §3)
 
 > Studio chat (studio-chat.md §3): the handle this session ran under, and

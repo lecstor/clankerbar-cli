@@ -226,14 +226,8 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		res.markUntrusted("the idle watchdog fired (" + res.IdleKilled + ") and claude's stream was not read " +
 			"to the end, so this session's spend, final message and claim settlement may be incomplete")
 	}
-	if ee, ok := waitErr.(*exec.ExitError); ok {
-		res.ExitCode = ee.ExitCode()
-		res.ExitSignal = exitSignal(ee)
-	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" && res.IdleKilled == "" {
-		return res, waitErr // couldn't run claude at all
-	} else if waitErr != nil {
-		// Our own kill: the child died on the cancel, and its exit code is the kill's, not a verdict.
-		res.ExitCode = -1
+	if err := c.classifyWait(waitErr, &res); err != nil {
+		return res, err
 	}
 	// Studio chat (studio-chat.md §3): the handle this session ran under, and the one failure the
 	// planner must recover from in-turn.
