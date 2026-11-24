@@ -70,6 +70,8 @@ func (s *drainSeq) prepareStart(ctx context.Context) startPrep {
 		NoCodeDelivered: st.DeliveryNoCode, OriginKnown: of.Known, OnOrigin: of.OnOrigin, Tip: of.Tip,
 		ImplementDoneTip: doneTip, ImplementDoneIsAncestor: of.DoneIsAncestor,
 		Reviews: st.Reviews, OpenMustIDs: openMustIDs(st.Reviews), OpenMustAtTip: openMustAtTip(st.Reviews, of.Tip),
+		OpenShouldAtTip: openShouldAtTip(st.Reviews, of.Tip),
+		FixDoneAtTip:    fixDoneAtTip(st.Reviews, task.PhasesDone[config.FixPhaseName], of.Tip),
 	}
 	choice := chooseStartPhase(s.phases, f)
 	if choice.Abort {
@@ -203,7 +205,8 @@ func (d *Driver) clearStartRefusal(taskID string) {
 
 // markPhaseDone records the phase marker a later claim's start choice reads: an evidenced,
 // non-handoff checkpoint of implement, fix or review. A review marker says only that the review
-// phase finished — never that the review was clean; only phasesDone.implement is read today.
+// phase finished — never that the review was clean. Both implement and fix markers are read by the
+// start table; the fix one is what stops a declined SHOULD from starting fix again.
 func (s *drainSeq) markPhaseDone(ctx context.Context, st *seqStep) {
 	if !s.runnerClaimed || !st.end.checkpoint || st.end.handoff != "" {
 		return

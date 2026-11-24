@@ -30,6 +30,9 @@ func TestChooseStartPhase(t *testing.T) {
 	must := func(status string) plane.ReviewFindingState {
 		return plane.ReviewFindingState{ID: "1.review-1.1", Severity: "must", Status: status}
 	}
+	should := func(status string) plane.ReviewFindingState {
+		return plane.ReviewFindingState{ID: "1.review-1.2", Severity: "should", Status: status}
+	}
 	// one review record with this seal state, reviewed at tip, carrying MUST counts.
 	recordCounts := func(state, tip string, musts int) []plane.ReviewRecordState {
 		return []plane.ReviewRecordState{{State: state, ReviewedTip: tip, Counts: plane.ReviewSeverityCounts{Must: musts}}}
@@ -150,6 +153,67 @@ func TestChooseStartPhase(t *testing.T) {
 				Reviews: withFindings("open", "tipB", must("open")), OpenMustIDs: []string{"1.review-1.1"}, OpenMustAtTip: true,
 			},
 			want: expect{index: 2, branch: "task/abc123", tip: "tipB", why: "fix"},
+		},
+		{
+			name:   "open SHOULDs on the released record at the tip start fix",
+			phases: full,
+			facts: startFacts{
+				HasWIP: true, Branch: "task/abc123", OriginKnown: true, OnOrigin: true, Tip: "tipB",
+				Reviews: withFindings("open", "tipB", should("open")), OpenShouldAtTip: true,
+			},
+			want: expect{index: 2, branch: "task/abc123", tip: "tipB", why: "fix"},
+		},
+		{
+			// A fix may decline a SHOULD without committing and without settling the finding, so the
+			// phase marker, not the finding, proves the round already ran.
+			name:   "open SHOULDs with fix already recorded at the tip hand over",
+			phases: full,
+			facts: startFacts{
+				HasWIP: true, Branch: "task/abc123", OriginKnown: true, OnOrigin: true, Tip: "tipB",
+				Reviews: withFindings("open", "tipB", should("open")), OpenShouldAtTip: true, FixDoneAtTip: true,
+			},
+			want: expect{index: 3, branch: "task/abc123", tip: "tipB", why: "hand over"},
+		},
+		{
+			// A nit is never fix work on resume, however many are open.
+			name:   "a nit-only released record at the tip hands over",
+			phases: full,
+			facts: startFacts{
+				HasWIP: true, Branch: "task/abc123", OriginKnown: true, OnOrigin: true, Tip: "tipA",
+				Reviews: withFindings("open", "tipA", plane.ReviewFindingState{ID: "1.review-1.1", Severity: "nit", Status: "open"}),
+			},
+			want: expect{index: 3, branch: "task/abc123", tip: "tipA", why: "hand over"},
+		},
+		{
+			name:   "a pass verdict at the tip hands over",
+			phases: full,
+			facts: startFacts{
+				HasWIP: true, Branch: "task/abc123", OriginKnown: true, OnOrigin: true, Tip: "tipA",
+				Reviews: []plane.ReviewRecordState{{State: "open", ReviewedTip: "tipA", Verdict: "pass"}},
+			},
+			want: expect{index: 3, branch: "task/abc123", tip: "tipA", why: "hand over"},
+		},
+		{
+			// With no fix phase there is nowhere to send the SHOULD: the terminal owner takes it.
+			name:   "open SHOULDs at the tip with no fix phase hand over",
+			phases: noVerify,
+			facts: startFacts{
+				HasWIP: true, Branch: "task/abc123", OriginKnown: true, OnOrigin: true, Tip: "tipB",
+				Reviews: withFindings("open", "tipB", should("open")), OpenShouldAtTip: true,
+			},
+			want: expect{index: 1, branch: "task/abc123", tip: "tipB", why: "hand over"},
+		},
+		{
+			// An older MUST outlives its tip and is the verifier's to adjudicate, even when the
+			// record at this tip raised a SHOULD.
+			name:   "open MUSTs outrank open SHOULDs at the tip",
+			phases: full,
+			facts: startFacts{
+				HasWIP: true, Branch: "task/abc123", OriginKnown: true, OnOrigin: true, Tip: "tipB",
+				Reviews: withFindings("open", "tipB", should("open")), OpenMustIDs: []string{"1.review-1.1"},
+				OpenShouldAtTip: true,
+			},
+			want: expect{index: 3, branch: "task/abc123", tip: "tipB", why: "verify"},
 		},
 		{
 			// A sealed round's findings are withheld, so it is not a record at the
@@ -533,6 +597,212 @@ func TestOpenMustAtTip(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := openMustAtTip(tc.records, tc.tip); got != tc.want {
 				t.Errorf("openMustAtTip = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// openShouldAtTip is what the caller precomputes for startFacts.OpenShouldAtTip, so its edges are
+// the fix row's edges: which seal states, which tip, which findings, and the counts fallback.
+func TestOpenShouldAtTip(t *testing.T) {
+	finding := func(id, severity, status string) plane.ReviewFindingState {
+		return plane.ReviewFindingState{ID: id, Severity: severity, Status: status}
+	}
+	openShould := []plane.ReviewFindingState{finding("1.review-1.2", "should", "open")}
+	// one released record at tip carrying these findings.
+	released := func(tip string, findings ...plane.ReviewFindingState) []plane.ReviewRecordState {
+		return []plane.ReviewRecordState{{State: "open", ReviewedTip: tip, Findings: findings}}
+	}
+
+	tests := []struct {
+		name    string
+		records []plane.ReviewRecordState
+		tip     string
+		want    bool
+	}{
+		{
+			name:    "a released record at the tip with an open SHOULD",
+			records: released("tipA", openShould...),
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			name:    "a sealed record is ignored",
+			records: []plane.ReviewRecordState{{State: "sealed", ReviewedTip: "tipA", Findings: openShould}},
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			name:    "a void record is ignored",
+			records: []plane.ReviewRecordState{{State: "void", ReviewedTip: "tipA", Findings: openShould}},
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			name:    "a record that reviewed another tip is ignored",
+			records: released("tipB", openShould...),
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			// Only SHOULDs at the tip select fix; an older open one beside a clean record does not.
+			name:    "a clean released record at the tip beside an older open SHOULD",
+			records: append(released("tipA", openShould...), plane.ReviewRecordState{State: "open", ReviewedTip: "tipB"}),
+			tip:     "tipB",
+			want:    false,
+		},
+		{
+			name: "a settled SHOULD is not open",
+			records: released("tipA",
+				finding("1.review-1.2", "should", "fixed"),
+				finding("1.review-1.3", "should", "refuted"),
+				finding("1.review-1.4", "should", "filed")),
+			tip:  "tipA",
+			want: false,
+		},
+		{
+			name:    "an open MUST is not a SHOULD",
+			records: released("tipA", finding("1.review-1.1", "must", "open")),
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			name:    "an open NIT is not a SHOULD",
+			records: released("tipA", finding("1.review-1.2", "nit", "open")),
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			// The read may trim the findings block to counts; a round that raised SHOULDs must
+			// still select fix rather than hand over.
+			name:    "counts-only record with SHOULDs falls back to the count",
+			records: []plane.ReviewRecordState{{State: "open", ReviewedTip: "tipA", Counts: plane.ReviewSeverityCounts{Should: 1}}},
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			name:    "counts-only record with no SHOULDs",
+			records: []plane.ReviewRecordState{{State: "open", ReviewedTip: "tipA", Counts: plane.ReviewSeverityCounts{Nit: 3}}},
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			name:    "an empty tip matches nothing",
+			records: released("tipA", openShould...),
+			tip:     "",
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := openShouldAtTip(tc.records, tc.tip); got != tc.want {
+				t.Errorf("openShouldAtTip = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// fixDoneAtTip is the one-shot guard: a fix that declined a SHOULD leaves the finding open at the
+// same tip, so only the phase marker can stop a resume from starting fix again.
+func TestFixDoneAtTip(t *testing.T) {
+	review := func(tip, at string) plane.ReviewRecordState {
+		return plane.ReviewRecordState{State: "open", ReviewedTip: tip, At: at}
+	}
+	done := func(tip, at string) plane.PhaseDone { return plane.PhaseDone{Tip: tip, At: at} }
+
+	tests := []struct {
+		name    string
+		records []plane.ReviewRecordState
+		done    plane.PhaseDone
+		tip     string
+		want    bool
+	}{
+		{
+			name:    "a fix marker at the tip after the review",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("tipA", "2026-11-20T11:00:00.000Z"),
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			name:    "a fix marker at the tip at the review's instant",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("tipA", "2026-11-20T10:00:00.000Z"),
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			// A newer review at the same tip re-raised the SHOULD: the older fix did not answer it.
+			name:    "a fix marker at the tip before a newer review there",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("tipA", "2026-11-20T09:00:00.000Z"),
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			name:    "a fix marker at another tip",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("tipB", "2026-11-20T11:00:00.000Z"),
+			tip:     "tipA",
+			want:    false,
+		},
+		{
+			name:    "a fix marker with no timestamp",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("tipA", ""),
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			name:    "a fix marker with an unparseable timestamp",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("tipA", "yesterday"),
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			name:    "a review record with no timestamp",
+			records: []plane.ReviewRecordState{review("tipA", "")},
+			done:    done("tipA", "2026-11-20T11:00:00.000Z"),
+			tip:     "tipA",
+			want:    true,
+		},
+		{
+			// A panel writes several records at one tip: the fix must answer the newest of them.
+			name: "the newest released record at the tip decides",
+			records: []plane.ReviewRecordState{
+				review("tipA", "2026-11-20T10:00:00.000Z"),
+				review("tipA", "2026-11-20T12:00:00.000Z"),
+			},
+			done: done("tipA", "2026-11-20T11:00:00.000Z"),
+			tip:  "tipA",
+			want: false,
+		},
+		{
+			name: "sealed and void records at the tip are ignored",
+			records: []plane.ReviewRecordState{
+				review("tipA", "2026-11-20T10:00:00.000Z"),
+				{State: "sealed", ReviewedTip: "tipA", At: "2026-11-20T13:00:00.000Z"},
+				{State: "void", ReviewedTip: "tipA", At: "2026-11-20T14:00:00.000Z"},
+			},
+			done: done("tipA", "2026-11-20T11:00:00.000Z"),
+			tip:  "tipA",
+			want: true,
+		},
+		{
+			name:    "no carried tip matches nothing",
+			records: []plane.ReviewRecordState{review("tipA", "2026-11-20T10:00:00.000Z")},
+			done:    done("", ""),
+			tip:     "",
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fixDoneAtTip(tc.records, tc.done, tc.tip); got != tc.want {
+				t.Errorf("fixDoneAtTip = %v, want %v", got, tc.want)
 			}
 		})
 	}
