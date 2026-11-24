@@ -6,8 +6,8 @@ import "fmt"
 
 // setupSkillURL is the served remediation half of doctor: doctor says WHAT is wrong, and the
 // numbered sections of this document say how the operator's agent fixes it. The section numbers
-// below are the skill's, so a renumbering there makes these pointers stale — the skill is the
-// source of truth.
+// callers pass are the skill's, so a renumbering there makes these pointers stale — the skill is
+// the source of truth.
 const setupSkillURL = "clankerbar.com/skills/clankerbar-setup.md"
 
 // setupSkillSection renders the pointer a setup-precondition remedy carries. The question-gated

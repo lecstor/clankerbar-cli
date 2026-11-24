@@ -16,7 +16,7 @@
 //     silently until someone extends this test - stated plainly per the repo
 //     convention rather than pinned badly.
 //   - The `clankerbar: <time>` log prefix framing around the credential notice.
-//   - Everything about doctor's WARN/FAIL prose except what is asserted below.
+//   - Doctor's WARN/FAIL prose except the two setup-skill pointers asserted below.
 package cli
 
 import (
@@ -128,6 +128,18 @@ func TestReadmeDoctorSampleMatchesCode(t *testing.T) {
 	} {
 		if !strings.Contains(sample, c.name) {
 			t.Errorf("README doctor sample never names check %q, but doctor emits it", c.name)
+		}
+	}
+
+	// The sample's two setup-skill pointers, taken from the helper the remedies
+	// use: a changed section number or URL has to move the README with it.
+	wantSections := []string{
+		setupSkillSection(1, "agent-instructions file"),
+		setupSkillSection(2, "pre-allow every toolchain"),
+	}
+	for _, want := range wantSections {
+		if !strings.Contains(sample, want) {
+			t.Errorf("README doctor sample must contain %q - the setup-skill pointer doctor's remedies emit", want)
 		}
 	}
 }
