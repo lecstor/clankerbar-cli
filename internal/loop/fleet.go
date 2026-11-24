@@ -89,15 +89,19 @@ type holdState struct {
 	zone  string
 }
 
-// fleetState derives the presence State for target ti from what the loop already tracks — no new
-// bookkeeping beyond the mid-drain marker set in drainPhases, the hold marker set in
-// holdThroughPause, and the waiting marker set when a drain ends by asking: - held at a phase
-// boundary by a pause window -> draining with the schedule reason, the window's end, and the held
-// task's ref and phase. - schedule-paused -> draining naming the window and its end - an own
-// blocking question unanswered -> waiting with its task ref - otherwise -> idle A backed-off target
-// (skipUntil still in the future) reports idle on purpose: the back-off is minutes-long and
-// self-clearing, and flapping the state to draining for every quiet spell would blur the one signal
-// draining exists for — "something is holding spawns closed until an operator acts".
+// fleetState derives the presence State for target ti from what the loop already tracks — the
+// mid-drain marker set in drainPhases, the hold marker set in holdThroughPause, and the waiting
+// marker set when a drain ends by asking:
+//   - held at a phase boundary by a pause window -> draining with the schedule reason, the window's
+//     end, and the held task's ref and phase
+//   - schedule-paused -> draining naming the window and its end
+//   - an own blocking question unanswered -> waiting with its task ref
+//   - otherwise -> idle
+//
+// A backed-off target (skipUntil still in the future) reports idle on purpose: the back-off is
+// minutes-long and self-clearing, and flapping the state to draining for every quiet spell would
+// blur the one signal draining exists for — "something is holding spawns closed until an operator
+// acts".
 func (d *Driver) fleetState(ti int) fleet.State {
 	d.iterMu.Lock()
 	s := d.iterAt(ti)

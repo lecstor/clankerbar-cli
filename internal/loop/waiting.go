@@ -1,17 +1,11 @@
 package loop
 
-// waiting.go — the daemon's report that one of its own blocking questions stands unanswered.
+// waiting.go — the daemon's report that one of its own blocking questions stands unanswered
+// (CLA-535). A blocking ask sets its task `blocked` and releases the run's claim, leaving the
+// target idle-polling with nothing claimable; the plane's `waiting` state (CLA-527) says so.
 //
-// CLA-535: a blocking ask_question sets its task `blocked` and releases the run's claim, so the
-// daemon goes back to idle-polling with nothing claimable — indistinguishable on the console from a
-// daemon with nothing to do. The plane gained a `waiting` presence state (CLA-527) and this is the
-// reporting half: while a target's own question is open, its beacons say `waiting` with the task
-// ref instead of `idle`.
-//
-// The summary counts open questions but does not say who asked them, so the marker records the
-// task the drain asked about. The marker is cleared on the first successful poll whose open-question
-// count is back at or below where it stood before the ask — the same "something was resolved" signal
-// the fleet and startup pauses use. It is REPORTING ONLY: no gate, back-off or spawn path reads it.
+// The summary counts open questions but cannot say WHICH task asked, so the marker carries the
+// ref. It is REPORTING ONLY: no gate, back-off or spawn path may read it.
 
 import (
 	"encoding/json"
