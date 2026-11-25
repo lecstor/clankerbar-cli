@@ -42,14 +42,22 @@ Usage:
                                 phase and per harness, how many sessions ran and
                                 how many died producing nothing (the dead-phase
                                 rate).
-  clankerbar upload <file>      Upload a file (screenshot, video, HTML) as a
-                                project asset and print exactly asset:<id> on
-                                stdout. The byte-free path: only the file's
-                                path, type, size and sha256 leave the shell —
-                                its bytes are sent by this process, never
-                                through a model or a tool argument. --task
-                                attributes the file to a task; --type overrides
-                                the content type its extension implies.
+  clankerbar upload <file>      Upload a file (screenshot, video, HTML, or a
+                                markdown/text/json/pdf document) as a project
+                                asset and print exactly asset:<id> on stdout.
+                                The byte-free path: only the file's path, type,
+                                size and sha256 leave the shell — its bytes are
+                                sent by this process, never through a model or a
+                                tool argument. --task attributes the file to a
+                                task; --type overrides the content type its
+                                extension implies.
+  clankerbar download <assetId> Fetch an uploaded asset and stream it to stdout,
+    [-o <path>]                 or to -o <path> (an existing directory writes the
+    [--sha256 <hex>]            plane's filename inside it, and stdout carries the
+                                path written). --sha256 verifies the bytes against
+                                a 64-character hash and refuses a mismatch. Same
+                                byte-free path, in reverse: the file is streamed
+                                by this process, never through a model.
   clankerbar deck <file.html>   Upload a self-contained review deck for a task
     --task <ref|id>             and print its review URL. Same byte-free path:
                                 the HTML goes up as a text/html asset, then
@@ -95,8 +103,8 @@ Usage:
 
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
 --help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
-'clankerbar upload --help', 'clankerbar deck --help', 'clankerbar hook
---help', 'clankerbar review run --help' or 'clankerbar review map --help' for
-their flags.
+'clankerbar upload --help', 'clankerbar download --help', 'clankerbar deck
+--help', 'clankerbar hook --help', 'clankerbar review run --help' or
+'clankerbar review map --help' for their flags.
 `)
 }
