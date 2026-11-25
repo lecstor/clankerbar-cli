@@ -226,14 +226,8 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		res.markUntrusted("the idle watchdog fired (" + res.IdleKilled + ") and claude's stream was not read " +
 			"to the end, so this session's spend, final message and claim settlement may be incomplete")
 	}
-	if ee, ok := waitErr.(*exec.ExitError); ok {
-		res.ExitCode = ee.ExitCode()
-		res.ExitSignal = exitSignal(ee)
-	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" && res.IdleKilled == "" {
-		return res, waitErr // couldn't run claude at all
-	} else if waitErr != nil {
-		// Our own kill: the child died on the cancel, and its exit code is the kill's, not a verdict.
-		res.ExitCode = -1
+	if err := c.classifyWait(waitErr, &res); err != nil {
+		return res, err
 	}
 	// Studio chat (studio-chat.md §3): the handle this session ran under, and the one failure the
 	// planner must recover from in-turn.
@@ -270,6 +264,22 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 	// reason: a refused progress or terminal call recorded no branch and declared no delivery, so
 	// there is nothing to check and nothing to complain about.
 	res.settleReport(toolUseID, !isError)
+
+	// A blocking ask has its own bookkeeping: the DRIVER needs the task it named even when the
+	// session held no claim (a runner-claimed session asks on the runner's behalf), while a
+	// success must still count as this session's handback when it DOES name the held claim.
+	if ask, waiting := res.pendingAsks[toolUseID]; waiting {
+		delete(res.pendingAsks, toolUseID)
+		if isError {
+			return
+		}
+		res.BlockingAsk = ask.taskID
+		if ask.mine {
+			res.Claim.Settled = true
+			res.notifyClaim()
+		}
+		return
+	}
 
 	kind, waiting := res.pending[toolUseID]
 	if !waiting {
@@ -396,15 +406,32 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			TaskID   string `json:"taskId"`
 			Blocking bool   `json:"blocking"`
 		}
-		if json.Unmarshal(input, &args) != nil {
+		if json.Unmarshal(input, &args) != nil || !args.Blocking {
 			return
 		}
-		if args.Blocking && res.Claim.Names(args.TaskID) {
-			res.expect(toolUseID, pendingSettle)
+		// Armed for ANY task: the driver compares it with the task IT holds, which a
+		// runner-claimed session never sees as its own claim. `mine` is the narrower
+		// question the session itself needs answered on success.
+		if res.pendingAsks == nil {
+			res.pendingAsks = map[string]askRequest{}
 		}
+		res.pendingAsks[toolUseID] = askRequest{taskID: args.TaskID, mine: res.Claim.Names(args.TaskID)}
 
 	case escalateQuestionTool:
-		// This one takes a questionId, so the held task cannot be confirmed from the arguments.
+		// This one takes a questionId, so the held task cannot be confirmed from the arguments. The
+		// call promotes a question the session already asked, and a successful one blocks the task
+		// it holds exactly like a blocking ask — so it is the claim's label the driver waits on.
+		ref := res.Claim.Ref
+		if ref == "" {
+			ref = res.Claim.TaskID
+		}
+		if ref != "" {
+			if res.pendingAsks == nil {
+				res.pendingAsks = map[string]askRequest{}
+			}
+			res.pendingAsks[toolUseID] = askRequest{taskID: ref, mine: true}
+			return
+		}
 		res.expect(toolUseID, pendingSettle)
 	}
 }

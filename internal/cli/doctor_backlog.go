@@ -217,6 +217,7 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 		if !sum.Spawnable() && sum.OpenQuestions > 0 {
 			c.status = warn
 			c.detail += " — nothing to claim; the loop will idle without spawning"
+			// No setup-skill section: answering the question is the operator's, not an agent's.
 			c.remedy = "answer the open question(s) at clankerbar.com, or expect an idle run"
 		}
 	case errors.Is(err, backlog.ErrUnauthorized):

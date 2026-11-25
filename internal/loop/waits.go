@@ -55,6 +55,61 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
+// routeClearAt is when route is usable again: the later of its usage mark and a withholding pricing
+// window, or a time not after now when it is already clear.
+func (d *Driver) routeClearAt(tc *config.Config, now time.Time, route string) time.Time {
+	at := now
+	// Ask the filter rather than RouteWindowAt: a "run" schedule offers its route back at peak,
+	// so its window never withholds anything and its mark is the only real wait.
+	if choice := tc.RouteChoiceAt(now, []string{route}); len(choice.Routes) == 0 && !choice.WaitUntil.IsZero() {
+		at = choice.WaitUntil
+	}
+	if until, marked := d.routeMarkExpiry(route); marked && until.After(at) {
+		at = until
+	}
+	return at
+}
+
+// routeWakeHint is how long a still-limited wait should sleep when a route the walk left blocked
+// clears sooner than the poll interval: the soonest instant any of the phase's routes is outside
+// both its usage mark and a withholding pricing window (CLA-986). ok=false keeps the caller on the
+// interval: a phase with no route list, or one with a route already clear, has no future instant.
+func (d *Driver) routeWakeHint(tc *config.Config, ph config.Phase) (time.Duration, bool) {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		return 0, false
+	}
+	now := d.clock()
+	var earliest time.Time
+	for _, route := range routes {
+		at := d.routeClearAt(tc, now, route)
+		if !at.After(now) {
+			return 0, false
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	// The same grace a stated-reset wake takes: a probe that lands a hair before the edge pays a
+	// whole interval for its timing.
+	return earliest.Sub(now) + d.waitGrace, true
+}
+
+// routeClearNow reports whether one of the phase's routes is usable RIGHT NOW. routeWakeHint only
+// answers with a future instant, which is not the same as no route being clear: a mark can expire
+// while a later route's probe is still running, and the walk then stops at tried[route] without
+// re-probing it (CLA-988).
+func (d *Driver) routeClearNow(tc *config.Config, ph config.Phase) bool {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	now := d.clock()
+	for _, route := range routes {
+		if !d.routeClearAt(tc, now, route).After(now) {
+			return true
+		}
+	}
+	return false
+}
+
 // supervisedWait pauses on a usage limit, then polls for an early reset rather than sleeping
 // blindly to the stated reset. The breaker is consulted HERE and not only by the caller, because
 // this loop does not return to the caller while the limit persists: it waits, probes, and waits
@@ -156,18 +211,37 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
-		got, cst, verdict := d.probeWake(ctx, a, t, tc, ph, sofar)
+		got, cst, verdict, end := d.probeWake(ctx, a, t, tc, ph, sofar)
 		tokens += got
 		cost += cst
-		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only here.
-		// A refused spawn is still an attempt: the next one is a full probeWait away, never sooner.
-		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 		switch verdict {
 		case wakeStop:
 			return tokens, cost, true
 		case wakeLifted:
 			return tokens, cost, false
 		}
+		// The successor deadline is measured from HERE, the end of the wake's last attempt, and only
+		// here. A refused spawn is still an attempt, so the next is a full probeWait away — unless a
+		// blocked route clears before that, which is the instant to wake at (CLA-986). A walk that
+		// ran out of routes may also have ended with a route ALREADY clear, which the hint declines
+		// (there is no future instant): that route is probed one grace out rather than a whole
+		// interval later (CLA-988). A probe error must keep the full interval, or a failing probe
+		// that marks nothing would tight-loop.
+		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if verdict == wakeStillLimited && end == wakeExhausted && d.routeClearNow(tc, ph) {
+			// Never lengthen the deadline: a stated reset or a short poll interval may already be
+			// sooner than one grace. A Driver built by hand in a test carries the zero value, and a
+			// zero grace would schedule the next paid probe with no sleep at all.
+			grace := d.waitGrace
+			if grace <= 0 {
+				grace = time.Minute
+			}
+			delay = min(delay, grace)
+		}
+		if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
+			delay = hint
+		}
+		nextProbe = time.Now().Add(delay)
 	}
 }
 
@@ -180,12 +254,24 @@ const (
 	wakeStop
 )
 
+// wakeEnd is why a still-limited wake stopped probing. It decides the successor deadline: only a
+// walk that ran out of routes can leave one usable NOW, and that route is worth re-probing one
+// grace out; a probe error marks nothing, so the full interval must stand or it cannot settle. The
+// value is meaningful only when the verdict is wakeStillLimited.
+type wakeEnd int
+
+const (
+	wakeExhausted   wakeEnd = iota // every route was probed, tried, marked, or window-blocked
+	wakeProbeFailed                // a probe could not be spawned, or its own output could not be read
+)
+
 // probeWake runs one wake's probes. A phase with a route list walks it: a route that probes limited
 // is marked exactly as a session limit marks it (stated reset, else the mark interval), and the next
 // unmarked routable route is probed in the same wake, so a route with no stated reset cannot mask
 // the routes behind it. The walk ends at the first unlimited probe, or when the next route is
-// already marked, tried, or window-blocked; at most one probe per route per wake.
-func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc *config.Config, ph config.Phase, sofar spend) (tokens int, cost float64, verdict wakeVerdict) {
+// already marked, tried, or window-blocked; at most one probe per route per wake. It also reports
+// whether that end was walk exhaustion or a probe failure, which decides the successor deadline.
+func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc *config.Config, ph config.Phase, sofar spend) (tokens int, cost float64, verdict wakeVerdict, end wakeEnd) {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	tried := map[string]bool{}
 	for {
@@ -194,26 +280,34 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 			if v := d.budgetStop(sofar.ti, time.Since(sofar.start)); v.dim != "" {
 				log.Printf("budget reached while paused: %s — ending the wait rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
 					v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
-				return tokens, cost, wakeStop
+				return tokens, cost, wakeStop, wakeExhausted
 			}
 		}
 		inv, ierr := d.probeInvocation(t, tc, ph)
 		if ierr != nil {
 			var blocked *routeWindowBlocked
-			if len(tried) > 0 && errors.As(ierr, &blocked) {
-				log.Printf("still limited on %s, and every other route is window-blocked (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
-				return tokens, cost, wakeStillLimited
+			if errors.As(ierr, &blocked) {
+				// A window is a scheduled condition, not a probe error: nothing spawned, and the next
+				// wake is aimed at the window's end (routeWakeHint) — so name the routes it holds.
+				// The disjunction is load-bearing: routableRoutesAt drops usage-marked routes before
+				// the window filter, so a route from an earlier wake can still carry a mark.
+				if len(tried) > 0 {
+					log.Printf("still limited on %s, and every other route is usage-marked or window-blocked (%v) — continuing to wait", strings.Join(sortedKeys(tried), ", "), ierr)
+				} else {
+					log.Printf("no route for the phase may start: each is usage-marked or window-blocked (%v) — continuing to wait", ierr)
+				}
+				return tokens, cost, wakeStillLimited, wakeExhausted
 			}
 			// A refused probe spawn spends nothing and learns nothing about the limit, so it reads exactly
 			// like any other probe error: log the named variable (the error carries it) and poll again next
 			// interval.
 			log.Printf("probe error: %v — will retry next interval", ierr)
-			return tokens, cost, wakeStillLimited
+			return tokens, cost, wakeStillLimited, wakeProbeFailed
 		}
 		if len(tried) > 0 {
 			if until, marked := d.routeMarkExpiry(inv.Model); tried[inv.Model] || (marked && time.Now().Before(until)) {
 				log.Printf("still limited on every routable route — continuing to wait")
-				return tokens, cost, wakeStillLimited
+				return tokens, cost, wakeStillLimited, wakeExhausted
 			}
 		}
 		got, err := a.Probe(ctx, inv)
@@ -227,7 +321,7 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 		d.charge(sofar.ti, tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
-				return tokens, cost, wakeStop
+				return tokens, cost, wakeStop, wakeProbeFailed
 			}
 			// A probe whose own output could not be read is not a blip that clears itself: it reports no
 			// verdict AND no spend, so a wait that keeps polling on it re-spawns a paid session every
@@ -238,13 +332,13 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 				// project stops draining and the siblings keep going; the local pool keeps the daemon-wide
 				// stop.
 				if d.exhaustUnmeasurable(sofar.ti, fmt.Sprintf("the pause probe's spend cannot be read (%v)", err)) {
-					return tokens, cost, wakeStop
+					return tokens, cost, wakeStop, wakeProbeFailed
 				}
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
-				return tokens, cost, wakeStop
+				return tokens, cost, wakeStop, wakeProbeFailed
 			}
 			log.Printf("probe error: %v — will retry next interval", err)
-			return tokens, cost, wakeStillLimited
+			return tokens, cost, wakeStillLimited, wakeProbeFailed
 		}
 		if !got.Limit.Limited {
 			if len(tried) > 0 {
@@ -252,11 +346,11 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 			} else {
 				log.Print("limit lifted — resuming")
 			}
-			return tokens, cost, wakeLifted
+			return tokens, cost, wakeLifted, wakeExhausted
 		}
 		if len(routes) == 0 || inv.Model == "" || len(tried) >= len(routes) {
 			log.Print("still limited — continuing to wait")
-			return tokens, cost, wakeStillLimited
+			return tokens, cost, wakeStillLimited, wakeExhausted
 		}
 		tried[inv.Model] = true
 		until := got.Limit.ResetAt

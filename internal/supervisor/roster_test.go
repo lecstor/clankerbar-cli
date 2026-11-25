@@ -8,11 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -206,8 +208,8 @@ func TestRosterCacheCorruptOrMissingReadsAsNothing(t *testing.T) {
 	}
 }
 
-// The cache write replaces a previous one (remove-then-create), so a symlink
-// planted at the name is removed, never followed.
+// The cache write replaces a previous one through a same-directory temp and a
+// rename, so a reader never sees the name missing and no temp is left behind.
 func TestRosterCacheReplacesSafely(t *testing.T) {
 	dir := t.TempDir()
 	writeCachedRoster(dir, testRosterEntries())
@@ -215,6 +217,99 @@ func TestRosterCacheReplacesSafely(t *testing.T) {
 	got := loadCachedRoster(dir)
 	if len(got) != 1 {
 		t.Fatalf("loaded %d entries after a replacement write, want 1", len(got))
+	}
+	if temps, err := filepath.Glob(filepath.Join(dir, rosterCacheName+"*.tmp")); err != nil {
+		t.Fatal(err)
+	} else if len(temps) != 0 {
+		t.Fatalf("the atomic write left temp file(s) behind: %v", temps)
+	}
+}
+
+// A planted symlink must be swapped for our file, not followed: the rename
+// replaces the directory entry, so the link's target is never written.
+func TestRosterCacheReplacesAPlantedSymlink(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(dir, rosterCacheName)); err != nil {
+		t.Fatal(err)
+	}
+
+	writeCachedRoster(dir, testRosterEntries())
+
+	if b, err := os.ReadFile(victim); err != nil || string(b) != "untouched" {
+		t.Fatalf("the symlink target was written through (body = %q, err = %v)", b, err)
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, rosterCacheName)); err != nil {
+		t.Fatalf("roster.json is missing after the replacement: %v", err)
+	} else if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("roster.json is still a symlink after the replacement")
+	}
+	if got := loadCachedRoster(dir); len(got) != 2 {
+		t.Fatalf("loaded %d entries, want the freshly written 2", len(got))
+	}
+}
+
+// A replacement must be atomic for a concurrent cold-start reader: it sees the
+// old roster or the new one, never a missing or half-written file. The old
+// remove-then-create write had exactly that window.
+func TestRosterCacheReplaceIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	writeCachedRoster(dir, testRosterEntries())
+	path := filepath.Join(dir, rosterCacheName)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	bad := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				select {
+				case bad <- fmt.Errorf("read during replace: %w", err):
+				default:
+				}
+				return
+			}
+			var entries []RosterEntry
+			if err := json.Unmarshal(b, &entries); err != nil {
+				select {
+				case bad <- fmt.Errorf("decode during replace: %w (%q)", err, b):
+				default:
+				}
+				return
+			}
+			if len(entries) == 0 {
+				select {
+				case bad <- fmt.Errorf("empty roster during replace"):
+				default:
+				}
+				return
+			}
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		entries := testRosterEntries()
+		if i%2 == 1 {
+			entries = entries[:1]
+		}
+		writeCachedRoster(dir, entries)
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-bad:
+		t.Fatal(err)
+	default:
 	}
 }
 

@@ -834,6 +834,28 @@ section note.
 > only allowed to speak up, not to stop the run.
 
 
+## `internal/cli/doctor_setup.go`
+
+### setupSkillSection
+
+> The served `clankerbar-setup` skill (`clankerbar.com/skills/clankerbar-setup.md`)
+> is doctor's remediation half: doctor says WHAT is wrong, and the skill's
+> numbered sections say how the operator's agent fixes it (CLA-197). A
+> setup-precondition remedy therefore names the section it means — the workdir
+> check's missing agent-instructions file points at section 1, and the toolchains
+> check's absent or denied grants point at section 2.
+>
+> The numbers belong to the SKILL, not to this package: a renumbering there makes
+> these pointers stale, so the skill stays the source of truth and the remedy is a
+> pointer rather than a paraphrase of the fix. The two checks the skill
+> deliberately has no section for — the queue gated behind the operator's
+> unanswered questions, and whether the machine will stay awake — carry no
+> section here either, because neither is an agent's to fix. Every other check
+> diagnoses the machine wiring around the loop (harnesses, credentials, state,
+> delivery, budgets) and has no counterpart among the skill's five structural
+> preconditions, so its remedy stays in doctor's own words.
+
+
 ## `internal/cli/doctor_statedir.go`
 
 ### WHERE the state dir sits is a capability question, not a tidiness one

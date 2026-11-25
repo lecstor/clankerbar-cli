@@ -443,6 +443,65 @@ func TestPrepareStart_FetchFailureIsHandedBackNotParked(t *testing.T) {
 	}
 }
 
+// fixVerifyPhases is the shipped implement -> review -> fix -> verify shape, by name.
+func fixVerifyPhases() []config.Phase {
+	return []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+		{Name: config.VerifyPhaseName},
+	}
+}
+
+// A review at the tip that closed with SHOULDs and no MUST is still fix work at the start: skipping
+// fix would hand over a tip nobody applied them to (CLA-986).
+func TestPrepareStart_ResumesFixForOpenShouldsAtTheTip(t *testing.T) {
+	brief := wipBrief("CLA-987")
+	state := plane.TaskState{Status: "in_progress", Reviews: []plane.ReviewRecordState{{
+		State: "open", ReviewedTip: startTip, At: "2026-11-20T10:00:00.000Z",
+		Findings: []plane.ReviewFindingState{{ID: "1.review-1.2", Severity: "should", Status: "open"}},
+	}}}
+	f := newStartFixture(t, brief, state, fixVerifyPhases(), []invokeStep{{res: okResult(1, 0)}})
+	f.origin = originBranchFacts{Known: true, OnOrigin: true, Tip: startTip, DoneIsAncestor: true}
+
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if f.h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want the fix phase only", f.h.invokeCalls)
+	}
+	inv := f.h.invocations[0]
+	if !strings.Contains(inv.Prompt, "PHASE 3") {
+		t.Errorf("the first spawn is not the fix phase: %q", inv.Prompt)
+	}
+	if inv.ResumeClaim.Branch != brief.Branch {
+		t.Errorf("fix ResumeClaim = %+v, want the recorded branch", inv.ResumeClaim)
+	}
+}
+
+// A fix that already ran at the tip — including one that declined the SHOULD and so left it open —
+// must hand over to verify instead of starting fix again.
+func TestPrepareStart_HandsOverWhenFixAlreadyRanAtTheTip(t *testing.T) {
+	brief := wipBrief("CLA-988")
+	brief.PhasesDone[config.FixPhaseName] = plane.PhaseDone{Tip: startTip, At: "2026-11-20T11:00:00.000Z"}
+	state := plane.TaskState{Status: "in_progress", Reviews: []plane.ReviewRecordState{{
+		State: "open", ReviewedTip: startTip, At: "2026-11-20T10:00:00.000Z",
+		Findings: []plane.ReviewFindingState{{ID: "1.review-1.2", Severity: "should", Status: "open"}},
+	}}}
+	f := newStartFixture(t, brief, state, fixVerifyPhases(), []invokeStep{{res: okResult(1, 0)}})
+	f.origin = originBranchFacts{Known: true, OnOrigin: true, Tip: startTip, DoneIsAncestor: true}
+
+	if _, _, stop, err := drainPhasesOnce(t, f.d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if f.h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want the verify phase only", f.h.invokeCalls)
+	}
+	if !strings.Contains(f.h.invocations[0].Prompt, "PHASE 4") {
+		t.Errorf("the first spawn is not the verify phase: %q", f.h.invocations[0].Prompt)
+	}
+}
+
 func TestMarkPhaseDone_RecordsACheckpointedImplementPhase(t *testing.T) {
 	f := newStartFixture(t, noWIPBrief("CLA-915"), plane.TaskState{}, twoPhases(),
 		[]invokeStep{{res: checkpointed(1, 0)}, {res: okResult(1, 0)}})

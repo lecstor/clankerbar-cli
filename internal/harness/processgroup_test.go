@@ -66,9 +66,9 @@ exec sleep 120
 
 	// Invoke must return promptly, not hang on a descendant holding an
 	// exec-owned pipe: cmd.Stderr is an io.MultiWriter, so os/exec makes its
-	// own pipe and Wait waits on its writer past the kill. (claude's session
-	// path sets no WaitDelay, so a surviving holder blocks Wait outright -
-	// which is itself the failure being asserted against.) Running Invoke on
+	// own pipe and Wait waits on its writer past the kill. (WaitDelay is armed
+	// on the session path, so a surviving holder ends Wait after 5s; before
+	// that arming it blocked Wait outright.) Running Invoke on
 	// its own goroutine makes that bound REAL: checked after the fact, an
 	// elapsed comparison cannot fire while Invoke is still blocked, and the
 	// regression it guards would hang to the package timeout instead of

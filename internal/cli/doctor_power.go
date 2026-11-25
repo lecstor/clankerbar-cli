@@ -13,7 +13,8 @@ import (
 // unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep policy — `pmset
 // -g` not running at all, and running but reporting no idle-sleep field. The two states are the
 // same state, so they say the same thing; keeping one string means a future edit cannot improve the
-// advice for one of them and leave the other behind.
+// advice for one of them and leave the other behind. No setup-skill section: keeping the machine
+// awake is the operator's, not an agent's.
 const unknownSleepRemedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait. Either way, `clankerbar run` holds a no-idle-sleep assertion for the length of the run; for any other invocation use `caffeinate -i …`"
 
 // checkPower answers the most basic precondition of an unattended run, and the one nothing else
@@ -58,6 +59,7 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 	default:
 		c.status = warn
 		c.detail = fmt.Sprintf("the machine idle-sleeps after %d min on the active power source, and nothing holds an assertion", mins)
+		// No setup-skill section, for the reason unknownSleepRemedy gives.
 		c.remedy = "`clankerbar run` holds one itself; for any other invocation use `caffeinate -i …`. Start the run on AC — plugging in later does NOT wake a sleeping Mac, and a closed lid sleeps regardless of either"
 	}
 	return c

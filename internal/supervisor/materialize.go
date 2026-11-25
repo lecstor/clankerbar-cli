@@ -197,8 +197,9 @@ func (d *Supervisor) materializedBytes(cfg *config.Config, dir string) ([]byte, 
 // STOP write is still gated by the settle window, never by directory absence.
 //
 // The write REPLACES the previous materialization — the cache is regenerated,
-// never appended to. The replace is remove-then-create through the state-dir
-// handle, so a symlink planted at the name is removed, never followed.
+// never appended to. The replace goes through the state-dir handle's same-
+// directory rename, so a symlink planted at the name is replaced, never
+// followed, and a reader never sees a half-written config.
 func (d *Supervisor) materializeConfig(inst *Instance) (string, error) {
 	inst.mu.Lock()
 	cfg := inst.cfg
@@ -216,12 +217,7 @@ func (d *Supervisor) materializeConfig(inst *Instance) (string, error) {
 		return "", err
 	}
 
-	if st.Exists(statedir.MaterializedConfigName) {
-		if err := st.Remove(statedir.MaterializedConfigName); err != nil {
-			return "", fmt.Errorf("replace %s: %w", statedir.MaterializedConfigName, err)
-		}
-	}
-	if err := st.WriteFile(statedir.MaterializedConfigName, data); err != nil {
+	if err := st.WriteFileAtomic(statedir.MaterializedConfigName, data); err != nil {
 		return "", fmt.Errorf("write %s: %w", statedir.MaterializedConfigName, err)
 	}
 	return filepath.Join(dir, statedir.MaterializedConfigName), nil

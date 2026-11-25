@@ -48,6 +48,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// poll on.
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 	d.loadRouteMarks()
+	d.loadWaiting()
 	// Every harness this run will SPAWN, not just the configured one: a mixed sequence's banner naming
 	// one of them is a log that disagrees with the sessions underneath it from the first line.
 	log.Printf("driving %s; state in %s; idle poll every %s", strings.Join(d.cfg.SpawnedHarnesses(), "+"), d.state.Path(), idle)
@@ -280,6 +281,10 @@ func (d *Driver) pickTarget(runCtx context.Context, idle time.Duration) (Target,
 				// did not happen at all, and now that it does it must not look like the first.
 				log.Printf("%squeue: ready=%d claimable=%d stale_claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
 					d.prefix(i), sum.Ready, sum.Claimable, sum.StaleClaimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
+				// CLA-535: a blocking question THIS target filed is answered when the project's
+				// open-question count is back to where it stood before the ask. Reporting only —
+				// nothing below gates on it.
+				d.clearAnsweredWaiting(i, sum)
 				// Console pause: the operator can pause a run from the web console, PER PROJECT.
 				if sum.Paused {
 					if !d.paused[i] {

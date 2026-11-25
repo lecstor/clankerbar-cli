@@ -1900,10 +1900,18 @@ section note.
 
 > markPhaseDone records the phase marker a later claim's start choice reads: an
 > evidenced, non-handoff checkpoint of implement, fix or review. A review marker
-> says only that the review phase finished — never that the review was clean;
-> only phasesDone.implement is read today. Verify is excluded by name because its
-> checkpoint means open MUSTs remain, so the seam it holds is for another fix
-> round, not a finished phase.
+> says only that the review phase finished — never that the review was clean.
+> Verify is excluded by name because its checkpoint means open MUSTs remain, so
+> the seam it holds is for another fix round, not a finished phase.
+>
+> CLA-987: the start table reads phasesDone.fix as well as phasesDone.implement.
+> A fix may decline a SHOULD without committing and without settling the finding
+> (the statuses are open, fixed, refuted and filed — there is no `declined`), so
+> the finding can stay open at the same tip after fix finished. Tip equality
+> alone would then start fix again on every claim, so the marker's At must also
+> be at or after the newest released review's At at that tip. A missing or
+> unparseable timestamp on either side leaves tip equality as the decision: the
+> marker is still the only evidence the phase ran.
 
 
 ## `internal/loop/fleet.go`
@@ -1952,8 +1960,9 @@ section note.
 ### fleetState
 
 > fleetState derives the presence State for target ti from what the loop already
-> tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases and
-> the hold marker set in holdThroughPause:
+> tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases,
+> the hold marker set in holdThroughPause, and the waiting marker set when a
+> drain ends by asking (CLA-535):
 >
 >   - held at a phase boundary by a pause window -> draining with the schedule
 >     reason, the window's end, and the held task's ref and phase (CLA-908).
@@ -1963,10 +1972,15 @@ section note.
 >   - console-, fleet-, startup- or budget-paused -> draining naming that cause:
 >     it is the one the operator has to act on, and it outranks the schedule.
 >   - schedule-paused            -> draining naming the window and its end
+>   - an own blocking question unanswered -> waiting {taskRef} naming the newest
+>     of its own asks, ranked below any deliberate pause (draining names why
+>     spawns are closed, waiting only what the poll waits on) and above idle: it
+>     is the one quiet state that needs the operator rather than reporting
 >   - otherwise                -> idle
 >
-> A backed-off target (skipUntil still in the future) reports idle on purpose:
-> the back-off is minutes-long and self-clearing, and flapping the state to
+> A backed-off target (skipUntil still in the future) contributes no presence
+> state of its own: it reports idle, or waiting while its own question stands.
+> The back-off is minutes-long and self-clearing, and flapping the state to
 > draining for every quiet spell would blur the one signal draining exists for —
 > "something is holding spawns closed until an operator acts".
 
@@ -2002,8 +2016,8 @@ section note.
 > per-target beacon, for the window in which the poll does not run. The running
 > target reports what fleetState derives for it (iteration with the current
 > claim's ref and phase); every other target the daemon serves reports its own
-> state, which is idle - or draining while a pause holds its spawns - because no
-> session is running there.
+> state — idle, waiting while its own blocking question stands, or draining while
+> a pause holds its spawns — because no session is running there.
 >
 > The other targets are not decoration. Each project has its own Fleet reporter
 > and its own project-scoped presence row, so beaconing only the running target
@@ -2059,9 +2073,9 @@ section note.
 > writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
 > plane beacon: telemetry is never control flow, so a write failure is logged
 > (once per streak) and dropped — the daemon's own life never depends on it.
-> The write is remove-then-create, like the roster cache write: a concurrent
-> reader (the roll) sees either the absent name or complete bytes, never a
-> torn file, and a symlink planted at the name is removed, not followed.
+> The write is remove-then-create: a concurrent reader (the roll) sees either
+> the absent name or complete bytes, never a torn file, and a symlink planted
+> at the name is removed, not followed.
 
 ### A concurrent beacon won the remove-then-create race
 
@@ -5481,6 +5495,29 @@ section note.
 > RESTART_NOW and HALT keep their existing boundaries.
 
 
+## `internal/loop/start_phase.go`
+
+### The SHOULD row
+
+> CLA-987: a review at the tip may close with 0 MUSTs and open SHOULDs. A start
+> that treats that record as a clean hand-over skips the fix phase an
+> uninterrupted implement -> review -> fix -> verify run would have had, so the
+> PR opens without even the cheap SHOULDs being applied or filed. The row sits
+> after the MUST rows — an older open MUST still outlives its tip and belongs to
+> the verifier — and only a released record at this exact tip selects it: a
+> SHOULD raised on an older tip, or one on a sealed/void record, is not evidence
+> this tip needs fixing.
+>
+> The row is deliberately bounded: a fix phase in the sequence is the only thing
+> that can answer it (a 2-phase implement -> review falls through to the
+> hand-over), and phasesDone.fix at the tip at or after the newest review there
+> turns the row off, so a fix that declined the SHOULD — leaving it open with no
+> commit — is not started twice for the same review. One edge is deliberate and
+> bounded: a verify round writes its own released record at the same tip, so
+> after a failed verify hand-over the marker looks older than the newest record
+> and fix runs once more. That is one extra fix per failed verify, not a loop.
+
+
 ## `internal/loop/task_worktree.go`
 
 ### taskworktree.go
@@ -5750,6 +5787,52 @@ section note.
 > all, and after CLA-258 claude parses one only from typed sources, so an
 > unknown reset is normal rather than exceptional.
 
+### routeWakeHint
+
+> routeWakeHint is how long a still-limited wait should sleep when a route the
+> walk left blocked clears sooner than the poll interval: the soonest instant any
+> of the phase's routes is outside BOTH its usage mark and its pricing window.
+>
+> The deadline after a wake used to be the interval measured from the last
+> attempt, always. When the walk ended with every remaining route window-blocked,
+> that overran the window's end by up to a full interval: on 2026-11-24 a daemon
+> waiting on Synthetic stopped its 12:23-13:59 wakes on two routes that were
+> inside the deepseek-peak window, then slept through 14:00 and probed again at
+> 14:29, leaving a usable route idle for 29 minutes. The walk knew the window's
+> end (the refusal carries it); the wait now uses it.
+>
+> A route's two blockers are not alternatives: the route is probeable only when
+> BOTH are clear, so the per-route answer is the later of the two, and the wake
+> is the earliest of those across the list. The same grace a stated-reset wake
+> takes is added, for the same reason: a probe that lands a hair before the edge
+> pays a whole interval for its timing. A route already clear returns no hint —
+> there is no future instant to wake at — but that is NOT evidence the walk
+> probed it: a mark can expire while a later route's probe is still running, and
+> the walk then stops at tried[route] without re-probing it. supervisedWait
+> covers that case through routeClearNow (CLA-988). When every route is marked
+> with the fallback interval (no stated reset), the hint is at or past the
+> interval and the caller keeps the interval unchanged.
+
+### routeClearAt
+
+> routeClearAt is the single per-route answer the wake hint and the clear-now
+> check both read: the later of the route's usage mark and a withholding pricing
+> window, or a time not after now when it is already usable. A "run" schedule
+> never withholds its route (it offers it back at peak), so only its mark can
+> hold it.
+
+### routeClearNow
+
+> routeClearNow reports whether one of the phase's routes is usable RIGHT NOW.
+> It exists for a wake that ran out of routes exactly as a route cleared: the
+> walk marked route A at its probe, A's mark expired while route B's probe was
+> still running, and the walk then stopped at "already tried" for A without
+> re-probing it. The hint only answers with a FUTURE instant, so without this
+> check the wait fell back to the whole interval with A sitting idle (CLA-988).
+> One grace out is the same precision a stated-reset wake takes; if the
+> provider's reset was approximate and the probe lands early, it simply marks
+> the route again.
+
 ### supervisedWait
 
 > supervisedWait pauses on a usage limit, then polls for an early reset rather
@@ -5858,10 +5941,14 @@ section note.
 > The walk ends at the first unlimited probe (resume), at a budget ceiling
 > (stop), or when the next route
 > probeInvocation would aim at is already marked, already tried this wake, or
-> window-blocked; at most one probe per route per wake. Only then does the wait
-> sleep its interval, so walking cannot become a tight loop, and every probe is
-> still charged to the ledger as it lands (CLA-287). The cost is at most one
-> probe per route per wake: routes are few and a probe is minimal.
+> window-blocked; at most one probe per route per wake. It also reports WHICH
+> still-limited ending it reached — the walk exhausted, or a probe/spawn error —
+> because only the first can leave a route clear NOW and earn the one-grace
+> successor deadline; a probe that failed marks nothing, so waking at grace
+> after one would re-spawn it in a tight loop (CLA-988). Otherwise the wait
+> schedules its successor deadline and every probe is still charged to the
+> ledger as it lands (CLA-287). The cost is at most one probe per route per
+> wake: routes are few and a probe is minimal.
 >
 > A wake's first probe may land on a marked route: when every route is marked,
 > probeInvocation aims at the one whose mark lifts first, as before. A

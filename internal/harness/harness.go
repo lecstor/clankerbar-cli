@@ -381,6 +381,16 @@ type Result struct {
 
 	Claim Claim
 
+	// BlockingAsk names the task a blocking ask was filed on: a SUCCESSFUL ask_question records the
+	// session's argument exactly as spelled (a UUID or a qualified ref), and a SUCCESSFUL
+	// escalate_question records the held claim's ref/label it escalated; "" when the session filed
+	// no blocking ask. A blocking ask sets its task `blocked` and releases the run's claim, so the
+	// loop reports `waiting` on that task instead of claiming the task was worked (CLA-535).
+	//
+	// It is kept on the Result rather than the Claim because a runner-claimed session files its
+	// ask without ever holding the claim itself: the driver, which does hold it, is the reader.
+	BlockingAsk string
+
 	// ClankerbarCalls is how many clankerbar MCP tool calls this session got a SUCCESSFUL result for.
 	// A refused call (the tool was not connected yet, the plane rejected it) does not count: it says
 	// nothing about whether the backlog was reachable, and the driver's no-MCP classification is
@@ -410,6 +420,11 @@ type Result struct {
 	events *events.Emitter
 
 	pending map[string]pendingKind
+
+	// pendingAsks are blocking ask_question requests whose RESULTS have not landed yet. They are
+	// kept apart from `pending` because an ask's taskId is needed on the result: it is the task
+	// the loop reports waiting on, and it may name a task this session never claimed.
+	pendingAsks map[string]askRequest
 
 	clankerbarCalls map[string]bool
 
@@ -483,6 +498,13 @@ const (
 	pendingClaim pendingKind = iota
 	pendingSettle
 )
+
+// askRequest is one blocking ask_question whose result has not landed yet: the task it names, and
+// whether that task is the claim this session observed (so a success is also its handback).
+type askRequest struct {
+	taskID string
+	mine   bool
+}
 
 func (r *Result) expect(toolUseID string, k pendingKind) {
 	if toolUseID == "" {

@@ -65,6 +65,25 @@ A **running** session is never interrupted; the filter decides only which route 
 new spawn may start on. A mid-session adapter route switch (CLA-782) is inside the
 session unit and is not re-filtered.
 
+The deadline for a supervised usage-limit wait's **next** probe — its first
+probe is `probeWait` alone, so the route term applies only to successors — is
+the earliest of:
+
+- the poll interval;
+- a stated reset plus a short grace, when that is sooner;
+- the instant one of the phase's routes clears **both** its usage mark and its
+  window, plus the same short grace.
+
+A window that ends mid-interval is therefore probed when it opens, instead of a
+usable route sitting idle until the next interval tick (CLA-986: a wake at 13:59
+held the probe to 14:29 when the window ended at 14:00). If the walk itself ends
+with a route already clear — its usage mark expired while a later route was
+being probed — the next probe is one grace away rather than the whole interval.
+A wake that ended on a probe error takes no one-grace shortcut: it keeps the
+ordinary deadline above — the poll interval, a nearer stated reset plus grace, or
+a route's clear instant plus grace — so a failing probe cannot be re-spawned at
+once (CLA-988).
+
 A usage MARK and a window are different answers to different questions, so both
 apply: a mark only ORDERs the candidates (a phase still starts, on the route whose
 mark lifts first), while a window removes them. When every route is marked the

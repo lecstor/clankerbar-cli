@@ -327,6 +327,39 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 	}
 }
 
+// CLA-535: a daemon waiting on the answer to one of its own blocking questions
+// says `waiting` and names the task as taskRef — the plane renders "waiting on
+// <ref>" and counts the fresh row as blocked on a question. The pause payload
+// belongs to draining and must not ride along.
+func TestMarshalReport_WaitingStateCarriesTheTaskRef(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateWaiting, TaskRef: "CLA-535"},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Kind        string `json:"kind"`
+			TaskRef     string `json:"taskRef"`
+			PauseReason string `json:"pauseReason"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.State.Kind != "waiting" {
+		t.Errorf("state.kind = %q, want waiting (%s)", got.State.Kind, b)
+	}
+	if got.State.TaskRef != "CLA-535" {
+		t.Errorf("state.taskRef = %q, want CLA-535 (%s)", got.State.TaskRef, b)
+	}
+	if got.State.PauseReason != "" {
+		t.Errorf("state.pauseReason = %q on a waiting state, want none", got.State.PauseReason)
+	}
+}
+
 // CLA-677: each iteration carries the drain's dollar spend as `costUsd`. It is
 // always present — deliberately UNLIKE `tokens`, which is omitempty — because a
 // zero here is a figure (the harnesses reported no cost), not an unknown the
@@ -829,6 +862,154 @@ func TestCloseStopsThePumpFromPostingAfterItReturns(t *testing.T) {
 	case <-later:
 		t.Fatal("a report was posted after Close returned — once the goodbye begins the pump must start no further POST")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Send racing Close must still leave the stopping beacon as the last POST. A
+// Send that has not enqueued when Close begins is refused, and the pump checks
+// done with priority, so no stale report can slip past the goodbye.
+func TestSendRacingCloseLeavesTheBeaconLast(t *testing.T) {
+	var mu sync.Mutex
+	var states []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var wire struct {
+			State struct {
+				Kind string `json:"kind"`
+			} `json:"state"`
+		}
+		_ = json.Unmarshal(body, &wire)
+		mu.Lock()
+		states = append(states, wire.State.Kind)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := New(srv.URL, "k")
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+				}
+			}
+		}()
+	}
+	// Let the pump go live, then race the goodbye against the senders.
+	time.Sleep(5 * time.Millisecond)
+	rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	close(stop)
+	wg.Wait()
+
+	// A send that lost the race must not have started a delayed POST either.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(states) == 0 {
+		t.Fatal("the plane received nothing")
+	}
+	if last := states[len(states)-1]; last != StateStopping {
+		t.Fatalf("posts = %v, want the stopping beacon last", states)
+	}
+	for i, s := range states {
+		if s == StateStopping && i != len(states)-1 {
+			t.Fatalf("posts = %v: the stopping beacon was not last", states)
+		}
+	}
+}
+
+// The Send/Close guard, pinned deterministically. startOnce.Do sits exactly
+// between Send's closed check and its enqueue, so a test-owned Do can hold a
+// Send open in that window while Close is called. With stateMu, Close is parked
+// until the Send has enqueued, so the report is drained before the beacon;
+// without it, Close runs the empty-queue goodbye straight past the blocked Send
+// and the report is never posted. TestSendRacingCloseLeavesTheBeaconLast cannot
+// pin this: losing that race is timing-dependent, and beacon-last holds without
+// the guard.
+func TestSendInsideStartOnceIsDeliveredBeforeTheBeacon(t *testing.T) {
+	var mu sync.Mutex
+	var kinds []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var wire struct {
+			State struct {
+				Kind string `json:"kind"`
+			} `json:"state"`
+		}
+		_ = json.Unmarshal(body, &wire)
+		mu.Lock()
+		kinds = append(kinds, wire.State.Kind)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := New(srv.URL, "k").(*httpReporter)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
+	// Pre-arm the once, holding Send's closed-check-to-enqueue window open.
+	armed := make(chan struct{})
+	go rep.startOnce.Do(func() {
+		close(armed)
+		<-release
+		go rep.pump() // what Send's own Do would have started
+	})
+	<-armed
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+	}()
+
+	// Let the Send reach the held-open once. Do not probe the guard field here:
+	// the test must compile and fail behaviourally when the guard is reverted.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-sendDone:
+		t.Fatal("the Send returned while the once was still held open")
+	default:
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		rep.Close(context.Background(), Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	}()
+
+	// With the guard Close cannot get past the Send until it enqueues, so it
+	// cannot return here. Without it, Close drains the still-empty queue, sends
+	// the beacon and returns while the Send is blocked — only then is the Send
+	// released, so its report can never be drained.
+	select {
+	case <-closeDone:
+		// The goodbye ran past a Send that was still mid-enqueue: release so
+		// the assertions below can report the missing report.
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	unblock()
+	<-sendDone
+	<-closeDone
+
+	mu.Lock()
+	got := append([]string(nil), kinds...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != StateIdle || got[1] != StateStopping {
+		t.Fatalf("plane received %v, want the blocked Send's report then the stopping beacon", got)
 	}
 }
 

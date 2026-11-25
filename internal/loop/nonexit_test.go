@@ -39,6 +39,32 @@ func TestDrainHandsBackAndCountsSpendWhenInvokeDiesInWait(t *testing.T) {
 	}
 }
 
+// CLA-430 needed no driver change: the adapter reclassifies the WaitDelay death, so what reaches
+// the drain is an ordinary nil-error Result. This happy-path sibling cannot produce exec.ErrWaitDelay
+// itself (a plain Result with no error is its whole input) and would pass with or without that
+// classification; it pins only the drain's side of the contract — no invoke failure and the spend
+// counted. The seam itself is driven end to end by the harness pin
+// TestClaudeInvokeTreatsAWaitDelayDeathAsACleanEnd.
+func TestDrainCountsACleanAttemptsSpend(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+
+	h := &fakeAdapter{steps: []invokeStep{{
+		res: held(okResult(1200, 0.5), openClaim()),
+	}}}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller()}})
+	openTestStateDir(t, d)
+
+	tokens, cost, _, err := drainOnce(t, d)
+	if err != nil {
+		t.Fatalf("drain error = %v — a Result the adapter classified as a clean end must not fail the attempt as an invoke error", err)
+	}
+	if tokens != 1200 || cost != 0.5 {
+		t.Errorf("drain returned tokens=%d cost=$%.2f, want 1200/$0.50 — the finished session's spend must reach the accumulators", tokens, cost)
+	}
+}
+
 // The boundary case of the same arm: a LAUNCH failure also arrives as
 // res-alongside-err, but its Result is an honest zero, so counting it changes
 // nothing and releasing it releases nothing.

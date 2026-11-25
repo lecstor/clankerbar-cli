@@ -36,12 +36,17 @@ import (
 
 // The presence states a daemon can report. They are the plane's vocabulary
 // (@clankerbar/shared INSTANCE_STATES) verbatim — the plane is a pipe, not a
-// judge, so the CLI owns the mapping from what its loop is doing to these four:
+// judge, so the CLI owns the mapping from what its loop is doing to these:
 //
 //   - idle      alive and polling, holding nothing, spawning normally
 //   - iteration mid-drain: n is the 1-based iteration number, taskRef the task
 //     being worked (empty until a claim has been observed), phase the label of
 //     the phase session about to spawn or running
+//   - waiting   alive and polling, with a blocking question OF ITS OWN standing
+//     unanswered (CLA-527/CLA-535): the plane set the task `blocked` and the
+//     operator is the only one who can move it. taskRef names the task whose
+//     answer is outstanding. Distinct from idle on purpose — this is the one
+//     quiet state that needs a human.
 //   - draining  alive but not spawning new sessions (console pause, fleet pause,
 //     startup-failure pause, budget ceiling, scheduled pause window). It carries
 //     the one cause the operator has to act on (State.PauseReason), and the
@@ -56,6 +61,7 @@ import (
 const (
 	StateIdle      = "idle"
 	StateIteration = "iteration"
+	StateWaiting   = "waiting"
 	StateDraining  = "draining"
 	StateStopping  = "stopping"
 	StateLimited   = "limited"
@@ -113,7 +119,7 @@ const (
 type State struct {
 	Kind    string // one of the State* constants
 	N       int    // iteration number, when Kind is iteration
-	TaskRef string // task being worked ("CLA-466"), when known; the HELD task on a schedule pause
+	TaskRef string // task being worked ("CLA-466"), when known; the task whose answer is outstanding on waiting; the HELD task on a schedule pause
 	Phase   string // phase label, when Kind is iteration, or the held phase on a schedule pause
 	// ResetAt is the harness's stated limit-reset instant, only meaningful on
 	// Kind == limited (CLA-728). The zero value means the harness stated no
@@ -428,13 +434,17 @@ type httpReporter struct {
 	client   *http.Client
 	queue    chan Report
 
-	// done is closed by Close; the pump's select on queue-vs-done then parks
-	// it for good. postMu serialises every POST so that after Close takes the
-	// lock nothing can land after the `stopping` beacon. closed makes Send a
-	// no-op once Close has run, guards Close's own idempotence, and guarantees
-	// the pump starts no POST after Close returns.
+	// done is closed by Close; the pump's select on queue-vs-done then parks it
+	// for good. postMu serialises every POST so that after Close takes the lock
+	// nothing can land after the `stopping` beacon. stateMu orders Send's
+	// enqueue against Close's transition: a Send that has not enqueued when
+	// Close takes it is refused, so the queue Close drains is final and a late
+	// Send cannot start the pump behind Close's back. closed is read by the
+	// pump under postMu, which is what guarantees it starts no POST after Close
+	// holds that lock.
 	done       chan struct{}
 	postMu     *ctxMutex
+	stateMu    sync.Mutex
 	closed     atomic.Bool
 	startOnce  sync.Once
 	dropped    atomic.Int64
@@ -442,6 +452,8 @@ type httpReporter struct {
 }
 
 func (r *httpReporter) Send(rep Report) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 	if r.closed.Load() {
 		return // Close has ended reporting — the stopping beacon already went out
 	}
@@ -467,10 +479,13 @@ func (r *httpReporter) Send(rep Report) {
 // POST, and the final beacon all draw on what the deadline leaves, so a hanging
 // plane cannot stretch one target past it. See Reporter.Close.
 func (r *httpReporter) Close(ctx context.Context, rep Report) {
+	r.stateMu.Lock()
 	if !r.closed.CompareAndSwap(false, true) {
+		r.stateMu.Unlock()
 		return // idempotent: only the first Close speaks
 	}
 	close(r.done) // the pump delivers nothing further — its in-flight one first
+	r.stateMu.Unlock()
 
 	// A caller passing an unbounded context (a direct Close outside Shutdown)
 	// still gets the ceiling; a caller sharing a tighter deadline keeps it.
@@ -530,6 +545,14 @@ drain:
 // the RECEIVE, not just the POST, so Close can park the pump: once Close holds
 // postMu the pump can no longer take a report, and any report it already holds
 // has been delivered before Close's critical section starts.
+//
+// The done pre-check before the select narrows the window: a pump that took a
+// queued report after Close was already waiting on postMu would deliver it
+// before the beacon, which is ordered safely, but it would be a POST nobody
+// needed. A non-blocking select cannot promise priority — Go picks randomly
+// when both are ready — so what actually keeps the beacon last is postMu: the
+// closed check and the deliver both happen under it, and Close holds it across
+// its drain and the beacon.
 func (r *httpReporter) pump() {
 	for {
 		r.postMu.Lock()
@@ -541,6 +564,12 @@ func (r *httpReporter) pump() {
 		if r.closed.Load() {
 			r.postMu.Unlock()
 			return
+		}
+		select {
+		case <-r.done:
+			r.postMu.Unlock()
+			return
+		default:
 		}
 		select {
 		case rep := <-r.queue:

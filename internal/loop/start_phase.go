@@ -1,6 +1,8 @@
 package loop
 
 import (
+	"time"
+
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -36,6 +38,12 @@ type startFacts struct {
 	// OpenMustAtTip is whether a released (State "open") record that reviewed Tip itself carries an
 	// open MUST. Only that selects fix: an older record's MUST beside a clean record at Tip does not.
 	OpenMustAtTip bool
+	// OpenShouldAtTip is whether a released (State "open") record that reviewed Tip itself carries an
+	// open SHOULD. fix may decline a SHOULD without committing, so FixDoneAtTip is what stops a loop.
+	OpenShouldAtTip bool
+	// FixDoneAtTip is whether phasesDone["fix"] already ran at Tip, at or after the review there: a
+	// fix that declined a SHOULD leaves the finding open at the same tip and must not start twice.
+	FixDoneAtTip bool
 }
 
 // startChoice is the phase to start at and what the start needs from the caller.
@@ -101,6 +109,11 @@ func chooseStartPhase(phases []config.Phase, f startFacts) startChoice {
 		}
 		return startAtName(phases, f, config.ReviewPhaseName, true,
 			"open MUSTs with none on the record at the tip and no fix->verify pair: review")
+	case f.OpenShouldAtTip && !f.FixDoneAtTip && phaseIndex(phases, config.FixPhaseName) >= 0:
+		// fix runs once per review at the tip. A fix that declined the SHOULD left it open with no
+		// commit, so the phase marker — never the finding's status — says the round already ran.
+		return startAtName(phases, f, config.FixPhaseName, true,
+			"open SHOULDs on the released record at the tip with no fix recorded there: fix")
 	case atTip:
 		return startAtIndex(f, handOverIndex(phases), true,
 			"a released record at the tip with no open MUST: hand over to the owner of the terminal step")
@@ -228,4 +241,85 @@ func openMustAtTip(records []plane.ReviewRecordState, tip string) bool {
 		}
 	}
 	return false
+}
+
+// openShouldAtTip reports whether a released record reviewed this exact tip and carries an open
+// SHOULD itself. Only that record's own findings count: an older record's SHOULD beside a clean
+// record at the tip does not select fix.
+func openShouldAtTip(records []plane.ReviewRecordState, tip string) bool {
+	if tip == "" {
+		return false
+	}
+	for _, r := range records {
+		if r.State != "open" || r.ReviewedTip != tip {
+			continue
+		}
+		if len(r.Findings) == 0 {
+			if r.Counts.Should > 0 {
+				return true
+			}
+			continue
+		}
+		for _, f := range r.Findings {
+			if f.Severity == "should" && f.Status == "open" {
+				return true
+			}
+		}
+		// The read may serve only part of the findings block. When findingsTotal is above the
+		// served count, the open SHOULD may be among the unserved ones: no served SHOULD being
+		// open is not evidence that none is, so the record's count has to decide.
+		if r.FindingsTotal > len(r.Findings) && r.Counts.Should > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// fixDoneAtTip reports whether fix already finished at this tip, at or after the newest review
+// there. A fix may decline a SHOULD without committing and without settling the finding, so the
+// phase marker is the only evidence it ran: without it a resume would start fix forever. A
+// timestamp that is missing or unparseable on either side leaves tip equality as the decision.
+func fixDoneAtTip(records []plane.ReviewRecordState, done plane.PhaseDone, tip string) bool {
+	if tip == "" || done.Tip != tip {
+		return false
+	}
+	doneAt, ok := parseRFCTime(done.At)
+	if !ok {
+		return true
+	}
+	reviewAt, ok := newestReleasedReviewTime(records, tip)
+	if !ok {
+		return true
+	}
+	return !doneAt.Before(reviewAt)
+}
+
+// newestReleasedReviewTime is the latest released record's At among those that reviewed tip. It
+// reports false when any such record has no usable timestamp: without one the ordering cannot be
+// established, so the caller falls back to tip equality.
+func newestReleasedReviewTime(records []plane.ReviewRecordState, tip string) (time.Time, bool) {
+	var newest time.Time
+	found := false
+	for _, r := range records {
+		if r.State != "open" || r.ReviewedTip != tip {
+			continue
+		}
+		at, ok := parseRFCTime(r.At)
+		if !ok {
+			return time.Time{}, false
+		}
+		if !found || at.After(newest) {
+			newest, found = at, true
+		}
+	}
+	return newest, found
+}
+
+// parseRFCTime reads a plane timestamp, reporting false when it is absent or not RFC3339.
+func parseRFCTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	return t, err == nil
 }

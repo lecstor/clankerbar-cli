@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -278,14 +279,14 @@ echo '{"is_error":false,"result":"alive","total_cost_usd":0.02,"usage":{"input_t
 	}
 }
 
-// --- claude WaitDelay (CLA-423) -----------------------------------------------
+// --- claude WaitDelay (CLA-423, CLA-430) ---------------------------------------
 //
 // The same out-of-group escapee shape the opencode adapter closes with
 // WaitDelay: a stub session that exits cleanly but leaves a daemonised
-// (setsid) grandchild holding the inherited stderr fd open. Without
-// WaitDelay the adapter hangs for the escapee's full lifetime - no context
-// deadline exists on this path to end it; with it, Invoke returns within
-// the delay and preserves whatever arrived before the forced close.
+// (setsid) grandchild holding the inherited stderr fd open. WaitDelay ends the
+// hang; since CLA-430 the adapter reads the resulting exec.ErrWaitDelay as the
+// clean end it is - the parsed Result with a nil error - because os/exec
+// guarantees that error only after a successful exit.
 
 func skipWithoutSetsid(t *testing.T) {
 	t.Helper()
@@ -294,7 +295,7 @@ func skipWithoutSetsid(t *testing.T) {
 	}
 }
 
-func TestClaudeInvokeReturnsWithinBoundWhileEscapeeStillLives(t *testing.T) {
+func TestClaudeInvokeTreatsAWaitDelayDeathAsACleanEnd(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "claude")
 	// Parent emits a minimal stream-json result and exits cleanly; the
@@ -320,24 +321,31 @@ exit 0
 	start := time.Now()
 	// No deadline anywhere - the production shape: the driver's run ctx
 	// (signal.NotifyContext) carries none and this adapter manufactures
-	// none, so arming must not depend on one. The elapsed bound is generous
-	// so the delay itself, not anything else, is what ends Invoke.
+	// none, so the backstop must not depend on one.
 	res, err := (claude{}).Invoke(context.Background(), Invocation{
 		Prompt:  "work",
 		Console: io.Discard,
 	})
 	elapsed := time.Since(start)
 
+	// The finished session must come back as a clean end, not an invoke failure: the driver treats a
+	// nil error with ExitCode 0 as an orderly exit and carries on with the attempt's work.
+	if err != nil {
+		t.Fatalf("Invoke error = %v (%T), want nil — the stub exited cleanly and only died in Wait; CLA-430 classifies that as a clean end carrying the parsed Result", err, err)
+	}
+	// The ~5s is the signature of the WaitDelay death, not decoration, so it is asserted: without this
+	// floor the test would pass VACUOUSLY if the stub ever stopped producing the death (the escapee
+	// dropped, the arming regressed) — err nil, ExitCode 0 and the parsed Result are all true of an
+	// ordinary clean exit too. Only a death in Wait holds Invoke for the delay.
+	if elapsed < 4*time.Second {
+		t.Errorf("Invoke returned after %s — under the 5s WaitDelay, so the stub did not die in Wait and this test pinned the ordinary clean-exit path instead of the CLA-430 classification arm", elapsed)
+	}
 	// The adapter must return; it must NOT hang past the 5s WaitDelay.
 	if elapsed > 10*time.Second {
 		t.Errorf("Invoke took %v — past the 5s WaitDelay; the escapee blocked Wait past its bound", elapsed)
 	}
-	// The non-exit WaitDelay death is the only thing that explains both
-	// the clean session output and the return within the delay.
-	if !errors.Is(err, exec.ErrWaitDelay) {
-		t.Logf("Invoke error = %v (%T) — expected exec.ErrWaitDelay; the stream was still parsed (res preserved)", err, err)
-	} else {
-		t.Logf("Invoke returned exec.ErrWaitDelay as expected (elapsed=%v)", elapsed)
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0 — the drain reads this figure as a successful attempt", res.ExitCode)
 	}
 	// Whatever arrived before the forced close must survive intact — the
 	// whole point of the backstop is that it catches the hang without
@@ -348,7 +356,79 @@ exit 0
 	if res.FinalMessage != "done" {
 		t.Errorf("FinalMessage = %q, want %q — the result event survived the forced close", res.FinalMessage, "done")
 	}
-	if res.Tokens == 0 && !res.UsageReported {
-		t.Log("Usage not reported — the stub's minimal event may not have reached the parser before the forced close; the result shape is the verification target, not exact token counts")
+	if res.Tokens != 20 || res.CostUSD != 0.01 {
+		t.Errorf("Tokens = %d, CostUSD = %v; want 20/0.01 — the finished session's figures must reach the budget intact", res.Tokens, res.CostUSD)
+	}
+	if !res.UsageReported {
+		t.Error("UsageReported = false — the result event reported; silence here would feed the zero-spend bound")
+	}
+}
+
+// The ErrWaitDelay arm's driver-kill guards are load-bearing, not defensive: a marker raised in the
+// window where the child has already exited and been reaped makes cmd.Cancel's Process.Kill read
+// os.ErrProcessDone, os/exec injects no error for that, and Wait returns ErrWaitDelay from the
+// inherited pipe exactly as an unkilled clean exit would. No stub can schedule that window, so the
+// classification is driven directly here; each guard must keep the death off the clean-end path,
+// whose ExitCode 0 is what the drain reads as a successful attempt.
+func TestClaudeClassifyWaitKeepsOurOwnKillsOffTheCleanEndPath(t *testing.T) {
+	waitDelay := fmt.Errorf("running %q: %w", "claude", exec.ErrWaitDelay)
+	foreign := errors.New("exec: not started")
+	cases := []struct {
+		name     string
+		waitErr  error
+		res      Result
+		wantErr  error
+		wantExit int
+	}{
+		{
+			name:     "an inherited pipe alone is a clean end",
+			waitErr:  waitDelay,
+			wantExit: 0,
+		},
+		{
+			name:     "no wait error leaves the result alone",
+			wantExit: 0,
+		},
+		{
+			name:     "the token ceiling keeps our kill's exit code",
+			waitErr:  waitDelay,
+			res:      Result{Raw: map[string]any{"terminal_reason": tokenCeilingReason}},
+			wantExit: -1,
+		},
+		{
+			name:     "a tool loop keeps our kill's exit code",
+			waitErr:  waitDelay,
+			res:      Result{ToolLoop: "claim_task"},
+			wantExit: -1,
+		},
+		{
+			name:     "an idle kill keeps our kill's exit code",
+			waitErr:  waitDelay,
+			res:      Result{IdleKilled: "90s"},
+			wantExit: -1,
+		},
+		{
+			name:     "a foreign error beside a marker is our kill, not a launch failure",
+			waitErr:  foreign,
+			res:      Result{IdleKilled: "90s"},
+			wantExit: -1,
+		},
+		{
+			name:    "a foreign error with no marker is returned",
+			waitErr: foreign,
+			wantErr: foreign,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tc.res
+			err := (claude{}).classifyWait(tc.waitErr, &res)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("classifyWait error = %v, want %v — an accounted-for death must return nil, a launch failure the raw error", err, tc.wantErr)
+			}
+			if res.ExitCode != tc.wantExit {
+				t.Errorf("ExitCode = %d, want %d — the drain reads this figure as the attempt's verdict", res.ExitCode, tc.wantExit)
+			}
+		})
 	}
 }

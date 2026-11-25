@@ -68,6 +68,11 @@ type phaseEnd struct {
 
 	noMCP bool
 
+	// blockingAsk is the task a SUCCESSFUL blocking ask_question named, as the session's argument
+	// spelled it; "" when the phase filed none. It rides the end rather than the claim because a
+	// runner-claimed session files its ask without ever observing a claim of its own (CLA-535).
+	blockingAsk string
+
 	toolLoop string
 
 	reportResumeFailed string
