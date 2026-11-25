@@ -88,6 +88,10 @@ const (
 	MCPConfigNative
 )
 
+// probePrompt is the message a usage-limit liveness probe sends. A bare "." invites models with
+// AGENTS.md in context to treat the turn as an open nudge to work the backlog instead of a no-op.
+const probePrompt = "Reply with OK only. Do not call any tools."
+
 // Capabilities are the adapter facts the driver has to branch on, so a feature that silently
 // half-works on an adapter that cannot support it is refused up front instead.
 type Capabilities struct {

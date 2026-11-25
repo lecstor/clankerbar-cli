@@ -31,7 +31,7 @@ func (codex) MCPConfigUse() MCPConfigUse {
 // otherwise swallow the prompt as its argument.
 func codexArgs(in Invocation) []string {
 	if in.Probe {
-		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}
+		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", probePrompt}
 	}
 	// Invocation.ExtraDirs is deliberately NOT translated here: codex's sandbox has no per-invocation
 	// flag for extra writable roots — its `workspace-write` scope is the cwd plus what

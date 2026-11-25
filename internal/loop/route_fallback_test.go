@@ -315,8 +315,8 @@ func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probeInvocation: %v", err)
 	}
-	if !inv.Probe || inv.Model != routePaidAlias {
-		t.Errorf("probe invocation = {Probe: %v, Model: %q}, want a probe on %q", inv.Probe, inv.Model, routePaidAlias)
+	if !inv.Probe || !inv.NoBacklogMCP || inv.Model != routePaidAlias {
+		t.Errorf("probe invocation = {Probe: %v, NoBacklogMCP: %v, Model: %q}, want a no-backlog probe on %q", inv.Probe, inv.NoBacklogMCP, inv.Model, routePaidAlias)
 	}
 
 	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias)
