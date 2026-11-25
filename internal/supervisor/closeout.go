@@ -45,10 +45,11 @@ package supervisor
 //     `approved` and the agent close-out can take it. A task is never left claimed
 //     by a run that has stopped. The exception is a merge that landed, or may have
 //     landed: an errored merge request is released only once a re-read shows its PR
-//     still OPEN. A landed merge's close is retried on transient failures, its
-//     delivery is recorded if it still fails, and the claim is left to its lease —
-//     because a merged PR is no longer OPEN, so releasing would strand the task
-//     forever.
+//     still OPEN. A landed merge's close is retried on transient failures and, if
+//     the plane refuses it with `evidence_required`, once more with the stored
+//     outcome plus the `**Tests**` evidence this pass verified; its delivery is
+//     recorded if it still fails, and the claim is left to its lease — because a
+//     merged PR is no longer OPEN, so releasing would strand the task forever.
 //
 // One log line per outcome, and each unchanged stand-down is said once rather than
 // on every poll: the supervisor's own log is a status surface, and a line repeated
@@ -505,9 +506,9 @@ func (d *Supervisor) settleMergedCloseOut(client plane.CloseOutAPI, label, key, 
 	if hasGated {
 		cite = &gated
 	}
-	retried, err := d.completeCloseOut(client, label, key, taskID, runID, decl, cite, verified)
+	retried, err := d.completeCloseOut(client, label, key, taskID, runID, decl, cite)
 	if err != nil {
-		d.recordMergedDelivery(client, label, key, taskID, runID, decl, err)
+		d.recordMergedDelivery(client, label, key, taskID, runID, decl, err, retried)
 		return
 	}
 	via := ""

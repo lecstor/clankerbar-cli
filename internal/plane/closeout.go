@@ -131,9 +131,9 @@ type CloseOutDelivery struct {
 }
 
 // CloseOutEvidence is what a close-out asserts when the plane refuses the close
-// with `evidence_required`. Outcome is the stored outcome kept verbatim with a
-// `**Tests**` section appended; the remaining fields are the check the merge was
-// gated on, so the stored ci attestation names exactly what the driver saw.
+// with `evidence_required`. Outcome is the stored outcome with a `**Tests**`
+// section appended; the remaining fields are the check the merge was gated on, so
+// the stored ci attestation names exactly what the driver saw.
 type CloseOutEvidence struct {
 	Outcome    string
 	Check      string
@@ -396,9 +396,9 @@ func (r *mcpReleaser) CompleteCloseOutWithEvidence(ctx context.Context, taskID, 
 }
 
 // TaskOutcome reads the outcome already stored on a task through `get_task` with
-// the compact view: the baseline a refused close keeps verbatim and appends its
-// evidence to. Both envelopes the plane has used are accepted (wrapped and bare),
-// like TaskRepo and TaskState.
+// the compact view: the baseline a refused close keeps and appends its evidence
+// to. Both envelopes the plane has used are accepted (wrapped and bare), like
+// TaskRepo and TaskState.
 func (r *mcpReleaser) TaskOutcome(ctx context.Context, taskID string) (string, error) {
 	if taskID == "" {
 		return "", errors.New("task outcome: taskId is required")

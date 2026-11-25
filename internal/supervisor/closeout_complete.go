@@ -12,9 +12,8 @@ package supervisor
 // The evidence retry is deliberately narrow. It fires only on that refusal code,
 // only once, and only with facts the close-out itself verified: the delivery check
 // it gated the merge on, and the merge commit it read back from the remote. It
-// keeps the stored outcome verbatim and appends the section; it never rewrites
-// what a reviewer approved, and it never invents a result for a check it did not
-// see.
+// keeps the stored outcome's text and appends the section; it never rewrites what
+// a reviewer approved, and it never invents a result for a check it did not see.
 
 import (
 	"context"
@@ -70,7 +69,7 @@ func retryCloseOutCall(ctx context.Context, what string, fn func() error) error 
 // plane's answer and is returned at once, with one exception: the close-out's
 // own evidence refusal (evidence_required) earns the single retry that asserts
 // the checks this pass verified. It reports whether that retry was attempted.
-func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, gated *closeOutGatedCheck, mergeVerified bool) (bool, error) {
+func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, gated *closeOutGatedCheck) (bool, error) {
 	ctx, cancel := d.closeOutCleanupCtx()
 	defer cancel()
 	what := fmt.Sprintf("%s PR %s merged as %s, but closing the task", label, decl.PR, decl.Commit)
@@ -80,7 +79,7 @@ func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, key, task
 	if err == nil || !plane.CloseOutEvidenceRefused(err) {
 		return false, err
 	}
-	return d.retryCloseOutWithEvidence(ctx, client, label, key, taskID, runID, decl, gated, mergeVerified, err)
+	return d.retryCloseOutWithEvidence(ctx, client, label, key, taskID, runID, decl, gated, err)
 }
 
 // recordMergedDelivery is the recovery write for a merge that landed but could
@@ -92,20 +91,24 @@ func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, key, task
 // It gets the same bounded retry as the close: a plane that has just answered 502
 // to every close attempt will often fail this write too, and this record is the
 // only durable place the merge SHA and PR are written down.
-func (d *Supervisor) recordMergedDelivery(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, closeErr error) {
+func (d *Supervisor) recordMergedDelivery(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, closeErr error, retried bool) {
 	ctx, cancel := d.closeOutCleanupCtx()
 	what := fmt.Sprintf("%s PR %s merged as %s, but recording the delivery", label, decl.PR, decl.Commit)
 	recErr := retryCloseOutCall(ctx, what, func() error {
 		return client.RecordCloseOutDelivery(ctx, taskID, runID, decl)
 	})
 	cancel()
+	retryNote := ""
+	if retried {
+		retryNote = "; the evidence_required retry was attempted and refused too"
+	}
 	if recErr == nil {
-		d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) - delivery RECORDED (mergeVerified:%t) so a successor can close it; the claim is left held rather than returning a merged PR to approved",
-			label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, decl.MergeVerified)
+		d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v)%s - delivery RECORDED (mergeVerified:%t) so a successor can close it; the claim is left held rather than returning a merged PR to approved",
+			label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, retryNote, decl.MergeVerified)
 		return
 	}
-	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR (if a close attempt was processed and its answer was lost, the task may already be closed)",
-		label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, recErr)
+	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v)%s AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR (if a close attempt was processed and its answer was lost, the task may already be closed)",
+		label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, retryNote, recErr)
 }
 
 // closeOutGatedCheck is the check the close-out gated its merge on, in the terms
@@ -122,11 +125,12 @@ type closeOutGatedCheck struct {
 
 // closeOutGatedCheckFor builds the citation a merged close's evidence may carry.
 // It reports false when the driver has no gated check result to stand behind — a
-// verdict that is not a pass, no PR number, or no judged head revision — and the
-// retry must then be skipped rather than padded with words.
+// verdict that is not a pass, a check with no name, no PR number, or no judged
+// head revision — and the retry must then be skipped rather than padded with
+// words.
 func closeOutGatedCheckFor(state delivery.PRState) (closeOutGatedCheck, bool) {
 	head := strings.TrimSpace(state.HeadOID)
-	if state.Check.Status != delivery.Pass || state.Number <= 0 || head == "" {
+	if state.Check.Status != delivery.Pass || state.Check.Kind == "" || state.Number <= 0 || head == "" {
 		return closeOutGatedCheck{}, false
 	}
 	return closeOutGatedCheck{
@@ -139,11 +143,11 @@ func closeOutGatedCheckFor(state delivery.PRState) (closeOutGatedCheck, bool) {
 }
 
 // retryCloseOutWithEvidence is the ONE retry a complete_task refusal with
-// `evidence_required` earns. It reads the stored outcome, keeps it verbatim, and
+// `evidence_required` earns. It reads the stored outcome, keeps its text, and
 // appends a `**Tests**` section built only from the gated check and the merge
 // the driver verified. It reports whether the retry was attempted, so the
 // close-out line can say so.
-func (d *Supervisor) retryCloseOutWithEvidence(ctx context.Context, client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, gated *closeOutGatedCheck, mergeVerified bool, refusal error) (bool, error) {
+func (d *Supervisor) retryCloseOutWithEvidence(ctx context.Context, client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, gated *closeOutGatedCheck, refusal error) (bool, error) {
 	if gated == nil {
 		d.closeOutSay(key, "close-out: %s PR %s merged as %s, but the plane refused the close with evidence_required and this close-out verified no check it could cite - not retrying", label, decl.PR, decl.Commit)
 		return false, refusal
@@ -151,6 +155,13 @@ func (d *Supervisor) retryCloseOutWithEvidence(ctx context.Context, client plane
 	stored, err := client.TaskOutcome(ctx, taskID)
 	if err != nil {
 		d.closeOutSay(key, "close-out: %s PR %s merged as %s, but the plane refused the close with evidence_required and the stored outcome could not be read (%v) - not retrying", label, decl.PR, decl.Commit, err)
+		return false, refusal
+	}
+	// An empty outcome leaves nothing to keep: appending the section alone would
+	// replace the record this retry exists to preserve, whether the plane served
+	// no body or the task genuinely carries no outcome.
+	if strings.TrimSpace(stored) == "" {
+		d.closeOutSay(key, "close-out: %s PR %s merged as %s, but the plane refused the close with evidence_required and the stored outcome is empty - not retrying, since there is no reviewed baseline to keep", label, decl.PR, decl.Commit)
 		return false, refusal
 	}
 	// The plane refuses an outcome with no **Tests** section; if the stored one
@@ -162,7 +173,7 @@ func (d *Supervisor) retryCloseOutWithEvidence(ctx context.Context, client plane
 	}
 
 	evidence := plane.CloseOutEvidence{
-		Outcome:    config.AppendOutcome(stored, closeOutTestsSection(*gated, decl, mergeVerified)),
+		Outcome:    config.AppendOutcome(stored, closeOutTestsSection(*gated, decl)),
 		Check:      gated.Check,
 		Conclusion: gated.Conclusion,
 		Branch:     gated.Branch,
@@ -182,15 +193,16 @@ func (d *Supervisor) retryCloseOutWithEvidence(ctx context.Context, client plane
 
 // closeOutTestsSection renders the `**Tests**` evidence the deterministic
 // close-out can actually stand behind. Every line is a fact it read itself: the
-// check it gated the merge on, and the merge commit with its ancestry verdict.
-// Nothing else belongs here — a result this path did not see is not evidence.
-func closeOutTestsSection(gated closeOutGatedCheck, decl plane.CloseOutDelivery, mergeVerified bool) string {
+// check it gated the merge on, and the merge commit with its ancestry verdict
+// from the same delivery the call sends. Nothing else belongs here — a result
+// this path did not see is not evidence.
+func closeOutTestsSection(gated closeOutGatedCheck, decl plane.CloseOutDelivery) string {
 	var b strings.Builder
 	b.WriteString(config.TestsHeading)
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "- %s (PR %s, head %s): %s — the delivery check this merge was gated on\n",
 		gated.Check, gated.PR, gated.HeadOID, gated.Conclusion)
-	if mergeVerified {
+	if decl.MergeVerified {
 		fmt.Fprintf(&b, "- merge %s into %s: verified as an ancestor of the remote branch (mergeVerified: true)\n",
 			decl.Commit, decl.IntegrationBranch)
 	} else {
