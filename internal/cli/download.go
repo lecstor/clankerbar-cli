@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/pflag"
 
@@ -111,6 +112,9 @@ func downloadToStdout(assetID string, stream *plane.AssetStream, expected string
 	}
 	n, err := io.Copy(w, stream.Body)
 	if err != nil {
+		if n > 0 {
+			return fmt.Errorf("download asset %q: %w - %d bytes were already written to stdout, so stdout holds a partial file", assetID, err, n)
+		}
 		return fmt.Errorf("download asset %q: %w", assetID, err)
 	}
 	if err := integrityError(stream, hasher, expected, n); err != nil {
@@ -203,13 +207,20 @@ func downloadName(serverName, assetID string) (string, error) {
 // isBareFileName reports whether name is a single path component this CLI is
 // willing to create. Both separators are rejected regardless of platform: a
 // response is not allowed to choose a path, and a name that means one thing on
-// Linux must not mean something else on Windows.
+// Linux must not mean something else on Windows. Control characters are refused
+// too: a filename is printed and logged as one line, and Go's mime decoder will
+// turn a percent-encoded %0A into a real newline.
 func isBareFileName(name string) bool {
 	if name == "" || name == "." || name == ".." {
 		return false
 	}
-	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+	if strings.ContainsAny(name, `/\`) {
 		return false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return false
+		}
 	}
 	if filepath.IsAbs(name) || filepath.Base(name) != name {
 		return false
@@ -230,6 +241,12 @@ func writeDownloadFile(target downloadTarget, stream *plane.AssetStream, expecte
 	}
 	defer root.Close()
 
+	// Replacing an existing file preserves its permissions the way cp does; a
+	// new file takes the usual 0644 less the umask. The in-flight temp starts
+	// 0600 when it will replace something, so a partial download is never more
+	// readable than the destination it is about to become.
+	var destPerm os.FileMode
+	exists := false
 	if fi, err := root.Lstat(target.name); err == nil {
 		switch {
 		case fi.Mode()&os.ModeSymlink != 0:
@@ -239,6 +256,8 @@ func writeDownloadFile(target downloadTarget, stream *plane.AssetStream, expecte
 		case !fi.Mode().IsRegular():
 			return 0, fmt.Errorf("%s is not a regular file", target.path)
 		}
+		destPerm = fi.Mode().Perm()
+		exists = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return 0, fileError(target.path, err)
 	}
@@ -247,13 +266,23 @@ func writeDownloadFile(target downloadTarget, stream *plane.AssetStream, expecte
 	if err != nil {
 		return 0, err
 	}
-	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	createMode := os.FileMode(0o644)
+	if exists {
+		createMode = 0o600
+	}
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, createMode)
 	if err != nil {
 		return 0, fileError(filepath.Join(target.dir, tmp), err)
 	}
 	discard := func() {
 		f.Close()
 		root.Remove(tmp)
+	}
+	if exists {
+		if err := f.Chmod(destPerm); err != nil {
+			discard()
+			return 0, fileError(filepath.Join(target.dir, tmp), err)
+		}
 	}
 
 	w := io.Writer(f)
@@ -344,18 +373,14 @@ func contentTypeOrUnknown(contentType string) string {
 
 // downloadAPI resolves the config, the target project and the account key, and
 // returns the download surface pointed at the asset's URL on the configured
-// origin.
+// origin. It relies on commandTarget for the slug and the origin: pickSlug never
+// returns an empty slug with a nil error, and Validate pins a non-empty
+// CredentialOrigin, so a resolved target always has a URL.
 func downloadAPI(cfgPath, project, assetID string) (plane.DownloadAPI, error) {
 	key, cfg, slug, err := commandTarget(cfgPath, project, "--project")
 	if err != nil {
 		return nil, err
 	}
-	if slug == "" {
-		return nil, errors.New("cannot resolve a project slug for the asset URL - pass --project <slug>, or set backlog_url naming /mcp/<slug>")
-	}
 	url := cfg.ProjectAssetURL(config.Project{Slug: slug}, assetID)
-	if url == "" {
-		return nil, errors.New("cannot resolve an asset URL - set backlog_url in the config so the plane's origin is known")
-	}
 	return plane.NewDownloadAPI(url, key), nil
 }

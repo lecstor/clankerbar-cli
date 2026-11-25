@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
 // fakeAssetPlane serves the one route a download uses:
@@ -35,11 +38,18 @@ type fakeAssetPlane struct {
 	contentType string
 	// filename is the Content-Disposition name; "" writes no header at all.
 	filename string
+	// disposition, when non-empty, is the whole Content-Disposition header
+	// verbatim. Some forms (an RFC 5987 %0A) cannot be produced by quoting
+	// filename as a plain parameter.
+	disposition string
 	// etag is the whole ETag header (quotes included); "" writes none.
 	etag string
 	// declaredLength, when >= 0, overrides the Content-Length header. A value
 	// larger than the body simulates a truncated transfer.
 	declaredLength int
+	// noLength omits Content-Length entirely and flushes the header before the
+	// body, so the response is really chunked (ContentLength == -1).
+	noLength bool
 
 	status     int
 	statusBody string
@@ -69,8 +79,8 @@ func newFakeAssetPlane(t *testing.T) *fakeAssetPlane {
 		p.mu.Unlock()
 
 		p.mu.Lock()
-		body, contentType, filename, etag := p.body, p.contentType, p.filename, p.etag
-		status, statusBody, declared := p.status, p.statusBody, p.declaredLength
+		body, contentType, filename, disposition, etag := p.body, p.contentType, p.filename, p.disposition, p.etag
+		status, statusBody, declared, noLength := p.status, p.statusBody, p.declaredLength, p.noLength
 		p.mu.Unlock()
 
 		if status != http.StatusOK {
@@ -81,18 +91,27 @@ func newFakeAssetPlane(t *testing.T) *fakeAssetPlane {
 		if contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
-		if filename != "" {
+		if disposition != "" {
+			w.Header().Set("Content-Disposition", disposition)
+		} else if filename != "" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 		}
 		length := len(body)
 		if declared >= 0 {
 			length = declared
 		}
-		w.Header().Set("Content-Length", fmt.Sprint(length))
+		if !noLength {
+			w.Header().Set("Content-Length", fmt.Sprint(length))
+		}
 		if etag != "" {
 			w.Header().Set("ETag", etag)
 		}
 		w.WriteHeader(http.StatusOK)
+		if noLength {
+			// Flush before writing so net/http cannot infer a length from a
+			// small buffered body: the response must really be chunked.
+			w.(http.Flusher).Flush()
+		}
 		_, _ = w.Write(body)
 	}))
 	t.Cleanup(p.srv.Close)
@@ -223,6 +242,13 @@ func TestDownloadToFile(t *testing.T) {
 		if raw, _ := os.ReadFile(dest); !bytes.Equal(raw, plane.body) {
 			t.Errorf("file = %q, want the replacement bytes", raw)
 		}
+		// Replacing a file must not widen its permissions: cp preserves mode,
+		// and a 0600 destination is often someone's private note.
+		if fi, err := os.Stat(dest); err != nil {
+			t.Fatalf("stat replaced file: %v", err)
+		} else if got := fi.Mode().Perm(); got != 0o600 {
+			t.Errorf("replaced file mode = %o, want the existing 0600 preserved", got)
+		}
 	})
 }
 
@@ -231,20 +257,25 @@ func TestDownloadToFile(t *testing.T) {
 // because the response must not choose where a file lands.
 func TestDownloadNameComesFromThePlaneSafely(t *testing.T) {
 	cases := []struct {
-		name       string
-		filename   string
-		wantSuffix string
+		name        string
+		filename    string
+		disposition string
+		wantSuffix  string
 	}{
-		{"traversal is refused", "../../etc/passwd", "asset-1"},
-		{"nested path is refused", "sub/doc.md", "asset-1"},
-		{"absolute path is refused", "/etc/passwd", "asset-1"},
-		{"missing header falls back to the id", "", "asset-1"},
-		{"a plain name is used", "handoff.md", "handoff.md"},
+		{"traversal is refused", "../../etc/passwd", "", "asset-1"},
+		{"nested path is refused", "sub/doc.md", "", "asset-1"},
+		{"absolute path is refused", "/etc/passwd", "", "asset-1"},
+		{"missing header falls back to the id", "", "", "asset-1"},
+		{"a plain name is used", "handoff.md", "", "handoff.md"},
+		// Go's mime decoder turns a percent-encoded %0A into a real newline, so
+		// the suggestion would put a newline in the path printed on stdout.
+		{"a control character is refused", "", `attachment; filename*=UTF-8''na%0Ame.md`, "asset-1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			plane := newFakeAssetPlane(t)
 			plane.filename = tc.filename
+			plane.disposition = tc.disposition
 			plane.setEtagFromBody()
 			t.Setenv("CLANKERBAR_API_KEY", "k")
 			cfg := assetConfig(t, plane)
@@ -379,6 +410,158 @@ func TestDownloadSha256Verification(t *testing.T) {
 		}
 		if reqs := plane.snapshot(); len(reqs) != 0 {
 			t.Errorf("requests = %+v, want none before the flag is valid", reqs)
+		}
+	})
+}
+
+// TestDownloadPlainDownloadVerifiesThePlaneETag: with no --sha256 the plane's
+// own strong ETag is still an integrity gate, in both output modes. Every other
+// test that sets an ETag sets it to the body's hash, so this is what pins the
+// check a plain download relies on: an ETag naming different bytes must refuse.
+func TestDownloadPlainDownloadVerifiesThePlaneETag(t *testing.T) {
+	body := []byte("the bytes the plane actually sent")
+	etag := sha256Hex([]byte("some other asset's bytes"))
+	if etag == sha256Hex(body) {
+		t.Fatal("test setup: the ETag must not describe the body")
+	}
+
+	t.Run("stdout", func(t *testing.T) {
+		plane := newFakeAssetPlane(t)
+		plane.body = body
+		plane.etag = `"` + etag + `"`
+		t.Setenv("CLANKERBAR_API_KEY", "k")
+		cfg := assetConfig(t, plane)
+
+		var stdout, stderr bytes.Buffer
+		err := downloadRun(context.Background(), []string{"-c", cfg, "asset-1"}, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("err = nil, want a refusal after the bytes arrived")
+		}
+		for _, want := range []string{"ETag", etag, "already written to stdout"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to name %q", err, want)
+			}
+		}
+		if !bytes.Equal(stdout.Bytes(), body) {
+			t.Errorf("stdout = %q, want the unverifiable bytes that were already written", stdout.String())
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		plane := newFakeAssetPlane(t)
+		plane.body = body
+		plane.etag = `"` + etag + `"`
+		t.Setenv("CLANKERBAR_API_KEY", "k")
+		cfg := assetConfig(t, plane)
+		dir := t.TempDir()
+
+		var stdout, stderr bytes.Buffer
+		err := downloadRun(context.Background(), []string{"-c", cfg, "-o", dir, "asset-1"}, &stdout, &stderr)
+		if err == nil {
+			t.Fatal("err = nil, want the ETag refusal")
+		}
+		for _, want := range []string{"ETag", etag, "nothing was written"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to name %q", err, want)
+			}
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("stdout = %q, want nothing", stdout.String())
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Errorf("download directory holds %d entries, want no destination and no temp file", len(entries))
+		}
+	})
+}
+
+// errReader fails the read after whatever the MultiReader has already yielded,
+// standing in for a connection that dies mid-body.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestDownloadStdoutPartialTransportError: a mid-stream transport failure leaves
+// the delivered bytes on stdout, and the error must say so rather than read like
+// a failed read of nothing.
+func TestDownloadStdoutPartialTransportError(t *testing.T) {
+	stream := &plane.AssetStream{
+		Body: io.NopCloser(io.MultiReader(
+			strings.NewReader("half a file"),
+			errReader{errors.New("connection reset")},
+		)),
+		ContentLength: -1,
+	}
+	var stdout, stderr bytes.Buffer
+	err := downloadToStdout("asset-1", stream, "", &stdout, &stderr)
+	if err == nil {
+		t.Fatal("err = nil, want the transport failure")
+	}
+	for _, want := range []string{"connection reset", "partial file", fmt.Sprintf("%d bytes", len("half a file"))} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to name %q", err, want)
+		}
+	}
+	if stdout.String() != "half a file" {
+		t.Errorf("stdout = %q, want the bytes delivered before the failure", stdout.String())
+	}
+}
+
+// TestDownloadWithoutADeclaredLength: a chunked response declares no length, so
+// the length check must be skipped rather than compared against -1.
+func TestDownloadWithoutADeclaredLength(t *testing.T) {
+	plane := newFakeAssetPlane(t)
+	plane.body = []byte("chunked bytes with no declared length")
+	plane.setEtagFromBody()
+	plane.noLength = true
+	t.Setenv("CLANKERBAR_API_KEY", "k")
+	cfg := assetConfig(t, plane)
+	dir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if err := downloadRun(context.Background(), []string{"-c", cfg, "-o", dir, "asset-1"}, &stdout, &stderr); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "notes.md")); err != nil || !bytes.Equal(raw, plane.body) {
+		t.Errorf("file = %q, %v; want the downloaded bytes", raw, err)
+	}
+}
+
+// TestDownloadNameRefusesUnsafeCandidates pins the refusal when neither the
+// plane's suggestion nor the asset id can be a bare filename.
+func TestDownloadNameRefusesUnsafeCandidates(t *testing.T) {
+	if _, err := downloadName("sub/doc.md", "a/b"); err == nil || !strings.Contains(err.Error(), "-o") {
+		t.Fatalf("err = %v, want a refusal naming -o", err)
+	}
+	if got, err := downloadName("sub/doc.md", "asset-1"); err != nil || got != "asset-1" {
+		t.Errorf("downloadName = %q, %v; want the asset id fallback", got, err)
+	}
+}
+
+// TestDownloadRefusesNonRegularDestinations: a device or FIFO is not a file a
+// download may write. The -o resolution refuses a device outright, and the write
+// path refuses the name it picks inside a directory (the second guard, hit when
+// a planted FIFO sits where the plane's filename lands).
+func TestDownloadRefusesNonRegularDestinations(t *testing.T) {
+	fake := newFakeAssetPlane(t)
+	fake.setEtagFromBody()
+	t.Setenv("CLANKERBAR_API_KEY", "k")
+	cfg := assetConfig(t, fake)
+
+	t.Run("-o is a device", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		err := downloadRun(context.Background(), []string{"-c", cfg, "-o", os.DevNull, "asset-1"}, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("err = %v, want a non-regular-file refusal", err)
+		}
+	})
+
+	t.Run("the chosen name is a device", func(t *testing.T) {
+		// Call the write directly: resolveDownloadTarget only inspects -o, so a
+		// name inside an existing directory reaches this guard.
+		target := downloadTarget{dir: filepath.Dir(os.DevNull), name: filepath.Base(os.DevNull), path: os.DevNull}
+		_, err := writeDownloadFile(target, &plane.AssetStream{Body: io.NopCloser(strings.NewReader("x"))}, "")
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("err = %v, want the write path's non-regular-file refusal", err)
 		}
 	})
 }
@@ -670,6 +853,9 @@ func TestIsBareFileName(t *testing.T) {
 		"a/b":                    false,
 		`a\b`:                    false,
 		"/abs":                   false,
+		"na\nme.md":              false,
+		"esc\x1b[31m":            false,
+		"nul\x00.md":             false,
 		strings.Repeat("a", 256): false,
 	} {
 		if got := isBareFileName(name); got != want {

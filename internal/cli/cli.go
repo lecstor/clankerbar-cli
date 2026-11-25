@@ -53,11 +53,13 @@ Usage:
                                 extension implies.
   clankerbar download <assetId> Fetch an uploaded asset and stream it to stdout,
     [-o <path>]                 or to -o <path> (an existing directory writes the
-    [--sha256 <hex>]            plane's filename inside it, and stdout carries the
-                                path written). --sha256 verifies the bytes against
-                                a 64-character hash and refuses a mismatch. Same
-                                byte-free path, in reverse: the file is streamed
-                                by this process, never through a model.
+    [--project <slug>]          plane's filename inside it, and stdout carries the
+    [--sha256 <hex>]            path written). --project targets a project the
+                                config does not name; --sha256 verifies the bytes
+                                against a 64-character hash and refuses a
+                                mismatch. Same byte-free path, in reverse: the
+                                file is streamed by this process, never through a
+                                model.
   clankerbar deck <file.html>   Upload a self-contained review deck for a task
     --task <ref|id>             and print its review URL. Same byte-free path:
                                 the HTML goes up as a text/html asset, then

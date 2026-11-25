@@ -1,10 +1,8 @@
 package plane
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -122,7 +120,7 @@ func (a *assetClient) Get(ctx context.Context) (*AssetStream, error) {
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
-		return nil, downloadRefusal(resp.StatusCode, raw)
+		return nil, refuseWithPlaneWords("download refused", resp.StatusCode, raw)
 	}
 
 	stream := &AssetStream{
@@ -135,30 +133,16 @@ func (a *assetClient) Get(ctx context.Context) (*AssetStream, error) {
 	return stream, nil
 }
 
-// downloadRefusal renders a rejected GET from the plane's own words. The route's
-// authorization failures are JSON (`{"error":{"code","message"}}`) and its one
-// not-found is a plain "Not found"; both must reach the caller verbatim, because
-// the plane is the only side that knows which of them it meant.
-func downloadRefusal(status int, raw []byte) error {
-	var wire struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &wire); err == nil && wire.Error.Message != "" {
-		if code := strings.TrimSpace(wire.Error.Code); code != "" {
-			return fmt.Errorf("download refused: HTTP %d %s: %s", status, code, wire.Error.Message)
-		}
-		return fmt.Errorf("download refused: HTTP %d: %s", status, wire.Error.Message)
-	}
-	return fmt.Errorf("download refused: HTTP %d: %s", status, strings.TrimSpace(string(raw)))
-}
-
-// dispositionFilename pulls the filename out of a Content-Disposition header,
-// RFC 6266 form (`attachment; filename="report.md"`), including the
-// `filename*=UTF-8”...` spelling mime.ParseMediaType decodes. Anything
-// unparseable yields "".
+// dispositionFilename pulls the filename out of a Content-Disposition header.
+// RFC 6266's plain form and RFC 5987's extended (percent-encoded) spelling both
+// decode:
+//
+//	attachment; filename="report.md"
+//	attachment; filename*=UTF-8''report.md
+//
+// Anything unparseable yields "". The result is raw: it may carry control
+// characters (a percent-encoded %0A decodes to a newline), so it is never safe
+// to use unwritten.
 func dispositionFilename(header string) string {
 	if strings.TrimSpace(header) == "" {
 		return ""

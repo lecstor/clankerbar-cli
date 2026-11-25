@@ -1623,10 +1623,10 @@ the rendered deck.
 are then the whole of stdout. With `-o <path>` it writes the file and prints
 exactly the path written, so `FILE=$(clankerbar download asset:x -o docs/)` is
 usable; `-o` naming an existing directory writes the plane's filename inside it,
-while a name the response suggests is reduced to a bare filename (never a path)
-and falls back to the asset id. Downloads go through a temporary file and a
-rename, so a failed transfer or hash check leaves nothing behind, and a symlink
-at the destination is refused rather than followed. `--sha256 <hex>` verifies the
+using the response's suggested name only when it is already a bare filename and
+the asset id otherwise. Downloads go through a temporary file and a rename, so
+a failed transfer or hash check leaves nothing behind, and a symlink at the
+destination is refused rather than followed. `--sha256 <hex>` verifies the
 bytes and refuses a mismatch; the plane's ETag is compared with that expected
 hash before anything is written, and with the received bytes before the file is
 named.

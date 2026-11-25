@@ -1,7 +1,6 @@
 package plane
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
@@ -258,24 +256,11 @@ func (r *mcpReleaser) PutUpload(ctx context.Context, uploadURL string, body io.R
 	return nil
 }
 
-// putRefusal renders a rejected PUT from the plane's own error shape
-// (`{"error":{"code","message"}}`), keeping the code so a 401/403 auth failure
-// is never mistaken for a hash or size mismatch. Anything that does not parse
-// still names the HTTP status and whatever the body said.
+// putRefusal renders a rejected PUT from the plane's own error shape, keeping
+// the code so a 401/403 auth failure is never mistaken for a hash or size
+// mismatch.
 func putRefusal(status int, raw []byte) error {
-	var wire struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &wire); err == nil && wire.Error.Message != "" {
-		if code := strings.TrimSpace(wire.Error.Code); code != "" {
-			return fmt.Errorf("upload PUT refused: HTTP %d %s: %s", status, code, wire.Error.Message)
-		}
-		return fmt.Errorf("upload PUT refused: HTTP %d: %s", status, wire.Error.Message)
-	}
-	return fmt.Errorf("upload PUT refused: HTTP %d: %s", status, strings.TrimSpace(string(raw)))
+	return refuseWithPlaneWords("upload PUT refused", status, raw)
 }
 
 // UploadReviewDeck calls the plane's upload_review_deck with the asset form:

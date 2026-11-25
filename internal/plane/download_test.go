@@ -6,6 +6,7 @@ package plane
 // the CLI verifies a download against (length, ETag hash, filename).
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -78,6 +79,31 @@ func TestDownload_RequestShapeAndStream(t *testing.T) {
 	}
 	if stream.SHA256 != hexSum {
 		t.Errorf("SHA256 = %q, want the ETag's lowercase hash %q", stream.SHA256, hexSum)
+	}
+}
+
+// TestDownload_ChunkedResponseHasNoLength: when the plane declares no length,
+// the stream must say so (-1) rather than invent one; the CLI skips the length
+// check only for -1.
+func TestDownload_ChunkedResponseHasNoLength(t *testing.T) {
+	body := []byte("a chunked body")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+
+	stream, err := NewDownloadAPI(srv.URL+"/api/projects/demo/assets/a-1", "k-1").Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer stream.Body.Close()
+	if stream.ContentLength != -1 {
+		t.Errorf("ContentLength = %d, want -1 for a response with no declared length", stream.ContentLength)
+	}
+	if raw, err := io.ReadAll(stream.Body); err != nil || !bytes.Equal(raw, body) {
+		t.Errorf("body = %q, %v; want the chunked bytes", raw, err)
 	}
 }
 
@@ -220,6 +246,7 @@ func TestDispositionFilename(t *testing.T) {
 		"plain":            {`attachment; filename="report.md"`, "report.md"},
 		"unquoted":         {`attachment; filename=report.txt`, "report.txt"},
 		"rfc5987":          {`attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf`, "résumé.pdf"},
+		"rfc5987 control":  {`attachment; filename*=UTF-8''na%0Ame.md`, "na\nme.md"},
 		"inline":           {"inline", ""},
 		"empty":            {"", ""},
 		"unparseable":      {`attachment; filename="unterminated`, ""},
