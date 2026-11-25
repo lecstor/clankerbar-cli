@@ -153,19 +153,23 @@ func (r *mcpReleaser) CreateUpload(ctx context.Context, req CreateUploadRequest)
 	}, nil
 }
 
-// validateUploadURL enforces the same transport floor and origin pinning as the
-// plane's MCP calls before any file bytes or upload capability token leave this
+// validateSameOriginURL enforces the same transport floor and origin pinning as
+// the plane's MCP calls before any file bytes or capability token leave this
 // process: HTTPS everywhere (or loopback HTTP for local dev) and, when the
 // client has a configured endpoint, the exact same origin as that endpoint.
-func validateUploadURL(endpoint, uploadURL string) error {
+//
+// It guards the upload PUT (whose URL is minted by the plane and carries a
+// single-use token) and the asset download (whose URL is built from the same
+// configured origin), so the message names neither operation's path.
+func validateSameOriginURL(endpoint, rawURL string) error {
 	// Validate the origin-only spelling, never the raw URL. secureurl.Origin
 	// embeds the string it was given in its error, and this error is printed to
 	// stderr and copied into logs while the raw URL's path carries the
 	// single-use upload token. Origin reads only scheme and host, so the
 	// refusal is the one the raw URL would get.
-	uploadOrigin, err := secureurl.Origin(originOnly(uploadURL))
+	rawOrigin, err := secureurl.Origin(originOnly(rawURL))
 	if err != nil {
-		return fmt.Errorf("unsafe upload URL: %w", err)
+		return fmt.Errorf("unsafe URL: %w", err)
 	}
 	if endpoint == "" {
 		return nil
@@ -174,8 +178,8 @@ func validateUploadURL(endpoint, uploadURL string) error {
 	if err != nil {
 		return fmt.Errorf("unsafe plane endpoint: %w", err)
 	}
-	if !secureurl.SameOrigin(endpointOrigin, uploadURL) {
-		return fmt.Errorf("upload URL origin %q does not match plane endpoint origin %q", uploadOrigin, endpointOrigin)
+	if !secureurl.SameOrigin(endpointOrigin, rawURL) {
+		return fmt.Errorf("URL origin %q does not match plane endpoint origin %q", rawOrigin, endpointOrigin)
 	}
 	return nil
 }
@@ -197,9 +201,10 @@ func originOnly(raw string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// sameOriginRedirect extends noDowngradeRedirect for upload PUTs: every redirect
-// hop must still satisfy secureurl.Origin and stay on the plane's origin so a
-// compromised response cannot redirect file bytes and capability tokens off-site.
+// sameOriginRedirect extends noDowngradeRedirect for requests that carry a
+// credential or file bytes: every redirect hop must still satisfy
+// secureurl.Origin and stay on the plane's origin, so a compromised response
+// cannot redirect file bytes, download bytes or capability tokens off-site.
 func sameOriginRedirect(endpoint string) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if err := noDowngradeRedirect(req, via); err != nil {
@@ -208,7 +213,7 @@ func sameOriginRedirect(endpoint string) func(*http.Request, []*http.Request) er
 		if endpoint == "" {
 			return nil
 		}
-		if err := validateUploadURL(endpoint, req.URL.String()); err != nil {
+		if err := validateSameOriginURL(endpoint, req.URL.String()); err != nil {
 			return fmt.Errorf("refusing redirect: %w", err)
 		}
 		return nil
@@ -227,7 +232,7 @@ func (r *mcpReleaser) PutUpload(ctx context.Context, uploadURL string, body io.R
 	if uploadURL == "" {
 		return errors.New("upload PUT: no upload URL")
 	}
-	if err := validateUploadURL(r.endpoint, uploadURL); err != nil {
+	if err := validateSameOriginURL(r.endpoint, uploadURL); err != nil {
 		return fmt.Errorf("upload PUT: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, body)
