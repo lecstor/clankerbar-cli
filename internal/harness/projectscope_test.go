@@ -67,21 +67,17 @@ func TestOpencodePermissionProjectRootScope(t *testing.T) {
 		{"edit", "../other-project/clankerbar/x.go", "deny"},
 	}
 
-	for _, readOnly := range []bool{false, true} {
-		perm := opencodePermission(readOnly, repo, extra)
-		checked := append([]ask(nil), inScope...)
-		if readOnly {
-			checked = append(checked, []ask{
-				{"edit", "../clankerbar/internal/config/config.go", "deny"},
-				{"edit", "internal/harness/opencode.go", "deny"},
-			}...)
-		} else {
-			checked = append(checked, writes...)
+	perm := opencodePermission(false, repo, extra)
+	for _, tc := range append(append([]ask(nil), inScope...), writes...) {
+		if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != tc.want {
+			t.Errorf("drain ask(permission=%s, pattern=%q) = %s, want %s", tc.permission, tc.pattern, got, tc.want)
 		}
-		for _, tc := range checked {
-			if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != tc.want {
-				t.Errorf("readOnly=%v ask(permission=%s, pattern=%q) = %s, want %s", readOnly, tc.permission, tc.pattern, got, tc.want)
-			}
+	}
+
+	probePerm := opencodePermission(true, repo, extra)
+	for _, tc := range append(append([]ask(nil), inScope...), writes...) {
+		if got := opencodeEvaluate(t, probePerm, tc.permission, tc.pattern); got != "deny" {
+			t.Errorf("probe ask(permission=%s, pattern=%q) = %s, want deny", tc.permission, tc.pattern, got)
 		}
 	}
 }

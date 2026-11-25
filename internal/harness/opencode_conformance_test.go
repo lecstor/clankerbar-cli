@@ -614,20 +614,30 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 		defer srv.Close()
 		iso := isolate(t)
 		work := t.TempDir()
-		in := iso.invocation("ignored", work, writeJSON(t, fakeConfigDoc(srv.URL)))
+		mcpDir := t.TempDir()
+		doc := fakeConfigDoc(srv.URL)
+		doc["mcp"] = map[string]any{"servers": map[string]any{"clankerbar": fakeMCPEntry(t, mcpDir)}}
+		in := iso.invocation("ignored", work, writeJSON(t, doc))
 		in.Probe = true
+		in.NoBacklogMCP = true
 		res := invokeConformance(t, in)
 		requireHit(t, fake)
 		requireV2Record(t, iso, res)
 		for _, r := range fake.requests() {
-			for _, gone := range []string{"edit", "write", "shell"} {
+			for _, gone := range []string{
+				"edit", "write", "shell", "read", "grep", "glob", "list",
+				"clankerbar_claim_task", "clankerbar_get_backlog_summary",
+			} {
 				if indexOfTool(r.Tools, gone) >= 0 {
-					t.Errorf("%s offered to a read-only run", gone)
+					t.Errorf("%s offered to a probe run", gone)
 				}
 			}
 		}
 		if exists(filepath.Join(work, "w1.txt")) || exists(filepath.Join(work, "b1.txt")) {
-			t.Error("a read-only run wrote into the workdir")
+			t.Error("a probe run wrote into the workdir")
+		}
+		if exists(filepath.Join(mcpDir, "starts")) || exists(filepath.Join(mcpDir, "calls.jsonl")) {
+			t.Error("probe run started or called the clankerbar MCP server")
 		}
 	})
 

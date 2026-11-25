@@ -139,8 +139,8 @@ func TestProbeKeepsItsPinnedPostureAheadOfTheTerminator(t *testing.T) {
 			// substitute its own trivial one, and must not leak this past the
 			// terminator either.
 			args := a.args(Invocation{Probe: true, Prompt: "--json"})
-			if n := len(args); n < 2 || args[n-2] != "--" || args[n-1] != "." {
-				t.Fatalf("%s probe = %q, want a `--`-terminated trivial prompt", a.name, args)
+			if n := len(args); n < 2 || args[n-2] != "--" || args[n-1] != probePrompt {
+				t.Fatalf("%s probe = %q, want a `--`-terminated probe prompt %q", a.name, args, probePrompt)
 			}
 		})
 	}

@@ -152,7 +152,8 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 
 		pctx, pcancel := context.WithTimeout(ctx, opencodeProbeTimeout)
 		probeIn := in
-		probeIn.Probe = true // no wall-clock double-cap, no console tee
+		probeIn.Probe = true        // no wall-clock double-cap, no console tee
+		probeIn.NoBacklogMCP = true // coherence probe must never reach the backlog
 		probeIn.ResumeClaim = res.Claim
 		probeRes, probeErr := o.runSession(pctx, probeIn,
 			opencodeResumeArgs(in, sid, resurrectionProbePrompt), nil) // a probe has no private server to steer
@@ -241,10 +242,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 func opencodeArgs(in Invocation) []string {
 	prompt := opencodePrompt(in.Prompt)
 	if in.Probe {
-		// The cheapest possible request: a trivial prompt, tools all denied by the read-only permission
-		// policy (see env) — just enough to see whether the provider still answers or is
-		// budget-exhausted.
-		prompt = "."
+		// Explicit no-tool prompt plus deny-all permission policy: a bare "." invites
+		// models with AGENTS.md in context to treat the probe as a backlog drain.
+		prompt = probePrompt
 	}
 	args := []string{"run", "--standalone", "--format", "json", "--agent", opencodeAgent}
 	if m := in.ModelArg(); m != "" {
@@ -279,6 +279,19 @@ func opencodePermission(readOnly bool, workdir string, extraDirs []string) strin
 // opencodePermissionPolicy is opencodePermission before marshalling, so the session config can
 // embed it as an object rather than a string.
 func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string) map[string]any {
+	if readOnly {
+		// Probes check provider liveness or session coherence only: deny every tool
+		// (filesystem, shell, network, MCP) so a probe cannot inspect the repo or
+		// mutate the backlog.
+		return map[string]any{
+			"*":         "deny",
+			"edit":      "deny",
+			"shell":     "deny",
+			"execute":   "deny",
+			"webfetch":  "deny",
+			"websearch": "deny",
+		}
+	}
 	_, abs := opencodeWorkdirPatterns(workdir)
 	read := map[string]string{"**": "allow", "../**": "deny", opencodeMCPResourcePattern: "allow"}
 	edit := map[string]string{"**": "allow", "../**": "deny"}
@@ -305,12 +318,7 @@ func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string)
 	perm["opencode_*"] = "deny"
 	perm["opencode_list_mcp_resources"] = "allow"
 	perm["opencode_read_mcp_resource"] = "allow"
-	if readOnly {
-		perm["edit"] = "deny"
-		perm["shell"] = "deny"
-	} else {
-		perm["shell"] = "allow"
-	}
+	perm["shell"] = "allow"
 	perm["*"] = "deny"
 	return perm
 }
@@ -1223,6 +1231,7 @@ func (opencode) Diagnostic(res Result) string { return opencodeErrorText(res) }
 
 func (o opencode) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	in.Probe = true
+	in.NoBacklogMCP = true
 	res, err := o.Invoke(ctx, in)
 	// Spend is taken off the Result on every path — see claude.Probe for why.
 	out := ProbeResult{Tokens: res.Tokens, CostUSD: res.CostUSD}
