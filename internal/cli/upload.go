@@ -142,10 +142,10 @@ func hashFile(path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-// parseOnePositional parses upload/deck/download args. Unlike most subcommands these take
-// exactly one POSITIONAL — a file or an asset id — so parseFlags' no-positionals rule does
-// not apply; this is that function with the rule replaced (the shape parseCtlArgs
-// already uses for ctl's action).
+// parseOnePositional parses upload/deck/download args. Unlike most subcommands
+// these take exactly one POSITIONAL — a file or an asset id — so parseFlags'
+// no-positionals rule does not apply; this is that function with the rule
+// replaced (the shape parseCtlArgs already uses for ctl's action).
 func parseOnePositional(fs *pflag.FlagSet, args []string, want string) (string, error) {
 	if err := rejectSingleDashLongFlags(fs, args); err != nil {
 		printUsage(fs)

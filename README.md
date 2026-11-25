@@ -1627,8 +1627,9 @@ while a name the response suggests is reduced to a bare filename (never a path)
 and falls back to the asset id. Downloads go through a temporary file and a
 rename, so a failed transfer or hash check leaves nothing behind, and a symlink
 at the destination is refused rather than followed. `--sha256 <hex>` verifies the
-bytes and refuses a mismatch; the plane's ETag hash is checked too, before
-anything is written.
+bytes and refuses a mismatch; the plane's ETag is compared with that expected
+hash before anything is written, and with the received bytes before the file is
+named.
 
 The plane owns the rules: the content-type allowlist and the size caps are
 checked on the declaration, and its refusal text is what you see, not a

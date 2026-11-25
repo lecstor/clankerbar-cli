@@ -77,8 +77,8 @@ func NewDownloadAPI(assetURL, apiKey string) DownloadAPI {
 // downloadTimeout bounds a whole asset GET, including reading its body.
 const downloadTimeout = 5 * time.Minute
 
-// downloadNotWired is NewDownloadAPI's not-wired answer: only Download, so it
-// cannot be asserted into a capability nobody requested.
+// downloadNotWired is NewDownloadAPI's not-wired answer: only Get, so it cannot
+// be asserted into a capability nobody requested.
 type downloadNotWired struct{}
 
 func (downloadNotWired) Get(context.Context) (*AssetStream, error) {
@@ -116,7 +116,10 @@ func (a *assetClient) Get(ctx context.Context) (*AssetStream, error) {
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	// Only 200 is a complete asset from this route. A 206 can only be a partial
+	// body (this client sends no Range), and treating any other 2xx as success
+	// would write a truncated file that no declared length accounts for.
+	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 		return nil, downloadRefusal(resp.StatusCode, raw)
@@ -154,7 +157,7 @@ func downloadRefusal(status int, raw []byte) error {
 
 // dispositionFilename pulls the filename out of a Content-Disposition header,
 // RFC 6266 form (`attachment; filename="report.md"`), including the
-// `filename*=UTF-8”…` spelling mime.ParseMediaType decodes. Anything
+// `filename*=UTF-8”...` spelling mime.ParseMediaType decodes. Anything
 // unparseable yields "".
 func dispositionFilename(header string) string {
 	if strings.TrimSpace(header) == "" {

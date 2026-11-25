@@ -106,6 +106,12 @@ func TestDownload_RefusalCarriesThePlanesWords(t *testing.T) {
 			wants:   []string{"HTTP 401", "unauthorized", "Invalid or revoked API key"},
 		},
 		{
+			name:   "a partial body is not an asset",
+			status: http.StatusPartialContent,
+			body:   "partial",
+			wants:  []string{"HTTP 206", "partial"},
+		},
+		{
 			name:   "an empty refusal still names the status",
 			status: http.StatusBadGateway,
 			body:   "",
