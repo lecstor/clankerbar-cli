@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -231,6 +232,127 @@ func TestCompleteCloseOutNeedsACommitAndABase(t *testing.T) {
 	}
 }
 
+// The evidence retry is the ONE call that asserts an outcome. It sends the same
+// delivery as the refused close and attests the check its evidence cites, so the
+// stored record names what the driver actually verified (CLA-1030).
+func TestCompleteCloseOutWithEvidenceSendsTheOutcomeAndTheAttestation(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").CompleteCloseOutWithEvidence(context.Background(), "t-1", "run-1", CloseOutDelivery{
+		Commit:            "38e21749",
+		PR:                "#12",
+		IntegrationBranch: "staging",
+		MergeVerified:     true,
+	}, CloseOutEvidence{
+		Outcome:    "the repair note\n\n**Tests**\n- pr (PR #12, head abc): pass",
+		Check:      "pr",
+		Conclusion: "pass",
+		Branch:     "clanker/close-me",
+		PR:         "#12",
+	})
+	if err != nil {
+		t.Fatalf("CompleteCloseOutWithEvidence: %v", err)
+	}
+	if name := toolName(t, got.body); name != "complete_task" {
+		t.Errorf("tool = %q, want complete_task", name)
+	}
+	args := toolArgs(t, got.body)
+	if args["runId"] != "run-1" || args["taskId"] != "t-1" {
+		t.Errorf("arguments = %+v, want the close signed by the claim's run", args)
+	}
+	outcome, _ := args["outcome"].(string)
+	if !strings.Contains(outcome, "the repair note") || !strings.Contains(outcome, "**Tests**") {
+		t.Errorf("outcome = %q, want the stored text with its Tests section asserted", outcome)
+	}
+	delivery, ok := args["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("no delivery block: %+v", args)
+	}
+	if delivery["commit"] != "38e21749" || delivery["pr"] != "#12" ||
+		delivery["integrationBranch"] != "staging" || delivery["mergeVerified"] != true {
+		t.Errorf("delivery = %+v, want the SAME delivery the first call sent", delivery)
+	}
+	attestation, ok := args["ciAttestation"].(map[string]any)
+	if !ok {
+		t.Fatalf("no ciAttestation block: %+v", args)
+	}
+	if attestation["check"] != "pr" || attestation["conclusion"] != "pass" ||
+		attestation["branch"] != "clanker/close-me" || attestation["pr"] != "#12" {
+		t.Errorf("ciAttestation = %+v, want the verified check named with its PR and branch", attestation)
+	}
+}
+
+// A retry that asserts nothing is not the evidence retry: the plane would refuse
+// it for the same reason, and a call that cannot name what it verified has no
+// business asserting an outcome.
+func TestCompleteCloseOutWithEvidenceNeedsAnOutcomeAndACheck(t *testing.T) {
+	api := NewCloseOutAPI("https://plane.example/mcp/demo", "k-1")
+	decl := CloseOutDelivery{Commit: "abc", IntegrationBranch: "staging"}
+	if err := api.CompleteCloseOutWithEvidence(context.Background(), "t-1", "run-1", decl, CloseOutEvidence{Check: "pr"}); err == nil {
+		t.Error("an evidence retry with no outcome must be refused")
+	}
+	if err := api.CompleteCloseOutWithEvidence(context.Background(), "t-1", "run-1", decl, CloseOutEvidence{Outcome: "**Tests**\n- none"}); err == nil {
+		t.Error("an evidence retry with no verified check named must be refused")
+	}
+	if err := api.CompleteCloseOutWithEvidence(context.Background(), "t-1", "run-1", CloseOutDelivery{Commit: "abc"}, CloseOutEvidence{Outcome: "x", Check: "pr"}); err == nil {
+		t.Error("an evidence retry must still carry a valid delivery")
+	}
+}
+
+// The stored-outcome read asks for the compact view — the baseline the retry
+// appends to, not the whole record — and accepts the plane's wrapped envelope.
+func TestTaskOutcomeAsksForTheCompactView(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"task\":{\"id\":\"t-1\",\"outcome\":\"the stored note\"}}"}]}}`)
+
+	outcome, err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").TaskOutcome(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("TaskOutcome: %v", err)
+	}
+	if outcome != "the stored note" {
+		t.Errorf("outcome = %q, want the text already stored on the task", outcome)
+	}
+	if name := toolName(t, got.body); name != "get_task" {
+		t.Errorf("tool = %q, want get_task", name)
+	}
+	args := toolArgs(t, got.body)
+	if args["taskId"] != "t-1" || args["view"] != "compact" {
+		t.Errorf("arguments = %+v, want the compact read of t-1", args)
+	}
+}
+
+// A bare (unwrapped) task object is the other envelope get_task has used; a null
+// outcome is an empty baseline, never an error.
+func TestTaskOutcomeAcceptsTheBareEnvelopeAndANullOutcome(t *testing.T) {
+	srv, _ := serve(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"id\":\"t-1\",\"outcome\":null}"}]}}`)
+
+	outcome, err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").TaskOutcome(context.Background(), "t-1")
+	if err != nil {
+		t.Fatalf("TaskOutcome: %v", err)
+	}
+	if outcome != "" {
+		t.Errorf("outcome = %q, want empty for a null record", outcome)
+	}
+}
+
+// Only the structured `evidence_required` refusal earns the retry: the code is
+// the machine-readable half of the plane's answer, and prose is not a code.
+func TestCloseOutEvidenceRefusedMatchesOnlyThatCode(t *testing.T) {
+	refusal := func(code string) error {
+		return fmt.Errorf("complete_task refused: {\"error\":{\"code\":%q,\"message\":\"no evidence\"}}", code)
+	}
+	if !CloseOutEvidenceRefused(refusal("evidence_required")) {
+		t.Error("the evidence_required refusal must be recognised")
+	}
+	for _, other := range []string{"delivery_required", "not_ready", "claim_lost"} {
+		if CloseOutEvidenceRefused(refusal(other)) {
+			t.Errorf("the %s refusal was mistaken for evidence_required", other)
+		}
+	}
+	if CloseOutEvidenceRefused(errors.New("complete_task refused: evidence_required")) {
+		t.Error("prose without the structured code must not be mistaken for the refusal")
+	}
+}
+
 // The recovery record is a `record_progress` write: it names the same delivery a
 // completed close would have, and it changes no status and asserts no outcome, so
 // it can never settle a claim the close-out could not finish.
@@ -296,6 +418,12 @@ func TestNewCloseOutAPINotWiredRefusesAndStaysNarrow(t *testing.T) {
 	}
 	if err := api.CompleteCloseOut(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}); !errors.Is(err, ErrNotWired) {
 		t.Errorf("CompleteCloseOut err = %v, want ErrNotWired", err)
+	}
+	if err := api.CompleteCloseOutWithEvidence(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}, CloseOutEvidence{Outcome: "x", Check: "pr"}); !errors.Is(err, ErrNotWired) {
+		t.Errorf("CompleteCloseOutWithEvidence err = %v, want ErrNotWired", err)
+	}
+	if _, err := api.TaskOutcome(ctx, "t-1"); !errors.Is(err, ErrNotWired) {
+		t.Errorf("TaskOutcome err = %v, want ErrNotWired", err)
 	}
 	if err := api.RecordCloseOutDelivery(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}); !errors.Is(err, ErrNotWired) {
 		t.Errorf("RecordCloseOutDelivery err = %v, want ErrNotWired", err)
