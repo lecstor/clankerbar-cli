@@ -86,18 +86,7 @@ const (
 	// reports) for longer than the fleet can tolerate: two minutes is well over a
 	// dozen clean close-outs, and everything past it waits for the next poll.
 	closeOutPassBudget = 2 * time.Minute
-
-	// closeOutCompleteAttempts bounds the retries of the final close after a
-	// merge landed. It is the one write whose failure must not fall back to a
-	// release: the PR is gone from the open list, so a release strands the task.
-	// Four attempts spend 1.75s of backoff inside the single cleanup timeout.
-	closeOutCompleteAttempts = 4
 )
-
-// closeOutCompleteBackoff is the wait before the second close attempt; it doubles
-// each retry. A var so a test can shrink it rather than wait the real bound out,
-// the same discipline closeOutBaseProbeTimeout keeps.
-var closeOutCompleteBackoff = 250 * time.Millisecond
 
 // closeOutBaseProbeTimeout bounds the close-out's own origin probe. The driver
 // gives its probe 30s (loop.prBaseProbeTimeout) because a phase spawn has nothing
@@ -530,75 +519,6 @@ func (d *Supervisor) settleMergedCloseOut(client plane.CloseOutAPI, label, key, 
 		return
 	}
 	d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s (merge commit is an ancestor of the remote tip) - task closed done%s", label, state.Number, shortSHA(mergeSHA), base, via)
-}
-
-// retryCloseOutCall runs one plane write, retrying a TRANSIENT plane failure
-// (transport or 5xx) within ctx. A tool-level refusal is the plane's considered
-// answer and is returned at once: retrying it would only repeat it. what names the
-// write for the retry line.
-func retryCloseOutCall(ctx context.Context, what string, fn func() error) error {
-	wait := closeOutCompleteBackoff
-	var err error
-	for attempt := 1; attempt <= closeOutCompleteAttempts; attempt++ {
-		if err = fn(); err == nil {
-			return nil
-		}
-		if !plane.Transient(err) || attempt == closeOutCompleteAttempts {
-			return err
-		}
-		log.Printf("close-out: %s failed transiently (attempt %d of %d: %v) - retrying",
-			what, attempt, closeOutCompleteAttempts, err)
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(wait):
-		}
-		wait *= 2
-	}
-	return err
-}
-
-// completeCloseOut closes the task done, retrying a TRANSIENT plane failure
-// (transport or 5xx) within one cleanup budget. A tool-level refusal is the
-// plane's answer and is returned at once, with one exception: the close-out's
-// own evidence refusal (evidence_required) earns the single retry that asserts
-// the checks this pass verified. It reports whether that retry was attempted.
-func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, gated *closeOutGatedCheck, mergeVerified bool) (bool, error) {
-	ctx, cancel := d.closeOutCleanupCtx()
-	defer cancel()
-	what := fmt.Sprintf("%s PR %s merged as %s, but closing the task", label, decl.PR, decl.Commit)
-	err := retryCloseOutCall(ctx, what, func() error {
-		return client.CompleteCloseOut(ctx, taskID, runID, decl)
-	})
-	if err == nil || !plane.CloseOutEvidenceRefused(err) {
-		return false, err
-	}
-	return d.retryCloseOutWithEvidence(ctx, client, label, key, taskID, runID, decl, gated, mergeVerified, err)
-}
-
-// recordMergedDelivery is the recovery write for a merge that landed but could
-// not be closed. The claim is LEFT HELD on purpose: releasing it would return a
-// merged task to approved with no open PR, and the lease expiry is the safe
-// hand-back - it offers the task as a takeover, and this record tells the
-// successor the merge SHA and PR are already merged.
-//
-// It gets the same bounded retry as the close: a plane that has just answered 502
-// to every close attempt will often fail this write too, and this record is the
-// only durable place the merge SHA and PR are written down.
-func (d *Supervisor) recordMergedDelivery(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, closeErr error) {
-	ctx, cancel := d.closeOutCleanupCtx()
-	what := fmt.Sprintf("%s PR %s merged as %s, but recording the delivery", label, decl.PR, decl.Commit)
-	recErr := retryCloseOutCall(ctx, what, func() error {
-		return client.RecordCloseOutDelivery(ctx, taskID, runID, decl)
-	})
-	cancel()
-	if recErr == nil {
-		d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) - delivery RECORDED (mergeVerified:%t) so a successor can close it; the claim is left held rather than returning a merged PR to approved",
-			label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, decl.MergeVerified)
-		return
-	}
-	d.closeOutSay(key, "close-out: %s PR %s merged as %s into %s, but closing the task failed (%v) AND the delivery could not be recorded (%v) - the claim is left held until its lease expires; a successor must close the task from that merge commit and PR (if a close attempt was processed and its answer was lost, the task may already be closed)",
-		label, decl.PR, decl.Commit, decl.IntegrationBranch, closeErr, recErr)
 }
 
 // settleMergeError decides what a failed MergePR means. The merge POST can land
