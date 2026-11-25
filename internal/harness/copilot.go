@@ -596,7 +596,7 @@ func copilotPrompt(in Invocation) string {
 		if in.MCPConfigPath != "" {
 			return "Call the clankerbar MCP tool get_backlog_summary once and reply with only its contents. Do not call any other tool."
 		}
-		return "."
+		return probePrompt
 	}
 	return in.Prompt
 }

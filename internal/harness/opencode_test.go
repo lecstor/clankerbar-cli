@@ -959,14 +959,15 @@ func TestOnlyOpencodeGuesses(t *testing.T) {
 	}
 }
 
-// Probe must build a READ-ONLY invocation: a trivial prompt and a permission
-// policy that denies edits, shell and the exfil tools — zero writes.
+// Probe must build a TOOL-FREE invocation: an explicit no-tool prompt and a
+// permission policy that denies every tool — filesystem, shell, network, and
+// MCP — so a usage-limit or coherence probe can never touch the repo or backlog.
 func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	args := opencodeArgs(Invocation{Probe: true, Prompt: "Work the backlog.", Model: "opencode/claude-haiku-4-5"})
 	joined := strings.Join(args, " ")
 	// The prompt sits last, behind a `--` terminator (see args_test.go).
-	if !strings.HasPrefix(joined, "run --standalone --format json") || !strings.HasSuffix(joined, " -- .") {
-		t.Errorf("probe args = %q, want a trivial `run --standalone --format json ... -- .` request", joined)
+	if !strings.HasPrefix(joined, "run --standalone --format json") || len(args) < 2 || args[len(args)-2] != "--" || args[len(args)-1] != probePrompt {
+		t.Errorf("probe args = %q, want a `run --standalone --format json ... -- %q` request", joined, probePrompt)
 	}
 	for _, a := range args {
 		if strings.Contains(a, "Work the backlog.") {
@@ -974,26 +975,54 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 		}
 	}
 
-	perm := opencodePermission(true, "/Users/jason/dev", nil) // readOnly
+	perm := opencodePermission(true, "/Users/jason/dev", nil) // probe
 	p := parsePolicy(t, perm)
-	for _, tool := range []string{"edit", "shell", "execute"} {
+	for _, tool := range []string{"*", "edit", "shell", "execute"} {
 		if p[tool] != "deny" {
-			t.Errorf("read-only policy: %s = %q, want deny", tool, p[tool])
+			t.Errorf("probe policy: %s = %q, want deny", tool, p[tool])
 		}
 	}
 	assertNetworkDenied(t, p)
-	// The read-only search tools survive the probe shape too: they read the
-	// workdir subtree and write nothing, the same class as `read`.
-	for _, tool := range []string{"grep", "glob", "list"} {
-		if p[tool] != "**:allow" {
-			t.Errorf("read-only policy: %s = %q, want **:allow (read-only search must stay available)", tool, p[tool])
+	for _, tc := range []struct{ permission, pattern string }{
+		{"read", "AGENTS.md"},
+		{"read", "mcp:clankerbar:*"},
+		{"edit", "a.go"},
+		{"shell", "git status"},
+		{"grep", "foo"},
+		{"glob", "**/*"},
+		{"list", "."},
+		{"external_directory", "/Users/jason/dev/*"},
+		{"clankerbar_next_task", "*"},
+		{"clankerbar_claim_task", "*"},
+		{"clankerbar_ask_question", "*"},
+		{"opencode_list_mcp_resources", "*"},
+		{"opencode_read_mcp_resource", "*"},
+	} {
+		if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {
+			t.Errorf("probe policy ask(permission=%s, pattern=%q) = %s, want deny", tc.permission, tc.pattern, got)
 		}
 	}
-	// The path-scoped working set survives the probe shape: reads inside the
-	// workdir are allowed, but nothing writes.
-	if p["read"] != "**:allow ../**:deny mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
-		t.Errorf("read-only policy must keep the path-scoped read/external_directory rules, got read=%q external_directory=%q",
-			p["read"], p["external_directory"])
+
+	// A probe built with NoBacklogMCP (as Probe and probeInvocation both set)
+	// also switches off every clankerbar MCP server in OPENCODE_CONFIG_CONTENT.
+	dir := t.TempDir()
+	mcpPath := filepath.Join(dir, "opencode.json")
+	if err := os.WriteFile(mcpPath, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env, err := (opencode{}).env(Invocation{
+		WorkDir:       dir,
+		ConfigDir:     t.TempDir(),
+		MCPConfigPath: mcpPath,
+		Probe:         true,
+		NoBacklogMCP:  true,
+	})
+	if err != nil {
+		t.Fatalf("env(probe): %v", err)
+	}
+	content := lastValue(env, "OPENCODE_CONFIG_CONTENT")
+	if !strings.Contains(content, `"disabled":true`) {
+		t.Errorf("probe OPENCODE_CONFIG_CONTENT did not disable clankerbar MCP: %s", content)
 	}
 }
 
@@ -1177,35 +1206,42 @@ func TestOpencodePermissionEffective(t *testing.T) {
 // carve-out is inert until a build exposes them top-level again. It is pinned in
 // both run shapes so that day does not need a policy change.
 func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
-	for _, shape := range []struct {
-		name     string
-		readOnly bool
-	}{{"drain", false}, {"probe", true}} {
-		t.Run(shape.name, func(t *testing.T) {
-			perm := opencodePermission(shape.readOnly, "/Users/jason/dev", nil)
-			for _, pattern := range []string{
-				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md",
-				"mcp:clankerbar:*",
-				"mcp:context7:*",
-			} {
-				if got := opencodeEvaluate(t, perm, "read", pattern); got != "allow" {
-					t.Errorf("ask(permission=read, pattern=%q) = %s, want allow", pattern, got)
-				}
+	t.Run("drain", func(t *testing.T) {
+		perm := opencodePermission(false, "/Users/jason/dev", nil)
+		for _, pattern := range []string{
+			"mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md",
+			"mcp:clankerbar:*",
+			"mcp:context7:*",
+		} {
+			if got := opencodeEvaluate(t, perm, "read", pattern); got != "allow" {
+				t.Errorf("ask(permission=read, pattern=%q) = %s, want allow", pattern, got)
 			}
-			denied := []struct{ permission, pattern string }{
-				{"read", "../../../etc/hosts"},
-				{"read", "../.ssh/id_ed25519"},
-				{"external_directory", "/etc/*"},
-				{"webfetch", "*"},
-				{"websearch", "*"},
+		}
+		denied := []struct{ permission, pattern string }{
+			{"read", "../../../etc/hosts"},
+			{"read", "../.ssh/id_ed25519"},
+			{"external_directory", "/etc/*"},
+			{"webfetch", "*"},
+			{"websearch", "*"},
+		}
+		for _, tc := range denied {
+			if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {
+				t.Errorf("ask(permission=%s, pattern=%q) = %s, want deny — the MCP carve-out must not loosen anything else", tc.permission, tc.pattern, got)
 			}
-			for _, tc := range denied {
-				if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {
-					t.Errorf("ask(permission=%s, pattern=%q) = %s, want deny — the MCP carve-out must not loosen anything else", tc.permission, tc.pattern, got)
-				}
+		}
+	})
+	t.Run("probe", func(t *testing.T) {
+		perm := opencodePermission(true, "/Users/jason/dev", nil)
+		for _, pattern := range []string{
+			"mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md",
+			"mcp:clankerbar:*",
+			"mcp:context7:*",
+		} {
+			if got := opencodeEvaluate(t, perm, "read", pattern); got != "deny" {
+				t.Errorf("probe ask(permission=read, pattern=%q) = %s, want deny", pattern, got)
 			}
-		})
-	}
+		}
+	})
 }
 
 // opencodeEvaluate replicates opencode's Permission.evaluate

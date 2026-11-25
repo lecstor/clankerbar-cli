@@ -379,8 +379,8 @@ func TestCopilotProbeIsReadOnly(t *testing.T) {
 // cheapest possible request.
 func TestCopilotProbeWithoutMCPIsJustAPing(t *testing.T) {
 	args := copilotArgs(Invocation{Probe: true, Prompt: "Work the backlog."})
-	if !strings.HasSuffix(strings.Join(args, " "), "-p .") {
-		t.Errorf("args %q: want the bare '.' probe prompt", strings.Join(args, " "))
+	if len(args) < 2 || args[len(args)-2] != "-p" || args[len(args)-1] != probePrompt {
+		t.Errorf("args %q: want -p %q", strings.Join(args, " "), probePrompt)
 	}
 	for _, i := range flagPositions(args, "--allow-tool") {
 		t.Errorf("args %q: a probe without an MCP config granted %q", strings.Join(args, " "), args[i+1])

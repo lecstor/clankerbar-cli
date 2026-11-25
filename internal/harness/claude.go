@@ -653,7 +653,7 @@ func (u usage) normalised() TokenUsage {
 // probe runs the cheapest possible request (tiny prompt, no tools, plain json) to answer "am I
 // still limited?" — no streaming, no console.
 func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
-	args := []string{"-p", ".", "--output-format", "json", "--permission-mode", "dontAsk", "--allowedTools", ""}
+	args := []string{"-p", probePrompt, "--output-format", "json", "--permission-mode", "dontAsk", "--allowedTools", "", "--max-turns", "1"}
 	cmd, err := sessionCommand(ctx, in.Nice, "claude", args...)
 	if err != nil {
 		return Result{}, err

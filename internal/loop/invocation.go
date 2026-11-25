@@ -210,6 +210,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		EnvAllowlist:  d.cfg.SessionEnvAllowlist(harnessName, t.Name),
 		Nice:          d.cfg.SessionNice,
 		Probe:         probe,
+		NoBacklogMCP:  probe,
 	}
 	// The agent event channel. The loop's top-level probe is a one-word liveness check, not a session
 	// doing work, so it never emits.
