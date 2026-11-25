@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -79,6 +80,9 @@ func TestCloseOutRetriesAnEvidenceRefusalWithTheDriversChecks(t *testing.T) {
 	}
 
 	outcome, _ := retry["outcome"].(string)
+	if !config.HasTestsSection(outcome) {
+		t.Errorf("the asserted outcome would still be refused for missing evidence:\n%s", outcome)
+	}
 	if !strings.HasPrefix(outcome, stored) {
 		t.Errorf("the asserted outcome does not keep the stored text verbatim:\n%q", outcome)
 	}
