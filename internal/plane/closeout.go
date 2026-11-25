@@ -51,6 +51,16 @@ type CloseOutAPI interface {
 	// claim's run.
 	CompleteCloseOut(ctx context.Context, taskID, runID string, d CloseOutDelivery) error
 
+	// CompleteCloseOutWithEvidence is CompleteCloseOut's one retry for a plane
+	// that refused the close with `evidence_required`: it sends the SAME
+	// delivery with ev's outcome asserted and the check it cites attested.
+	CompleteCloseOutWithEvidence(ctx context.Context, taskID, runID string, d CloseOutDelivery, ev CloseOutEvidence) error
+
+	// TaskOutcome reads the outcome already stored on a task (get_task, compact
+	// view). A close-out whose evidence the plane refused appends to this text
+	// rather than replacing the reviewed record.
+	TaskOutcome(ctx context.Context, taskID string) (string, error)
+
 	// RecordCloseOutDelivery records the delivery on the task WITHOUT changing
 	// its status (`record_progress`). It is the recovery write for a merge that
 	// landed but whose CompleteCloseOut could not be finished: returning the
@@ -120,6 +130,32 @@ type CloseOutDelivery struct {
 	MergeVerified     bool
 }
 
+// CloseOutEvidence is what a close-out asserts when the plane refuses the close
+// with `evidence_required`. Outcome is the stored outcome kept verbatim with a
+// `**Tests**` section appended; the remaining fields are the check the merge was
+// gated on, so the stored ci attestation names exactly what the driver saw.
+type CloseOutEvidence struct {
+	Outcome    string
+	Check      string
+	Conclusion string
+	Branch     string
+	PR         string
+}
+
+// closeOutEvidenceRefusal is the plane's code for a completion whose outcome
+// carries no verification evidence. It is the ONLY refusal the close-out retries
+// with an asserted outcome (CLA-1030): every other refusal is the plane's
+// considered answer to the call as made.
+const closeOutEvidenceRefusal = "evidence_required"
+
+// CloseOutEvidenceRefused reports whether err is that refusal. Callers branch on
+// this rather than retrying every refusal: a rejection for any other reason would
+// only repeat.
+func CloseOutEvidenceRefused(err error) bool {
+	code, _, ok := refusalCode(err)
+	return ok && code == closeOutEvidenceRefusal
+}
+
 // closeOutQueueLimit bounds one listing. The cap is the caller's to report when it
 // bites: a project with more than this many approved tasks has a stalled
 // integration queue, and quietly closing out a page of it would hide that.
@@ -151,6 +187,10 @@ func (coNotWired) ReleaseCloseOut(context.Context, string, string, bool) error {
 func (coNotWired) CompleteCloseOut(context.Context, string, string, CloseOutDelivery) error {
 	return ErrNotWired
 }
+func (coNotWired) CompleteCloseOutWithEvidence(context.Context, string, string, CloseOutDelivery, CloseOutEvidence) error {
+	return ErrNotWired
+}
+func (coNotWired) TaskOutcome(context.Context, string) (string, error) { return "", ErrNotWired }
 func (coNotWired) RecordCloseOutDelivery(context.Context, string, string, CloseOutDelivery) error {
 	return ErrNotWired
 }
@@ -316,6 +356,73 @@ func (r *mcpReleaser) CompleteCloseOut(ctx context.Context, taskID, runID string
 		"runId":    runID,
 		"delivery": closeOutDeliveryBlock(d),
 	})
+}
+
+// CompleteCloseOutWithEvidence closes the task on the ONE retry a plane's
+// `evidence_required` refusal earns. It sends the same delivery as the refused
+// call, asserts ev.Outcome (the stored outcome with the driver's own verified
+// checks appended), and attests the check that evidence cites — so the record
+// says what was seen, not merely that the close was retried.
+func (r *mcpReleaser) CompleteCloseOutWithEvidence(ctx context.Context, taskID, runID string, d CloseOutDelivery, ev CloseOutEvidence) error {
+	if taskID == "" || runID == "" {
+		return errors.New("complete close-out with evidence: taskId and runId are both required")
+	}
+	if d.Commit == "" || d.IntegrationBranch == "" {
+		return errors.New("complete close-out with evidence: the delivery must name a commit and an integration branch")
+	}
+	if strings.TrimSpace(ev.Outcome) == "" {
+		return errors.New("complete close-out with evidence: the asserted outcome is empty")
+	}
+	if strings.TrimSpace(ev.Check) == "" {
+		return errors.New("complete close-out with evidence: the attestation must name the check that was verified")
+	}
+	attestation := map[string]any{"check": ev.Check}
+	if ev.Conclusion != "" {
+		attestation["conclusion"] = ev.Conclusion
+	}
+	if ev.Branch != "" {
+		attestation["branch"] = ev.Branch
+	}
+	if ev.PR != "" {
+		attestation["pr"] = ev.PR
+	}
+	return r.call(ctx, "complete_task", map[string]any{
+		"taskId":        taskID,
+		"runId":         runID,
+		"delivery":      closeOutDeliveryBlock(d),
+		"outcome":       ev.Outcome,
+		"ciAttestation": attestation,
+	})
+}
+
+// TaskOutcome reads the outcome already stored on a task through `get_task` with
+// the compact view: the baseline a refused close keeps verbatim and appends its
+// evidence to. Both envelopes the plane has used are accepted (wrapped and bare),
+// like TaskRepo and TaskState.
+func (r *mcpReleaser) TaskOutcome(ctx context.Context, taskID string) (string, error) {
+	if taskID == "" {
+		return "", errors.New("task outcome: taskId is required")
+	}
+	raw, err := r.callText(ctx, "get_task", map[string]any{
+		"taskId": taskID,
+		"view":   "compact",
+	})
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		Task *struct {
+			Outcome any `json:"outcome"`
+		} `json:"task"`
+		Outcome any `json:"outcome"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return "", fmt.Errorf("get_task: decode response: %w", err)
+	}
+	if payload.Task != nil {
+		return wireString(payload.Task.Outcome), nil
+	}
+	return wireString(payload.Outcome), nil
 }
 
 // RecordCloseOutDelivery writes the delivery with `record_progress`, which
