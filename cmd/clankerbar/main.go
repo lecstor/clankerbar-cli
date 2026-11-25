@@ -63,6 +63,8 @@ func run(args []string) int {
 			err = cli.DeadRate(ctx, args[2:])
 		case "upload":
 			err = cli.Upload(ctx, args[2:])
+		case "download":
+			err = cli.Download(ctx, args[2:])
 		case "deck":
 			err = cli.Deck(ctx, args[2:])
 		case "review":

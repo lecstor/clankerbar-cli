@@ -358,6 +358,40 @@ func TestProjectSummaryURL(t *testing.T) {
 	})
 }
 
+func TestProjectAssetURL(t *testing.T) {
+	c := &Config{BacklogURL: defaultBacklogURL}
+	if got := c.ProjectAssetURL(Project{Slug: "ezyapp"}, "a-1"); got != "https://clankerbar.com/api/projects/ezyapp/assets/a-1" {
+		t.Errorf("ProjectAssetURL() = %q", got)
+	}
+
+	c = &Config{BacklogURL: "https://plane.internal"}
+	if got := c.ProjectAssetURL(Project{Slug: "proj"}, "a-1"); got != "https://plane.internal/api/projects/proj/assets/a-1" {
+		t.Errorf("ProjectAssetURL() = %q, want the explicit origin", got)
+	}
+
+	// Both path segments are escaped: a hostile slug cannot add a route segment,
+	// and an id carrying a slash addresses one asset, not a nested path.
+	c = &Config{BacklogURL: defaultBacklogURL}
+	if got := c.ProjectAssetURL(Project{Slug: "a/b"}, "x/../y"); got != "https://clankerbar.com/api/projects/a%2Fb/assets/x%2F..%2Fy" {
+		t.Errorf("ProjectAssetURL() = %q, want both segments path-escaped", got)
+	}
+
+	for _, tc := range []struct {
+		name string
+		cfg  *Config
+		p    Project
+		id   string
+	}{
+		{"no origin", &Config{}, Project{Slug: "p"}, "a-1"},
+		{"no slug", &Config{BacklogURL: defaultBacklogURL}, Project{}, "a-1"},
+		{"no asset id", &Config{BacklogURL: defaultBacklogURL}, Project{Slug: "p"}, ""},
+	} {
+		if got := tc.cfg.ProjectAssetURL(tc.p, tc.id); got != "" {
+			t.Errorf("%s: ProjectAssetURL() = %q, want empty", tc.name, got)
+		}
+	}
+}
+
 // The CLA-310 empty-rollup opt-out resolves per project: a matching entry's
 // own value wins; an unmatched slug (the single-project shape reaching the
 // resolver with an empty one) falls back to the top level.

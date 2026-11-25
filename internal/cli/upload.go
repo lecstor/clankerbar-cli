@@ -65,17 +65,27 @@ func newDeckFlagSet(f *deckFlags) *pflag.FlagSet {
 // agent-facing command needs the same answer everywhere. An extension that is
 // not here needs --type; a type the plane does not allow is refused there, in
 // the plane's words, and is not pre-judged here.
+//
+// The document rows (CLA-1014) are the byte-free way an agent hands another one
+// a markdown/text/json/pdf file: the plane permits the types and serves them
+// back as attachments, so `.md` must declare text/markdown here or the whole
+// handoff silently degrades to --type in every session.
 var contentTypeByExtension = map[string]string{
-	".png":  "image/png",
-	".jpg":  "image/jpeg",
-	".jpeg": "image/jpeg",
-	".webp": "image/webp",
-	".gif":  "image/gif",
-	".svg":  "image/svg+xml",
-	".mp4":  "video/mp4",
-	".webm": "video/webm",
-	".html": "text/html",
-	".htm":  "text/html",
+	".png":      "image/png",
+	".jpg":      "image/jpeg",
+	".jpeg":     "image/jpeg",
+	".webp":     "image/webp",
+	".gif":      "image/gif",
+	".svg":      "image/svg+xml",
+	".mp4":      "video/mp4",
+	".webm":     "video/webm",
+	".html":     "text/html",
+	".htm":      "text/html",
+	".md":       "text/markdown",
+	".markdown": "text/markdown",
+	".txt":      "text/plain",
+	".json":     "application/json",
+	".pdf":      "application/pdf",
 }
 
 // contentTypeFor reports the content type the file's extension implies.
@@ -132,11 +142,11 @@ func hashFile(path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-// parseOneFileArg parses upload/deck args. Unlike most subcommands these take
-// exactly one POSITIONAL — the file — so parseFlags' no-positionals rule does
-// not apply; this is that function with the rule replaced (the shape parseCtlArgs
-// already uses for ctl's action).
-func parseOneFileArg(fs *pflag.FlagSet, args []string, want string) (string, error) {
+// parseOnePositional parses upload/deck/download args. Unlike most subcommands
+// these take exactly one POSITIONAL — a file or an asset id — so parseFlags'
+// no-positionals rule does not apply; this is that function with the rule
+// replaced (the shape parseCtlArgs already uses for ctl's action).
+func parseOnePositional(fs *pflag.FlagSet, args []string, want string) (string, error) {
 	if err := rejectSingleDashLongFlags(fs, args); err != nil {
 		printUsage(fs)
 		return "", err
@@ -161,27 +171,28 @@ func parseOneFileArg(fs *pflag.FlagSet, args []string, want string) (string, err
 	return fs.Arg(0), nil
 }
 
-// uploadAPI resolves the config, the target project and the account key, and
-// returns the upload surface pointed at that project's MCP endpoint.
+// commandTarget resolves what every file-oriented command needs before it can
+// address the plane: the account key, the validated config, and the target
+// project's slug. `flag` names the selector in a refusal (always --project).
 //
 // The config is loaded and VALIDATED the way the daemon does it, because
 // Validate is what pins the workdir absolutely and discovers `<workdir>/.mcp.json`
 // — the file whose `/mcp/<slug>` names the project in the single-project case —
 // so a command that skipped it could resolve a different project than the
-// daemon's own poll. The endpoint itself is still assembled only from
+// daemon's own poll. Callers still assemble their endpoint only from
 // CredentialOrigin (never the workdir file's host), exactly like every other
 // credentialed call.
-func uploadAPI(cfgPath, project string) (plane.UploadAPI, error) {
+func commandTarget(cfgPath, project, flag string) (string, *config.Config, string, error) {
 	key := os.Getenv("CLANKERBAR_API_KEY")
 	if key == "" {
-		return nil, errors.New("CLANKERBAR_API_KEY is not set - export the account key the daemon runs with")
+		return "", nil, "", errors.New("CLANKERBAR_API_KEY is not set - export the account key the daemon runs with")
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+		return "", nil, "", fmt.Errorf("load config: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		return "", nil, "", err
 	}
 
 	slug := project
@@ -189,10 +200,20 @@ func uploadAPI(cfgPath, project string) (plane.UploadAPI, error) {
 		// No --project: the config answers, the same derivation the daemon's
 		// poll uses. A multi-project config has no single answer and says so,
 		// naming --project as the way to choose.
-		slug, err = pickSlug(cfg, "", "--project")
+		slug, err = pickSlug(cfg, "", flag)
 		if err != nil {
-			return nil, err
+			return "", nil, "", err
 		}
+	}
+	return key, cfg, slug, nil
+}
+
+// uploadAPI resolves the config, the target project and the account key, and
+// returns the upload surface pointed at that project's MCP endpoint.
+func uploadAPI(cfgPath, project string) (plane.UploadAPI, error) {
+	key, cfg, slug, err := commandTarget(cfgPath, project, "--project")
+	if err != nil {
+		return nil, err
 	}
 
 	endpoint := cfg.BacklogEndpoint()
@@ -216,7 +237,7 @@ func Upload(ctx context.Context, args []string) error {
 func uploadRun(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var f uploadFlags
 	fs := newUploadFlagSet(&f)
-	path, err := parseOneFileArg(fs, args, "clankerbar upload needs exactly one file: upload <file> [--task <ref|id>] [--type <mime>]")
+	path, err := parseOnePositional(fs, args, "clankerbar upload needs exactly one file: upload <file> [--task <ref|id>] [--type <mime>]")
 	if err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
 			return nil
@@ -296,7 +317,7 @@ func Deck(ctx context.Context, args []string) error {
 func deckRun(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var f deckFlags
 	fs := newDeckFlagSet(&f)
-	path, err := parseOneFileArg(fs, args, "clankerbar deck needs exactly one file: deck <file.html> --task <ref|id>")
+	path, err := parseOnePositional(fs, args, "clankerbar deck needs exactly one file: deck <file.html> --task <ref|id>")
 	if err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
 			return nil

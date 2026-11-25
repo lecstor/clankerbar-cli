@@ -87,6 +87,22 @@ func projectSummaryPath(origin, slug string) string {
 	return origin + "/api/projects/" + url.PathEscape(slug) + "/backlog-summary"
 }
 
+// ProjectAssetURL returns one uploaded asset's download URL:
+// `<origin>/api/projects/<slug>/assets/<assetId>`, on the same trusted CredentialOrigin as every
+// other credentialed call. Both path segments are escaped, so neither a config's slug nor a
+// caller's asset id can smuggle a path segment into the route.
+//
+// This is the `clk_`-authenticated download door (CLA-1013), the read half of the byte-free
+// asset path: the CLI's own process streams the bytes to disk, so nothing carries them through
+// a model or a tool argument.
+func (c *Config) ProjectAssetURL(p Project, assetID string) string {
+	origin := c.CredentialOrigin()
+	if origin == "" || p.Slug == "" || assetID == "" {
+		return ""
+	}
+	return origin + "/api/projects/" + url.PathEscape(p.Slug) + "/assets/" + url.PathEscape(assetID)
+}
+
 // FleetReportURL returns the URL of the daemon's fleet presence beacon target: the plane's `POST
 // .../fleet/report` surface, which takes presence plus any finished iteration records in one
 // authenticated call. Unlike the summary route there is NO legacy slug-less form — the report

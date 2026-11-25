@@ -245,27 +245,69 @@ func TestUploadStdoutCarriesOnlyTheAssetRef(t *testing.T) {
 
 func TestContentTypeFor(t *testing.T) {
 	for name, want := range map[string]string{
-		"shot.png":     "image/png",
-		"photo.jpg":    "image/jpeg",
-		"photo.JPEG":   "image/jpeg",
-		"anim.gif":     "image/gif",
-		"drawing.webp": "image/webp",
-		"icon.svg":     "image/svg+xml",
-		"clip.mp4":     "video/mp4",
-		"clip.webm":    "video/webm",
-		"deck.html":    "text/html",
-		"deck.htm":     "text/html",
+		"shot.png":       "image/png",
+		"photo.jpg":      "image/jpeg",
+		"photo.JPEG":     "image/jpeg",
+		"anim.gif":       "image/gif",
+		"drawing.webp":   "image/webp",
+		"icon.svg":       "image/svg+xml",
+		"clip.mp4":       "video/mp4",
+		"clip.webm":      "video/webm",
+		"deck.html":      "text/html",
+		"deck.htm":       "text/html",
+		"notes.md":       "text/markdown",
+		"notes.markdown": "text/markdown",
+		"NOTES.MD":       "text/markdown",
+		"notes.txt":      "text/plain",
+		"data.json":      "application/json",
+		"brief.pdf":      "application/pdf",
 	} {
 		got, ok := contentTypeFor(name)
 		if !ok || got != want {
 			t.Errorf("contentTypeFor(%q) = %q, %v; want %q, true", name, got, ok, want)
 		}
 	}
-	if got, ok := contentTypeFor("archive.xyz"); ok {
-		t.Errorf("contentTypeFor(archive.xyz) = %q, want unknown", got)
+	for _, name := range []string{"archive.xyz", "noextension", "notes.mdown", "notes.mkd"} {
+		if got, ok := contentTypeFor(name); ok {
+			t.Errorf("contentTypeFor(%q) = %q, want unknown", name, got)
+		}
 	}
-	if got, ok := contentTypeFor("noextension"); ok {
-		t.Errorf("contentTypeFor(noextension) = %q, want unknown", got)
+}
+
+// TestUploadDocumentTypes: a document an agent hands to another agent must go up
+// on the byte-free path with its own type, without --type. The declaration and
+// the PUT are separate requests, so both are pinned: one drifting from the other
+// is a hash-verified transfer whose type is wrong.
+func TestUploadDocumentTypes(t *testing.T) {
+	cases := map[string]string{
+		"notes.md":   "text/markdown",
+		"notes.txt":  "text/plain",
+		"data.json":  "application/json",
+		"brief.pdf":  "application/pdf",
+		"a.markdown": "text/markdown",
+	}
+	for file, want := range cases {
+		t.Run(file, func(t *testing.T) {
+			plane := newFakePlane(t)
+			t.Setenv("CLANKERBAR_API_KEY", "k")
+			path := writeUploadFile(t, file, []byte("document bytes"))
+			cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
+
+			var stdout, stderr bytes.Buffer
+			if err := uploadRun(context.Background(), []string{"-c", cfg, path}, &stdout, &stderr); err != nil {
+				t.Fatalf("upload %s: %v", file, err)
+			}
+			if stdout.String() != "asset:asset-1\n" {
+				t.Errorf("stdout = %q, want the asset reference", stdout.String())
+			}
+			_, calls, puts := plane.snapshot()
+			if len(calls) != 1 || calls[0].args["contentType"] != want {
+				t.Fatalf("create_upload = %+v, want contentType %s", calls, want)
+			}
+			if len(puts) != 1 || puts[0].contentType != want {
+				t.Fatalf("PUTs = %+v, want Content-Type %s", puts, want)
+			}
+		})
 	}
 }
 
@@ -487,17 +529,17 @@ func TestUploadErrorExits(t *testing.T) {
 func TestUploadPlaneRefusalPassesThrough(t *testing.T) {
 	plane := newFakePlane(t)
 	plane.createUploadError = true
-	plane.createUploadBody = `{"error":{"code":"unsupported_content_type","message":"Content type 'application/pdf' is not allowed. Allowed: image/png, text/html."}}`
+	plane.createUploadBody = `{"error":{"code":"unsupported_content_type","message":"Content type 'application/zip' is not allowed. Allowed: image/png, text/html."}}`
 	t.Setenv("CLANKERBAR_API_KEY", testKey)
-	doc := writeUploadFile(t, "doc.pdf", []byte("%PDF"))
+	doc := writeUploadFile(t, "archive.zip", []byte("PK"))
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
 
 	var stdout, stderr bytes.Buffer
-	err := uploadRun(context.Background(), []string{"-c", cfg, "--type", "application/pdf", doc}, &stdout, &stderr)
+	err := uploadRun(context.Background(), []string{"-c", cfg, "--type", "application/zip", doc}, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("err = nil, want the plane's refusal")
 	}
-	for _, want := range []string{"unsupported_content_type", "Content type 'application/pdf' is not allowed."} {
+	for _, want := range []string{"unsupported_content_type", "Content type 'application/zip' is not allowed."} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err = %v, want it to carry %q verbatim", err, want)
 		}
