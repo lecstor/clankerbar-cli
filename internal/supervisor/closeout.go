@@ -488,7 +488,7 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	// finish, records the delivery and leaves the claim to its lease - because a
 	// release would put the task back on `approved` with no PR for either path to
 	// find again.
-	d.settleMergedCloseOut(client, label, key, task.ID, runID, state.Number, base, mergeSHA, check)
+	d.settleMergedCloseOut(client, label, key, task.ID, runID, state, base, mergeSHA, check)
 }
 
 // settleMergedCloseOut finishes a task whose PR this pass has already merged.
@@ -496,27 +496,40 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 // It has NO release path, by construction: the merge landed, so the task must
 // never return to `approved` — there is no open PR left for the agent close-out
 // to find. A close that fails transiently (a 502, a timeout) is retried within
-// one cleanup budget, and a close that still cannot be finished leaves the claim
-// to its lease with the delivery recorded, so the successor can close the task
-// from the merge SHA and PR rather than rediscovering a merge that already
-// happened.
-func (d *Supervisor) settleMergedCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, pr int, base, mergeSHA string, check delivery.Check) {
+// one cleanup budget; a close the plane refuses because the stored outcome
+// carries no verification evidence gets ONE evidence-bearing retry (CLA-1030);
+// and a close that still cannot be finished leaves the claim to its lease with
+// the delivery recorded, so the successor can close the task from the merge SHA
+// and PR rather than rediscovering a merge that already happened.
+func (d *Supervisor) settleMergedCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, state delivery.PRState, base, mergeSHA string, check delivery.Check) {
 	verified := check.Status == delivery.Pass
 	decl := plane.CloseOutDelivery{
 		Commit:            mergeSHA,
-		PR:                fmt.Sprintf("#%d", pr),
+		PR:                fmt.Sprintf("#%d", state.Number),
 		IntegrationBranch: base,
 		MergeVerified:     verified,
 	}
-	if err := d.completeCloseOut(client, label, taskID, runID, decl); err != nil {
+	// The citation is built before the close so a refusal with evidence_required
+	// can be answered from facts this close-out already read, never from a guess.
+	gated, hasGated := closeOutGatedCheckFor(state)
+	var cite *closeOutGatedCheck
+	if hasGated {
+		cite = &gated
+	}
+	retried, err := d.completeCloseOut(client, label, key, taskID, runID, decl, cite, verified)
+	if err != nil {
 		d.recordMergedDelivery(client, label, key, taskID, runID, decl, err)
 		return
 	}
+	via := ""
+	if retried {
+		via = "; the plane first refused the close for missing evidence, and the driver's verified checks closed it"
+	}
 	if !verified {
-		d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s, but the merge could not be verified (%s) - task closed done with mergeVerified:false", label, pr, shortSHA(mergeSHA), base, check.Detail)
+		d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s, but the merge could not be verified (%s) - task closed done with mergeVerified:false%s", label, state.Number, shortSHA(mergeSHA), base, check.Detail, via)
 		return
 	}
-	d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s (merge commit is an ancestor of the remote tip) - task closed done", label, pr, shortSHA(mergeSHA), base)
+	d.closeOutSay(key, "close-out: %s PR #%d merged as %s into %s (merge commit is an ancestor of the remote tip) - task closed done%s", label, state.Number, shortSHA(mergeSHA), base, via)
 }
 
 // retryCloseOutCall runs one plane write, retrying a TRANSIENT plane failure
@@ -547,14 +560,20 @@ func retryCloseOutCall(ctx context.Context, what string, fn func() error) error 
 
 // completeCloseOut closes the task done, retrying a TRANSIENT plane failure
 // (transport or 5xx) within one cleanup budget. A tool-level refusal is the
-// plane's answer and is returned at once: retrying it would only repeat it.
-func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, taskID, runID string, decl plane.CloseOutDelivery) error {
+// plane's answer and is returned at once, with one exception: the close-out's
+// own evidence refusal (evidence_required) earns the single retry that asserts
+// the checks this pass verified. It reports whether that retry was attempted.
+func (d *Supervisor) completeCloseOut(client plane.CloseOutAPI, label, key, taskID, runID string, decl plane.CloseOutDelivery, gated *closeOutGatedCheck, mergeVerified bool) (bool, error) {
 	ctx, cancel := d.closeOutCleanupCtx()
 	defer cancel()
 	what := fmt.Sprintf("%s PR %s merged as %s, but closing the task", label, decl.PR, decl.Commit)
-	return retryCloseOutCall(ctx, what, func() error {
+	err := retryCloseOutCall(ctx, what, func() error {
 		return client.CompleteCloseOut(ctx, taskID, runID, decl)
 	})
+	if err == nil || !plane.CloseOutEvidenceRefused(err) {
+		return false, err
+	}
+	return d.retryCloseOutWithEvidence(ctx, client, label, key, taskID, runID, decl, gated, mergeVerified, err)
 }
 
 // recordMergedDelivery is the recovery write for a merge that landed but could
@@ -609,7 +628,7 @@ func (d *Supervisor) settleMergeError(ctx context.Context, verifier *delivery.Ve
 	if strings.EqualFold(after.State, "MERGED") && after.MergeCommit != "" {
 		d.closeOutSay(key, "close-out: %s PR #%d's merge request failed (%v), but the PR reads MERGED as %s - finishing the close from that commit", label, state.Number, mergeErr, shortSHA(after.MergeCommit))
 		check := d.verifyMerge(ctx, verifier, dir, base, after.MergeCommit)
-		d.settleMergedCloseOut(client, label, key, task.ID, runID, state.Number, base, after.MergeCommit, check)
+		d.settleMergedCloseOut(client, label, key, task.ID, runID, state, base, after.MergeCommit, check)
 		return false
 	}
 	d.closeOutSay(key, "close-out: %s PR #%d's merge request failed (%v), and the PR now reads %q with no merge commit to name (judged head %s) - the claim is LEFT HELD: releasing it would return a task with no open PR to approved", label, state.Number, mergeErr, after.State, shortSHA(state.HeadOID))

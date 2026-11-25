@@ -1171,7 +1171,7 @@ func TestCloseOutHoldsTheClaimWhenThePlaneRefusesTheClose(t *testing.T) {
 	f.servePlane(t, "clanker")
 	f.plane.refuseWhen = func(tool string, args map[string]any) string {
 		if tool == "complete_task" {
-			return "done refused: evidence_required"
+			return `{"error":{"code":"not_ready","message":"the task is not ready for this write"}}`
 		}
 		return ""
 	}
@@ -1345,9 +1345,9 @@ func TestCloseOutSaysWhenTheDeliveryCouldNotBeRecorded(t *testing.T) {
 	f.plane.refuseWhen = func(tool string, _ map[string]any) string {
 		switch tool {
 		case "complete_task":
-			return "done refused: evidence_required"
+			return `{"error":{"code":"not_ready","message":"the task is not ready for this write"}}`
 		case "record_progress":
-			return "progress refused: the task is done"
+			return `{"error":{"code":"not_holding","message":"the task is no longer held"}}`
 		}
 		return ""
 	}
