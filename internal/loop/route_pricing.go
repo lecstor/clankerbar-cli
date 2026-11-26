@@ -140,6 +140,9 @@ func mergeRouteLists(lists [][]string) []string {
 func (d *Driver) routeWindowHold(tc *config.Config, now time.Time, lists [][]string) (active bool, until time.Time) {
 	for _, routes := range lists {
 		choice := d.routableRoutesAt(tc, now, routes)
+		// An empty choice for a NON-empty list is NOT "no configured routes": every route of it is
+		// Stop-blocked, which no window end will lift, so there is no hold instant to wait for. That
+		// spawn is refused downstream with a LIMIT_STOP (invocationFor's stopRefusalFor), not held.
 		if len(choice.Routes) > 0 || choice.WaitUntil.IsZero() {
 			continue
 		}

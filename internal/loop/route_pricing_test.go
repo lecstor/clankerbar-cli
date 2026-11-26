@@ -455,7 +455,7 @@ func TestProbeInvocation_RefusesWhenEveryRouteIsWindowed(t *testing.T) {
 	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo, routeCC)
 	d.now = func() time.Time { return at }
 
-	_, err := d.probeInvocation(d.targets[0], d.cfg, d.cfg.Phases[0])
+	_, err := d.probeInvocation(d.targets[0], d.cfg, d.cfg.Phases[0], nil)
 	var blocked *routeWindowBlocked
 	if !errors.As(err, &blocked) {
 		t.Fatalf("probeInvocation error = %v, want *routeWindowBlocked — a probe must not spawn on a windowed route", err)
@@ -469,7 +469,7 @@ func TestProbeInvocation_RefusesWhenEveryRouteIsWindowed(t *testing.T) {
 	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeGo)
 	single.cfg.RouteSchedules, single.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
 	single.now = func() time.Time { return at }
-	if _, err := single.probeInvocation(single.targets[0], single.cfg, single.cfg.Phases[0]); !errors.As(err, &blocked) {
+	if _, err := single.probeInvocation(single.targets[0], single.cfg, single.cfg.Phases[0], nil); !errors.As(err, &blocked) {
 		t.Errorf("single-route probe error = %v, want *routeWindowBlocked", err)
 	}
 
@@ -477,7 +477,7 @@ func TestProbeInvocation_RefusesWhenEveryRouteIsWindowed(t *testing.T) {
 	run := routedDriver(t, &fakeAdapter{}, twoPhases(), routeGo, routeCC)
 	run.cfg.RouteSchedules, run.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedRun, routeGo, routeCC)
 	run.now = func() time.Time { return at }
-	inv, err := run.probeInvocation(run.targets[0], run.cfg, run.cfg.Phases[0])
+	inv, err := run.probeInvocation(run.targets[0], run.cfg, run.cfg.Phases[0], nil)
 	if err != nil {
 		t.Fatalf("probe under run: %v, want a probe on the first route", err)
 	}

@@ -130,18 +130,11 @@ func (d *Driver) routeClearAt(tc *config.Config, now time.Time, route string) (a
 	return at, window, true
 }
 
-// routeWakeHint is how long a still-limited wait should sleep when a route the walk left blocked
+// routeWakeHintFor is how long a still-limited wait should sleep when a route the walk left blocked
 // clears sooner than the poll interval: the soonest instant any of the phase's routes is outside
 // both its usage mark and a withholding pricing window (CLA-986). ok=false keeps the caller on the
 // interval: a phase with no route list, a Stop-blocked set with no future instant, or one with a
 // route already clear, has no future instant.
-func (d *Driver) routeWakeHint(tc *config.Config, ph config.Phase) (time.Duration, bool) {
-	routes, _ := tc.ModelRoutesForPhase(ph)
-	return d.routeWakeHintFor(tc, routes)
-}
-
-// routeWakeHintFor is routeWakeHint over an explicit route list, for the callers holding the
-// resolved (escalation-applied) list rather than the phase's configured one.
 func (d *Driver) routeWakeHintFor(tc *config.Config, routes []string) (time.Duration, bool) {
 	if len(routes) == 0 {
 		return 0, false
@@ -170,16 +163,10 @@ func (d *Driver) routeWakeHintFor(tc *config.Config, routes []string) (time.Dura
 	return earliest.Sub(now) + d.waitGrace, true
 }
 
-// routeClearNow reports whether one of the phase's routes is usable RIGHT NOW. routeWakeHint only
-// answers with a future instant, which is not the same as no route being clear: a mark can expire
-// while a later route's probe is still running, and the walk then stops at tried[route] without
-// re-probing it (CLA-988). A Stop-blocked route never clears now.
-func (d *Driver) routeClearNow(tc *config.Config, ph config.Phase) bool {
-	routes, _ := tc.ModelRoutesForPhase(ph)
-	return d.routeClearNowFor(tc, routes)
-}
-
-// routeClearNowFor is routeClearNow over an explicit route list.
+// routeClearNowFor reports whether one of routes is usable RIGHT NOW. routeWakeHintFor only answers
+// with a future instant, which is not the same as no route being clear: a mark can expire while a
+// later route's probe is still running, and the walk then stops at tried[route] without re-probing
+// it (CLA-988). A Stop-blocked route never clears now.
 func (d *Driver) routeClearNowFor(tc *config.Config, routes []string) bool {
 	now := d.clock()
 	for _, route := range routes {
@@ -231,6 +218,10 @@ func (d *Driver) waitAvailabilityAt(tc *config.Config, now time.Time, routes []s
 			if window {
 				av.scheduleAt = at
 			}
+		} else if at.Equal(av.earliest) && window {
+			// The same instant reached as a WINDOW end on any route is a schedule pause, whatever
+			// order the routes came in.
+			av.scheduleAt = at
 		}
 	}
 	if !av.scheduleAt.IsZero() {
@@ -240,15 +231,19 @@ func (d *Driver) waitAvailabilityAt(tc *config.Config, now time.Time, routes []s
 }
 
 // routeWindowZoneAt names the IANA zone of the schedule whose window ends at until, so the beacon's
-// resume instant renders in the operator's own clock rather than the daemon's.
+// resume instant renders in the operator's own clock rather than the daemon's. Only a window that
+// actually WITHHOLDS its route counts: a `run` schedule's window end is not what the wait is
+// waiting for, even when the minutes coincide.
 func (d *Driver) routeWindowZoneAt(tc *config.Config, now time.Time, routes []string, until time.Time) string {
 	for _, route := range routes {
-		sched := tc.RouteScheduleFor(route)
-		if sched == nil {
+		if choice := tc.RouteChoiceAt(now, []string{route}); len(choice.Routes) > 0 || !choice.WaitUntil.Equal(until) {
 			continue
 		}
-		if active, end := sched.ActiveAt(now); active && end.Equal(until) {
-			return sched.Timezone
+		if sched := tc.RouteScheduleFor(route); sched != nil {
+			// The window still governs the route at now, so the choice above named its end.
+			if active, end := sched.ActiveAt(now); active && end.Equal(until) {
+				return sched.Timezone
+			}
 		}
 	}
 	return ""
@@ -284,10 +279,12 @@ func (d *Driver) waitBeaconState(tc *config.Config, routes []string, statedReset
 }
 
 // logStopBlocked says, once per occurrence, that no configured route can start: the operator's move
-// is a RELOAD after resolving the account, not another wait.
-func logStopBlocked(ph config.Phase, refusal *routeStopBlocked) {
+// is a RELOAD after resolving the account, not another wait. The refusal already carries the phase
+// label its constructor resolved (the session path uses the phase index), so it is not re-derived
+// here from a Label(0) copy.
+func logStopBlocked(refusal *routeStopBlocked) {
 	log.Printf("every configured route for the %s phase is Stop-blocked (%v) — writing %s and ending the wait: a budget/credit exhaustion has no reset to poll for, so resolve the account and write RELOAD (or restart)",
-		ph.Label(0), strings.Join(refusal.routes, ", "), LimitStopName)
+		refusal.phase, strings.Join(refusal.routes, ", "), LimitStopName)
 }
 
 // writeStopBlocked records the LIMIT_STOP marker for a phase-wide stop. The line names the reason

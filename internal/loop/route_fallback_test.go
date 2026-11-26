@@ -394,7 +394,7 @@ func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias, routePaidAlias)
 	d.markRouteLimited(routeFreeAlias, time.Now().Add(2*time.Hour))
 	d.markRouteLimited(routePaidAlias, time.Now().Add(time.Hour))
-	inv, err := d.probeInvocation(Target{}, d.cfg, d.cfg.Phases[0])
+	inv, err := d.probeInvocation(Target{}, d.cfg, d.cfg.Phases[0], nil)
 	if err != nil {
 		t.Fatalf("probeInvocation: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
 
 	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias)
 	single.markRouteLimited(routeFreeAlias, time.Now().Add(time.Hour))
-	inv, err = single.probeInvocation(Target{}, single.cfg, single.cfg.Phases[0])
+	inv, err = single.probeInvocation(Target{}, single.cfg, single.cfg.Phases[0], nil)
 	if err != nil {
 		t.Fatalf("probeInvocation (single): %v", err)
 	}

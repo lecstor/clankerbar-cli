@@ -82,9 +82,12 @@ func TestSupervisedWait_ALimitedFirstRouteIsMarkedAndTheNextRouteProbedInTheSame
 				t.Errorf("ROUTE_MARKS = %v, the route that probed open must not be marked", marks)
 			}
 			if tc.resetAt.IsZero() {
-				// Marked at probe time, one poll interval into the wait, for one poll interval.
-				if until.Before(start.Add(2*interval)) || until.After(start.Add(elapsed+interval)) {
-					t.Errorf("mark lifts %s after the wait began, want one poll interval (%s) past the probe", until.Sub(start), interval)
+				// Marked at probe time for one poll interval. The ENTRY probe can run at once — a route
+				// that is clear at entry is worth testing without sleeping first (CLA-1024) — so measure
+				// from the probe, not from a fixed offset into the wait.
+				probeAt := h.probeStarts[0]
+				if until.Before(probeAt.Add(interval)) || until.After(probeAt.Add(interval+100*time.Millisecond)) {
+					t.Errorf("mark lifts %s after its probe, want one poll interval (%s) past it", until.Sub(probeAt).Round(time.Millisecond), interval)
 				}
 			} else if !until.Equal(tc.resetAt) {
 				t.Errorf("mark = %s, want the stated reset %s", until, tc.resetAt)

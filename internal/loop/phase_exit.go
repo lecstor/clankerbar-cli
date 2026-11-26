@@ -92,8 +92,10 @@ func usageLimitEnd(a harness.Adapter, res harness.Result) bool {
 	return a.DetectLimit(res).Limited || res.TurnStopReason == "usage_limit"
 }
 
-// handleUsageLimit waits out a rolling usage limit and re-runs the session, or ends the phase on a
-// hard stop or a limit the phase must not wait for.
+// handleUsageLimit waits out a rolling usage limit and re-runs the session. A hard stop SIDELINES
+// the route that reported it and waits on the phase's remaining routes when one can still start
+// (CLA-1024); it ends the phase — with LIMIT_STOP stopping the run — only when no configured route
+// is left to wait on.
 func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attemptVerdict {
 	d := r.d
 	t := r.t

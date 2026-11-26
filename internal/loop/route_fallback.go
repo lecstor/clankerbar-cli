@@ -296,19 +296,22 @@ func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 }
 
 // probeInvocation is the supervised-wait probe's Invocation: the phase harness's probe invocation,
-// aimed at probeRouteFor's route when the phase has a route list. A phase whose every route is
-// inside a "wait" pricing window has NO route a probe may start on, so it refuses the probe rather
-// than letting the phase's model through: the probe is a paid session, and paying the peak price to
-// learn whether a limit lifted is exactly what the schedule exists to prevent. A phase whose every
-// route is Stop-blocked refuses for a harder reason — no probe can lift a dead subscription — and
-// names that state separately so the wait can stop instead of aiming at a window that will not open
-// (CLA-1024).
-func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (harness.Invocation, error) {
+// aimed at the wait's own route list. A phase whose every route is inside a "wait" pricing window
+// has NO route a probe may start on, so it refuses the probe rather than letting the phase's model
+// through: the probe is a paid session, and paying the peak price to learn whether a limit lifted is
+// exactly what the schedule exists to prevent. A phase whose every route is Stop-blocked refuses for
+// a harder reason — no probe can lift a dead subscription — and names that state separately so the
+// wait can stop instead of aiming at a window that will not open (CLA-1024). routes is the wait's
+// resolved list (the same one probeWake walks), so the entry deadline and the probe cannot disagree
+// about the route set (review 1.review-1.12).
+func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase, routes []string) (harness.Invocation, error) {
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), true)
 	if err != nil {
 		return inv, err
 	}
-	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		routes, _ = tc.ModelRoutesForPhase(ph)
+	}
 	if len(routes) == 0 {
 		return inv, nil
 	}

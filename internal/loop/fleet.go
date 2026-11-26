@@ -262,23 +262,16 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 	})
 }
 
-// beaconLimited tells the plane this daemon is parked on a usage limit, for EVERY target it serves.
-// The wait blocks the whole loop, so no other project's queue is being serviced either —
-// beaconing only the target whose harness hit the limit would leave the other projects' presence
-// rows silent, and each of those reads as a dead instance for exactly the reason this state exists
-// to correct. routes is the per-route hold breakdown of the phase being waited out (CLA-1026), and
-// it rides only the WAITING target's row: the sibling projects are paused by the same wait, but the
-// route names and schedules belong to the waiting project's config, and another project's row must
-// not show routes it never configured (review 1.review-1.4).
-func (d *Driver) beaconLimited(ti int, resetAt time.Time, routes []fleet.RouteHold) {
-	d.beaconWait(ti, fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt, Routes: routes})
-}
-
 // beaconWait publishes one wait state to every target this daemon serves. The supervised wait's own
 // state is derived live (waitBeaconState): `limited` with the earliest concrete instant a route
 // lifts, or `draining` with the schedule's resume time when a pause window — daemon-wide or a route
-// pricing window — is what the wait is actually waiting for (CLA-1024). The route breakdown rides
-// only ti's row, for the same reason beaconLimited documents.
+// pricing window — is what the wait is actually waiting for (CLA-1024). The wait blocks the whole
+// loop, so no other project's queue is being serviced either: beaconing only the target whose
+// harness hit the limit would leave the other projects' presence rows silent, and each of those
+// reads as a dead instance for exactly the reason this state exists to correct. The route breakdown
+// rides only ti's row: the sibling projects are paused by the same wait, but the route names and
+// schedules belong to the waiting project's config, and another project's row must not show routes
+// it never configured (review 1.review-1.4).
 func (d *Driver) beaconWait(ti int, st fleet.State) {
 	d.writeLocalBeacon(st)
 	for i := range d.targets {
