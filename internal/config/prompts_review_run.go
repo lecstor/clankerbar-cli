@@ -14,21 +14,23 @@ type ReviewRunBriefOptions struct {
 	Description string
 }
 
-// reviewRunMUSTBarGrades is reviewMUSTBarGrades for a review with no done-when bar. Two clauses
-// name the task's doneWhen as an input this review does not have, so they are removed rather than
-// left to reach a session as an instruction it cannot follow; every other grading rule — the
-// evidence kinds, the seventh kind, and the not-a-MUST list — is the phase's verbatim.
+// reviewRunMUSTBarGrades is reviewMUSTBarGrades for a review with no done-when bar. Every clause
+// that names the task's doneWhen as an input this review does not have is removed rather than left
+// to reach a session as an instruction it cannot follow; every other grading rule — the evidence
+// kinds, the seventh kind, and the not-a-MUST list — is the phase's verbatim.
 var reviewRunMUSTBarGrades = strings.NewReplacer(
+	reviewPRExistenceExemption, "",
 	"doneWhen - quote the clause of the task's doneWhen the change violates; ", "",
 	"missing tests the doneWhen does not require (except untested)", "missing tests the change does not require (except untested)",
 ).Replace(reviewMUSTBarGrades)
 
 // reviewRunGateScope is reviewGateScope for a review with no phase sequence. The discipline itself
 // is the phase's verbatim (no full gate runs, targeted probes only, the probe's output as the
-// finding's evidence), which is what keeps the command's review comparable.
+// finding's evidence), which is what keeps the command's review comparable; only the sentence that
+// describes a phase sequence is replaced.
 var reviewRunGateScope = strings.NewReplacer(
-	"The implement phase self-verified at this tip and the fix and verify phases run the gates again over what they change, so do NOT run",
-	"No earlier phase has vouched for this change's gates, and a review's value is the reading rather than a second gate run, so do NOT run",
+	reviewGateScopePhases,
+	"No earlier phase has vouched for this change's gates, and a review's value is the reading rather than a second gate run.",
 	"that is where a defect the implementer's own gates missed is found",
 	"that is where a defect a passing gate does not show is found",
 	"The panel shares this one worktree, so an artifact left behind is the next member's - and the fix phase's - dirty tree.",

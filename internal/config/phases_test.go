@@ -1719,9 +1719,12 @@ func TestReviewOnlyBriefsDoNotRerunTheGates(t *testing.T) {
 	}
 	for name, brief := range reviewOnly {
 		for _, want := range []string{
-			// The claim: the gates are another phase's job, at THIS tip.
+			// The claim: the gates are another phase's job, at THIS tip - and the verify phase
+			// re-checks only the fix delta, so a reviewer cannot read the gate sentence as
+			// "verify re-runs everything, so I should too".
 			"THE GATES ARE NOT YOURS TO RE-RUN",
-			"the fix and verify phases run the gates again over what they change",
+			"the fix phase runs the gates again over what it changes",
+			"the verify phase re-checks only the fix delta",
 			// The prohibition names what was actually re-run, so "do not run
 			// the suite" cannot be read as "do not run a test".
 			"do NOT run the repo's full test suite, typecheck, build or long checks",

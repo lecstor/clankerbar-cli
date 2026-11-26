@@ -131,6 +131,10 @@ const (
 	PhaseBranchPlaceholder = "{{branch}}"
 	PhasePRBasePlaceholder = "{{prBase}}"
 
+	// PhaseTaskRefPlaceholder names the task's human-readable ref (e.g. `CLA-482`). A terminal phase
+	// opens the task's PR, and the ref in its title is what matches the PR back to the task.
+	PhaseTaskRefPlaceholder = "{{taskRef}}"
+
 	// PhaseBasePlaceholder names the commit a brief's `git diff` starts from: the merge-base of
 	// origin/<prBase> and the worktree tip, as the runner computed it during worktree prep, or
 	// origin/<prBase> when no SHA was available. Never a bare local <prBase>: the local base branch
