@@ -229,7 +229,7 @@ func TestOneRouteOpencodeSessionMarksItsRouteOnALimit(t *testing.T) {
 			if !oc.DetectLimit(res).Limited {
 				t.Fatalf("the stub's session did not classify as limited: %+v", oc.DetectLimit(res))
 			}
-			d.noteRouteFallbacks(d.targets[0], 1, inv, res)
+			d.noteRouteFallbacks(0, d.targets[0], 1, inv, res)
 
 			until, ok := persistedRouteMarks(t, d)[routeFreeAlias]
 			if !ok {

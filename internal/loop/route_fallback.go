@@ -180,11 +180,15 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 }
 
 // noteRouteFallbacks records the marks an adapter reported and writes each SWITCH to the daemon log
-// and the iteration log.
-func (d *Driver) noteRouteFallbacks(t Target, drainNum int, inv harness.Invocation, res harness.Result) {
-	_, _, fallbacks := harness.RouteFallbacks(res)
+// and the iteration log. It also revises the live route on the fleet card (CLA-1026): a session
+// that fell back from one route to another is running on the LAST route the adapter named.
+func (d *Driver) noteRouteFallbacks(ti int, t Target, drainNum int, inv harness.Invocation, res harness.Result) {
+	_, finished, fallbacks := harness.RouteFallbacks(res)
 	if len(fallbacks) == 0 {
 		return
+	}
+	if finished != "" {
+		d.noteIterationModel(ti, t, finished)
 	}
 	now := time.Now()
 	interval := d.routeMarkInterval()
@@ -230,6 +234,17 @@ func routeRetryLabel(until time.Time) string {
 func (d *Driver) routeRoutesFor(tc *config.Config, ph config.Phase) config.RouteChoice {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	return d.routableRoutes(tc, routes)
+}
+
+// phaseStartModel is the route a phase's next session will start on, marks and pricing windows
+// applied. It is what `state.model` reports while the iteration runs (CLA-1026); "" when the phase
+// resolves no routable route, which the wire omits rather than guessing a name.
+func (d *Driver) phaseStartModel(tc *config.Config, ph config.Phase) string {
+	choice := d.routeRoutesFor(tc, ph)
+	if len(choice.Routes) == 0 {
+		return ""
+	}
+	return choice.Routes[0]
 }
 
 // probeRouteFor is the route a supervised-wait probe should test for a phase with a route list

@@ -160,7 +160,7 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 	if len(s.phasesRun) == 0 || s.phasesRun[len(s.phasesRun)-1] != st.ph.Label(s.i) {
 		s.phasesRun = append(s.phasesRun, st.ph.Label(s.i))
 	}
-	d.beginIteration(ti, t, drainNum, ref, st.ph.Label(s.i))
+	d.beginIteration(ti, t, drainNum, ref, st.ph.Label(s.i), d.phaseStartModel(s.tc, st.ph))
 
 	// CLA-662: whether this session RESUMED a predecessor's claim — the exact condition drainPhase's
 	// transient arm keys on (prev != nil), so the streak follows the ends that arm produces.

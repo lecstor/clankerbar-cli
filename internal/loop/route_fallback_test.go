@@ -180,7 +180,7 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 			Route: routeFreeAlias, Next: routePaidAlias, Reason: "usage_limit",
 		}},
 	}}
-	d.noteRouteFallbacks(d.targets[0], 1, harness.Invocation{}, res)
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
 
 	until, ok := d.routeMarkExpiry(routeFreeAlias)
 	if !ok {
@@ -249,7 +249,7 @@ func TestNoteRouteFallbacks_DeniedLastRouteIsMarkedButNotLoggedAsASwitch(t *test
 			{Route: routePaidAlias, Reason: "usage_limit"},
 		},
 	}}
-	d.noteRouteFallbacks(d.targets[0], 1, harness.Invocation{}, res)
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
 
 	if _, ok := d.routeMarkExpiry(routePaidAlias); !ok {
 		t.Error("the denied last route was not marked; the next phase would retry it for nothing")

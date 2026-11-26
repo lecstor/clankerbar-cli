@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 )
 
 // routeWindowBlocked is invocationFor's refusal when every route a phase may start on is inside a
@@ -72,7 +73,59 @@ func (s *drainSeq) routeWindowHoldState(lists [][]string) boundaryHoldState {
 		return boundaryHoldState{}
 	}
 	detail, zone := routeWindowHoldDetail(tc, lists, now, until)
-	return boundaryHoldState{active: true, until: until, label: "route windows", detail: detail, zone: zone}
+	// CLA-1026: the hold carries every configured route the windows withhold, so the draining
+	// beacon names the pricing window instead of collapsing to one "usage limit" word.
+	return boundaryHoldState{active: true, until: until, label: "route windows", detail: detail, zone: zone,
+		routes: d.routeHoldsAt(tc, now, mergeRouteLists(lists))}
+}
+
+// phaseRouteHolds is the per-route hold breakdown for one phase's configured routes (CLA-1026):
+// every route that cannot start right now, in configured order.
+func (d *Driver) phaseRouteHolds(tc *config.Config, ph config.Phase) []fleet.RouteHold {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	return d.routeHoldsAt(tc, d.clock(), routes)
+}
+
+// routeHoldsAt collects the active hold on each configured route: an active usage mark first — the
+// plane presents usage limits ahead of windows — else an active pricing window. A route with neither
+// is not held and contributes no entry.
+func (d *Driver) routeHoldsAt(tc *config.Config, now time.Time, routes []string) []fleet.RouteHold {
+	if len(routes) == 0 {
+		return nil
+	}
+	holds := make([]fleet.RouteHold, 0, len(routes))
+	for _, route := range routes {
+		if until, marked := d.routeMarkExpiry(route); marked && now.Before(until) {
+			holds = append(holds, fleet.RouteHold{Route: route, Reason: fleet.RouteHoldUsageLimit, Until: until})
+			continue
+		}
+		if active, until := tc.RouteWindowAt(route, now); active {
+			holds = append(holds, fleet.RouteHold{
+				Route:    route,
+				Reason:   fleet.RouteHoldWindow,
+				Schedule: strings.TrimSpace(tc.RouteWindows[route]),
+				Until:    until,
+			})
+		}
+	}
+	return holds
+}
+
+// mergeRouteLists is every route from a fan-out's per-phase lists, in configured order with
+// duplicates dropped: one route may be offered to several panel members and must appear once.
+func mergeRouteLists(lists [][]string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, routes := range lists {
+		for _, route := range routes {
+			if route == "" || seen[route] {
+				continue
+			}
+			seen[route] = true
+			out = append(out, route)
+		}
+	}
+	return out
 }
 
 // routeWindowHold reports whether every route list is blocked under a "wait" schedule, and the

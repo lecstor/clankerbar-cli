@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -157,7 +158,14 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		resetMu.Unlock()
 	}
 
-	d.beaconLimited(currentReset())
+	// CLA-1026: every beacon re-reads the phase's configured routes, because a usage mark can expire
+	// and a pricing window can open while the wait holds — the card must show why each route is
+	// still off, not only the one reason the wait began with.
+	currentRoutes := func() []fleet.RouteHold {
+		return d.phaseRouteHolds(d.liveCfg(t), ph)
+	}
+
+	d.beaconLimited(currentReset(), currentRoutes())
 
 	// The re-beacon runs on its OWN goroutine, not as another wake in the probe loop below.
 	beaconStop := make(chan struct{})
@@ -171,7 +179,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			case <-beaconStop:
 				return
 			case <-tk.C:
-				d.beaconLimited(currentReset())
+				d.beaconLimited(currentReset(), currentRoutes())
 			}
 		}
 	}()

@@ -372,7 +372,7 @@ func TestFleetState_RouteWindowHoldCarriesItsEndAndZone(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, nil, routeGo)
 	until := brisbaneAt(t, 9, 14, 0)
 	d.schedPaused = true
-	d.holdPause(0, "CB-7", "implement", until, "Australia/Brisbane")
+	d.holdPause(0, "CB-7", "implement", until, "Australia/Brisbane", nil)
 
 	st := d.fleetState(0)
 	if st.Kind != fleet.StateDraining {
@@ -393,7 +393,7 @@ func TestFleetState_RouteWindowHoldCarriesItsEndAndZone(t *testing.T) {
 
 	// A stale hold with no instant falls back to plain draining, so the row never
 	// shows a reason with no resume time.
-	d.holdPause(0, "CB-7", "implement", time.Time{}, "")
+	d.holdPause(0, "CB-7", "implement", time.Time{}, "", nil)
 	if st := d.fleetState(0); st.PauseReason != "" {
 		t.Errorf("a hold with no instant reported reason %q, want plain draining", st.PauseReason)
 	}

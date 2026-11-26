@@ -27,6 +27,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,12 +116,45 @@ const (
 	PauseReasonBudget = "budget"
 )
 
+// The per-route hold reasons a paused multi-route daemon reports (CLA-1026), the
+// plane's vocabulary (ROUTE_HOLD_REASONS) verbatim: a usage limit is quota the
+// provider reported, a window is the CLI's own pricing schedule. The console
+// keeps them distinct so "why isn't it using the other subscriptions?" has an
+// answer.
+const (
+	// RouteHoldUsageLimit: the route carries an active usage-limit mark.
+	RouteHoldUsageLimit = "usage_limit"
+	// RouteHoldWindow: the route is inside its pricing/availability window.
+	RouteHoldWindow = "window"
+)
+
+// RouteHold is one configured route a paused daemon cannot start a session on,
+// and why (CLA-1026). It mirrors the plane's RouteHold: the route's own
+// `provider/model` name, one closed reason, and — for a window — the schedule
+// that holds it. Until is zero when the hold has no stated end.
+type RouteHold struct {
+	Route    string
+	Reason   string    // one of RouteHoldUsageLimit / RouteHoldWindow
+	Schedule string    // the pricing schedule's name, only with Reason == RouteHoldWindow
+	Until    time.Time // when the hold is expected to lift; zero means unstated
+}
+
 // State is the presence half of a report: what the daemon is doing right now.
 type State struct {
 	Kind    string // one of the State* constants
 	N       int    // iteration number, when Kind is iteration
 	TaskRef string // task being worked ("CLA-466"), when known; the task whose answer is outstanding on waiting; the HELD task on a schedule pause
 	Phase   string // phase label, when Kind is iteration, or the held phase on a schedule pause
+	// Model is the route the running iteration's session is actually on
+	// (`provider/model`), only meaningful on Kind == iteration (CLA-1026). It is
+	// the phase's resolved starting route, updated when a mid-session route
+	// fallback switches. Empty when no route was resolved; the plane then shows
+	// nothing rather than a guessed name.
+	Model string
+	// Routes is the per-route hold breakdown of a paused multi-route daemon
+	// (CLA-1026), only meaningful on Kind == limited or a route-window draining.
+	// Every configured route held right now appears once, in configured order.
+	Routes []RouteHold
 	// ResetAt is the harness's stated limit-reset instant, only meaningful on
 	// Kind == limited (CLA-728). The zero value means the harness stated no
 	// reset — the console then says "probing for a reset" rather than guessing
@@ -662,6 +696,90 @@ func wirePauseUntil(st State) string {
 	return st.PauseUntil.UTC().Format(time.RFC3339)
 }
 
+// The plane's bounds on `state.model` and `state.routes` (CLA-1025/CLA-1026):
+// MAX_ROUTE_NAME, MAX_ROUTE_SCHEDULE and MAX_ROUTE_HOLDS in @clankerbar/shared.
+// The plane REFUSES the whole report — presence refresh included — on an
+// over-bound value, so the reporter must never send one.
+const (
+	maxRouteHolds    = 16
+	maxRouteName     = 120
+	maxRouteSchedule = 100
+)
+
+// wireModel renders an iteration state's live route, or "" — which `omitempty`
+// drops — on any other kind or when no route was resolved. The plane reads
+// `model` only on `iteration`, so a value left on another state is dropped here
+// rather than shipped as a key the plane would ignore.
+func wireModel(st State) string {
+	if st.Kind != StateIteration {
+		return ""
+	}
+	model := strings.TrimSpace(st.Model)
+	if model == "" {
+		return ""
+	}
+	if len(model) > maxRouteName {
+		// The plane refuses the whole report on this, losing unrelated rows and the
+		// presence refresh; a route name can only come from config, so this is a
+		// config bug to see rather than a value to ship.
+		log.Printf("fleet: dropping state.model %q: over the plane's %d-character route bound", model, maxRouteName)
+		return ""
+	}
+	return model
+}
+
+// wireRoutes renders a paused state's per-route hold list, or nil — which
+// `omitempty` drops — on any other kind or when nothing is held. The plane reads
+// `routes` only on `limited` and `draining`, so a list left on another state is
+// dropped here for the same reason as resetAt. The FIRST maxRouteHolds entries
+// in configured order are kept: the plane refuses the whole report beyond its
+// cap, and the first routes are the ones the phase will try first.
+func wireRoutes(st State) []wireRouteHold {
+	if st.Kind != StateLimited && st.Kind != StateDraining {
+		return nil
+	}
+	if len(st.Routes) == 0 {
+		return nil
+	}
+	routes := st.Routes
+	if len(routes) > maxRouteHolds {
+		log.Printf("fleet: %d route holds exceed the plane's cap of %d — reporting the first %d in configured order and dropping %d, or the plane would refuse the whole report",
+			len(routes), maxRouteHolds, maxRouteHolds, len(routes)-maxRouteHolds)
+		routes = routes[:maxRouteHolds]
+	}
+	out := make([]wireRouteHold, 0, len(routes))
+	for _, h := range routes {
+		route := strings.TrimSpace(h.Route)
+		if route == "" || len(route) > maxRouteName {
+			log.Printf("fleet: dropping a route hold with an empty or over-long route name (%q): the plane refuses the whole report over it", h.Route)
+			continue
+		}
+		reason := strings.TrimSpace(h.Reason)
+		if reason != RouteHoldUsageLimit && reason != RouteHoldWindow {
+			log.Printf("fleet: dropping the route hold on %q: reason %q is not one of the two the plane knows", route, h.Reason)
+			continue
+		}
+		w := wireRouteHold{Route: route, Reason: reason}
+		if reason == RouteHoldWindow {
+			if sched := strings.TrimSpace(h.Schedule); sched != "" {
+				if len(sched) > maxRouteSchedule {
+					log.Printf("fleet: route hold on %q names a %d-character schedule, over the plane's %d bound — reporting the window without its name", route, len(sched), maxRouteSchedule)
+				} else {
+					w.Schedule = sched
+				}
+			}
+		}
+		if !h.Until.IsZero() {
+			w.Until = h.Until.UTC().Format(time.RFC3339)
+		}
+		out = append(out, w)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // ── Wire shape ────────────────────────────────────────────────────────────────
 // Exactly what apps/web/src/server/fleet-report.ts parseFleetReport reads
 // (CLA-465). Kept as a separate marshalling step with its own tags so the Go
@@ -672,6 +790,14 @@ type wireState struct {
 	N       int    `json:"n,omitempty"`
 	TaskRef string `json:"taskRef,omitempty"`
 	Phase   string `json:"phase,omitempty"`
+	// Model is the running iteration's live route (CLA-1026): the plane reads it
+	// on `iteration` only and stores it bounded to MAX_ROUTE_NAME. A string so
+	// `omitempty` can actually omit it, like ResetAt.
+	Model string `json:"model,omitempty"`
+	// Routes is the per-route hold list (CLA-1026): read on `limited` and
+	// `draining` only, bounded to the plane's MAX_ROUTE_HOLDS. Omitted when
+	// nothing is held, so an older plane reads exactly the bytes it always did.
+	Routes []wireRouteHold `json:"routes,omitempty"`
 	// ResetAt is the `limited` state's payload (CLA-728), RFC 3339 with an
 	// explicit zone — the only shape the plane's parser accepts. Omitted when
 	// the harness stated no reset, so the plane reads "probing", never a
@@ -686,6 +812,16 @@ type wireState struct {
 	// resetAt, so an old plane sees the bytes it always did.
 	PauseReason string `json:"pauseReason,omitempty"`
 	PauseUntil  string `json:"pauseUntil,omitempty"`
+}
+
+// wireRouteHold is one `state.routes` entry. `route` and `reason` are always
+// present (the plane refuses an entry without them); `schedule` rides only a
+// window hold and `until` only when the hold states an end.
+type wireRouteHold struct {
+	Route    string `json:"route"`
+	Reason   string `json:"reason"`
+	Schedule string `json:"schedule,omitempty"`
+	Until    string `json:"until,omitempty"`
 }
 
 // wireUsage is the normalised breakdown on the wire. Each key is omitted when
@@ -764,6 +900,8 @@ func marshalReport(rep Report) ([]byte, error) {
 			N:           rep.State.N,
 			TaskRef:     rep.State.TaskRef,
 			Phase:       rep.State.Phase,
+			Model:       wireModel(rep.State),
+			Routes:      wireRoutes(rep.State),
 			ResetAt:     wireResetAt(rep.State),
 			PauseReason: wirePauseReason(rep.State),
 			PauseUntil:  wirePauseUntil(rep.State),

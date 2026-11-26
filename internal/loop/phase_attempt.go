@@ -214,7 +214,7 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	if ctx.Err() == nil {
 		at.runLost = renewalCause(sctx, joined, loss.cause())
 	}
-	d.noteRouteFallbacks(t, drainNum, at.inv, at.res)
+	d.noteRouteFallbacks(r.ti, t, drainNum, at.inv, at.res)
 	if at.logFile != nil {
 		_ = at.logFile.Close()
 	}
