@@ -23,7 +23,7 @@ const worktreeReclaimStep = " AFTER the PR is confirmed open - and before this s
 // carries the task's ref, so a PR opened by a terminal phase is matched back to its Clankerbar task -
 // the promotion deck's task mapping depends on it.
 const prTitleTaskRefRule = " Its title MUST carry the task ref " + PhaseTaskRefPlaceholder + " - as a suffix, " +
-	"e.g. `feat(prompts): ... (MAK-482)`, or as a prefix, e.g. `MAK-482: ...` - so the PR is matched back to " +
+	"e.g. `feat(...): ... (MAK-482)`, or as a prefix, e.g. `MAK-482: ...` - so the PR is matched back to " +
 	"this task."
 
 // reviewTerminalStep is the review phase's LAST instruction, kept as a constant so its position can

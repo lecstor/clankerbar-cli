@@ -245,6 +245,81 @@ func TestRunnerFixVerifyBriefLeavesThePRToTheVerifier(t *testing.T) {
 	}
 }
 
+// CLA-1032: both runner briefs that open a PR require the task's ref in the title, so the PR is
+// matched back to its Clankerbar task. The verify and final-fix phases are the runner flow's PR
+// openers; the fix-verify variant leaves the PR to the verifier and carries no title rule.
+func TestRunnerPRBriefsRequireTheTaskRefInTheTitle(t *testing.T) {
+	for _, tc := range []struct{ name, brief string }{
+		{"fix", RunnerFixBrief()},
+		{"verify", RunnerVerifyBrief()},
+	} {
+		if !strings.Contains(tc.brief, prTitleTaskRefRule) {
+			t.Errorf("the runner %s brief does not carry the shared PR-title rule:\n%s", tc.name, tc.brief)
+		}
+		if !strings.Contains(tc.brief, PhaseTaskRefPlaceholder) {
+			t.Errorf("the runner %s brief never carries %s:\n%s", tc.name, PhaseTaskRefPlaceholder, tc.brief)
+		}
+	}
+	if strings.Contains(RunnerFixVerifyBrief(), "title MUST carry the task ref") {
+		t.Errorf("the runner fix-verify brief carries a PR-title rule but opens no PR:\n%s", RunnerFixVerifyBrief())
+	}
+}
+
+// CLA-1032: the review runs before the terminal phase opens the PR, so its absence (and the task's
+// not-yet-in_review state) is never a MUST. The runner review-only brief carries the gate text and
+// the grading bar, so both halves of the exemption must survive the runner's own brief.
+func TestRunnerReviewBriefExemptsPRExistence(t *testing.T) {
+	brief := RunnerReviewOnlyBrief()
+	for _, want := range []string{
+		reviewPRExistenceScope,
+		reviewPRExistenceExemption,
+		"never raise a MUST that the PR does not exist",
+		"NEVER a MUST finding during review",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner review-only brief never says %q:\n%s", want, brief)
+		}
+	}
+}
+
+// CLA-1032: the verification round's checks are scoped to the fix delta, and its report says so -
+// the runner flow has no session after verify to run a full gate, and the fix phase already did.
+func TestRunnerVerifyBriefScopesItsChecksAndReport(t *testing.T) {
+	brief := RunnerVerifyBrief()
+	if !strings.Contains(brief, verifyCheckScope) {
+		t.Errorf("the runner verify brief does not carry the scoped-check rule:\n%s", brief)
+	}
+	for _, want := range []string{
+		"RUN CHECKS SCOPED, NEVER THE REPO'S WHOLE GATE LIST AGAIN",
+		"the fix delta's own tests",
+		"regression surface",
+		"a prior finding said was red",
+		"CI carries the full suite",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner verify brief never says %q:\n%s", want, brief)
+		}
+	}
+	// The done report's tests field asks for the targeted checks that ran, never a full-suite
+	// description the verifier did not perform.
+	if !strings.Contains(brief, runnerVerifyReportFields) {
+		t.Fatalf("the runner verify brief does not carry the verify report fields:\n%s", brief)
+	}
+	for _, want := range []string{
+		"the targeted checks you actually ran and saw",
+		"the fix phase already ran the full gates at HEAD",
+	} {
+		if !strings.Contains(runnerVerifyReportFields, want) {
+			t.Errorf("the runner verify report never says %q:\n%s", want, runnerVerifyReportFields)
+		}
+	}
+	for _, banned := range []string{"tests (what you actually ran and saw while verifying)"} {
+		if strings.Contains(runnerVerifyReportFields, banned) {
+			t.Errorf("the runner verify report still asks for %q, not the scoped checks:\n%s", banned, runnerVerifyReportFields)
+		}
+	}
+}
+
 // The verification round adjudicates through the report's findingUpdates, and
 // only its no-open-MUST arm hands the task over.
 func TestRunnerVerifyBriefReportsTheRound(t *testing.T) {

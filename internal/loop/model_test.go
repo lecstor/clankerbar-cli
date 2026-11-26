@@ -112,8 +112,8 @@ func TestDrainWithRetries_AnUnphasedRunStillPinsTheConfiguredModel(t *testing.T)
 // that reviews it — an author briefing its own reviewer frames away from its own
 // weak spots without meaning to. That is a property of the CALL GRAPH, not of
 // the words in the shipped brief: the driver is the caller, it builds phase N+1's
-// prompt from CONFIG plus exactly three claim-derived values (the task id, the
-// run id, and the verified branch since CLA-457), and phase N's
+// prompt from CONFIG plus exactly four claim-derived values (the task id, its
+// qualified ref, the run id, and the verified branch since CLA-457), and phase N's
 // session output is not an input to it at all — the branch is plane state the
 // checkpoint verified on the origin remote, not prose a session could frame
 // with.
@@ -167,18 +167,19 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 	// promises to catch.
 	//
 	// Stating the WHOLE of the brief's provenance closes it: the operator's
-	// config, with exactly three claim-derived values substituted — plus
+	// config, with exactly four claim-derived values substituted — plus
 	// {{prBase}}, which is not claim-derived but config-derived (CLA-608: the
 	// stubbed probe says the integration branch is on origin, so it resolves to
 	// the config's own default) — and nothing else. Any field that ever reaches
 	// the prompt makes it differ.
 	//
-	// The third claim value — {{branch}} — joined in CLA-457 and is the one
-	// deliberate exception to "no stream-derived text in the brief": it is the
-	// branch the checkpoint VERIFIED on the origin remote, legitimately a branch
-	// name and nothing a session could smuggle prose through. The implementing
-	// session still cannot frame its own reviewer: an arbitrary branch name
-	// changes what the reviewer works in, never what it is told to attack.
+	// The claim values — {{branch}} joined in CLA-457, {{taskRef}} in CLA-1032 — are the
+	// deliberate exception to "no stream-derived text in the brief": the branch is the
+	// branch the checkpoint VERIFIED on the origin remote and the ref is the task's own
+	// identifier from the claim, neither one prose a session could smuggle through. The
+	// implementing session still cannot frame its own reviewer: an arbitrary branch name
+	// or ref changes what the reviewer works in and what it calls the task, never what it
+	// is told to attack.
 	claim := openClaim()
 	// The attribution and position values are CONFIG-derived, not session-derived:
 	// the reviewing phase's own harness/model, the implement phase's, and the
@@ -193,6 +194,7 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 	implementModel, _ := tc.ModelForPhase(implementer)
 	want := strings.NewReplacer(
 		config.PhaseTaskPlaceholder, claim.TaskID,
+		config.PhaseTaskRefPlaceholder, claimLabel(claim),
 		config.PhaseRunPlaceholder, claim.RunID,
 		config.PhaseBranchPlaceholder, "clanker/x",
 		config.PhasePRBasePlaceholder, config.DefaultIntegrationBranch,

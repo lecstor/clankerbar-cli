@@ -369,7 +369,7 @@ const verifyDriverBounds = " The driver counts rounds: this is a hard cap of thr
 // verifyCheckScope bounds a verification round's commands: the fix delta, its regression surface and the
 // gates a prior finding named red. The fix phase ran the repo's gates at HEAD and the PR's CI carries the
 // full suite once it opens, so a second identical full run is cost without evidence.
-const verifyCheckScope = " RUN CHECKS SCOPED, NEVER THE REPO'S WHOLE GATE LIST AGAIN: verify with targeted commands " +
+const verifyCheckScope = "RUN CHECKS SCOPED, NEVER THE REPO'S WHOLE GATE LIST AGAIN: verify with targeted commands " +
 	"only - the fix delta's own tests, the regression surface those fixes touch, and any check a prior finding " +
 	"said was red. Do NOT re-run the repo's full test suite, full build, or multi-minute smoke/e2e sweeps when " +
 	"the fix phase already ran them at HEAD: the PR's CI carries the full suite once it opens, and a second " +
