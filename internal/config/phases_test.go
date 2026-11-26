@@ -541,6 +541,25 @@ func TestValidate_RefusesAResumeBriefInFirstPosition(t *testing.T) {
 	}
 }
 
+// {{taskRef}} is filled from the previous phase's claim exactly as {{taskId}} is, so a first phase
+// carrying it would tell its session to open a PR titled "{{taskRef}}".
+func TestValidate_RefusesTheTaskRefInTheFirstPhase(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{
+		{Name: "custom", Prompt: "Open the PR titled " + PhaseTaskRefPlaceholder},
+		{Name: ReviewPhaseName},
+	}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted {{taskRef}} in phase 0, which has no previous claim to fill it from")
+	}
+	if !strings.Contains(err.Error(), PhaseTaskRefPlaceholder) {
+		t.Errorf("the rejection does not name the placeholder that cannot be filled: %v", err)
+	}
+}
+
 // The name becomes part of an iteration log's filename, and statedir refuses one
 // it does not like — costing the phase the single artifact an operator has to
 // debug the sequence with.
