@@ -32,7 +32,8 @@ func (d *Driver) releaseCarried(ctx context.Context, t Target, carried *harness.
 }
 
 // releaseCarriedEnd is releaseCarried for a phase about to loop back to a FRESH session — a
-// usage-limit wait, a transient backoff.
+// usage-limit wait, a transient backoff. usageLimit names the cause on the lease end, which is
+// how the plane spares the reclaim budget for the wait that follows.
 func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd, usageLimit bool) phaseEnd {
 	// Only a hold that actually happened needs undoing. Every other end has ALREADY been through the
 	// handback in drainPhase's seam block, and releasing again would hand the task back twice —

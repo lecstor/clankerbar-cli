@@ -2243,6 +2243,7 @@ func TestRun_UsageLimitLeaseEndCarriesTheReason(t *testing.T) {
 		{name: "a quiet death", res: held(zeroUsageResult(), wip), want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
 			cfg := fastCfg()
 			cfg.StateDir = t.TempDir()
 			cfg.MaxIterations = 1
@@ -2261,6 +2262,10 @@ func TestRun_UsageLimitLeaseEndCarriesTheReason(t *testing.T) {
 			}
 			if len(rel.calls) != 0 {
 				t.Errorf("ReleaseDriver called (%+v) — CLA-708 forbids it on pushed work", rel.calls)
+			}
+			out := logs.String()
+			if said := strings.Contains(out, "usage limit, reclaim budget not charged"); said != (tc.want != "") {
+				t.Errorf("the lease-ended line says the reason was accepted = %v, want %v:\n%s", said, tc.want != "", out)
 			}
 		})
 	}
