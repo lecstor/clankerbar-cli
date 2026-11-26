@@ -2048,9 +2048,12 @@ type releaseCall struct{ taskID, runID string }
 type fakeReleaser struct {
 	calls       []releaseCall
 	expireCalls []releaseCall
-	err         error
-	expireErr   error
-	onCall      func() // fired inside the handback, to observe what has NOT happened yet
+	// expireReasons is the `reason` argument of each ExpireLease call, aligned with expireCalls:
+	// CLA-1029's usage-limit path is distinguished from an ordinary expiry by it.
+	expireReasons []string
+	err           error
+	expireErr     error
+	onCall        func() // fired inside the handback, to observe what has NOT happened yet
 }
 
 func (f *fakeReleaser) ReleaseDriver(_ context.Context, taskID, runID string) error {
@@ -2065,8 +2068,9 @@ func (f *fakeReleaser) ReleaseDriver(_ context.Context, taskID, runID string) er
 // which one a branch-bearing claim uses is the whole safety property:
 // ReleaseDriver would post `ready` over the branch, ExpireLease keeps it for
 // takeover.
-func (f *fakeReleaser) ExpireLease(_ context.Context, taskID, runID string) error {
+func (f *fakeReleaser) ExpireLease(_ context.Context, taskID, runID, reason string) error {
 	f.expireCalls = append(f.expireCalls, releaseCall{taskID, runID})
+	f.expireReasons = append(f.expireReasons, reason)
 	return f.expireErr
 }
 
@@ -2212,6 +2216,53 @@ func TestRun_ReleasesBeforeSleepingOutAUsageLimit(t *testing.T) {
 	}
 	if rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
 		t.Errorf("released %+v, want {t-1 r-1}", rel.calls[0])
+	}
+}
+
+// CLA-1029: the lease-end reason is the SAME classification handleUsageLimit acts on, taken at
+// the seam because the handback runs before that branch. A rolling limit, a hard stop and a turn
+// stopped on the usage limit all name `usage_limit`; a nonzero exit, an output-cap stall and a
+// quiet death name nothing, so the plane keeps charging those to the reclaim budget.
+func TestRun_UsageLimitLeaseEndCarriesTheReason(t *testing.T) {
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/t-1-work"}
+	stalled := stalledHeldResult()
+	stalled.Claim = wip
+	turnStopped := held(okResult(5, 0.05), wip)
+	turnStopped.TurnStopReason = "usage_limit"
+
+	for _, tc := range []struct {
+		name string
+		res  harness.Result
+		want string
+	}{
+		{name: "a rolling usage limit", res: held(limitResult(), wip), want: plane.ReasonUsageLimit},
+		{name: "a hard usage stop", res: held(limitStopResult(), wip), want: plane.ReasonUsageLimit},
+		{name: "a turn stopped on the usage limit", res: turnStopped, want: plane.ReasonUsageLimit},
+		{name: "a nonzero exit", res: held(nonRetryableResult(), wip), want: ""},
+		{name: "an output-cap stall", res: stalled, want: ""},
+		{name: "a quiet death", res: held(zeroUsageResult(), wip), want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := fastCfg()
+			cfg.StateDir = t.TempDir()
+			cfg.MaxIterations = 1
+
+			h := &fakeAdapter{steps: []invokeStep{{res: tc.res}}}
+			rel := &fakeReleaser{}
+			// A limit pauses, a failure errors; either way the assertion is what the
+			// handback sent, not whether the run survived.
+			_ = runWithReleaser(t, cfg, h, busyPoller(), rel)
+
+			if len(rel.expireReasons) != 1 {
+				t.Fatalf("expire reasons = %q, want exactly one expiry — pushed work must end the lease (releases: %+v)", rel.expireReasons, rel.calls)
+			}
+			if rel.expireReasons[0] != tc.want {
+				t.Errorf("reason = %q, want %q", rel.expireReasons[0], tc.want)
+			}
+			if len(rel.calls) != 0 {
+				t.Errorf("ReleaseDriver called (%+v) — CLA-708 forbids it on pushed work", rel.calls)
+			}
+		})
 	}
 }
 

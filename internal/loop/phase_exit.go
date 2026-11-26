@@ -84,6 +84,14 @@ func (r *phaseRun) countTrustedSpend(at *phaseAttempt) {
 	r.d.charge(r.ti, r.tc.HarnessFor(r.ph), at.res.Tokens, at.res.CostUSD)
 }
 
+// usageLimitEnd reports whether the session that just ended died on the provider's usage limit -
+// the same classification handleUsageLimit acts on, taken HERE because the handback runs first.
+// DetectLimit covers a rolling-window cap and a hard stop; the turn stop reason covers a
+// multi-turn session whose sequence a limit ended.
+func usageLimitEnd(a harness.Adapter, res harness.Result) bool {
+	return a.DetectLimit(res).Limited || res.TurnStopReason == "usage_limit"
+}
+
 // handleUsageLimit waits out a rolling usage limit and re-runs the session, or ends the phase on a
 // hard stop or a limit the phase must not wait for.
 func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attemptVerdict {
@@ -138,7 +146,7 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		}
 		// Whatever this attempt held open is not held open any more: every path below either waits or
 		// retries with a FRESH session, which re-claims.
-		r.end = d.releaseCarriedEnd(ctx, t, r.end)
+		r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
 		remaining, bounded := tc.Budget.Remaining(d.budgetElapsed(r.ti, time.Since(prior.start)))
 		if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this ceiling; not waiting, so start a fresh run after the reset (log: %s)",
@@ -294,7 +302,7 @@ func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemp
 		}
 		// As in the limit branch: the retry is a fresh session that re-claims, so nothing may stay held
 		// open across it.
-		r.end = d.releaseCarriedEnd(ctx, t, r.end)
+		r.end = d.releaseCarriedEnd(ctx, t, r.end, false)
 		r.retries++
 		if d.cfg.MaxRetries > 0 && r.retries > d.cfg.MaxRetries {
 			return attemptVerdict{next: attemptReturn, err: fmt.Errorf(

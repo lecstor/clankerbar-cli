@@ -233,6 +233,6 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	if !panelMember && !at.retryNoMCP && !resumeOnly {
 		// A tool-loop kill is never the undeclared hand-off CLA-384 counts, even when the process exited
 		// 0 an instant before the kill landed: it was killed failing to move the task on.
-		r.end.releasedToQueue = d.releaseHeldClaim(ctx, t, at.res, last && at.res.ExitCode == 0 && at.toolLoop == "")
+		r.end.releasedToQueue = d.releaseHeldClaim(ctx, t, at.res, last && at.res.ExitCode == 0 && at.toolLoop == "", usageLimitEnd(r.a, at.res))
 	}
 }

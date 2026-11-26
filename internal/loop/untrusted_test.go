@@ -359,10 +359,10 @@ func TestReleaseHeldClaim_CountsUndeclaredHandoffs(t *testing.T) {
 	tgt := d.targets[0]
 
 	pushed := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}}
-	d.releaseHeldClaim(context.Background(), tgt, pushed, true)
+	d.releaseHeldClaim(context.Background(), tgt, pushed, true, false)
 	d.releaseHeldClaim(context.Background(), tgt, harness.Result{
 		Claim: harness.Claim{TaskID: "t-2", RunID: "r-2", HasWIP: true},
-	}, true)
+	}, true, false)
 
 	if d.undeclared != 2 {
 		t.Errorf("undeclared = %d, want 2", d.undeclared)
@@ -392,7 +392,7 @@ func TestReleaseHeldClaim_DoesNotCountAPlainHandback(t *testing.T) {
 
 	d.releaseHeldClaim(context.Background(), d.targets[0], harness.Result{
 		Claim: harness.Claim{TaskID: "t-3", RunID: "r-3"},
-	}, true)
+	}, true, false)
 
 	if d.undeclared != 0 {
 		t.Errorf("undeclared = %d on a releasable claim, want 0", d.undeclared)

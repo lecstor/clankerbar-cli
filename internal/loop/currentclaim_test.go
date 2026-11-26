@@ -182,7 +182,7 @@ func TestReleaseHeldClaim_CarriesTheDriverMarkerOnTheWire(t *testing.T) {
 
 	rel := plane.New(srv.URL+"/mcp/demo", "k-1")
 	d := &Driver{}
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, held(okResult(1, 0), openClaim()), false); !released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, held(okResult(1, 0), openClaim()), false, false); !released {
 		t.Fatal("the handback did not land: the marker cannot be checked on a request that was never made")
 	}
 
@@ -218,7 +218,7 @@ func TestReleaseHeldClaim_EndsTheLeaseOnPushedWork(t *testing.T) {
 	openTestStateDir(t, d)
 	d.noteCurrentClaim(pushedWorkResult().Claim, "proj")
 
-	released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), true)
+	released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), true, false)
 	if released {
 		t.Error("an expired lease is not a task back in the ready queue; a seam retry must not re-claim it as one")
 	}
@@ -243,6 +243,82 @@ func TestReleaseHeldClaim_EndsTheLeaseOnPushedWork(t *testing.T) {
 	}
 }
 
+// CLA-1029: a session that died on the provider's usage limit names it on the expiry, so the
+// plane charges the next takeover to its quota ladder instead of the task's reclaim budget. The
+// log says the budget was spared, which is only true when the plane ACCEPTED the reason.
+func TestReleaseHeldClaim_EndsTheLeaseWithTheUsageLimitReason(t *testing.T) {
+	logs := captureLogs(t)
+	rel := &fakeReleaser{}
+	d := &Driver{}
+	openTestStateDir(t, d)
+
+	released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), false, true)
+	if released {
+		t.Error("an expired lease is not a task back in the ready queue")
+	}
+	if len(rel.expireReasons) != 1 || rel.expireReasons[0] != plane.ReasonUsageLimit {
+		t.Fatalf("expire reasons = %q, want exactly %q — the plane cannot spare the reclaim budget it is not told about", rel.expireReasons, plane.ReasonUsageLimit)
+	}
+	if len(rel.calls) != 0 {
+		t.Errorf("released %+v — a claim with pushed work must keep its takeover hand-off", rel.calls)
+	}
+	if out := logs.String(); !strings.Contains(out, "usage limit, reclaim budget not charged") {
+		t.Errorf("the lease-ended line must say the usage limit was sent and accepted; got:\n%s", out)
+	}
+}
+
+// reasonRefusingReleaser is an older plane: release_task's strict schema has no `reason`, so an
+// expiry carrying one is refused. It records every reason attempted so a test can see the retry,
+// and hands the successful (reasonless) call to the embedded fake.
+type reasonRefusingReleaser struct {
+	*fakeReleaser
+	reasons []string
+}
+
+func (r *reasonRefusingReleaser) ExpireLease(ctx context.Context, taskID, runID, reason string) error {
+	r.reasons = append(r.reasons, reason)
+	if reason != "" {
+		return fmt.Errorf("%w: release_task: Input validation error: Invalid arguments for tool release_task: Unrecognized key(s) in object: 'reason'", plane.ErrReasonUnsupported)
+	}
+	return r.fakeReleaser.ExpireLease(ctx, taskID, runID, reason)
+}
+
+// CLA-1029: a plane that refuses the unknown `reason` argument must not cost the immediate
+// takeover. The handback retries once without the reason, says so once per run, and never falls
+// back to ReleaseDriver (CLA-708 forbids it on pushed work).
+func TestReleaseHeldClaim_RetriesWithoutTheReasonWhenThePlaneRefusesIt(t *testing.T) {
+	logs := captureLogs(t)
+	f := &fakeReleaser{}
+	rel := &reasonRefusingReleaser{fakeReleaser: f}
+	d := &Driver{}
+	openTestStateDir(t, d)
+
+	for i := 0; i < 2; i++ {
+		if released := d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), true, true); released {
+			t.Error("an expired lease is not a task back in the ready queue")
+		}
+	}
+	if got, want := fmt.Sprint(rel.reasons), fmt.Sprint([]string{plane.ReasonUsageLimit, "", plane.ReasonUsageLimit, ""}); got != want {
+		t.Errorf("expire reasons = %s, want %s — each handback retries once without the reason", got, want)
+	}
+	if len(f.expireCalls) != 2 {
+		t.Errorf("the lease ended %d time(s), want 2 — the fallback must still end it", len(f.expireCalls))
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("fell back to ReleaseDriver (%+v) — that is the one call forbidden for pushed work", f.calls)
+	}
+	out := logs.String()
+	if got := strings.Count(out, "does not accept a usage-limit reason"); got != 1 {
+		t.Errorf("the unsupported-reason line appeared %d times, want once per run:\n%s", got, out)
+	}
+	if !strings.Contains(out, "ended the lease on t-1 (pushed work kept for takeover)") {
+		t.Errorf("the lease-ended line is missing:\n%s", out)
+	}
+	if strings.Contains(out, "reclaim budget not charged") {
+		t.Errorf("the log claims the budget was spared by a reason the plane refused:\n%s", out)
+	}
+}
+
 // A plane that does not serve release_task (an older protocol) is not a failed
 // handback — it is the old behaviour, announced once — and the old line stays,
 // because it is still what happened.
@@ -252,7 +328,7 @@ func TestReleaseHeldClaim_FallsBackWhenThePlanePredatesExpireLease(t *testing.T)
 	d := &Driver{}
 
 	for i := 0; i < 2; i++ {
-		d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), true)
+		d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), true, false)
 	}
 	if len(rel.expireCalls) != 2 {
 		t.Errorf("expireLease attempted %d times, want 2 before the fallback", len(rel.expireCalls))
@@ -274,7 +350,7 @@ func TestReleaseHeldClaim_ReportsAFailedExpire(t *testing.T) {
 	rel := &fakeReleaser{expireErr: errors.New("plane unavailable")}
 	d := &Driver{}
 
-	d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), false)
+	d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, pushedWorkResult(), false, false)
 
 	out := logs.String()
 	if !strings.Contains(out, "could not end the lease on t-1") {
@@ -290,7 +366,7 @@ func TestReleaseHeldClaim_ReportsAFailedExpire(t *testing.T) {
 func TestReleaseHeldClaim_UntrustedNeverExpiresTheLease(t *testing.T) {
 	rel := &fakeReleaser{}
 	d := &Driver{}
-	d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, held(untrustedResult(0, 0), openClaim()), true)
+	d.releaseHeldClaim(context.Background(), Target{Name: "proj", Releaser: rel}, held(untrustedResult(0, 0), openClaim()), true, false)
 	if len(rel.expireCalls) != 0 {
 		t.Errorf("expireLease called on a truncated stream: %+v", rel.expireCalls)
 	}

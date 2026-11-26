@@ -43,7 +43,7 @@ func TestReleaseHeldClaim_NamesTheOutputCapStall(t *testing.T) {
 	logs := captureLogs(t)
 	d := &Driver{}
 
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), true); released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), true, false); released {
 		t.Error("a claim with pushed work must not be released to the queue")
 	}
 
@@ -72,7 +72,7 @@ func TestReleaseHeldClaim_KeepsTheGenericLineWithoutAStall(t *testing.T) {
 	delete(res.Raw, harness.OutputCapReasoningKey)
 
 	d := &Driver{}
-	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, res, true)
+	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, res, true, false)
 
 	out := logs.String()
 	if !strings.Contains(out, "never moved the task on") {
@@ -89,7 +89,7 @@ func TestReleaseHeldClaim_NamesTheStallWithoutTheCounter(t *testing.T) {
 	logs := captureLogs(t)
 	d := &Driver{}
 
-	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), false)
+	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), false, false)
 
 	out := logs.String()
 	if !strings.Contains(out, "stalled: output cap hit with no output (reasoning=32000)") {
@@ -113,7 +113,7 @@ func TestReleaseHeldClaim_NamesTheStallOnTheReleasePath(t *testing.T) {
 	res.Claim.HasWIP = false
 	res.Claim.Branch = ""
 
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true); !released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true, false); !released {
 		t.Error("a stalled claim with no pushed work must still be released to the queue")
 	}
 
@@ -143,7 +143,7 @@ func TestReleaseHeldClaim_KeepsTheGenericLineOnTheReleasePathWithoutAStall(t *te
 	delete(res.Raw, harness.TerminalReasonKey)
 	delete(res.Raw, harness.OutputCapReasoningKey)
 
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true); !released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true, false); !released {
 		t.Error("a releasable claim must be handed back")
 	}
 

@@ -551,7 +551,7 @@ func TestHeartbeat_NotWiredDegradesCleanly(t *testing.T) {
 func TestExpireLease_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 
-	if err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1"); err != nil {
+	if err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", ReasonUsageLimit); err != nil {
 		t.Fatalf("ExpireLease: %v", err)
 	}
 	params, _ := got.body["params"].(map[string]any)
@@ -568,12 +568,71 @@ func TestExpireLease_RequestShape(t *testing.T) {
 	if args["driver"] != true {
 		t.Errorf("driver = %v, want true - the plane records this as a driver's call for a dead session", args["driver"])
 	}
+	if args["reason"] != ReasonUsageLimit {
+		t.Errorf("reason = %v, want %q - the plane charges the takeover to its quota ladder only when the death is named", args["reason"], ReasonUsageLimit)
+	}
 	// `checkGreen` is the other attestation and belongs to a close-out release;
 	// the expiry and a green-check claim are two different assertions.
 	for _, forbidden := range []string{"checkGreen", "status", "outcome", "delivery"} {
 		if _, present := args[forbidden]; present {
 			t.Errorf("expire must not carry %q: %+v", forbidden, args)
 		}
+	}
+}
+
+// CLA-1029: an ordinary expiry carries no reason at all — the plane must not read a quota death
+// into a failure or a stall the driver did not classify as one.
+func TestExpireLease_NoReasonOmitsTheArgument(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", ""); err != nil {
+		t.Fatalf("ExpireLease: %v", err)
+	}
+	params, _ := got.body["params"].(map[string]any)
+	args, _ := params["arguments"].(map[string]any)
+	if _, present := args["reason"]; present {
+		t.Errorf("an ordinary expiry carried reason: %+v", args)
+	}
+}
+
+// The MCP server's strict input schema rejects an argument an older plane does not know, and the
+// SDK reports the ZodError detail in a -32602 message. That rejection of the ARGUMENT is
+// ErrReasonUnsupported so the caller can retry without it; the client itself makes exactly one
+// call.
+func TestExpireLease_ReasonRefusalIsReportedAsUnsupported(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Input validation error: Invalid arguments for tool release_task: [\n  {\n    \"code\": \"unrecognized_keys\",\n    \"keys\": [\n      \"reason\"\n    ],\n    \"path\": [],\n    \"message\": \"Unrecognized key(s) in object: 'reason'\"\n  }\n]"}}`
+	srv, got := serve(t, http.StatusOK, body)
+
+	err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", ReasonUsageLimit)
+	if !errors.Is(err, ErrReasonUnsupported) {
+		t.Fatalf("err = %v, want ErrReasonUnsupported", err)
+	}
+	if len(got.bodies) != 1 {
+		t.Fatalf("made %d calls, want exactly 1 — the retry belongs to the caller", len(got.bodies))
+	}
+}
+
+// A refusal of the CALL is not a reason-schema rejection: the caller must not retry it without
+// the reason and read the second refusal as the failure.
+func TestExpireLease_CallRefusalIsNotReasonUnsupported(t *testing.T) {
+	srv, _ := serve(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"not_holding"}]}}`)
+
+	err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", ReasonUsageLimit)
+	if err == nil || errors.Is(err, ErrReasonUnsupported) {
+		t.Errorf("err = %v, want a plain refusal", err)
+	}
+}
+
+// A reason this build does not send is refused before the wire, so a typo cannot become a call
+// the plane has to reject.
+func TestExpireLease_RefusesAnUnknownReason(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", "because"); err == nil {
+		t.Fatal("expected an error")
+	}
+	if got.method != "" {
+		t.Errorf("hit the network (%s) for a reason the build does not send", got.method)
 	}
 }
 
@@ -627,7 +686,7 @@ func TestUnknownTool_NamesTheRequiredPlaneVersionAndDoesNotRetry(t *testing.T) {
 		call func(Releaser) error
 	}{
 		{"ReleaseDriver", "release_task", func(r Releaser) error { return r.ReleaseDriver(context.Background(), "t-1", "r-1") }},
-		{"ExpireLease", "release_task", func(r Releaser) error { return r.ExpireLease(context.Background(), "t-1", "r-1") }},
+		{"ExpireLease", "release_task", func(r Releaser) error { return r.ExpireLease(context.Background(), "t-1", "r-1", "") }},
 		{"RecordBranch", "record_progress", func(r Releaser) error {
 			return r.(Recorder).RecordBranch(context.Background(), "t-1", "r-1", "clanker/x")
 		}},
@@ -675,7 +734,7 @@ func TestToolRefusal_IsNotAnUnknownTool(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"record_progress refused: not_found: No task t-1 in this project."}]}}`,
 	} {
 		srv, _ := serve(t, http.StatusOK, body)
-		err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1")
+		err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", "")
 		if err == nil || errors.Is(err, ErrPlaneTooOld) {
 			t.Errorf("refusal %s classified as an unknown tool: %v", body, err)
 		}
@@ -683,7 +742,7 @@ func TestToolRefusal_IsNotAnUnknownTool(t *testing.T) {
 }
 
 func TestExpireLease_NotWired(t *testing.T) {
-	if err := New("", "").ExpireLease(context.Background(), "t-1", "r-1"); !errors.Is(err, ErrNotWired) {
+	if err := New("", "").ExpireLease(context.Background(), "t-1", "r-1", ""); !errors.Is(err, ErrNotWired) {
 		t.Errorf("err = %v, want ErrNotWired", err)
 	}
 }
@@ -696,7 +755,7 @@ func TestExpireLease_RequiresBothIDs(t *testing.T) {
 		{"no run", "t-1", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := r.ExpireLease(context.Background(), tt.task, tt.run); err == nil {
+			if err := r.ExpireLease(context.Background(), tt.task, tt.run, ""); err == nil {
 				t.Fatal("expected an error")
 			}
 			if got.method != "" {
