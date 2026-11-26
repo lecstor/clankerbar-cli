@@ -164,7 +164,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	// successor: a route window that ends before the poll interval is when the usable route comes
 	// back, so sleeping the whole interval from the entry is the same 29-minute idle CLA-986 fixed
 	// for successors (CLA-1024).
-	nextProbe := time.Now().Add(d.waitWakeDelay(d.liveCfg(t), ph, lim))
+	nextProbe := time.Now().Add(d.waitWakeDelay(d.liveCfg(t), ph, currentRoutes(), lim))
 	pauseSaid := false
 
 	for {
@@ -295,10 +295,14 @@ func (d *Driver) pauseChunk(until time.Time) time.Duration {
 // waitWakeDelay is how long the wait sleeps from NOW before its next probe: the stated reset or the
 // poll interval, shorter when a route the wait left blocked clears sooner (CLA-986). The entry sleep
 // takes this same delay (CLA-1024), so a wait entered at 13:45 with a route windowed until 14:00
-// wakes at 14:00 rather than 14:15.
-func (d *Driver) waitWakeDelay(tc *config.Config, ph config.Phase, lim harness.Limit) time.Duration {
+// wakes at 14:00 rather than 14:15. routes is the resolved list the wait was entered with; a nil one
+// falls back to the phase's configured list, which is what the walk will use.
+func (d *Driver) waitWakeDelay(tc *config.Config, ph config.Phase, routes []string, lim harness.Limit) time.Duration {
 	delay := probeWait(time.Now(), lim.ResetAt, d.pollIntervalLive(), d.waitGrace)
-	if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
+	if len(routes) == 0 {
+		routes, _ = tc.ModelRoutesForPhase(ph)
+	}
+	if hint, ok := d.routeWakeHintFor(tc, routes); ok && hint < delay {
 		delay = hint
 	}
 	return delay
@@ -593,7 +597,10 @@ type waitOutcome struct {
 
 // waitResponsive is the shared body of waitOrStop and waitOrStopHalt.
 func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEndsWait, reloadEndsWait bool) waitOutcome {
-	const chunk = 3 * time.Second
+	chunk := d.waitChunk
+	if chunk <= 0 {
+		chunk = 3 * time.Second
+	}
 	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed time.
 	wallStart := time.Now().Round(0)
 	end := time.Now().Add(dur)

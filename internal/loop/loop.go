@@ -193,6 +193,11 @@ type Driver struct {
 
 	waitGrace time.Duration
 
+	// waitChunk is how long a responsive sleep runs before re-reading the control markers (STOP, the
+	// restart family, HALT, RELOAD). Zero means the production 3s — the seam lets a test assert that
+	// a RELOAD or STOP ends a multi-hour sleep promptly without spending three seconds per case.
+	waitChunk time.Duration
+
 	limitBeaconInterval time.Duration
 
 	leaseRenewalInterval time.Duration
