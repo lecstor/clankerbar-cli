@@ -143,8 +143,15 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	tag := r.tag
 	ph := r.ph
 	a := r.a
+	// The retry label names whichever ladder spawned this attempt: the fresh-session transient
+	// ladder (r.retries) or a resumed phase's in-claim retry. It labels the FILE as well as the spawn
+	// line, so a post-mortem can find the attempt the line named.
+	retry := r.retries
+	if retry == 0 {
+		retry = r.resumedTransientRetries
+	}
 	logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
-		time.Now().Format("20060102-150405"), drainNum, tag, r.retries, randomTail())
+		time.Now().Format("20060102-150405"), drainNum, tag, retry, randomTail())
 	f, ferr := d.state.Create(logName)
 	at.logPath = filepath.Join(d.state.Path(), logName)
 	// The console is where the adapter streams the session: the file, and NOT the terminal unless the
@@ -184,10 +191,10 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	}
 	// The spawn line stamps what the session was actually spawned WITH: phase and the resolved model
 	// id inv.Model carries (ModelForPhase's output, never the tier alias).
-	if r.retries == 0 {
+	if retry == 0 {
 		log.Printf("iteration %d %s- spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	} else {
-		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), r.retries, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
+		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), retry, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	}
 
 	at.logFile = f
@@ -259,8 +266,11 @@ func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	at.orderlyExit = at.toolLoop == "" && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock)
 	at.recoveredExit = !at.orderlyExit && at.toolLoop == "" && at.res.Untrusted == "" && harness.RecoveredErrors(at.res) > 0
 	at.checkpointable = at.toolLoop == "" && (at.res.ExitCode == 0 || ((at.capped || at.ceiling || at.wallclock) && at.res.Claim.HasWIP) || at.recoveredExit)
-	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
-		(deadPhase(at.res) || at.toolLoop != "" || at.res.ReportResumeFailed != "")
+	// CLA-1033: a resume-only failure is retryable on the LAST phase too — the work was delivered and only
+	// the report was lost, and the claim was kept for exactly this retry. The genuine-death signatures stay
+	// non-retryable there, where there is no claim-staying retry to offer.
+	at.dead = at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
+		((!last && (deadPhase(at.res) || at.toolLoop != "")) || at.res.ReportResumeFailed != "")
 }
 
 // openPhaseEnd books the exit into the dead-phase tally and starts the attempt's phaseEnd: its

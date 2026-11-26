@@ -218,6 +218,17 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			fmt.Fprintf(console, "!! resurrection %d succeeded — session continued in place\n", n+1)
 		}
 	}
+	// A route that failed for a provider reason — transient, a quiet death left unrecovered, or a
+	// death before any tool call — is abandoned for the next configured route, resuming the session
+	// when it named one and starting fresh when it died before it could.
+	if !in.Probe {
+		if err := o.switchRoutesOnProviderError(ctx, in, in.RouteList(), &res, deadline, delivery); err != nil {
+			return res, err
+		}
+		if finished := RouteFinished(res); finished != "" {
+			in = in.OnRoute(finished)
+		}
+	}
 	o.resumeBadReport(ctx, in, &res, deadline, delivery)
 	if len(res.TurnMessages) > 0 {
 		res.TurnMessages[len(res.TurnMessages)-1] = res.FinalMessage

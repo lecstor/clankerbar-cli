@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // CLA-782: model route fallback. A usage limit on one route resumes the SAME
@@ -169,12 +170,105 @@ func TestOpencodeInvokeSwitchesRouteOnASubscriptionRateLimit(t *testing.T) {
 	}
 }
 
-// A transient 429 is NOT a switch: it rides the existing retry ladder, on the
-// route that already holds the context.
-func TestOpencodeInvokeTransientRateLimitDoesNotSwitch(t *testing.T) {
+// A transient provider error is now a route failure: the next configured route resumes
+// the SAME session, because a route that dies transiently would only be retried into
+// the same failure on this one.
+func TestOpencodeInvokeSwitchesRouteOnATransientProviderError(t *testing.T) {
 	script, logPath := routeStubScript(t,
 		`{"type":"error","sessionID":"ses_live","error":{"type":"provider.rate-limit","message":"429 Too Many Requests"}}`)
 	opencodeStub(t, script)
+
+	console := &bytes.Buffer{}
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:  "Work.",
+		Model:   routeFree,
+		Routes:  []string{routeFree, routePaid},
+		Console: console,
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 2 {
+		t.Fatalf("the stub ran %d times, want 2 (the failed route + one continuation on the next):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !strings.Contains(calls[1], "-s ses_live") || !strings.Contains(calls[1], "--model "+routePaid) {
+		t.Errorf("the failover did not resume the same session on the next route: %s", calls[1])
+	}
+	if !strings.Contains(calls[1], "failed with a provider error") {
+		t.Errorf("the continuation did not tell the session what happened: %s", calls[1])
+	}
+	if (opencode{}).IsTransient(res) {
+		t.Error("a clean continuation was classified transient")
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the continuation's 0", res.ExitCode)
+	}
+	if res.Tokens != 200 || res.CostUSD != 0.003 {
+		t.Errorf("spend = %d tokens / %v, want 200 / 0.003 summed across both routes", res.Tokens, res.CostUSD)
+	}
+	started, finished, fallbacks := RouteFallbacks(res)
+	if started != routeFree || finished != routePaid {
+		t.Errorf("route report = %q -> %q, want %q -> %q", started, finished, routeFree, routePaid)
+	}
+	if len(fallbacks) != 1 || fallbacks[0].Route != routeFree || fallbacks[0].Next != routePaid || fallbacks[0].Reason != routeFailReasonProvider {
+		t.Fatalf("fallbacks = %+v, want free -> paid (provider_error)", fallbacks)
+	}
+	if !fallbacks[0].ResetAt.IsZero() {
+		t.Errorf("ResetAt = %v, want zero: the driver owns the error cooldown", fallbacks[0].ResetAt)
+	}
+	if !strings.Contains(console.String(), "resuming the session on "+routePaid) {
+		t.Errorf("console missing the failover line; got:\n%s", console.String())
+	}
+}
+
+// A session offered ONE route has no failover to take, however it died: a transient end runs once,
+// reports no fallback, and leaves the driver's own retry to own it.
+func TestOpencodeInvokeOneRouteTransientDoesNotSwitch(t *testing.T) {
+	script, logPath := routeStubScript(t,
+		`{"type":"error","sessionID":"ses_live","error":{"data":{"statusCode":503},"message":"Service Unavailable"}}`)
+	opencodeStub(t, script)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 1 {
+		t.Fatalf("the stub ran %d times, want 1 (a one-route list has no failover):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !(opencode{}).IsTransient(res) {
+		t.Error("the one-route transient end was not classified transient; the test no longer exercises the guard")
+	}
+	if started, finished, fallbacks := RouteFallbacks(res); started != "" || finished != "" || len(fallbacks) != 0 {
+		t.Errorf("a one-route transient reported a route fallback: %q -> %q %+v", started, finished, fallbacks)
+	}
+}
+
+// A usage limit that ends the session on a route the PROVIDER walk reached is reported exactly as
+// the limit walk reports one: otherwise only the route the session moved off would be marked, and
+// the next phase would walk straight back into the limited one.
+func TestOpencodeInvokeReportsALimitOnAProviderFailoverRoute(t *testing.T) {
+	const reset = "2030-02-03T04:05:06Z"
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"-s ses_live"*)
+    echo '{"type":"error","sessionID":"ses_live","error":{"type":"provider.quota","message":"Usage limit reached. Resets at `+reset+`"}}'
+    exit 1
+    ;;
+  *)
+    echo '{"type":"step_finish","sessionID":"ses_live","part":{"type":"step-finish","reason":"stop","tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    echo '{"type":"error","sessionID":"ses_live","error":{"data":{"statusCode":503},"message":"Service Unavailable"}}'
+    exit 1
+    ;;
+esac
+`)
 
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt: "Work.",
@@ -184,14 +278,177 @@ func TestOpencodeInvokeTransientRateLimitDoesNotSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
-	if calls := stubCalls(t, logPath); len(calls) != 1 {
-		t.Fatalf("the stub ran %d times, want 1 — a transient 429 must not switch routes:\n%s", len(calls), strings.Join(calls, "\n"))
+	if calls := stubCalls(t, logPath); len(calls) != 2 || !strings.Contains(calls[1], "--model "+routePaid) {
+		t.Fatalf("want the session resumed on the next route; the stub ran:\n%s", strings.Join(calls, "\n"))
 	}
-	if !(opencode{}).IsTransient(res) {
-		t.Error("a provider.rate-limit was not classified transient")
+	_, finished, fallbacks := RouteFallbacks(res)
+	if finished != routePaid {
+		t.Errorf("finished = %q, want %q (the route that ended the session)", finished, routePaid)
 	}
-	if _, _, fallbacks := RouteFallbacks(res); len(fallbacks) != 0 {
-		t.Errorf("a transient blip reported route fallbacks: %+v", fallbacks)
+	if len(fallbacks) != 2 {
+		t.Fatalf("fallbacks = %+v, want the provider failover and the ending route's limit", fallbacks)
+	}
+	if fb := fallbacks[0]; fb.Route != routeFree || fb.Next != routePaid || fb.Reason != routeFailReasonProvider {
+		t.Errorf("fallbacks[0] = %+v, want free -> paid (provider_error)", fb)
+	}
+	fb := fallbacks[1]
+	if fb.Route != routePaid || fb.Next != "" || fb.Reason != "usage_limit" {
+		t.Fatalf("fallbacks[1] = %+v, want the ending paid route's usage_limit", fb)
+	}
+	if got := fb.ResetAt.UTC().Format("2006-01-02T15:04:05Z"); got != reset {
+		t.Errorf("ResetAt = %s, want the last route's stated reset %s", got, reset)
+	}
+}
+
+// A quiet death the resurrection loop could not recover is a dead provider route, not a dead
+// session: the next route resumes the same session with the provider-error continuation.
+func TestOpencodeInvokeFailsOverAfterAFailedResurrection(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"Confirm you are intact"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"I am fine."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *"failed with a provider error"*)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c9","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":80,"input":60,"output":20,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.002}}'
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree, routePaid},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 3 {
+		t.Fatalf("the stub ran %d times, want 3 (dead run, failed probe, provider failover):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !strings.Contains(calls[1], "Confirm you are intact") {
+		t.Errorf("the second call was not the resurrection probe: %s", calls[1])
+	}
+	if !strings.Contains(calls[2], "-s ses_dead") || !strings.Contains(calls[2], "--model "+routePaid) {
+		t.Errorf("the quiet death did not resume the session on the next route: %s", calls[2])
+	}
+	if (opencode{}).ZeroUsageUnknown(res) {
+		t.Error("the recovered session still carries the quiet-death marker")
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the failover's clean 0", res.ExitCode)
+	}
+	// Spend sums across the dead run (zero), the probe (900) and the continuation (80).
+	if res.Tokens != 980 || res.CostUSD != 0.003 {
+		t.Errorf("spend = %d tokens / %v, want 980 / 0.003 across dead run, probe and continuation", res.Tokens, res.CostUSD)
+	}
+	_, finished, fallbacks := RouteFallbacks(res)
+	if finished != routePaid {
+		t.Errorf("finished = %q, want %q", finished, routePaid)
+	}
+	if len(fallbacks) != 1 || fallbacks[0].Reason != routeFailReasonQuiet {
+		t.Fatalf("fallbacks = %+v, want one quiet_death failover", fallbacks)
+	}
+}
+
+// A non-zero exit before the session completed any tool call is a provider death with no work to
+// protect: with no session id, the next route starts FRESH on the original prompt.
+func TestOpencodeInvokeNoToolExitStartsFreshOnTheNextRoute(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, `#!/bin/sh
+if [ -f "`+logPath+`" ]; then
+  echo "$*" >> "`+logPath+`"
+  echo '{"type":"tool_use","sessionID":"ses_new","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+  echo '{"type":"step_finish","sessionID":"ses_new","part":{"type":"step-finish","reason":"stop","tokens":{"total":70,"input":50,"output":20,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.002}}'
+else
+  echo "$*" > "`+logPath+`"
+  echo '{"type":"text","part":{"type":"text","text":"junk tokens then nothing"}}'
+  exit 1
+fi
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree, routePaid},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 2 {
+		t.Fatalf("the stub ran %d times, want 2 (the no-tool death + a fresh start):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if strings.Contains(calls[1], "-s ") {
+		t.Errorf("a route with no session id was resumed instead of started fresh: %s", calls[1])
+	}
+	if !strings.Contains(calls[1], "--model "+routePaid) || !strings.Contains(calls[1], "-- Work.") {
+		t.Errorf("the fresh start lost the route or the original prompt: %s", calls[1])
+	}
+	if res.ExitCode != 0 || res.ToolCalls != 1 {
+		t.Errorf("ExitCode = %d, ToolCalls = %d; want the fresh route's clean 0 with one completed call", res.ExitCode, res.ToolCalls)
+	}
+	_, finished, fallbacks := RouteFallbacks(res)
+	if finished != routePaid {
+		t.Errorf("finished = %q, want %q", finished, routePaid)
+	}
+	if len(fallbacks) != 1 || fallbacks[0].Reason != routeFailReasonNoTool {
+		t.Fatalf("fallbacks = %+v, want one no_tool_exit failover", fallbacks)
+	}
+}
+
+// A no-tool death that DID name its session resumes it: the transcript is worth keeping even
+// though the turn completed no call.
+func TestOpencodeInvokeNoToolExitResumesTheNamedSession(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"failed with a provider error"*)
+    echo '{"type":"step_finish","sessionID":"ses_live","part":{"type":"step-finish","reason":"stop","tokens":{"total":40,"input":30,"output":10,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *)
+    echo '{"type":"text","sessionID":"ses_live","part":{"type":"text","text":"thinking"}}'
+    exit 1
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree, routePaid},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	calls := stubCalls(t, logPath)
+	if len(calls) != 2 {
+		t.Fatalf("the stub ran %d times, want 2:\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !strings.Contains(calls[1], "-s ses_live") || !strings.Contains(calls[1], "--model "+routePaid) {
+		t.Errorf("the named session was not resumed on the next route: %s", calls[1])
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want the failover's clean 0", res.ExitCode)
+	}
+	if _, _, fallbacks := RouteFallbacks(res); len(fallbacks) != 1 || fallbacks[0].Reason != routeFailReasonNoTool {
+		t.Fatalf("fallbacks = %+v, want one no_tool_exit failover", fallbacks)
 	}
 }
 

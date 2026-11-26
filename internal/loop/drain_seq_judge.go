@@ -13,8 +13,9 @@ import (
 
 // The walk stages that judge how a phase ended: dead, handed off, or verified.
 
-// judgeDeadPhase retries a dead first phase up to the per-task bound, then parks the task; a
-// fleet-wide run of deaths pauses the target instead.
+// judgeDeadPhase retries a dead phase at the walk's start phase, and a resume-only failure in ANY
+// position — the last phase included (CLA-1033) — each up to the per-task bound, then parks the
+// task; a fleet-wide run of deaths pauses the target instead.
 func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 	d := s.d
 	t := s.t
@@ -28,9 +29,10 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			taskID = st.end.claim.Claim.TaskID
 		}
 		// CLA-877: a resume-only failure KEPT its claim on purpose (see settleWithoutCheckpoint), so the
-		// retry resumes that same run without a re-claim.
+		// retry resumes that same run without a re-claim. CLA-1033: that retry is allowed on the LAST phase
+		// too — a verify round routinely pushes and opens the PR before its report resume stalls.
 		resumeOnly := st.end.reportResumeFailed != "" && st.end.claim != nil && st.end.claim.Claim.Held()
-		retryable := !st.last && (s.i == s.start || resumeOnly)
+		retryable := (!st.last && s.i == s.start) || resumeOnly
 
 		if retryable && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
