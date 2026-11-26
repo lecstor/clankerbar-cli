@@ -150,6 +150,9 @@ func runRig(o runOptions) (int, error) {
 	}
 	setup, err := prepareRigSession(&o)
 	if err != nil {
+		if setup.ln != nil {
+			_ = setup.ln.Close()
+		}
 		return 1, err
 	}
 	defer setup.ln.Close()

@@ -100,11 +100,6 @@ const PRVerified Kind = "pr"
 const (
 	prPollBudget   = 30 * time.Second
 	prPollInterval = 2 * time.Second
-
-	// ghWaitDelay matches the git runner's cut-off discipline: os/exec's Wait
-	// blocks until every child holding the pipes closes them, so an explicit
-	// WaitDelay is what actually bounds a wedged helper.
-	ghWaitDelay = 5 * time.Second
 )
 
 // ghCheck is one entry of `gh pr view --json statusCheckRollup`. The rollup

@@ -23,6 +23,9 @@ func checkBudget(cfg *config.Config) check {
 		return c
 	}
 
+	// A cost ceiling on a harness that never reports cost is not a weak ceiling but an ABSENT one: no
+	// code path can reach it, because nothing populates the figure it compares against (codex exec
+	// reports tokens, not money).
 	costBlind := costBlindHarnesses(cfg)
 	inertCost := b.MaxCostUSD > 0 && len(costBlind) > 0
 	dials := summariseBudgetDials(cfg, b, costBlind, inertCost)

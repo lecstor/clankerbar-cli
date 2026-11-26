@@ -217,6 +217,11 @@ func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []strin
 	return runGHBin(ctx, v.ghBin, dir, extraEnv, false, args...)
 }
 
+// ghWaitDelay matches the git runner's cut-off discipline: os/exec's Wait
+// blocks until every child holding the pipes closes them, so an explicit
+// WaitDelay is what actually bounds a wedged helper.
+const ghWaitDelay = 5 * time.Second
+
 // runGHProbe is the credential probe's spawn: runGHBin with the parent's
 // GH_TOKEN/GITHUB_TOKEN dropped. It is a named wrapper rather than a bare bool
 // at the call because this is the one spawn where the flag decides which
@@ -226,7 +231,7 @@ func runGHProbe(ctx context.Context, ghBin, dir string, args ...string) (string,
 }
 
 // runGHBin is runGH with the binary spelled out, so the per-owner token
-// resolution in delivery.go (TokenForOwner, CLA-458) drives the same spawn
+// resolution in gitrun.go (TokenForOwner, CLA-458) drives the same spawn
 // discipline without a Verifier in hand - CLA-459's doctor consumer passes
 // "gh" here. extraEnv carries per-invocation environment additions (see
 // runGHScoped); pass nil for the plain spawn. dropAmbientTokens removes the

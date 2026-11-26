@@ -17,7 +17,7 @@ type opencode struct{}
 func (opencode) Name() string { return "opencode" }
 
 // opencode DOES receive mcp_config_path - as OPENCODE_CONFIG and, rewritten, as
-// OPENCODE_CONFIG_CONTENT (see env below) - and that is exactly why "does the adapter hand it over"
+// OPENCODE_CONFIG_CONTENT (see opencode_permission.go) - and that is exactly why "does the adapter hand it over"
 // was the wrong question to gate a preflight on. A Claude-shaped file is a different schema: 1.18.2
 // refused to start on it, and 1.18.18 and 2.0.32 silently skip its `mcpServers` key, so the session
 // gets no clankerbar tools.
