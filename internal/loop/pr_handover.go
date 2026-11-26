@@ -56,12 +56,14 @@ const worktreeReclaimTimeout = 30 * time.Second
 
 // reclaimHandedOverWorktree removes the task worktree the runner prepared, after
 // the hand-over landed. It never fails the phase: the task is already in
-// in_review with its PR open and linked, so a leftover tree is a warning.
+// in_review with its PR open and linked, so a leftover tree is a warning. It
+// outlives a cancellation for the same reason the handback does: a stop that
+// lands here must not leave the tree behind.
 func (r *phaseRun) reclaimHandedOverWorktree(ctx context.Context, branch string) {
 	if strings.TrimSpace(r.opts.taskDir) == "" {
 		return
 	}
-	rctx, cancel := context.WithTimeout(ctx, worktreeReclaimTimeout)
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), worktreeReclaimTimeout)
 	defer cancel()
 	if err := reclaimTaskWorktree(rctx, r.opts.taskDir, branch); err != nil {
 		log.Printf("%siteration %d: the %s phase: the task is handed over and its PR is linked, but the runner could not reclaim the task worktree %s (%v) — leaving it in place",

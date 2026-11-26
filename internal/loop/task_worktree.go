@@ -58,7 +58,7 @@ type worktreePrep struct {
 
 // reclaimTaskWorktree removes the runner-prepared task worktree and its local
 // branch, from the repository's main checkout, AFTER the hand-over has landed
-// (CLA-1035). It mirrors the running instruction the terminal briefs used to
+// (CLA-1035). It mirrors the reclaim instruction the terminal briefs used to
 // carry: `git worktree remove` without --force, then point the branch at its
 // remote and `git branch -d` without -D. A refusal is returned, never forced
 // through - the caller logs it as a warning, because the task is already in
