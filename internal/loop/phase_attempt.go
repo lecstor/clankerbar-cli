@@ -266,8 +266,11 @@ func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	at.orderlyExit = at.toolLoop == "" && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock)
 	at.recoveredExit = !at.orderlyExit && at.toolLoop == "" && at.res.Untrusted == "" && harness.RecoveredErrors(at.res) > 0
 	at.checkpointable = at.toolLoop == "" && (at.res.ExitCode == 0 || ((at.capped || at.ceiling || at.wallclock) && at.res.Claim.HasWIP) || at.recoveredExit)
-	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
-		(deadPhase(at.res) || at.toolLoop != "" || at.res.ReportResumeFailed != "")
+	// CLA-1033: a resume-only failure is retryable on the LAST phase too — the work was delivered and only
+	// the report was lost, and the claim was kept for exactly this retry. The genuine-death signatures stay
+	// non-retryable there, where there is no claim-staying retry to offer.
+	at.dead = at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
+		((!last && (deadPhase(at.res) || at.toolLoop != "")) || at.res.ReportResumeFailed != "")
 }
 
 // openPhaseEnd books the exit into the dead-phase tally and starts the attempt's phaseEnd: its

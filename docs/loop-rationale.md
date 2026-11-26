@@ -1334,7 +1334,8 @@ section note.
 > operator decision's "retry the implement phase N times, then park" is
 > exactly `i == start` in the shipped [implement, review] sequence. A
 > resume-only failure is the exception (see below): it KEEPS the claim, so
-> `prev` re-seeds it and it may retry at any non-last position.
+> `prev` re-seeds it and it may retry in any phase position, the last
+> included (CLA-1033).
 >
 > CLA-396: a dead phase feeds BOTH counters, but the per-task park is
 > checked and taken FIRST — before the fleet counter's trip is even
@@ -1363,6 +1364,27 @@ section note.
 > seeds the retry's brief exactly as it seeded the failed attempt's. Only
 > the start phase carries the prep facts (s.prep), and those it keeps —
 > minus the stale tip, dropped below.
+
+### CLA-1033
+
+> CLA-1033: the resume-only retry was originally scoped to non-last
+> positions, which left the LAST phase with no recovery: `classifyExit`
+> never set `at.dead` there, so judgeDeadPhase never saw the failure, the
+> verification gate judged the round unverifiable, and the drain's
+> deferred handback called expireHeldClaim. A verify round routinely
+> pushes the branch and opens the PR before its report resume stalls, so
+> that sequence burned a reclaim slot on a task whose work was already
+> finished (MAK-482 Run 3).
+>
+> The widening is one conjunct in classifyExit and one parenthesisation in
+> `retryable`: a resume-only failure is dead on the last phase too, while
+> the genuine-death signatures (a dead phase, a tool-loop kill) keep their
+> `!last` guard — there is no claim-staying retry to offer them, and the
+> ordinary handback remains their whole recovery. Everything else about
+> the retry is unchanged: it keeps the held claim, so `prev` still seeds
+> the verify brief with the branch it named, and the per-task bound still
+> parks the task on the fourth consecutive failure rather than spinning
+> sessions on a phase that cannot re-emit its report.
 
 ### CLA-900
 
