@@ -1,6 +1,8 @@
 # built binary
 /clankerbar
 /dist/
+# build output of scripts/opencode-rig (go build ./scripts/opencode-rig)
+/opencode-rig
 
 # loop state (markers + per-iteration logs)
 .clankerbar-loop/

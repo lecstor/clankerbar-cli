@@ -199,13 +199,13 @@ func originOnly(raw string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// sameOriginRedirect extends noDowngradeRedirect for requests that carry a
-// credential or file bytes: every redirect hop must still satisfy
+// sameOriginRedirect extends secureurl.NoDowngradeRedirect for requests that
+// carry a credential or file bytes: every redirect hop must still satisfy
 // secureurl.Origin and stay on the plane's origin, so a compromised response
 // cannot redirect file bytes, download bytes or capability tokens off-site.
 func sameOriginRedirect(endpoint string) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
-		if err := noDowngradeRedirect(req, via); err != nil {
+		if err := secureurl.NoDowngradeRedirect(req, via); err != nil {
 			return err
 		}
 		if endpoint == "" {

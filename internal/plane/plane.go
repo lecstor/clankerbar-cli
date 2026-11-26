@@ -287,7 +287,7 @@ func wiredClient(mcpURL, apiKey string) *mcpReleaser {
 	return &mcpReleaser{
 		endpoint: endpoint,
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: 20 * time.Second, CheckRedirect: noDowngradeRedirect},
+		client:   &http.Client{Timeout: 20 * time.Second, CheckRedirect: secureurl.NoDowngradeRedirect},
 		// The PUT carries a whole file and a URL capability token, so it gets
 		// its own longer deadline and must never redirect off the plane's
 		// origin or downgrade to cleartext.
@@ -687,18 +687,6 @@ func sseData(raw []byte) []byte {
 		}
 	}
 	return trimmed
-}
-
-// noDowngradeRedirect refuses a redirect that would put the bearer token on the
-// wire in cleartext. Go already strips Authorization when a redirect changes
-// host, but it FORWARDS it on an https -> http hop to the SAME host — which is
-// exactly the cleartext exposure the credential-origin rule exists to prevent
-// (CLA-257), arriving by a route config validation cannot see.
-func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
-	if _, err := secureurl.Origin(req.URL.String()); err != nil {
-		return fmt.Errorf("refusing redirect: %w", err)
-	}
-	return nil
 }
 
 // Heartbeat renews a live claim's lease. It is the driver-side renewal (CLA-358):

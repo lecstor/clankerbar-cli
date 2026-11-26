@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -143,45 +144,62 @@ func (s *stringList) Set(v string) error {
 }
 
 func runRig(o runOptions) (int, error) {
+	o, err := resolveRigOptions(o)
+	if err != nil {
+		return 1, err
+	}
+	setup, err := prepareRigSession(&o)
+	if err != nil {
+		if setup.ln != nil {
+			_ = setup.ln.Close()
+		}
+		return 1, err
+	}
+	defer setup.ln.Close()
+	return executeRig(o, setup)
+}
+
+// resolveRigOptions validates the run's inputs and resolves the run and sandbox
+// directories. Everything the run produces lives under the run directory, so a
+// report can always be tied to its raw logs.
+func resolveRigOptions(o runOptions) (runOptions, error) {
 	o.StartedAt = time.Now()
 	if _, ok := scenarios()[o.Scenario]; !ok {
-		return 1, fmt.Errorf("unknown scenario %q (have padding, reasoning-replay, schema)", o.Scenario)
+		return o, fmt.Errorf("unknown scenario %q (have padding, reasoning-replay, schema)", o.Scenario)
 	}
 	if o.Model == "" && o.Provider == "" {
-		return 1, fmt.Errorf("--model is required: the rig must know which provider's baseURL to redirect and the report must name the model asked for")
+		return o, fmt.Errorf("--model is required: the rig must know which provider's baseURL to redirect and the report must name the model asked for")
 	}
 	if o.Provider == "" {
 		p, _, err := providerFromModel(o.Model)
 		if err != nil {
-			return 1, err
+			return o, err
 		}
 		o.Provider = p
 	}
 	if o.Deadline <= 0 {
-		return 1, fmt.Errorf("--deadline must be positive")
+		return o, fmt.Errorf("--deadline must be positive")
 	}
 	if o.ConfigDir != "" {
 		o.ConfigDir = expandHome(o.ConfigDir)
 	}
 
-	// Run directory. Everything the run produces lives under it, so a report can
-	// always be tied to its raw logs.
 	if o.Out == "" {
 		o.Out = filepath.Join(os.TempDir(), "opencode-rig", runID(o.Scenario, o.StartedAt))
 	}
 	out, err := filepath.Abs(o.Out)
 	if err != nil {
-		return 1, err
+		return o, err
 	}
 	o.Out = out
 	if err := os.MkdirAll(o.Out, 0o755); err != nil {
-		return 1, err
+		return o, err
 	}
 	// One run per directory. Reusing a directory would mix this run's logs with
 	// a previous run's and let a stale stub-capped marker stop a healthy
 	// session, so refuse rather than silently contaminate the evidence.
 	if fileExists(filepath.Join(o.Out, "run.json")) {
-		return 1, fmt.Errorf("run directory %s already holds a run (run.json); pass a new --out", o.Out)
+		return o, fmt.Errorf("run directory %s already holds a run (run.json); pass a new --out", o.Out)
 	}
 
 	// The sandbox: an empty directory, deliberately not the repo. The rig studies
@@ -191,126 +209,145 @@ func runRig(o runOptions) (int, error) {
 		o.Workdir = filepath.Join(o.Out, "sandbox")
 	}
 	if err := os.MkdirAll(o.Workdir, 0o755); err != nil {
-		return 1, err
+		return o, err
 	}
 	o.Workdir, err = filepath.Abs(o.Workdir)
 	if err != nil {
-		return 1, err
+		return o, err
 	}
+	return o, nil
+}
+
+// rigSetup is everything resolved before the session is spawned: the tool
+// catalog, the config layers, the proxy's listener and the isolation dirs.
+type rigSetup struct {
+	cat         catalog
+	schemasPath string
+	basePath    string
+	upstream    string
+	proxyURL    string
+	ln          net.Listener
+	sourcePath  string
+	contentPath string
+	content     []byte
+	isolation   []string
+}
+
+func prepareRigSession(o *runOptions) (rigSetup, error) {
+	var setup rigSetup
 
 	// Tool catalog: live from the plane, or a file (the schema scenario's
 	// proposed shape).
-	schemasPath := filepath.Join(o.Out, "schemas.json")
-	var cat catalog
+	setup.schemasPath = filepath.Join(o.Out, "schemas.json")
+	var err error
 	if o.Schemas == "live" {
 		key := os.Getenv("CLANKERBAR_API_KEY")
 		if o.PlaneKeyFile != "" {
 			key, err = readKeyFile(o.PlaneKeyFile)
 			if err != nil {
-				return 1, err
+				return setup, err
 			}
 		}
-		cat, err = fetchCatalog(context.Background(), o.PlaneURL, key)
+		setup.cat, err = fetchCatalog(context.Background(), o.PlaneURL, key)
 		if err != nil {
-			return 1, fmt.Errorf("fetching the plane's tool schemas: %w", err)
+			return setup, fmt.Errorf("fetching the plane's tool schemas: %w", err)
 		}
-		cat.Source = o.PlaneURL
-		if err := saveCatalog(schemasPath, cat); err != nil {
-			return 1, err
+		setup.cat.Source = o.PlaneURL
+		if err := saveCatalog(setup.schemasPath, setup.cat); err != nil {
+			return setup, err
 		}
 	} else {
-		cat, err = loadCatalog(expandHome(o.Schemas))
+		setup.cat, err = loadCatalog(expandHome(o.Schemas))
 		if err != nil {
-			return 1, err
+			return setup, err
 		}
-		if cat.Source == "" {
-			cat.Source = o.Schemas
+		if setup.cat.Source == "" {
+			setup.cat.Source = o.Schemas
 		}
 		// Keep the exact catalog the run served, beside the rest of the evidence.
-		if err := saveCatalog(schemasPath, cat); err != nil {
-			return 1, err
+		if err := saveCatalog(setup.schemasPath, setup.cat); err != nil {
+			return setup, err
 		}
 	}
 	// A scenario whose stub answers one tool and whose prompt asks for it is
 	// pointless against a catalog that does not serve that tool: the model is
 	// offered the old surface (or nothing), the stub logs no call for it, and
 	// the report says nothing about what the scenario claims to test.
-	if want := catalogTool(o.Scenario, o.SchemaTool); want != "" && !contains(cat.toolNames(), want) {
-		return 1, fmt.Errorf("%s scenario: tool %q is not in the catalog (have %s). Serve a catalog from a plane that serves it (or a file with --schemas)",
-			o.Scenario, want, strings.Join(cat.toolNames(), ", "))
+	if want := catalogTool(o.Scenario, o.SchemaTool); want != "" && !contains(setup.cat.toolNames(), want) {
+		return setup, fmt.Errorf("%s scenario: tool %q is not in the catalog (have %s). Serve a catalog from a plane that serves it (or a file with --schemas)",
+			o.Scenario, want, strings.Join(setup.cat.toolNames(), ", "))
 	}
 
 	// Base config: the fleet's own file when present.
-	basePath := o.MCPConfig
-	if basePath == "" {
-		basePath = defaultBaseConfig()
+	setup.basePath = o.MCPConfig
+	if setup.basePath == "" {
+		setup.basePath = defaultBaseConfig()
 	}
-	if basePath != "" {
-		basePath = expandHome(basePath)
-		if _, err := os.Stat(basePath); err != nil {
-			return 1, fmt.Errorf("--mcp-config: %w", err)
+	if setup.basePath != "" {
+		setup.basePath = expandHome(setup.basePath)
+		if _, err := os.Stat(setup.basePath); err != nil {
+			return setup, fmt.Errorf("--mcp-config: %w", err)
 		}
 	}
 
 	// Decide the upstream from the base config before anything is rewritten.
-	upstream := o.Upstream
-	if upstream == "" {
-		upstream, err = providerBaseURL(basePath, o.Provider)
+	setup.upstream = o.Upstream
+	if setup.upstream == "" {
+		setup.upstream, err = providerBaseURL(setup.basePath, o.Provider)
 		if err != nil {
-			return 1, err
+			return setup, err
 		}
 	}
 
 	// The proxy binds port 0 here, before the session exists: a free port chosen
 	// by the kernel and a listener that is already accepting. There is no
 	// readiness sleep to get wrong.
-	ln, proxyURL, err := listen()
+	setup.ln, setup.proxyURL, err = listen()
 	if err != nil {
-		return 1, fmt.Errorf("cannot bind the proxy's port: %w", err)
+		return setup, fmt.Errorf("cannot bind the proxy's port: %w", err)
 	}
-	defer ln.Close()
 
 	self, err := os.Executable()
 	if err != nil {
-		return 1, fmt.Errorf("locating the rig binary (needed to spawn the stub): %w", err)
+		return setup, fmt.Errorf("locating the rig binary (needed to spawn the stub): %w", err)
 	}
 	stubArgs := []string{
 		"stub",
 		"--scenario", o.Scenario,
 		"--out", o.Out,
-		"--schemas", schemasPath,
+		"--schemas", setup.schemasPath,
 		"--max-calls", strconv.Itoa(o.MaxToolCalls),
 	}
 	srcData, replacedUpstream, err := buildSourceConfig(sourceConfigOpts{
-		BasePath:     basePath,
+		BasePath:     setup.basePath,
 		ProviderID:   o.Provider,
-		ProxyBaseURL: proxyURL,
+		ProxyBaseURL: setup.proxyURL,
 		Self:         self,
 		StubArgs:     stubArgs,
 	})
 	if err != nil {
-		return 1, err
+		return setup, err
 	}
 	if o.Upstream == "" && replacedUpstream != "" {
-		fmt.Fprintf(os.Stderr, "opencode-rig: provider %s baseURL %s -> %s (proxy)\n", o.Provider, replacedUpstream, proxyURL)
+		fmt.Fprintf(os.Stderr, "opencode-rig: provider %s baseURL %s -> %s (proxy)\n", o.Provider, replacedUpstream, setup.proxyURL)
 	}
-	sourcePath, err := writeSourceConfig(o.Out, srcData)
+	setup.sourcePath, err = writeSourceConfig(o.Out, srcData)
 	if err != nil {
-		return 1, err
+		return setup, err
 	}
 	// readOnly=true pins the adapter's READ-ONLY policy (internal/harness:
 	// shell and edit denied, reads scoped to the workdir). The rig never studies
 	// a write, and the fleet's writable policy allows `shell` unscoped - a shell
 	// tool would read the whole checkout regardless of the sandbox's path rules.
-	content, err := generatedContent(sourcePath, o.Workdir, true)
+	setup.content, err = generatedContent(setup.sourcePath, o.Workdir, true)
 	if err != nil {
-		return 1, fmt.Errorf("generating the session config through harness.OpencodeSessionConfig: %w", err)
+		return setup, fmt.Errorf("generating the session config through harness.OpencodeSessionConfig: %w", err)
 	}
-	contentPath := filepath.Join(o.Out, "opencode-config-content.json")
+	setup.contentPath = filepath.Join(o.Out, "opencode-config-content.json")
 	// The content layer carries the provider block, so a literal apiKey in the
 	// source config lands here too: never world-readable.
-	if err := writeCredentialFile(contentPath, content); err != nil {
-		return 1, err
+	if err := writeCredentialFile(setup.contentPath, setup.content); err != nil {
+		return setup, err
 	}
 
 	scenario := scenarios()[o.Scenario]
@@ -325,17 +362,19 @@ func runRig(o runOptions) (int, error) {
 		{"XDG_STATE_HOME", filepath.Join(o.Out, "xdg", "state")},
 		{"XDG_CACHE_HOME", filepath.Join(o.Out, "xdg", "cache")},
 	}
-	var isolation []string
 	for _, pair := range isolationPairs {
 		if err := os.MkdirAll(pair[1], 0o755); err != nil {
-			return 1, err
+			return setup, err
 		}
-		isolation = append(isolation, pair[0]+"="+pair[1])
+		setup.isolation = append(setup.isolation, pair[0]+"="+pair[1])
 	}
+	return setup, nil
+}
 
-	upstreamURL, err := url.Parse(upstream)
+func executeRig(o runOptions, setup rigSetup) (int, error) {
+	upstreamURL, err := url.Parse(setup.upstream)
 	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
-		return 1, fmt.Errorf("--upstream (or the config's options.baseURL) is not an absolute URL: %q", upstream)
+		return 1, fmt.Errorf("--upstream (or the config's options.baseURL) is not an absolute URL: %q", setup.upstream)
 	}
 	proxy, err := newRecordingProxy(upstreamURL, o.Out)
 	if err != nil {
@@ -347,26 +386,26 @@ func runRig(o runOptions) (int, error) {
 		Scenario:       o.Scenario,
 		Model:          o.Model,
 		Provider:       o.Provider,
-		Upstream:       upstream,
-		ProxyURL:       proxyURL,
-		BaseConfig:     basePath,
-		SourceConfig:   sourcePath,
-		ContentConfig:  contentPath,
+		Upstream:       setup.upstream,
+		ProxyURL:       setup.proxyURL,
+		BaseConfig:     setup.basePath,
+		SourceConfig:   setup.sourcePath,
+		ContentConfig:  setup.contentPath,
 		Workdir:        o.Workdir,
 		Out:            o.Out,
-		SchemaSource:   cat.Source,
-		SchemaFile:     schemasPath,
-		Tools:          cat.toolNames(),
+		SchemaSource:   setup.cat.Source,
+		SchemaFile:     setup.schemasPath,
+		Tools:          setup.cat.toolNames(),
 		Deadline:       o.Deadline.String(),
 		MaxToolCalls:   o.MaxToolCalls,
 		StartedAt:      o.StartedAt.UTC().Format(time.RFC3339),
-		Prompt:         prompt,
+		Prompt:         o.Prompt,
 		OpencodeBin:    o.OpencodeBin,
-		IsolationDirs:  isolation,
+		IsolationDirs:  setup.isolation,
 		OpencodeConfig: o.ConfigDir,
 	}
 	fmt.Printf("opencode-rig: %s\n  scenario: %s\n  model: %s (provider %s)\n  tools: %d from %s\n  proxy: %s -> %s\n  run dir: %s\n",
-		rec.RunID, o.Scenario, o.Model, o.Provider, len(cat.Tools), schemaSourceLabel(o.Schemas), proxyURL, upstream, o.Out)
+		rec.RunID, o.Scenario, o.Model, o.Provider, len(setup.cat.Tools), schemaSourceLabel(o.Schemas), setup.proxyURL, setup.upstream, o.Out)
 
 	if o.DryRun {
 		// Deliberately no run.json: a dry run spawns nothing, and the reuse guard
@@ -377,7 +416,7 @@ func runRig(o runOptions) (int, error) {
 		display.ServerURL = "<url>"
 		fmt.Printf("  dry run: would start opencode serve, wait for MCP server %q, then attach with:\n  %s %s\n",
 			"clankerbar", o.OpencodeBin, strings.Join(opencodeArgs(display), " "))
-		fmt.Printf("  session config content: %s\n", contentPath)
+		fmt.Printf("  session config content: %s\n", setup.contentPath)
 		return 0, nil
 	}
 
@@ -385,7 +424,7 @@ func runRig(o runOptions) (int, error) {
 	// puts the handler on the listener. A listener that fails now cannot be
 	// recovered from, but the session will fail loudly on the first request.
 	srv := &http.Server{Handler: proxy, ReadHeaderTimeout: 30 * time.Second}
-	go func() { _ = srv.Serve(ln) }()
+	go func() { _ = srv.Serve(setup.ln) }()
 	defer func() {
 		_ = srv.Close()
 	}()
@@ -405,7 +444,7 @@ func runRig(o runOptions) (int, error) {
 	// stub's MCP server reports connected, and only then attach the run. Without
 	// this the model's first turn can be offered no clankerbar tools at all -
 	// verified, not assumed: the first live run of this rig did exactly that.
-	serverEnv := sessionEnv(o, content, isolation, extraEnv)
+	serverEnv := sessionEnv(o, setup.content, setup.isolation, extraEnv)
 	fmt.Printf("  starting opencode serve; waiting for MCP server %q to connect...\n", "clankerbar")
 	sessionServer, err := startRigServer(o.OpencodeBin, serverEnv, o.Workdir, o.Out)
 	if err != nil {
@@ -417,7 +456,7 @@ func runRig(o runOptions) (int, error) {
 	}
 	o.ServerURL, o.ServerPassword = sessionServer.url, sessionServer.password
 
-	code, err := runSession(o, content, isolation, extraEnv)
+	code, err := runSession(o, setup.content, setup.isolation, extraEnv)
 	if err != nil {
 		return 1, err
 	}

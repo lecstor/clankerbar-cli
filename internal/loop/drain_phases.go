@@ -14,26 +14,9 @@ import (
 // handback skipped at the seam happens here instead — otherwise a budget stop leaves the task
 // leased to nobody.
 func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
-	tc := d.targetCfg(t)
-	phases := tc.EffectivePhases()
-	rawPhases := make([]config.Phase, len(phases))
-	for i := range phases {
-		rawPhases[i] = phases[i]
-		if src := phases[i].ConfiguredIndex(); src < len(tc.Phases) {
-			rawPhases[i] = tc.Phases[src]
-		}
-	}
-	// CLA-638: where the fix→verify pair lives, when the sequence has one.
-	fixIdx := -1
-	for i := range phases {
-		if i+1 < len(phases) && phases[i].Name == config.FixPhaseName && isVerifyPhase(phases[i+1]) {
-			fixIdx = i
-		}
-	}
-	s := &drainSeq{
-		d: d, t: t, tc: tc, ti: ti, drainNum: drainNum, prior: prior, phases: phases, rawPhases: rawPhases, fixIdx: fixIdx,
-		verifyResolved: map[string]bool{}, panelFailed: map[string]panelMemberFailure{}, drainStart: time.Now(),
-	}
+	s := d.newDrainSeq(drainNum, ti, t, prior)
+	phases := s.phases
+	tc := s.tc
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way it ends — hence the
 	// defer, and hence state the deferred record reads.
 	defer s.recordIteration()
@@ -214,6 +197,31 @@ walk:
 
 	s.payOwedWaits(ctx)
 	return s.tokens, s.cost, s.handoffs, s.stop, s.err
+}
+
+// newDrainSeq builds the state one drain's phase walk mutates, including the raw
+// phase blocks behind each effective phase and the fix→verify pair's position.
+func (d *Driver) newDrainSeq(drainNum, ti int, t Target, prior spend) *drainSeq {
+	tc := d.targetCfg(t)
+	phases := tc.EffectivePhases()
+	rawPhases := make([]config.Phase, len(phases))
+	for i := range phases {
+		rawPhases[i] = phases[i]
+		if src := phases[i].ConfiguredIndex(); src < len(tc.Phases) {
+			rawPhases[i] = tc.Phases[src]
+		}
+	}
+	// CLA-638: where the fix→verify pair lives, when the sequence has one.
+	fixIdx := -1
+	for i := range phases {
+		if i+1 < len(phases) && phases[i].Name == config.FixPhaseName && isVerifyPhase(phases[i+1]) {
+			fixIdx = i
+		}
+	}
+	return &drainSeq{
+		d: d, t: t, tc: tc, ti: ti, drainNum: drainNum, prior: prior, phases: phases, rawPhases: rawPhases, fixIdx: fixIdx,
+		verifyResolved: map[string]bool{}, panelFailed: map[string]panelMemberFailure{}, drainStart: time.Now(),
+	}
 }
 
 // drainWithRetries runs a single unphased drain — the whole task in one session. ti is the

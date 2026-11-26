@@ -399,7 +399,7 @@ func New(endpoint, apiKey string) Reporter {
 	return &httpReporter{
 		endpoint: endpoint,
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: reportTimeout, CheckRedirect: noDowngradeRedirect},
+		client:   &http.Client{Timeout: reportTimeout, CheckRedirect: secureurl.NoDowngradeRedirect},
 		queue:    make(chan Report, queueCap),
 		done:     make(chan struct{}),
 		postMu:   newCtxMutex(),
@@ -700,7 +700,7 @@ func Probe(ctx context.Context, endpoint, apiKey string) error {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: reportTimeout, CheckRedirect: noDowngradeRedirect}
+	client := &http.Client{Timeout: reportTimeout, CheckRedirect: secureurl.NoDowngradeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -722,16 +722,4 @@ func firstLine(s string) string {
 		}
 	}
 	return s
-}
-
-// noDowngradeRedirect refuses a redirect that would put the bearer token on the
-// wire in cleartext — the same guard the backlog poller and the plane client
-// carry (CLA-257): Go forwards Authorization on an https -> http hop to the SAME
-// host, which is exactly the exposure the credential-origin rule exists to
-// prevent.
-func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
-	if _, err := secureurl.Origin(req.URL.String()); err != nil {
-		return fmt.Errorf("refusing redirect: %w", err)
-	}
-	return nil
 }
