@@ -95,7 +95,7 @@ func TestRunnerClaim_LastPhaseReportResumeFailureRetriesInTheSameClaim(t *testin
 	}
 	if got := handbacks(&f.startReleaser.claimingReleaser, walkClaimTaskID); got != 0 {
 		t.Errorf("handed the task back %d time(s), want none — a resume-only failure keeps the claim: %+v / %+v",
-			got, f.calls, f.expireCalls)
+			got, f.startReleaser.claimingReleaser.calls, f.startReleaser.claimingReleaser.expireCalls)
 	}
 	if got := h.invocations[2].ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != walkClaimRunID {
 		t.Errorf("the retry's ResumeClaim = %+v, want the SAME %s/%s the runner holds", got, walkClaimTaskID, walkClaimRunID)
@@ -200,7 +200,7 @@ func TestRunnerClaim_LastPhaseGenuineDeathsStayNonRetryable(t *testing.T) {
 			}
 			if got := handbacks(&f.startReleaser.claimingReleaser, walkClaimTaskID); got != 1 {
 				t.Errorf("handed the task back %d time(s), want exactly 1 — a non-retryable last-phase death keeps the ordinary handback: %+v / %+v",
-					got, f.calls, f.expireCalls)
+					got, f.startReleaser.claimingReleaser.calls, f.startReleaser.claimingReleaser.expireCalls)
 			}
 			if out := logged.String(); strings.Contains(out, "SAME claim") {
 				t.Errorf("a genuine last-phase %s was retried in-claim; only a report-resume failure may be:\n%s", tc.name, out)
