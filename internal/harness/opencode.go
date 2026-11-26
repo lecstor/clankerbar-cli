@@ -785,7 +785,11 @@ var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
 var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
 	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
 	`|\b(?:limit|quota)\b[^.\n"]{0,40}\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b` +
-	`|\b(session|daily|weekly)\s+usage\s+limit`)
+	`|\b(session|daily|weekly)\s+usage\s+limit` +
+	// CLA-1024: a FREE-TIER cap ("Free usage limit reached") is a recurring rolling limit like any
+	// other plan window, even untagged: reading it as a depleted paid account stops the whole run on
+	// a cap that lifts. The hard-stop arms above it still win (a monthly cap or a 402 stays Stop).
+	`|\bfree\s+(?:tier\s+)?usage\s+limit`)
 
 // opencodeResetRe captures the reset instant a rolling quota STATES as RFC3339, e.g. "Your limit
 // resets at 2026-10-20T15:56:48.251Z." When the message does not state one the parse returns the
