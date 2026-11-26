@@ -13,8 +13,9 @@ import (
 
 // The walk stages that judge how a phase ended: dead, handed off, or verified.
 
-// judgeDeadPhase retries a dead first phase up to the per-task bound, then parks the task; a
-// fleet-wide run of deaths pauses the target instead.
+// judgeDeadPhase retries a dead phase at the walk's start phase, and a resume-only failure in ANY
+// position — the last phase included (CLA-1033) — each up to the per-task bound, then parks the
+// task; a fleet-wide run of deaths pauses the target instead.
 func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 	d := s.d
 	t := s.t
