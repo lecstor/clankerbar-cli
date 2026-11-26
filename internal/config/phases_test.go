@@ -1816,7 +1816,7 @@ func TestPRBriefsRequireTheTaskRefInTheTitle(t *testing.T) {
 		"no-code fix brief": noCodeFixBrief,
 		"no-code verify":    noCodeVerifyBrief,
 	} {
-		if strings.Contains(brief, "title MUST carry the task ref") {
+		if strings.Contains(brief, prTitleTaskRefRule) {
 			t.Errorf("the %s carries a PR-title rule but opens no PR:\n%s", name, brief)
 		}
 	}

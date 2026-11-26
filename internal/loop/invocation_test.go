@@ -21,7 +21,7 @@ func taskRefPhases() []config.Phase {
 	}
 }
 
-func renderedTaskRef(t *testing.T, claim harness.Claim, runner *runnerBriefing) string {
+func taskRefPrompt(t *testing.T, claim harness.Claim, runner *runnerBriefing) string {
 	t.Helper()
 	d, _ := phaseDriver(t, &fakeAdapter{}, taskRefPhases())
 	phases := d.cfg.EffectivePhases()
@@ -36,7 +36,7 @@ func renderedTaskRef(t *testing.T, claim harness.Claim, runner *runnerBriefing) 
 // The claim's own ref is the first source: it is the identifier the session itself wrote on the
 // plane, so a ref and a UUID can never disagree about which task the PR belongs to.
 func TestInvocationForPrefersTheClaimsOwnRef(t *testing.T) {
-	got := renderedTaskRef(t, harness.Claim{TaskID: "t-1", Ref: "CLA-1032", RunID: "r-1", Branch: "clanker/x"}, nil)
+	got := taskRefPrompt(t, harness.Claim{TaskID: "t-1", Ref: "CLA-1032", RunID: "r-1", Branch: "clanker/x"}, nil)
 	if want := "Open the PR as CLA-1032"; !strings.Contains(got, want) {
 		t.Errorf("the brief does not carry %q:\n%s", want, got)
 	}
@@ -48,7 +48,7 @@ func TestInvocationForPrefersTheClaimsOwnRef(t *testing.T) {
 // A runner-claimed session's observed claim does not always carry the ref; the runner's own task
 // brief does, and a UUID in a PR title would not match the task back.
 func TestInvocationForFallsBackToTheRunnersTaskRef(t *testing.T) {
-	got := renderedTaskRef(t,
+	got := taskRefPrompt(t,
 		harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
 		&runnerBriefing{task: plane.TaskBrief{ID: "t-1", Ref: "CLA-777"}, runID: "r-1"})
 	if want := "Open the PR as CLA-777"; !strings.Contains(got, want) {
@@ -62,7 +62,7 @@ func TestInvocationForFallsBackToTheRunnersTaskRef(t *testing.T) {
 // With no ref anywhere the fallback is the UUID - the same last resort claimLabel uses, so a
 // title still names the task rather than leaving a literal placeholder.
 func TestInvocationForFallsBackToTheTaskIDWhenNoRefExists(t *testing.T) {
-	got := renderedTaskRef(t, harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"}, nil)
+	got := taskRefPrompt(t, harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"}, nil)
 	if want := "Open the PR as t-1"; !strings.Contains(got, want) {
 		t.Errorf("the brief does not fall back to the task ID %q:\n%s", want, got)
 	}

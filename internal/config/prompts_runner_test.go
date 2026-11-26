@@ -260,7 +260,7 @@ func TestRunnerPRBriefsRequireTheTaskRefInTheTitle(t *testing.T) {
 			t.Errorf("the runner %s brief never carries %s:\n%s", tc.name, PhaseTaskRefPlaceholder, tc.brief)
 		}
 	}
-	if strings.Contains(RunnerFixVerifyBrief(), "title MUST carry the task ref") {
+	if strings.Contains(RunnerFixVerifyBrief(), prTitleTaskRefRule) {
 		t.Errorf("the runner fix-verify brief carries a PR-title rule but opens no PR:\n%s", RunnerFixVerifyBrief())
 	}
 }
@@ -313,10 +313,8 @@ func TestRunnerVerifyBriefScopesItsChecksAndReport(t *testing.T) {
 			t.Errorf("the runner verify report never says %q:\n%s", want, runnerVerifyReportFields)
 		}
 	}
-	for _, banned := range []string{"tests (what you actually ran and saw while verifying)"} {
-		if strings.Contains(runnerVerifyReportFields, banned) {
-			t.Errorf("the runner verify report still asks for %q, not the scoped checks:\n%s", banned, runnerVerifyReportFields)
-		}
+	if strings.Contains(runnerVerifyReportFields, "what you actually ran and saw while verifying") {
+		t.Errorf("the runner verify report still asks for what was run, not the scoped checks:\n%s", runnerVerifyReportFields)
 	}
 }
 
