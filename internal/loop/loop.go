@@ -242,6 +242,9 @@ type Driver struct {
 	restartRequested atomic.Bool
 
 	expireUnsupportedOnce sync.Once
+	// expireReasonUnsupportedOnce is the once-per-run note for a plane that refuses the usage-limit
+	// `reason` on release_task: the fallback repeats on every pushed-work handback, the log does not.
+	expireReasonUnsupportedOnce sync.Once
 
 	beaconWriteFailed atomic.Bool
 

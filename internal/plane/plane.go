@@ -54,6 +54,17 @@ const RequiredPlaneProtocol = 41
 // from, and the error names that version.
 var ErrPlaneTooOld = errors.New("the plane does not serve the task tools this build needs")
 
+// ErrReasonUnsupported means the plane refused release_task because it does not accept the
+// optional `reason` argument at all - a plane older than the CLA-1028 cutover, whose strict tool
+// schema rejects the unknown key. The caller retries once without the reason: ending the lease
+// still matters more than the reclaim-budget exemption the reason buys.
+var ErrReasonUnsupported = errors.New("the plane does not accept a release reason")
+
+// ReasonUsageLimit is the release_task `reason` for a session that died on its provider's usage
+// limit. Valid only with expire: true; the plane stores it on the run and charges the next
+// takeover to its own usage-limit ladder instead of the task's reclaim budget (CLA-1028).
+const ReasonUsageLimit = "usage_limit"
+
 // ErrQuestionNotFiled wraps a park that moved the task to `parked` but then
 // failed to file the question that raises it to the operator. The task IS
 // parked — it will not be retried by a clanker — so the caller must not report
@@ -94,7 +105,12 @@ type Releaser interface {
 	// to release_task - the plane's CLA-707 primitive, written for a dead session
 	// whose work IS pushed. Unlike ReleaseDriver it keeps the WIP hand-off, so it
 	// is the correct handback for a claim with a branch recorded.
-	ExpireLease(ctx context.Context, taskID, runID string) error
+	//
+	// reason is "" for an ordinary expiry, or ReasonUsageLimit when the provider's
+	// quota killed the session (CLA-1029). It is sent only alongside expire, and a
+	// plane that does not know the argument refuses the call with
+	// ErrReasonUnsupported, which the caller retries without.
+	ExpireLease(ctx context.Context, taskID, runID, reason string) error
 }
 
 // Attester records the driver's own verdict on a delivery a session declared.
@@ -216,10 +232,14 @@ type ParkAPI interface {
 type notWired struct{}
 
 func (notWired) ReleaseDriver(context.Context, string, string) error { return ErrNotWired }
-func (notWired) ExpireLease(context.Context, string, string) error   { return ErrNotWired }
-func (notWired) Heartbeat(context.Context, string) error             { return ErrNotWired }
-func (notWired) PeekNextTask(context.Context) (NextTask, error)      { return NextTask{}, ErrNotWired }
-func (notWired) TaskRepo(context.Context, string) (string, error)    { return "", ErrNotWired }
+func (notWired) ExpireLease(context.Context, string, string, string) error {
+	return ErrNotWired
+}
+func (notWired) Heartbeat(context.Context, string) error        { return ErrNotWired }
+func (notWired) PeekNextTask(context.Context) (NextTask, error) { return NextTask{}, ErrNotWired }
+func (notWired) TaskRepo(context.Context, string) (string, error) {
+	return "", ErrNotWired
+}
 func (notWired) TaskState(context.Context, string) (TaskState, error) {
 	return TaskState{}, ErrNotWired
 }
@@ -311,17 +331,30 @@ func (r *mcpReleaser) ReleaseDriver(ctx context.Context, taskID, runID string) e
 //
 // `driver: true` marks it as a driver's call for a dead session, which is what
 // both the loop (on an abandoned phase) and the supervisor (on a child exit) are
-// making.
-func (r *mcpReleaser) ExpireLease(ctx context.Context, taskID, runID string) error {
+// making. A non-empty reason rides beside `expire` (CLA-1029); a plane that
+// predates the argument refuses the call as an unknown key, reported as
+// ErrReasonUnsupported so the caller can retry without it.
+func (r *mcpReleaser) ExpireLease(ctx context.Context, taskID, runID, reason string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("expire lease: taskId and runId are both required")
 	}
-	return r.call(ctx, "release_task", map[string]any{
+	if reason != "" && reason != ReasonUsageLimit {
+		return fmt.Errorf("expire lease: %q is not a release reason this build sends", reason)
+	}
+	args := map[string]any{
 		"taskId": taskID,
 		"runId":  runID,
 		"expire": true,
 		"driver": true,
-	})
+	}
+	if reason != "" {
+		args["reason"] = reason
+	}
+	err := r.call(ctx, "release_task", args)
+	if err != nil && reason != "" && reasonArgumentRefused(err.Error()) {
+		return fmt.Errorf("%w: %v", ErrReasonUnsupported, err)
+	}
+	return err
 }
 
 // RecordBranch writes a work-in-progress branch onto a task, so a session that
@@ -603,6 +636,36 @@ func unknownTool(tool, msg string) bool {
 		"unknown tool",
 		"tool not registered",
 		"not a registered tool",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// reasonArgumentRefused reports whether an expiry's failure is the plane rejecting the `reason`
+// ARGUMENT itself rather than refusing the call - the input-schema refusal an older plane gives
+// for a key its strict schema does not know. Two shapes are recognised: an explicit
+// unrecognised/additional-property complaint naming the argument, and the MCP SDK's generic
+// `Invalid arguments for tool <name>` validation refusal. The second is only safe because every
+// other argument the expiry sends predates this build, so the newly added reason is the one an
+// older plane can object to. A plain refusal (`not_holding`, `not_your_claim`) matches neither and
+// is reported as the call failure it is.
+func reasonArgumentRefused(msg string) bool {
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "invalid arguments for tool") {
+		return true
+	}
+	if !strings.Contains(lower, "reason") {
+		return false
+	}
+	for _, phrase := range []string{
+		"unrecognized_keys",
+		"unrecognized key",
+		"unknown key",
+		"unexpected key",
+		"additional propert",
 	} {
 		if strings.Contains(lower, phrase) {
 			return true

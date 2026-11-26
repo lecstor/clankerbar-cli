@@ -76,6 +76,11 @@ func TestDeadChildsClaimIsHandedBack(t *testing.T) {
 			} else if call.args["expire"] != true {
 				t.Errorf("a claim with a recorded branch must expire the lease (args: %+v)", call.args)
 			}
+			// CLA-1029: a child exit carries no harness result, so there is no usage-limit
+			// classification to send and the expiry must not guess one.
+			if reason, present := call.args["reason"]; present {
+				t.Errorf("the supervisor's child-exit handback carried reason=%v: %+v", reason, call.args)
+			}
 
 			// The record describes a process that is gone; leaving it would make
 			// the NEXT child's exit hand back the wrong claim.
@@ -248,6 +253,11 @@ func TestShutdownHandsBackAClaimStillPresent(t *testing.T) {
 				}
 			} else if call.args["expire"] != true {
 				t.Errorf("a claim with a recorded branch must expire the lease (args: %+v)", call.args)
+			}
+			// CLA-1029: a child exit carries no harness result, so there is no usage-limit
+			// classification to send and the expiry must not guess one.
+			if reason, present := call.args["reason"]; present {
+				t.Errorf("the supervisor's child-exit handback carried reason=%v: %+v", reason, call.args)
 			}
 
 			waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {

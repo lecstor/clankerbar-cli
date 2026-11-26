@@ -718,6 +718,100 @@ func TestDrainPhases_AResumedPhaseLimitEndsTheSequenceButNotTheRun(t *testing.T)
 	}
 }
 
+// CLA-1029 review 1.review-1.1 / 1.review-1.2: a phase that CHECKPOINTS (holds pushed work with a
+// verified branch) and only then dies on a provider limit must still name the limit on the lease
+// end. The seam's handback ends only a claim it did not hold open; the arms that end the phase
+// without releaseCarriedEnd used to leave the checkpointed claim to the drain's deferred
+// releaseCarried, which expired it with no reason - the reclaim-budget charge CLA-1028 spares.
+func TestDrainPhases_UsageLimitLeaseEndCarriesTheReasonAfterACheckpoint(t *testing.T) {
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+	// checkpointed keeps the exit clean and the branch verified; only the limit classification and
+	// the pushed work change, so each case reaches the seam's holdCheckpoint first.
+	checkpoint := func(kind string) harness.Result {
+		res := checkpointed(1, 0)
+		res.Claim = wip
+		res.Raw = map[string]any{"kind": kind}
+		return res
+	}
+
+	for _, tc := range []struct {
+		name     string
+		res      harness.Result
+		resetAt  time.Time
+		wantStop bool
+	}{
+		{
+			// The rolling arm releaseCarriedEnd already carried the reason into: a reset past the
+			// ceiling stops the run right after the handback, so the claim is owed one.
+			name: "a first-phase rolling limit after a checkpoint", res: checkpoint("limit"),
+			resetAt: time.Now().Add(3 * time.Hour), wantStop: true,
+		},
+		{
+			// The hard-stop arm used to return before the handback: no reset to wait for, so the run
+			// stops and the checkpointed claim is still owed its lease end.
+			name: "a first-phase hard stop after a checkpoint", res: checkpoint("limitStop"),
+			wantStop: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{{res: tc.res}}, limitResetAt: tc.resetAt}
+			d, rel := phaseDriver(t, h, twoPhases())
+			// A bounded ceiling so a rolling reset past it is refused rather than waited out.
+			d.cfg.Budget = config.Budget{MaxWallClock: config.Duration(30 * time.Minute)}
+
+			_, _, stop, err := drainPhasesOnce(t, d)
+			if err != nil {
+				t.Fatalf("drainPhases: %v", err)
+			}
+			if stop != tc.wantStop {
+				t.Errorf("stop = %v, want %v", stop, tc.wantStop)
+			}
+			if len(rel.expireReasons) != 1 || rel.expireReasons[0] != plane.ReasonUsageLimit {
+				t.Fatalf("expire reasons = %q, want exactly one %q — the checkpoint was held across the limit death, so the deferred handback is too late to name the cause", rel.expireReasons, plane.ReasonUsageLimit)
+			}
+			if len(rel.calls) != 0 {
+				t.Errorf("ReleaseDriver called (%+v) — CLA-708 forbids it on pushed work", rel.calls)
+			}
+			if h.invokeCalls != 1 {
+				t.Errorf("spawned %d sessions; the run stopped at the limited first phase", h.invokeCalls)
+			}
+		})
+	}
+}
+
+// CLA-1029 review 1.review-1.1: the resumed-phase arm returns before releaseCarriedEnd too. Three
+// phases so the resumed phase is NOT last: the seam only holds a checkpoint open when a successor
+// exists, and that held claim is exactly the one this arm must end with the reason.
+func TestDrainPhases_ResumedPhaseLimitAfterACheckpointCarriesTheReason(t *testing.T) {
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+	limited := checkpointed(1, 0)
+	limited.Claim = wip
+	limited.Raw = map[string]any{"kind": "limit"}
+	three := []config.Phase{{Name: "implement"}, {Name: "middle", Prompt: "carry on"}, {Name: "publish"}}
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: checkpointed(1, 0)}, {res: limited}},
+		limitResetAt: time.Now().Add(2 * time.Hour),
+	}
+	d, rel := phaseDriver(t, h, three)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("a resumed phase hit a rolling usage limit and the run stopped; the sequence must end without the daemon exiting")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions; the resumed phase must not advance to the next phase on a claim that is being handed back", h.invokeCalls)
+	}
+	if len(rel.expireReasons) != 1 || rel.expireReasons[0] != plane.ReasonUsageLimit {
+		t.Fatalf("expire reasons = %q, want exactly one %q — the checkpointed claim the resumed phase held must be ended with the cause", rel.expireReasons, plane.ReasonUsageLimit)
+	}
+	if len(rel.calls) != 0 {
+		t.Errorf("ReleaseDriver called (%+v) — CLA-708 forbids it on pushed work", rel.calls)
+	}
+}
+
 // A resumed phase that is NOT the last must end the sequence too: the wait is
 // owed, but no later phase may spawn against a run whose lease is lapsing.
 func TestDrainPhases_AResumedPhaseLimitDoesNotAdvanceToTheNextPhase(t *testing.T) {

@@ -34,7 +34,7 @@ func (d *Driver) openReviewGate(ctx context.Context, drainNum int, t Target, ph 
 			end.claim = prev
 			if !opts.panelParallel && !panelOptional {
 				end.released = prev.Claim.Held()
-				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false, false)
 			}
 		}
 		return review, end, true
@@ -97,7 +97,7 @@ func (d *Driver) verifyDigestFor(ctx context.Context, drainNum int, t Target, ph
 			if prev != nil {
 				end.claim = prev
 				end.released = prev.Claim.Held()
-				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false, false)
 			}
 			return "", end, true
 		}
