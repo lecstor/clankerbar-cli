@@ -82,9 +82,11 @@ the brief substitutes the task and run ids and the session calls
 `heartbeat(runId)` instead. It re-reads the bar and the standing decisions from
 the plane, works in that same worktree — never on the integration branch itself —
 reads the diff and runs the adversarial review gate. It does **not** re-run the
-repo's gates: the implement phase self-verified at this tip and the fix and
-verify phases run them again over what they change, so a command here is only a
-targeted probe of a suspected defect, and the worktree is left clean. It is
+repo's gates: the implement phase self-verified at this tip, the fix phase runs
+the repo's gates at HEAD, and verify re-checks only the fix delta, its
+regression surface and any gate a prior finding said was red - the PR's CI
+carries the full suite once it is open. So a command here is only a targeted
+probe of a suspected defect, and the worktree is left clean. It is
 **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through

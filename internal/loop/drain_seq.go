@@ -102,9 +102,10 @@ type drainSeq struct {
 	transientRung int
 	transientKey  resumedTransientKey
 	// finalDead / lastProducedNothing are the FINAL attempt's dead classifications (the seam's, and
-	// the tally's wider one): a death that was retried past must not brand the record, and a
-	// LAST-phase death never sets end.dead at all (no retry/park applies) yet the record must still
-	// read `dead` — see phaseEnd.producedNothing.
+	// the tally's wider one): a death that was retried past must not brand the record, and a GENUINE
+	// last-phase death (deadPhase/toolLoop) never sets end.dead at all (no retry/park applies) yet the
+	// record must still read `dead` — see phaseEnd.producedNothing. A resume-only failure on the last
+	// phase is not genuine: it sets end.dead and is retried/parked (CLA-1033).
 	finalDead           bool
 	lastProducedNothing bool
 	// askedRef is the task this drain ended by filing a blocking question on — s.seen's label at

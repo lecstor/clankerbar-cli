@@ -2503,7 +2503,8 @@ section note.
 >
 > {{prBase}} names the branch the TASK'S REPO's PRs target (CLA-608), resolved
 > per repo at phase-spawn time (config.PRBaseFor, else loop.Driver.prBaseFor).
-> Unlike the other three it is not a per-run fact and rides EVERY built-in
+> Unlike the other four ({{taskId}}, {{taskRef}}, {{runId}}, {{branch}}) it is
+> not a per-run fact and rides EVERY built-in
 > phase, the implement phase included: the implement brief's resumed-work rule
 > needs a branch to name, and that rule runs in phase 1, before any claim
 > exists for the other placeholders to come from. It replaced literal
@@ -2835,9 +2836,13 @@ section note.
 > spent the session reading and some watching builds.
 >
 > The gates belong to the phases that own them: implement self-verifies at its
-> tip, and the fix and verify phases run the gates again over what they change.
-> A reviewer's value is the reading, so a command is scoped to a PROBE of a
-> defect it already suspects - evidence for a finding, never a second gate.
+> tip, the fix phase runs the repo's gates at HEAD, and verify re-checks only
+> the fix delta, its regression surface and any gate a prior finding said was
+> red - the PR's CI carries the full suite once it is open. That ownership
+> sentence is `reviewGateScopePhases`, its own constant so the standalone review
+> command can replace exactly it (`reviewRunGateScope`). A reviewer's value is
+> the reading, so a command is scoped to a PROBE of a defect it already
+> suspects - evidence for a finding, never a second gate.
 >
 > The last sentence is the panel's: members share one worktree, so a probe that
 > writes a report, coverage file or snapshot hands the next member (and the fix
@@ -3287,8 +3292,10 @@ section note.
 > worktreeReclaimStep is the reclaim every FINAL phase step carries: the session
 > that takes the work off the machine removes the tree it worked in, because the
 > close-out that merges may not touch a tree it did not create (CLA-534). It is
-> one constant so the shipped review and verify steps and the runner's final fix
-> and verify steps cannot drift apart.
+> one constant so the shipped review and fix steps cannot drift apart. A
+> runner-claimed session does NOT carry it: the runner prepared the tree and
+> reclaims it itself after the hand-over (CLA-1035), and two owners of one tree
+> would race.
 >
 > Order is the property: it follows the PR's confirmation, because until then
 > the tree may hold the only copy of the work, and it precedes the phase's final
@@ -3333,7 +3340,8 @@ section note.
 >
 > CLA-536: this phase's session is the last one to work in the tree, so the
 > reclaim rides the shared worktreeReclaimStep - after the PR, before the
-> hand-off that must stay the emphatic final call.
+> hand-off that must stay the emphatic final call. The runner-claimed briefs
+> leave both the PR and the reclaim to the runner (CLA-1035).
 
 ### reviewOnlyTerminalStep
 
@@ -3554,12 +3562,14 @@ section note.
 ### reviewRunMUSTBarGrades
 
 > reviewRunMUSTBarGrades is reviewMUSTBarGrades for a review with no done-when
-> bar. Two clauses name the task's doneWhen as an input this review does not
-> have, so they are removed rather than left to reach a session as an
-> instruction it cannot follow; every other grading rule — the evidence kinds,
-> the seventh kind, and the not-a-MUST list — is the phase's verbatim. A test
-> pins that both replacements landed, because a silently failed Replace would
-> hand the session a bar that names a bar it was told does not exist.
+> bar. Every clause naming the task's doneWhen as an input this review does not
+> have — the quote-the-clause evidence kind, the missing-tests exception, and
+> the PR-existence exemption — is removed rather than left to reach a session as
+> an instruction it cannot follow; every other grading rule — the remaining
+> evidence kinds, the seventh kind, and the not-a-MUST list — is the phase's
+> verbatim. A test pins that all three replacements landed, because a silently
+> failed Replace would hand the session a bar that names a bar it was told does
+> not exist.
 
 ### reviewRunGateScope
 
@@ -3617,8 +3627,9 @@ section note.
 > a CI poll duplicates what the runner opens and waits for, and a fetched skill
 > page is the turn cost this design exists to remove.
 >
-> The PR clause is scoped to the brief's own terminal step because the fix and
-> verify briefs still open the PR until the runner owns the close-out (B7/B8).
+> The PR clause is unconditional: the runner opens the PR from the branch it
+> has verified on origin and records it on the task (CLA-1035), so a session
+> that opened one would race the runner and could leave a PR nobody linked.
 
 ### runnerCloseOutBrief
 

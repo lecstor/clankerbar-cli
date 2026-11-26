@@ -85,7 +85,9 @@ var runnerVerifyReportFields = "verdict (\"pass\" when this round raises no new 
 	runnerDoneFindingShape + " carrying evidenceKind and evidence, and the count you left out in omitted), " +
 	"omitted (an integer count, 0 when you left nothing out - never a list), " + runnerFindingUpdatesField +
 	", notes (why any finding is still open, and the reason you " +
-	"state for a full second pass), and tests (what you actually ran and saw while verifying)"
+	"state for a full second pass), and tests (the targeted checks you actually ran and saw - the fix delta's " +
+	"tests, its regression surface, any check a prior finding named red - or, when no new command was needed, " +
+	"that the fix phase already ran the full gates at HEAD)"
 
 // RunnerDoneReportFor is the report-format paragraph of a runner brief, and "" for anything else. A
 // handoff successor is handed the predecessor's own successor text instead of a brief, so this is

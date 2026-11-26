@@ -209,6 +209,10 @@ type Driver struct {
 
 	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
 
+	// newPROpener resolves the surface a runner-owned hand-over opens its PR
+	// with (CLA-1035), rooted at the session's worktree.
+	newPROpener func(workdir string) prEnsurer
+
 	newSalvager func(workdir string) workSalvager
 
 	// probePRBase reads the origin remote of the checkout in dir to resolve a repo's PR base when no
@@ -318,6 +322,13 @@ type deliveryVerifier interface {
 	Verify(ctx context.Context, c delivery.Claim) delivery.Report
 }
 
+// prEnsurer opens (or reuses) the pull request a runner-owned hand-over carries
+// (CLA-1035). A separate interface from deliveryVerifier so the seam's fakes can
+// keep implementing only the checks they drive.
+type prEnsurer interface {
+	EnsurePR(ctx context.Context, spec delivery.PRSpec) (int, error)
+}
+
 type workSalvager interface {
 	Salvage(ctx context.Context, taskID, label string, recorded ...string) salvage.Outcome
 }
@@ -370,6 +381,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 			}
 			return v
 		},
+		newPROpener: func(workdir string) prEnsurer { return delivery.New(workdir, "") },
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 		probePRBase: ProbeOriginPRBase,

@@ -53,6 +53,9 @@ func phaseDriverWithReleaser(t *testing.T, h harness.Adapter, phases []config.Ph
 	// drive real repositories, and are untouched by this default.
 	d.cfg.WorkDir = t.TempDir()
 	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	// A runner-owned hand-over opens its PR through its own surface (CLA-1035);
+	// stub it so no phase test reaches a real gh.
+	d.newPROpener = func(string) prEnsurer { return &fakePROpener{} }
 	// The PR-base probe (CLA-608) is stubbed to "the configured integration
 	// branch exists on origin", so a phase prompt fills {{prBase}} with the
 	// config's own branch and no test reaches git or the network. The tests

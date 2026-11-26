@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // The planner loop's 2-second wake poll (studio-chat.md §4).
@@ -59,7 +61,7 @@ func NewConversationPoller(endpoint, apiKey string) ConversationPoller {
 	return &httpConversationPoller{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: 15 * time.Second, CheckRedirect: noDowngradeRedirect},
+		client:   &http.Client{Timeout: 15 * time.Second, CheckRedirect: secureurl.NoDowngradeRedirect},
 	}
 }
 
