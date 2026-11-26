@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -20,12 +21,13 @@ import (
 )
 
 // iterState is one target's mid-drain presence: what `iteration {n, taskRef, phase}` the Fleet page
-// should show while this drain runs.
+// should show while this drain runs, and the route its session is actually on (CLA-1026).
 type iterState struct {
 	on    bool
 	n     int
 	ref   string
 	phase string
+	model string
 }
 
 // hostnameOnce caches os.Hostname for the life of the driver.
@@ -87,6 +89,10 @@ type holdState struct {
 	// hold carries its instant instead of the presence row falling back to plain draining.
 	until time.Time
 	zone  string
+	// routes is the per-route hold breakdown a ROUTE-window hold carries (CLA-1026): every configured
+	// route the window list withholds, and why. It is empty for the daemon-wide pause, which has no
+	// per-route cause to name.
+	routes []fleet.RouteHold
 }
 
 // fleetState derives the presence State for target ti from what the loop already tracks — the
@@ -111,7 +117,7 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	// A running session outranks every pause flag: the flags only ever hold the NEXT spawn, and the
 	// iteration is what the Fleet page shows while work is in flight.
 	if s.on && !h.on {
-		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
+		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase, Model: s.model}
 	}
 	// A pause the operator has to act on wins over the schedule: report one cause, and it is the one
 	// waiting on a human.
@@ -169,6 +175,9 @@ func (d *Driver) scheduleState(h holdState) fleet.State {
 		st.PauseReason = fleet.PauseReasonSchedule
 		st.PauseUntil = h.until
 		st.PauseZone = h.zone
+		// CLA-1026: name every route the window list withholds, so the console can show both the
+		// usage-limited routes and the ones with quota that the pricing window is holding.
+		st.Routes = h.routes
 	default:
 		return st
 	}
@@ -199,13 +208,13 @@ func (d *Driver) holdAt(ti int) holdState {
 
 // holdPause and clearHoldPause mark a target as held at a phase boundary by the schedule and drop
 // the mark when it ends.
-func (d *Driver) holdPause(ti int, ref, phase string, until time.Time, zone string) {
+func (d *Driver) holdPause(ti int, ref, phase string, until time.Time, zone string, routes []fleet.RouteHold) {
 	d.iterMu.Lock()
 	defer d.iterMu.Unlock()
 	if ti < 0 || ti >= len(d.hold) {
 		return
 	}
-	d.hold[ti] = holdState{on: true, ref: ref, phase: phase, until: until, zone: zone}
+	d.hold[ti] = holdState{on: true, ref: ref, phase: phase, until: until, zone: zone, routes: routes}
 }
 
 func (d *Driver) clearHoldPause(ti int) {
@@ -257,11 +266,17 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 // The wait blocks the whole loop, so no other project's queue is being serviced either —
 // beaconing only the target whose harness hit the limit would leave the other projects' presence
 // rows silent, and each of those reads as a dead instance for exactly the reason this state exists
-// to correct.
-func (d *Driver) beaconLimited(resetAt time.Time) {
-	st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
-	d.writeLocalBeacon(st)
+// to correct. routes is the per-route hold breakdown of the phase being waited out (CLA-1026), and
+// it rides only the WAITING target's row: the sibling projects are paused by the same wait, but the
+// route names and schedules belong to the waiting project's config, and another project's row must
+// not show routes it never configured (review 1.review-1.4).
+func (d *Driver) beaconLimited(ti int, resetAt time.Time, routes []fleet.RouteHold) {
+	d.writeLocalBeacon(fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt, Routes: routes})
 	for i := range d.targets {
+		st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
+		if i == ti {
+			st.Routes = routes
+		}
 		d.sendBeacon(i, d.targets[i], st)
 	}
 }
@@ -418,7 +433,7 @@ func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harne
 		}
 		s.ref = ref
 		d.iter[ti] = s
-		st := fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
+		st := fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase, Model: s.model}
 		d.iterMu.Unlock()
 		d.beacon(ti, t, st)
 	}
@@ -461,8 +476,9 @@ func (d *Driver) fleetShutdown() {
 }
 
 // beginIteration marks target ti mid-drain and beacons the phase change NOW, so the console does
-// not wait out a poll interval to learn which phase is about to run.
-func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase string) {
+// not wait out a poll interval to learn which phase is about to run. model is that phase's
+// resolved starting route (CLA-1026), shown on the card while the session runs.
+func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase, model string) {
 	// A drain of the very task this target was waiting on is evidence its answer landed — the ask
 	// leaves that task blocked, so it cannot be claimed while the question stands. A drain of any
 	// OTHER task says nothing about the open question, so the marker stays until the poll sees the
@@ -470,10 +486,31 @@ func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase strin
 	d.clearWaiting(ti, ref)
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
-		d.iter[ti] = iterState{on: true, n: drainNum, ref: ref, phase: phase}
+		d.iter[ti] = iterState{on: true, n: drainNum, ref: ref, phase: phase, model: model}
 	}
 	d.iterMu.Unlock()
 	d.beacon(ti, t, d.fleetState(ti))
+}
+
+// noteIterationModel revises the live route the card shows, when a mid-session route fallback
+// switched to another route (CLA-1026). Only a CHANGE beacons, and only during a live iteration: a
+// session that reports no switch must not turn the card into a stream.
+func (d *Driver) noteIterationModel(ti int, t Target, model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	d.iterMu.Lock()
+	s := d.iterAt(ti)
+	if !s.on || s.model == model {
+		d.iterMu.Unlock()
+		return
+	}
+	s.model = model
+	d.iter[ti] = s
+	st := fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase, Model: s.model}
+	d.iterMu.Unlock()
+	d.beacon(ti, t, st)
 }
 
 // endIteration clears the mid-drain marker and posts ONE iteration record with the outcome mapped

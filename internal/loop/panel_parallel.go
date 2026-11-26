@@ -175,7 +175,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	// One presence beacon for the panel, not one per member: beginIteration also writes the local
 	// BEACON file (remove-then-create), and N goroutines doing that to one name would race for a line
 	// nobody reads mid-panel.
-	d.beginIteration(ti, t, drainNum, claimLabel(carried.Claim), phases[start].Label(start))
+	d.beginIteration(ti, t, drainNum, claimLabel(carried.Claim), phases[start].Label(start), d.phaseStartModel(d.targetCfg(t), phases[start]))
 	log.Printf("%siteration %d: review panel: running %d members concurrently (cap %d), each in its own detached worktree at %s",
 		labelOf(t), drainNum, n, concurrency, shortSHA(tip))
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -113,8 +114,10 @@ func (d *Driver) routeClearNow(tc *config.Config, ph config.Phase) bool {
 // supervisedWait pauses on a usage limit, then polls for an early reset rather than sleeping
 // blindly to the stated reset. The breaker is consulted HERE and not only by the caller, because
 // this loop does not return to the caller while the limit persists: it waits, probes, and waits
-// again for as long as it takes.
-func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
+// again for as long as it takes. routes is the resolved phase's configured route list (escalation
+// applied): the per-route holds on the limited beacons describe THOSE routes, including ones a mark
+// already dropped from the adapter's fallback chain.
+func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, routes []string, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	tc := d.targetCfg(t)
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 
@@ -157,7 +160,16 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		resetMu.Unlock()
 	}
 
-	d.beaconLimited(currentReset())
+	// CLA-1026: every beacon re-reads the hold on each route, because a usage mark can expire and a
+	// pricing window can open while the wait holds — the card must show why each route is still off,
+	// not only the one reason the wait began with. The routes and windows come from the config this
+	// wait PROBES with (captured on entry), so the beacon cannot describe a set the wait does not use
+	// after a RELOAD (review 1.review-1.5); the marks stay live, since they are run state.
+	currentRoutes := func() []fleet.RouteHold {
+		return d.routeHoldsAt(tc, d.clock(), routes)
+	}
+
+	d.beaconLimited(sofar.ti, currentReset(), currentRoutes())
 
 	// The re-beacon runs on its OWN goroutine, not as another wake in the probe loop below.
 	beaconStop := make(chan struct{})
@@ -171,7 +183,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			case <-beaconStop:
 				return
 			case <-tk.C:
-				d.beaconLimited(currentReset())
+				d.beaconLimited(sofar.ti, currentReset(), currentRoutes())
 			}
 		}
 	}()

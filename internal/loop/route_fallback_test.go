@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -180,7 +181,7 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 			Route: routeFreeAlias, Next: routePaidAlias, Reason: "usage_limit",
 		}},
 	}}
-	d.noteRouteFallbacks(d.targets[0], 1, harness.Invocation{}, res)
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
 
 	until, ok := d.routeMarkExpiry(routeFreeAlias)
 	if !ok {
@@ -249,7 +250,7 @@ func TestNoteRouteFallbacks_DeniedLastRouteIsMarkedButNotLoggedAsASwitch(t *test
 			{Route: routePaidAlias, Reason: "usage_limit"},
 		},
 	}}
-	d.noteRouteFallbacks(d.targets[0], 1, harness.Invocation{}, res)
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
 
 	if _, ok := d.routeMarkExpiry(routePaidAlias); !ok {
 		t.Error("the denied last route was not marked; the next phase would retry it for nothing")
@@ -327,5 +328,60 @@ func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
 	}
 	if inv.Model != routeFreeAlias {
 		t.Errorf("single route: probe model = %q, want the harness block's %q", inv.Model, routeFreeAlias)
+	}
+}
+
+// CLA-1026: the fallback is the live route change. A session that started on the
+// free route and finished on the paid one revises the fleet card on the switch.
+func TestNoteRouteFallbacks_RevisesTheLiveRoute(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	ff := &fakeFleet{}
+	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	d.targets[0].Fleet = ff
+	d.iter = []iterState{{on: true, n: 1, ref: "CLA-1", phase: "implement", model: routeFreeAlias}}
+
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{},
+		switchedResult(harness.Result{}, routeFreeAlias, routePaidAlias, reset))
+
+	if got := d.fleetState(0).Model; got != routePaidAlias {
+		t.Errorf("state.model = %q, want the route that finished the session %q", got, routePaidAlias)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateIteration || sent[0].State.Model != routePaidAlias {
+		t.Fatalf("switch beacon = %+v, want exactly one iteration beacon on %q", sent, routePaidAlias)
+	}
+	if _, ok := d.routeMarkExpiry(routeFreeAlias); !ok {
+		t.Error("the denied route lost its mark; the card update must not disturb the fallback bookkeeping")
+	}
+
+	// A session that reported no switch leaves the card alone.
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, harness.Result{})
+	if got, _ := ff.reports(); len(got) != 1 {
+		t.Errorf("a no-switch result beaconed; want the one switch beacon, got %d", len(got))
+	}
+}
+
+// phaseStartModel is the route state.model reports and the spawn will use: marks
+// and pricing windows applied, "" when the phase resolves no route at all.
+func TestPhaseStartModel_AppliesMarksAndWindows(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo, routeZen)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+	ph := d.cfg.EffectivePhases()[0]
+
+	if got := d.phaseStartModel(d.cfg, ph); got != routeZen {
+		t.Errorf("windowed start = %q, want %q", got, routeZen)
+	}
+	// With the only open route marked too, every route is withheld (one by its mark, one by its
+	// window) and no session will start: the spawn is refused, so there is no live route to name.
+	d.markRouteLimited(routeZen, time.Now().Add(time.Hour))
+	if got := d.phaseStartModel(d.cfg, ph); got != "" {
+		t.Errorf("all-blocked start = %q, want empty — a refused spawn has no live route", got)
+	}
+
+	empty := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller()}})
+	if got := empty.phaseStartModel(empty.cfg, empty.cfg.EffectivePhases()[0]); got != "" {
+		t.Errorf("start model = %q, want empty for a config with no route", got)
 	}
 }

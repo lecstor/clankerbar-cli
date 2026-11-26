@@ -291,7 +291,7 @@ func TestFleetState_HeldPhaseOutranksTheIterationMarker(t *testing.T) {
 	d, _, _, _ := pauseDriver(t, peakSchedule(t), &at)
 	d.schedPaused = true
 	d.iter = []iterState{{on: true, n: 3, ref: "CB-7", phase: "implement"}}
-	d.holdPause(0, "CB-7", "review", time.Time{}, "")
+	d.holdPause(0, "CB-7", "review", time.Time{}, "", nil)
 
 	got := d.fleetState(0)
 	if got.Kind != fleet.StateDraining || got.PauseReason != fleet.PauseReasonSchedule {

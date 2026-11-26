@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -288,7 +289,7 @@ func TestBeaconSessionTargets_LocalBeaconCarriesTheHeldTarget(t *testing.T) {
 	sibling := &fakeFleet{}
 	d.targets = append(d.targets, Target{Poller: busyPoller(), Fleet: sibling})
 	d.schedPaused = true
-	d.holdPause(0, "t-1", "review", time.Time{}, "")
+	d.holdPause(0, "t-1", "review", time.Time{}, "", nil)
 
 	d.beaconSessionTargets(0, d.targets[0])
 
@@ -759,7 +760,7 @@ func TestPollBeaconState_Precedence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pollBeaconState(tc.cur, tc.next); got != tc.want {
+			if got := pollBeaconState(tc.cur, tc.next); !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("pollBeaconState(%+v, %+v) = %+v, want %+v", tc.cur, tc.next, got, tc.want)
 			}
 		})
@@ -784,7 +785,7 @@ func TestPickTarget_LocalBeaconKeepsTheSchedulePause(t *testing.T) {
 	d.now = func() time.Time { return at }
 	// The first target is the one a schedule holds; the sibling is paused from
 	// the console and is polled after it.
-	d.holdPause(0, "t-1", "review", time.Time{}, "")
+	d.holdPause(0, "t-1", "review", time.Time{}, "", nil)
 
 	pick(t, d)
 

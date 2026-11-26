@@ -372,7 +372,7 @@ func TestFleetState_RouteWindowHoldCarriesItsEndAndZone(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, nil, routeGo)
 	until := brisbaneAt(t, 9, 14, 0)
 	d.schedPaused = true
-	d.holdPause(0, "CB-7", "implement", until, "Australia/Brisbane")
+	d.holdPause(0, "CB-7", "implement", until, "Australia/Brisbane", nil)
 
 	st := d.fleetState(0)
 	if st.Kind != fleet.StateDraining {
@@ -393,7 +393,7 @@ func TestFleetState_RouteWindowHoldCarriesItsEndAndZone(t *testing.T) {
 
 	// A stale hold with no instant falls back to plain draining, so the row never
 	// shows a reason with no resume time.
-	d.holdPause(0, "CB-7", "implement", time.Time{}, "")
+	d.holdPause(0, "CB-7", "implement", time.Time{}, "", nil)
 	if st := d.fleetState(0); st.PauseReason != "" {
 		t.Errorf("a hold with no instant reported reason %q, want plain draining", st.PauseReason)
 	}
@@ -616,5 +616,71 @@ func TestDrainPhase_RouteWindowRefusalIsHeldNotEmpty(t *testing.T) {
 	}
 	if !strings.Contains(end.windowWhy, routeGo) {
 		t.Errorf("windowWhy = %q, want it to name the blocked routes", end.windowWhy)
+	}
+}
+
+// CLA-1026: the route-window hold publishes the same per-route breakdown a limit
+// does, so the draining row names the pricing window that holds the routes WITH
+// quota rather than only the usage limit that started the pause. A route shared
+// by two panel members' lists appears once, in configured order.
+func TestRouteWindowHoldState_CarriesPerRouteHolds(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo, routeZen)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+	reset := at.Add(time.Hour)
+	d.markRouteLimited(routeZen, reset)
+
+	seq := &drainSeq{d: d, t: d.targets[0], ti: 0}
+	hs := seq.routeWindowHoldState([][]string{{routeGo, routeZen}, {routeGo}})
+	if !hs.active {
+		t.Fatal("the window hold is not active with every route withheld")
+	}
+	if want := brisbaneAt(t, 9, 14, 0); !hs.until.Equal(want) {
+		t.Errorf("hold until = %s, want the window's end %s", hs.until, want)
+	}
+	if len(hs.routes) != 2 {
+		t.Fatalf("hold routes = %+v, want the two configured routes once each", hs.routes)
+	}
+	if hs.routes[0].Route != routeGo || hs.routes[0].Reason != fleet.RouteHoldWindow || hs.routes[0].Schedule != "deepseek-peak" {
+		t.Errorf("first hold = %+v, want the windowed %q with its schedule", hs.routes[0], routeGo)
+	}
+	if hs.routes[1].Route != routeZen || hs.routes[1].Reason != fleet.RouteHoldUsageLimit {
+		t.Errorf("second hold = %+v, want the usage-limited %q", hs.routes[1], routeZen)
+	}
+
+	// The presence row is what the console reads: the hold state's routes ride the draining
+	// beacon, and they are gone once the hold clears.
+	d.schedPaused = true
+	d.holdPause(0, "CB-7", "implement", hs.until, hs.zone, hs.routes)
+	st := d.fleetState(0)
+	if st.Kind != fleet.StateDraining || st.PauseReason != fleet.PauseReasonSchedule {
+		t.Fatalf("state = %+v, want the schedule draining pause", st)
+	}
+	if len(st.Routes) != 2 || st.Routes[0].Route != routeGo || st.Routes[1].Route != routeZen {
+		t.Errorf("draining state routes = %+v, want the hold's breakdown", st.Routes)
+	}
+	if st.TaskRef != "CB-7" || st.Phase != "implement" {
+		t.Errorf("held state names %q at %q, want CB-7 at implement", st.TaskRef, st.Phase)
+	}
+	d.clearHoldPause(0)
+	if st := d.fleetState(0); len(st.Routes) != 0 {
+		t.Errorf("a cleared hold still reported routes: %+v", st.Routes)
+	}
+}
+
+// review 1.review-1.2: a `when_all_blocked: run` schedule serves its routes AT PEAK PRICE, so a
+// route inside its window can start and is not held. Reporting it as a window hold would replace
+// the true "usage limit" sentence with a cause that is withholding nothing.
+func TestRouteHoldsAt_RunWindowIsNotAHold(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0) // inside the 11:00-14:00 peak window
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo, routeZen)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedRun, routeGo)
+	d.now = func() time.Time { return at }
+	d.markRouteLimited(routeZen, at.Add(time.Hour))
+
+	holds := d.routeHoldsAt(d.cfg, at, []string{routeGo, routeZen})
+	if len(holds) != 1 || holds[0].Route != routeZen || holds[0].Reason != fleet.RouteHoldUsageLimit {
+		t.Fatalf("holds = %+v, want only %q usage_limit: the run-windowed %q can start at peak price", holds, routeZen, routeGo)
 	}
 }

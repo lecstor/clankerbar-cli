@@ -62,7 +62,7 @@ func TestSupervisedWait_WakesAtTheRouteWindowEndNotTheProbeInterval(t *testing.T
 	logs := captureLogs(t)
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: start.Add(firstWake)},
-		h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+		h, d.cfg.Phases[0], nil, d.targets[0], spend{start: start})
 	elapsed := time.Since(start)
 
 	if stop {
@@ -127,7 +127,7 @@ func TestSupervisedWait_WakesAtGraceWhenTheWalkLeavesARouteClear(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: start.Add(firstWake)},
-		h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+		h, d.cfg.Phases[0], nil, d.targets[0], spend{start: start})
 	elapsed := time.Since(start)
 
 	if stop {
@@ -173,7 +173,7 @@ func TestSupervisedWait_ProbeErrorKeepsTheFullInterval(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true},
-		h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+		h, d.cfg.Phases[0], nil, d.targets[0], spend{start: start})
 
 	if stop {
 		t.Fatalf("a probe error falls back to polling; it must not stop the wait\n%s", logs.String())

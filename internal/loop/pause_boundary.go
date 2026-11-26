@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
@@ -48,6 +49,9 @@ type boundaryHoldState struct {
 	label  string // "scheduled pause" / "route windows", for the log lines
 	detail string // the schedule's own description, in the entry line's parens
 	zone   string // IANA zone the instant is rendered in (the presence row)
+	// routes is the per-route hold breakdown a route-window hold publishes on its draining beacon
+	// (CLA-1026). The daemon-wide pause has no per-route cause and leaves it nil.
+	routes []fleet.RouteHold
 }
 
 // holdSequence holds the sequence at its next boundary while decide reports a cause. Shared by the
@@ -95,7 +99,7 @@ func (s *drainSeq) holdSequence(ctx context.Context, st *seqStep, decide func() 
 	if claim != nil && claim.Claim.Held() {
 		heldRef = claimLabel(claim.Claim)
 	}
-	d.holdPause(s.ti, heldRef, st.ph.Label(s.i), until, hs.zone)
+	d.holdPause(s.ti, heldRef, st.ph.Label(s.i), until, hs.zone, hs.routes)
 	defer d.clearHoldPause(s.ti)
 	// until carries the window's own zone, so the line names the operator's local resume time rather
 	// than the daemon's.
@@ -187,7 +191,7 @@ func (s *drainSeq) holdWakeLoop(ctx context.Context, st *seqStep, decide func() 
 		until = hs.until
 		// Re-publish the hold with the fresh instant: a RELOAD can shorten or move the window mid-hold,
 		// and the presence row must not count down to an instant the config no longer says.
-		d.holdPause(s.ti, heldRef, st.ph.Label(s.i), until, hs.zone)
+		d.holdPause(s.ti, heldRef, st.ph.Label(s.i), until, hs.zone, hs.routes)
 		// Wake at the next cadence, or when the window ends, whichever is first.
 		wait := interval
 		if remaining := until.Sub(now); remaining < wait {
