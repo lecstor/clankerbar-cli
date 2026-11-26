@@ -21,13 +21,14 @@ import (
 // The write order a test asserts against. Reads are counted, never listed: only
 // the writes have an order the plane depends on.
 const (
-	callOutcome  = "RecordOutcome"
-	callAppend   = "AppendReview"
-	callFindings = "UpdateFindings"
-	callSubmit   = "SubmitForReview"
-	callBranch   = "RecordBranch"
-	callPark     = "Park"
-	callClose    = "CloseReviewRound"
+	callOutcome    = "RecordOutcome"
+	callAppend     = "AppendReview"
+	callFindings   = "UpdateFindings"
+	callSubmit     = "SubmitForReview"
+	callBranch     = "RecordBranch"
+	callPark       = "Park"
+	callClose      = "CloseReviewRound"
+	callDeliveryPR = "RecordDeliveryPR"
 )
 
 // reportReleaser is the runner's plane client as a done report uses it: the
@@ -48,6 +49,7 @@ type reportReleaser struct {
 	submits  []plane.Submission
 	branches []string
 	parks    []string
+	prs      []string
 	rounds   int
 }
 
@@ -109,6 +111,15 @@ func (r *reportReleaser) SubmitForReview(_ context.Context, _, _ string, sub pla
 	return nil
 }
 
+// RecordDeliveryPR records the PR the runner opened, before the hand-over it belongs to.
+func (r *reportReleaser) RecordDeliveryPR(_ context.Context, _, _, pr string) error {
+	if err := r.write(callDeliveryPR); err != nil {
+		return err
+	}
+	r.prs = append(r.prs, pr)
+	return nil
+}
+
 func (r *reportReleaser) RecordBranch(_ context.Context, _, _, branch string) error {
 	if err := r.write(callBranch); err != nil {
 		return err
@@ -154,7 +165,7 @@ func doneReportFor(rep string) string {
 // so a test exercises the writes rather than the brief that decided them.
 func doneRun(t *testing.T, kind reportKind, rel plane.Releaser, prev *harness.Result) *phaseRun {
 	t.Helper()
-	return &phaseRun{
+	r := &phaseRun{
 		d:        &Driver{cfg: &config.Config{}},
 		t:        Target{Name: "t", Releaser: rel},
 		phases:   []config.Phase{{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}},
@@ -164,6 +175,10 @@ func doneRun(t *testing.T, kind reportKind, rel plane.Releaser, prev *harness.Re
 		prev:     prev,
 		prBase:   "staging",
 	}
+	// The runner opens the PR itself now, so every report path that hands a task over needs the
+	// opener it calls. Tests that drive the opener's failure replace this.
+	r.d.newPROpener = func(string) prEnsurer { return &fakePROpener{} }
+	return r
 }
 
 // doneAttempt is a clean exit still holding the task, with final as its report
@@ -343,8 +358,11 @@ func TestApplyDoneReport_FixLastAnswersFindingsThenSubmits(t *testing.T) {
 
 	r.applyDoneReport(context.Background(), at)
 
-	if want := []string{callFindings, callBranch, callSubmit}; !equalCalls(rel.calls, want) {
-		t.Fatalf("writes = %v, want %v — the branch is recorded, and the hand-over carries the outcome", rel.calls, want)
+	if want := []string{callFindings, callBranch, callDeliveryPR, callSubmit}; !equalCalls(rel.calls, want) {
+		t.Fatalf("writes = %v, want %v — the branch is recorded, the PR is linked, and the hand-over carries the outcome", rel.calls, want)
+	}
+	if len(rel.prs) != 1 || rel.prs[0] != "#42" {
+		t.Errorf("delivery prs = %v, want the runner's opened PR", rel.prs)
 	}
 	if len(rel.submits) != 1 {
 		t.Fatalf("submissions = %+v, want one", rel.submits)

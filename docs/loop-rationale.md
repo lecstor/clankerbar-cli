@@ -4469,6 +4469,35 @@ section note.
 > is not enough here.
 
 
+## `internal/loop/pr_handover.go`
+
+### pr_handover.go
+
+> pr_handover.go — the runner owns the pull request a runner-claimed task is
+> reviewed through (CLA-1035). A session used to open it and reclaim its tree in
+> the gap before its done report; a session that died there (MAK-482 Run 3) left
+> a PR the task never named, delivery.pr null, and a worktree nobody removed.
+>
+> The runner now runs the whole sequence after a terminal done report: open (or
+> reuse) the PR, record delivery.pr, submit_for_review, then reclaim the tree.
+> The order is the property. A PR that cannot be opened or linked fails the
+> hand-over closed - no submit, no reclaim, the claim stays live and the pushed
+> branch survives for takeover - because an in_review task with no PR is the
+> state this replaces. A reclaim failure is only a warning: by then the task is
+> safely in review with its PR open and linked.
+>
+> The title is `<ref>: <task title>`, so the PR is always matched back to its
+> task; the body is assembled deterministically from the task's record (ref,
+> branch, the session's summary and tests, the round's verdict), so a retried
+> hand-over does not churn the PR.
+
+### outcomeTests
+
+> outcomeTests lifts the body of an outcome's **Tests** section, so a fix report
+> that omitted its own tests still gives the PR the gates the run actually
+> executed.
+
+
 ## `internal/loop/prbase.go`
 
 ### prBaseFor
@@ -5581,7 +5610,22 @@ section note.
 >     are returned, and the session starts clean at the pre-merge tip with the
 >     conflict to resolve itself.
 >
-> Nothing here pushes or opens a PR; that is the close-out's job (B7).
+> Nothing here pushes or opens a PR; that is the close-out's job (B7). It DOES
+> reclaim the task's own tree after a successful hand-over (CLA-1035): the
+> runner prepared it, so the runner removes it, never the session.
+
+### reclaimTaskWorktree
+
+> reclaimTaskWorktree removes the runner-prepared task worktree and its local
+> branch, from the repository's main checkout, AFTER the hand-over landed
+> (CLA-1035). It mirrors the reclaim instruction the terminal briefs used to
+> carry: `git worktree remove` without --force, then point the branch at its
+> remote and `git branch -d` without -D. It acts only on a registered worktree
+> on the task's branch whose path sits under a task-worktree root shape, and
+> never on the main checkout: that is the runner's own tree, and any other path
+> is somebody else's. A refusal is returned, never forced through, because the
+> task is already in in_review with its PR open and linked - the caller logs a
+> warning and leaves the tree for the operator.
 
 ### adoptBranchWorktree
 

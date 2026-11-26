@@ -1,7 +1,7 @@
 // report_writes.go — the writes a runner makes ABOUT a session's own records:
 // the outcome it declared, the reviewer's durable record, the fixer's finding
-// updates, and the hand-over. They share one interface because all four sign
-// with the holding run.
+// updates, the delivery's pull request, and the hand-over. They share one
+// interface because all of them sign with the holding run.
 package plane
 
 import (
@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrDuplicateReviewer means the plane refused an appended record because its
@@ -39,6 +40,10 @@ type ReportWriter interface {
 	// SubmitForReview hands the task over for review, optionally closing the
 	// round in the same atomic write.
 	SubmitForReview(ctx context.Context, taskID, runID string, s Submission) error
+
+	// RecordDeliveryPR records the pull request a runner-owned hand-over
+	// carries, before the hand-over moves the task to in_review.
+	RecordDeliveryPR(ctx context.Context, taskID, runID, pr string) error
 }
 
 var _ ReportWriter = (*mcpReleaser)(nil)
@@ -88,6 +93,24 @@ func (r *mcpReleaser) RecordOutcome(ctx context.Context, taskID, runID, outcome 
 		"taskId":  taskID,
 		"runId":   runID,
 		"outcome": outcome,
+	})
+}
+
+// RecordDeliveryPR records the pull request a runner-owned hand-over carries. It
+// writes ONLY the delivery's pr member: a retried hand-over must not restate the
+// branch, the outcome or a status the task already carries.
+func (r *mcpReleaser) RecordDeliveryPR(ctx context.Context, taskID, runID, pr string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("record delivery PR: taskId and runId are both required")
+	}
+	pr = strings.TrimSpace(pr)
+	if pr == "" {
+		return errors.New("record delivery PR: refusing to record an empty pull request")
+	}
+	return r.call(ctx, "record_progress", map[string]any{
+		"taskId":   taskID,
+		"runId":    runID,
+		"delivery": map[string]any{"pr": pr},
 	})
 }
 

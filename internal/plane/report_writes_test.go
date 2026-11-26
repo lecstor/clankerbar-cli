@@ -74,6 +74,48 @@ func TestRecordOutcome_RefusesLocally(t *testing.T) {
 	}
 }
 
+func TestRecordDeliveryPR_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := mustClient(t, srv).RecordDeliveryPR(context.Background(), "t-1", "r-1", "#12"); err != nil {
+		t.Fatalf("RecordDeliveryPR: %v", err)
+	}
+	if name := toolName(t, got.body); name != "record_progress" {
+		t.Errorf("tool = %q, want record_progress", name)
+	}
+	want := map[string]any{
+		"taskId":   "t-1",
+		"runId":    "r-1",
+		"delivery": map[string]any{"pr": "#12"},
+	}
+	if args := toolArgs(t, got.body); !reflect.DeepEqual(args, want) {
+		t.Errorf("arguments = %+v, want %+v", args, want)
+	}
+}
+
+func TestRecordDeliveryPR_RefusesLocally(t *testing.T) {
+	cases := []struct {
+		name          string
+		taskID, runID string
+		pr            string
+	}{
+		{name: "empty task id", runID: "r-1", pr: "#12"},
+		{name: "empty run id", taskID: "t-1", pr: "#12"},
+		{name: "empty pr", taskID: "t-1", runID: "r-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := serve(t, http.StatusOK, okBody)
+			if err := mustClient(t, srv).RecordDeliveryPR(context.Background(), tc.taskID, tc.runID, tc.pr); err == nil {
+				t.Fatal("a value the plane would refuse must be refused locally")
+			}
+			if len(got.bodies) != 0 {
+				t.Errorf("sent %d request(s), want none: %+v", len(got.bodies), got.bodies)
+			}
+		})
+	}
+}
+
 func TestAppendReview_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 

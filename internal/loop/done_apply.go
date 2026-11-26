@@ -283,6 +283,12 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 	if !r.recordVerifiedBranch(ctx, at, branch) {
 		return
 	}
+	// The runner owns the PR: it opens (or reuses) it and links it on the task BEFORE the hand-over,
+	// so a task can never sit in in_review with delivery.pr null. A failure here leaves the claim
+	// live and the pushed branch for takeover.
+	if !r.handOverPR(ctx, at, w, st, rep, branch) {
+		return
+	}
 	sub := plane.Submission{
 		Outcome:      config.AppendOutcome(st.Outcome, config.RenderFixesSection(at.attr, rep)),
 		RiskDeclared: rep.RiskDeclared(),
@@ -297,6 +303,9 @@ func (r *phaseRun) applyFixLastReport(ctx context.Context, w plane.ReportWriter,
 	at.res.Claim.Settled = true
 	log.Printf("%siteration %d: the %s phase: handed %s over for review",
 		labelOf(r.t), r.drainNum, r.phaseLabel(), claimLabel(at.res.Claim))
+	// Only once the task is safely in review: the tree holds the only copy of the work until the
+	// branch is pushed, and the PR is linked, so a reclaim failure is a warning, never a failure.
+	r.reclaimHandedOverWorktree(ctx, branch)
 }
 
 // applyVerifyReport writes a verification round's record: the finding answers, the review block,
@@ -363,6 +372,14 @@ func (r *phaseRun) handOverVerifiedRound(ctx context.Context, at *phaseAttempt, 
 		return
 	}
 	rep := *r.end.doneReport
+	// The runner owns the PR here too: open (or reuse) it and link it before the hand-over.
+	branch := r.doneBranch(at)
+	if branch == "" {
+		branch = r.end.branch
+	}
+	if !r.handOverPR(ctx, at, w, st, rep, branch) {
+		return
+	}
 	sub := plane.Submission{RiskDeclared: rep.RiskDeclared(), Touches: riskTouches(rep)}
 	// The plane's in_review guard reads **Tests** from the stored outcome.
 	if !config.HasTestsSection(st.Outcome) {
@@ -376,6 +393,7 @@ func (r *phaseRun) handOverVerifiedRound(ctx context.Context, at *phaseAttempt, 
 	at.res.Claim.Settled = true
 	log.Printf("%siteration %d: the %s phase closed its round with no open MUST and the task in_progress — the runner handed %s over for review",
 		labelOf(r.t), r.drainNum, r.phaseLabel(), claimLabel(at.res.Claim))
+	r.reclaimHandedOverWorktree(ctx, branch)
 }
 
 // parkReported parks the task on the session's own reason, appended to the outcome it found so the

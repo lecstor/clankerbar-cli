@@ -210,18 +210,23 @@ func TestRunnerFixBriefsReportTheirFindingUpdates(t *testing.T) {
 	}
 }
 
-// The last fix phase opens the PR, and its report must carry the risk the runner
-// hands the task over with.
-func TestRunnerFixBriefDeclaresRiskAndOpensThePR(t *testing.T) {
+// CLA-1035: the last fix phase no longer opens its own PR - the runner does, from the branch it has
+// verified on origin - and its report must carry the risk the runner hands the task over with.
+func TestRunnerFixBriefDeclaresRiskAndLeavesThePRToTheRunner(t *testing.T) {
 	brief := RunnerFixBrief()
 	for _, want := range []string{
-		"open a PR targeting the repo's PR base branch",
+		"The runner opens the PR targeting the repo's PR base branch",
 		"risk { touches: [...] }",
 		"risk_vocabulary",
-		"The runner hands the task over with submit_for_review itself",
+		"hands the task over with submit_for_review itself",
 	} {
 		if !strings.Contains(brief, want) {
 			t.Errorf("the runner fix brief never says %q:\n%s", want, brief)
+		}
+	}
+	for _, banned := range []string{prTitleTaskRefRule, worktreeReclaimStep, "if none exists for this branch"} {
+		if strings.Contains(brief, banned) {
+			t.Errorf("the runner fix brief still carries the session's own PR step %q:\n%s", banned, brief)
 		}
 	}
 	// The served `finishing` page is a skill page, and those are forbidden here.
@@ -230,14 +235,15 @@ func TestRunnerFixBriefDeclaresRiskAndOpensThePR(t *testing.T) {
 	}
 }
 
-// A verification round follows the fix-verify phase, so the PR stays the
-// verifier's: the fixer commits, pushes and reports.
+// A verification round follows the fix-verify phase, so the PR and the hand-over stay that round's:
+// the fixer commits, pushes and reports.
 func TestRunnerFixVerifyBriefLeavesThePRToTheVerifier(t *testing.T) {
 	brief := RunnerFixVerifyBrief()
 	for _, want := range []string{
-		"Do NOT open a PR",
-		"do NOT move the task to in_review",
+		"do NOT open a PR",
+		"Do NOT move the task to in_review",
 		"the VERIFICATION round after you carries that terminal step",
+		"the runner opens the PR from the verified branch",
 	} {
 		if !strings.Contains(brief, want) {
 			t.Errorf("the runner fix-verify brief never says %q:\n%s", want, brief)
@@ -245,23 +251,45 @@ func TestRunnerFixVerifyBriefLeavesThePRToTheVerifier(t *testing.T) {
 	}
 }
 
-// CLA-1032: both runner briefs that open a PR require the task's ref in the title, so the PR is
-// matched back to its Clankerbar task. The verify and final-fix phases are the runner flow's PR
-// openers; the fix-verify variant leaves the PR to the verifier and carries no title rule.
-func TestRunnerPRBriefsRequireTheTaskRefInTheTitle(t *testing.T) {
+// CLA-1035: every runner brief leaves the PR to the runner, so none carries the session's
+// PR-title rule or the worktree reclaim - and the prohibition forbids opening a PR outright,
+// with no terminal-step escape hatch.
+func TestRunnerBriefsLeaveThePRAndTheReclaimToTheRunner(t *testing.T) {
 	for _, tc := range []struct{ name, brief string }{
+		{"implement", RunnerImplementBrief()},
+		{"review-only", RunnerReviewOnlyBrief()},
 		{"fix", RunnerFixBrief()},
+		{"fix-verify", RunnerFixVerifyBrief()},
 		{"verify", RunnerVerifyBrief()},
 	} {
-		if !strings.Contains(tc.brief, prTitleTaskRefRule) {
-			t.Errorf("the runner %s brief does not carry the shared PR-title rule:\n%s", tc.name, tc.brief)
-		}
-		if !strings.Contains(tc.brief, PhaseTaskRefPlaceholder) {
-			t.Errorf("the runner %s brief never carries %s:\n%s", tc.name, PhaseTaskRefPlaceholder, tc.brief)
+		for _, banned := range []string{prTitleTaskRefRule, worktreeReclaimStep, PhaseTaskRefPlaceholder} {
+			if strings.Contains(tc.brief, banned) {
+				t.Errorf("the runner %s brief still carries %q; the runner owns the PR and the reclaim", tc.name, banned)
+			}
 		}
 	}
-	if strings.Contains(RunnerFixVerifyBrief(), prTitleTaskRefRule) {
-		t.Errorf("the runner fix-verify brief carries a PR-title rule but opens no PR:\n%s", RunnerFixVerifyBrief())
+	if strings.Contains(runnerForbidden, "unless this brief's own terminal step") {
+		t.Errorf("the runner prohibition still has the PR escape hatch:\n%s", runnerForbidden)
+	}
+	if !strings.Contains(runnerForbidden, "do NOT open a PR") {
+		t.Errorf("the runner prohibition does not forbid opening a PR:\n%s", runnerForbidden)
+	}
+}
+
+// The verify round keeps its one push exception, then the runner opens the PR and hands over.
+func TestRunnerVerifyBriefLeavesThePRToTheRunner(t *testing.T) {
+	brief := RunnerVerifyBrief()
+	for _, want := range []string{
+		"confirm the branch is pushed",
+		"The runner opens the PR targeting the repo's PR base branch",
+		"hands the task to in_review",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the runner verify brief never says %q:\n%s", want, brief)
+		}
+	}
+	if strings.Contains(brief, "open a PR targeting") {
+		t.Errorf("the runner verify brief still opens the PR itself:\n%s", brief)
 	}
 }
 
@@ -330,7 +358,8 @@ func TestRunnerVerifyBriefReportsTheRound(t *testing.T) {
 		"omitted",
 		"notes",
 		"risk { touches: [...] }",
-		"The runner records the round and hands the task to in_review",
+		"The runner opens the PR targeting the repo's PR base branch",
+		"records it on the task and hands the task to in_review",
 		"Never decide to run another round yourself",
 		verifyStoppingRule,
 		verifyDriverBounds,
@@ -588,29 +617,22 @@ func TestRunnerFixGradingRulePointsAtTheReport(t *testing.T) {
 	}
 }
 
-// CLA-536: the runner's final phases open the PR and hand the task over
-// themselves, so they must reclaim the tree too. The live 3-phase sequence ends
-// at the runner fix brief and the 4-phase one at the runner verify brief, and no
-// session after either may touch the tree - a missing reclaim leaks every
-// worktree the drain creates.
-func TestRunnerFinalPhaseBriefsReclaimTheWorktree(t *testing.T) {
-	for _, tc := range []struct{ name, brief, push, pr, finalCall string }{
-		{"fix", RunnerFixBrief(), "COMMIT and PUSH the fixes", "open a PR targeting the repo's PR base branch", DoneMarker},
-		{"verify", RunnerVerifyBrief(), "confirm the branch is pushed", "open a PR targeting the repo's PR base branch", DoneMarker},
-	} {
-		assertReclaimSequence(t, "runner "+tc.name, tc.brief, tc.push, tc.pr, tc.finalCall)
-	}
-
-	// A phase with a session after it must not reclaim: implement's review phase
-	// still works in the tree, the review-only gate hands to fix, and fix-verify
-	// hands to the verification round.
+// CLA-1035: no runner brief reclaims the worktree any more - the runner removes the tree itself
+// after a successful hand-over. A brief that still carried the step would have the session race
+// the runner for a tree the runner prepared.
+func TestRunnerBriefsLeaveTheWorktreeReclaimToTheRunner(t *testing.T) {
 	for name, brief := range map[string]string{
 		"implement":   RunnerImplementBrief(),
 		"review-only": RunnerReviewOnlyBrief(),
+		"fix":         RunnerFixBrief(),
 		"fix-verify":  RunnerFixVerifyBrief(),
+		"verify":      RunnerVerifyBrief(),
 	} {
 		if strings.Contains(brief, worktreeReclaimStep) {
-			t.Errorf("the runner %s brief reclaims a tree a later phase still works in:\n%s", name, brief)
+			t.Errorf("the runner %s brief still reclaims the worktree the runner owns:\n%s", name, brief)
+		}
+		if strings.Contains(brief, "git worktree remove") || strings.Contains(brief, "git branch -d") {
+			t.Errorf("the runner %s brief still runs the reclaim commands:\n%s", name, brief)
 		}
 	}
 }
