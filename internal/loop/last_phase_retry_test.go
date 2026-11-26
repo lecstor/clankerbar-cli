@@ -212,7 +212,7 @@ func TestRunnerClaim_LastPhaseGenuineDeathsStayNonRetryable(t *testing.T) {
 // classifyExit is the first of the two guards: `at.dead` is what judgeDeadPhase
 // reads. On the last phase it must be true for a resume-only failure and false
 // for the deaths that have no claim-staying retry to offer.
-func TestClassifyExit_LastPhaseResumeOnlyOnlyIsDead(t *testing.T) {
+func TestClassifyExit_OnlyResumeFailureIsDeadOnTheLastPhase(t *testing.T) {
 	claim := lastPhaseClaim()
 	// A genuine dead phase is "no branch recorded": deadPhase keys on a claim
 	// with pushed work cleared.
