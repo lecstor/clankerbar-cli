@@ -618,3 +618,62 @@ func TestSupervisedWait_HaltEndsTheWaitPromptly(t *testing.T) {
 		t.Errorf("the wait must say the HALT ended it; log was:\n%s", out)
 	}
 }
+
+// --- CLA-1026: the limit beacon names every route's own cause ----------------
+
+// The dashboard gap this closes: some routes are usage-limited while another,
+// with quota, sits inside its pricing window. Collapsing both to "usage limit"
+// raises the question of why the other subscriptions are not being used. The
+// beacon carries each configured route's active hold, in configured order, with
+// a usage mark taking precedence over a window on the same route.
+func TestSupervisedWait_LimitedBeaconCarriesThePerRouteHolds(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0) // inside the 11:00-14:00 peak window
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement", Model: config.ModelRoutes{routeZen, routeGo, routeSynthetic}, Prompt: "Work."}}
+	cfg.Prompt = ""
+	cfg.RouteSchedules, cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo, routeZen)
+	h := &fakeAdapter{probeResults: []harness.Limit{{Limited: false}}}
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Fleet: ff}})
+	openTestStateDir(t, d)
+	d.now = func() time.Time { return at }
+	d.limitBeaconInterval = time.Hour
+	reset := time.Now().Add(time.Hour)
+	// routeZen is both marked and inside the window: the mark is the cause that reaches its end
+	// first and is the one the plane presents first, so it must not be reported as the window.
+	d.markRouteLimited(routeZen, reset)
+
+	ph := cfg.Phases[0]
+	_, _, stop := d.supervisedWait(context.Background(),
+		harness.Limit{Limited: true, ResetAt: reset}, h, ph, d.targets[0], spend{start: time.Now()})
+	if stop {
+		t.Fatal("the open route's probe lifts the limit; the wait should resume, not stop")
+	}
+
+	sent, _ := ff.reports()
+	if len(sent) != 1 {
+		t.Fatalf("got %d presence reports, want exactly the entry one: %+v", len(sent), sent)
+	}
+	if got := sent[0].State.Kind; got != fleet.StateLimited {
+		t.Fatalf("entry beacon state = %q, want %q", got, fleet.StateLimited)
+	}
+	holds := sent[0].State.Routes
+	if len(holds) != 2 {
+		t.Fatalf("state.routes = %+v, want the two held routes (the open %q is not held)", holds, routeSynthetic)
+	}
+	if holds[0].Route != routeZen || holds[0].Reason != fleet.RouteHoldUsageLimit {
+		t.Errorf("first hold = %+v, want %q usage_limit — a mark outranks the same route's window", holds[0], routeZen)
+	}
+	if !holds[0].Until.Equal(reset) {
+		t.Errorf("usage-limit until = %s, want the mark's expiry %s", holds[0].Until, reset)
+	}
+	if holds[1].Route != routeGo || holds[1].Reason != fleet.RouteHoldWindow {
+		t.Errorf("second hold = %+v, want %q window", holds[1], routeGo)
+	}
+	if holds[1].Schedule != "deepseek-peak" {
+		t.Errorf("window hold names schedule %q, want deepseek-peak", holds[1].Schedule)
+	}
+	if want := brisbaneAt(t, 9, 14, 0); !holds[1].Until.Equal(want) {
+		t.Errorf("window hold until = %s, want the window's end %s", holds[1].Until, want)
+	}
+}

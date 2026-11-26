@@ -1409,3 +1409,249 @@ func TestMarshalReport_PauseOnlyOnTheDrainingState(t *testing.T) {
 		t.Errorf("an iteration state carried a pause payload: %s", b)
 	}
 }
+
+// --- CLA-1026: the live route and per-route holds ----------------------------
+
+// `state.model` is the route the RUNNING iteration is on. The plane reads it
+// on `iteration` only, bounded to MAX_ROUTE_NAME, and omits it when the phase
+// resolved no route — absence must stay absence, never a guessed name.
+func TestMarshalReport_IterationStateCarriesTheLiveModel(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateIteration, N: 2, TaskRef: "CLA-1", Phase: "implement", Model: "commandcode/deepseek/deepseek-v4.1-flash"},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Kind  string `json:"kind"`
+			Model string `json:"model"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if got.State.Kind != StateIteration {
+		t.Errorf("state.kind = %q, want %q", got.State.Kind, StateIteration)
+	}
+	if got.State.Model != "commandcode/deepseek/deepseek-v4.1-flash" {
+		t.Errorf("state.model = %q, want the running route", got.State.Model)
+	}
+
+	empty, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateIteration, N: 2},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(empty), `"model"`) {
+		t.Errorf("an iteration with no resolved route grew a model key: %s", empty)
+	}
+}
+
+// The route belongs to `iteration` alone, like resetAt belongs to `limited`:
+// the plane ignores it elsewhere, so a value left on another state is dropped
+// here rather than shipped as a key the plane would ignore.
+func TestMarshalReport_ModelOnlyOnTheIterationState(t *testing.T) {
+	for _, kind := range []string{StateIdle, StateWaiting, StateDraining, StateStopping, StateLimited} {
+		b, err := marshalReport(Report{
+			Identity: Identity{Instance: "x"},
+			State:    State{Kind: kind, Model: "commandcode/deepseek/deepseek-v4.1-flash"},
+		})
+		if err != nil {
+			t.Fatalf("marshalReport(%s): %v", kind, err)
+		}
+		if strings.Contains(string(b), `"model"`) {
+			t.Errorf("a %s state carried a model: %s", kind, b)
+		}
+	}
+}
+
+// A paused multi-route daemon reports each configured route with its own cause:
+// a usage limit from the driver's route marks, and a pricing window with its
+// schedule name. The `until` instants ride RFC 3339 UTC like every other instant
+// on this wire, and the two reasons are the plane's closed enum verbatim.
+func TestMarshalReport_LimitedStateCarriesRouteHolds(t *testing.T) {
+	reset := time.Date(2026, 11, 27, 3, 0, 0, 0, time.FixedZone("AWST", 8*60*60))
+	windowEnd := time.Date(2026, 11, 27, 4, 0, 0, 0, time.FixedZone("AEST", 10*60*60))
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateLimited, ResetAt: reset, Routes: []RouteHold{
+			{Route: "synthetic/hf:deepseek", Reason: RouteHoldUsageLimit, Until: reset},
+			{Route: "opencode-go/deepseek", Reason: RouteHoldWindow, Schedule: "deepseek-peak", Until: windowEnd},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Kind   string `json:"kind"`
+			Routes []struct {
+				Route    string `json:"route"`
+				Reason   string `json:"reason"`
+				Schedule string `json:"schedule"`
+				Until    string `json:"until"`
+			} `json:"routes"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if len(got.State.Routes) != 2 {
+		t.Fatalf("state.routes = %+v, want the two configured routes", got.State.Routes)
+	}
+	if got.State.Routes[0].Route != "synthetic/hf:deepseek" || got.State.Routes[0].Reason != RouteHoldUsageLimit {
+		t.Errorf("first hold = %+v, want the usage-limited route", got.State.Routes[0])
+	}
+	if got.State.Routes[0].Schedule != "" {
+		t.Errorf("a usage-limit hold carried schedule %q; a schedule belongs to a window", got.State.Routes[0].Schedule)
+	}
+	if got.State.Routes[1].Reason != RouteHoldWindow || got.State.Routes[1].Schedule != "deepseek-peak" {
+		t.Errorf("second hold = %+v, want the windowed route with its schedule", got.State.Routes[1])
+	}
+	for i, want := range []time.Time{reset, windowEnd} {
+		parsed, err := time.Parse(time.RFC3339, got.State.Routes[i].Until)
+		if err != nil {
+			t.Fatalf("state.routes[%d].until %q is not RFC 3339: %v\n%s", i, got.State.Routes[i].Until, err, b)
+		}
+		if !parsed.Equal(want) {
+			t.Errorf("state.routes[%d].until = %s, want %s", i, parsed.UTC(), want.UTC())
+		}
+		if !strings.HasSuffix(got.State.Routes[i].Until, "Z") {
+			t.Errorf("state.routes[%d].until %q carries no explicit UTC designator; the plane refuses a zoneless instant", i, got.State.Routes[i].Until)
+		}
+	}
+}
+
+// A route-window hold leaves the spawns closed and reports the same breakdown on
+// `draining`; every other state drops it, for the same "a stray field says
+// nothing" rule the plane applies to resetAt and pauseReason.
+func TestMarshalReport_RouteHoldsOnlyOnThePausedStates(t *testing.T) {
+	holds := []RouteHold{{Route: "opencode-go/deepseek", Reason: RouteHoldWindow, Schedule: "deepseek-peak"}}
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateDraining, PauseReason: PauseReasonSchedule, Routes: holds},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if !strings.Contains(string(b), `"routes":[{"route":"opencode-go/deepseek","reason":"window","schedule":"deepseek-peak"}]`) {
+		t.Errorf("a route-window draining state did not carry its holds: %s", b)
+	}
+
+	for _, kind := range []string{StateIdle, StateIteration, StateWaiting, StateStopping} {
+		b, err := marshalReport(Report{
+			Identity: Identity{Instance: "x"},
+			State:    State{Kind: kind, Routes: holds},
+		})
+		if err != nil {
+			t.Fatalf("marshalReport(%s): %v", kind, err)
+		}
+		if strings.Contains(string(b), `"routes"`) {
+			t.Errorf("a %s state carried route holds: %s", kind, b)
+		}
+	}
+}
+
+// The plane refuses the WHOLE report — presence refresh included — beyond its
+// MAX_ROUTE_HOLDS cap, so the first entries in configured order are kept and the
+// clamp is logged as the interface violation it is.
+func TestMarshalReport_RouteHoldsAreBounded(t *testing.T) {
+	buf := captureLog(t)
+	holds := make([]RouteHold, maxRouteHolds+3)
+	for i := range holds {
+		holds[i] = RouteHold{Route: fmt.Sprintf("route/%02d", i), Reason: RouteHoldUsageLimit}
+	}
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateLimited, Routes: holds},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Routes []struct {
+				Route string `json:"route"`
+			} `json:"routes"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if len(got.State.Routes) != maxRouteHolds {
+		t.Fatalf("state.routes carried %d entries, want the plane cap %d", len(got.State.Routes), maxRouteHolds)
+	}
+	for i, r := range got.State.Routes {
+		if want := fmt.Sprintf("route/%02d", i); r.Route != want {
+			t.Errorf("state.routes[%d] = %q, want %q — the clamp must keep configured order", i, r.Route, want)
+		}
+	}
+	if !strings.Contains(buf.String(), "exceed the plane's cap") {
+		t.Errorf("the clamp did not say why entries were dropped:\n%s", buf.String())
+	}
+}
+
+// Entries the plane cannot represent would 400 the whole batch, so they are
+// dropped here with a line: an unknown reason, a blank route, an over-long
+// route. The valid entries beside them still go out.
+func TestMarshalReport_RouteHoldDropsUnrepresentableEntries(t *testing.T) {
+	buf := captureLog(t)
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateLimited, Routes: []RouteHold{
+			{Route: "", Reason: RouteHoldUsageLimit},
+			{Route: strings.Repeat("r", maxRouteName+1), Reason: RouteHoldWindow},
+			{Route: "route/known", Reason: "quota"},
+			{Route: "route/good", Reason: RouteHoldUsageLimit},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Routes []struct {
+				Route  string `json:"route"`
+				Reason string `json:"reason"`
+			} `json:"routes"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if len(got.State.Routes) != 1 || got.State.Routes[0].Route != "route/good" || got.State.Routes[0].Reason != RouteHoldUsageLimit {
+		t.Fatalf("state.routes = %+v, want only the one representable entry", got.State.Routes)
+	}
+	if n := strings.Count(buf.String(), "fleet: dropping a route hold:"); n != 3 {
+		t.Errorf("dropped %d route holds with a log line, want 3:\n%s", n, buf.String())
+	}
+}
+
+// An unstated end is omitted, not rendered as year zero; a window with no
+// schedule name still names its reason, so the console says "window" rather
+// than hollow.
+func TestMarshalReport_RouteHoldOmitsUnstatedFields(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateLimited, Routes: []RouteHold{
+			{Route: "route/a", Reason: RouteHoldUsageLimit},
+			{Route: "route/b", Reason: RouteHoldWindow},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), "0001-01-01") {
+		t.Errorf("an unstated until leaked year zero: %s", b)
+	}
+	if strings.Contains(string(b), `"schedule"`) {
+		t.Errorf("a window with no schedule grew a schedule key: %s", b)
+	}
+	if !strings.Contains(string(b), `"route":"route/b","reason":"window"`) {
+		t.Errorf("the window hold lost its reason: %s", b)
+	}
+}

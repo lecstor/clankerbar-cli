@@ -618,3 +618,53 @@ func TestDrainPhase_RouteWindowRefusalIsHeldNotEmpty(t *testing.T) {
 		t.Errorf("windowWhy = %q, want it to name the blocked routes", end.windowWhy)
 	}
 }
+
+// CLA-1026: the route-window hold publishes the same per-route breakdown a limit
+// does, so the draining row names the pricing window that holds the routes WITH
+// quota rather than only the usage limit that started the pause. A route shared
+// by two panel members' lists appears once, in configured order.
+func TestRouteWindowHoldState_CarriesPerRouteHolds(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo, routeZen)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+	reset := at.Add(time.Hour)
+	d.markRouteLimited(routeZen, reset)
+
+	seq := &drainSeq{d: d, t: d.targets[0], ti: 0}
+	hs := seq.routeWindowHoldState([][]string{{routeGo, routeZen}, {routeGo}})
+	if !hs.active {
+		t.Fatal("the window hold is not active with every route withheld")
+	}
+	if want := brisbaneAt(t, 9, 14, 0); !hs.until.Equal(want) {
+		t.Errorf("hold until = %s, want the window's end %s", hs.until, want)
+	}
+	if len(hs.routes) != 2 {
+		t.Fatalf("hold routes = %+v, want the two configured routes once each", hs.routes)
+	}
+	if hs.routes[0].Route != routeGo || hs.routes[0].Reason != fleet.RouteHoldWindow || hs.routes[0].Schedule != "deepseek-peak" {
+		t.Errorf("first hold = %+v, want the windowed %q with its schedule", hs.routes[0], routeGo)
+	}
+	if hs.routes[1].Route != routeZen || hs.routes[1].Reason != fleet.RouteHoldUsageLimit {
+		t.Errorf("second hold = %+v, want the usage-limited %q", hs.routes[1], routeZen)
+	}
+
+	// The presence row is what the console reads: the hold state's routes ride the draining
+	// beacon, and they are gone once the hold clears.
+	d.schedPaused = true
+	d.holdPause(0, "CB-7", "implement", hs.until, hs.zone, hs.routes)
+	st := d.fleetState(0)
+	if st.Kind != fleet.StateDraining || st.PauseReason != fleet.PauseReasonSchedule {
+		t.Fatalf("state = %+v, want the schedule draining pause", st)
+	}
+	if len(st.Routes) != 2 || st.Routes[0].Route != routeGo || st.Routes[1].Route != routeZen {
+		t.Errorf("draining state routes = %+v, want the hold's breakdown", st.Routes)
+	}
+	if st.TaskRef != "CB-7" || st.Phase != "implement" {
+		t.Errorf("held state names %q at %q, want CB-7 at implement", st.TaskRef, st.Phase)
+	}
+	d.clearHoldPause(0)
+	if st := d.fleetState(0); len(st.Routes) != 0 {
+		t.Errorf("a cleared hold still reported routes: %+v", st.Routes)
+	}
+}

@@ -751,12 +751,12 @@ func wireRoutes(st State) []wireRouteHold {
 	for _, h := range routes {
 		route := strings.TrimSpace(h.Route)
 		if route == "" || len(route) > maxRouteName {
-			log.Printf("fleet: dropping a route hold with an empty or over-long route name (%q): the plane refuses the whole report over it", h.Route)
+			log.Printf("fleet: dropping a route hold: route %q is empty or over the plane's %d-character bound", h.Route, maxRouteName)
 			continue
 		}
 		reason := strings.TrimSpace(h.Reason)
 		if reason != RouteHoldUsageLimit && reason != RouteHoldWindow {
-			log.Printf("fleet: dropping the route hold on %q: reason %q is not one of the two the plane knows", route, h.Reason)
+			log.Printf("fleet: dropping a route hold: route %q names reason %q, not one of the two the plane knows", route, h.Reason)
 			continue
 		}
 		w := wireRouteHold{Route: route, Reason: reason}
