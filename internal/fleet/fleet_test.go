@@ -1655,3 +1655,57 @@ func TestMarshalReport_RouteHoldOmitsUnstatedFields(t *testing.T) {
 		t.Errorf("the window hold lost its reason: %s", b)
 	}
 }
+
+// A schedule name past the plane's MAX_ROUTE_SCHEDULE cannot ride the wire (the
+// plane refuses the whole report), but the hold itself is still the useful fact:
+// the reason goes out and only the name is dropped, with a line.
+func TestMarshalReport_RouteHoldDropsAnOverLongScheduleName(t *testing.T) {
+	buf := captureLog(t)
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateLimited, Routes: []RouteHold{{
+			Route:    "opencode-go/deepseek",
+			Reason:   RouteHoldWindow,
+			Schedule: strings.Repeat("s", maxRouteSchedule+1),
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Routes []map[string]any `json:"routes"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if len(got.State.Routes) != 1 {
+		t.Fatalf("state.routes = %v, want the hold kept without its over-long name", got.State.Routes)
+	}
+	if _, ok := got.State.Routes[0]["schedule"]; ok {
+		t.Errorf("the over-long schedule name was sent anyway: %v", got.State.Routes[0])
+	}
+	if !strings.Contains(buf.String(), "over the plane's") {
+		t.Errorf("the dropped schedule name was not logged:\n%s", buf.String())
+	}
+}
+
+// The live route is bounded like a hold's route: an over-long name is dropped
+// rather than 400ing the whole beacon, presence refresh included.
+func TestMarshalReport_OverLongModelIsOmitted(t *testing.T) {
+	buf := captureLog(t)
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateIteration, Model: strings.Repeat("m", maxRouteName+1)},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), `"model"`) {
+		t.Errorf("an over-bound state.model went out: %s", b)
+	}
+	if !strings.Contains(buf.String(), "dropping state.model") {
+		t.Errorf("the dropped model was not logged:\n%s", buf.String())
+	}
+}

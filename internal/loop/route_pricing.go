@@ -86,9 +86,10 @@ func (d *Driver) phaseRouteHolds(tc *config.Config, ph config.Phase) []fleet.Rou
 	return d.routeHoldsAt(tc, d.clock(), routes)
 }
 
-// routeHoldsAt collects the active hold on each configured route: an active usage mark first — the
-// plane presents usage limits ahead of windows — else an active pricing window. A route with neither
-// is not held and contributes no entry.
+// routeHoldsAt collects the active hold on each configured route: an active usage mark first, else an
+// active pricing window. The route has ONE reason on the wire, and a route held by both is denied by
+// its quota first — the same precedence the plane's summary gives usage limits over windows. A route
+// with neither is not held and contributes no entry.
 func (d *Driver) routeHoldsAt(tc *config.Config, now time.Time, routes []string) []fleet.RouteHold {
 	if len(routes) == 0 {
 		return nil
