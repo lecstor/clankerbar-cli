@@ -28,9 +28,12 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			taskID = st.end.claim.Claim.TaskID
 		}
 		// CLA-877: a resume-only failure KEPT its claim on purpose (see settleWithoutCheckpoint), so the
-		// retry resumes that same run without a re-claim.
+		// retry resumes that same run without a re-claim. CLA-1033: that retry is not limited to the phase
+		// the walk started at, nor to a non-final one — the last phase (a verify round, or a terminal fix)
+		// routinely pushes and opens the PR before its report resume stalls, and expiring the lease there
+		// hands a finished task to a takeover.
 		resumeOnly := st.end.reportResumeFailed != "" && st.end.claim != nil && st.end.claim.Claim.Held()
-		retryable := !st.last && (s.i == s.start || resumeOnly)
+		retryable := (!st.last && s.i == s.start) || resumeOnly
 
 		if retryable && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
