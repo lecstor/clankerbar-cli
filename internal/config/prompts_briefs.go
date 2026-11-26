@@ -57,23 +57,37 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 	"that had to reach outside its own area), never the default." + rerunGuidance + reviewTerminalStep +
 	handoffGuidance
 
+// reviewGateScopePhases states whose job the gates are across a configured sequence: the implement
+// phase self-verified at this tip, the fix phase re-runs the gates over what it changes, and the
+// verify phase re-checks only the fix delta. It is its own constant so the standalone review
+// command can replace exactly this sentence (reviewRunGateScope).
+const reviewGateScopePhases = "The implement phase self-verified at this tip and the fix phase runs the gates " +
+	"again over what it changes; the verify phase re-checks only the fix delta, its regression surface and any " +
+	"gate a prior finding said was red, not the whole tree."
+
 // reviewGateScope defines what "run the adversarial review gate" means for a review-only phase, and
 // what it does NOT mean. A reviewer's value is the reading, so a command is scoped to a PROBE of a
 // defect it already suspects - evidence for a finding, never a second gate.
-const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase self-verified at this tip and the fix " +
-	"and verify phases run the gates again over what they change, so do NOT run the repo's full test suite, " +
-	"typecheck, build or long checks (a PDF validator, a whole-browser e2e sweep - anything that takes minutes) " +
-	"as a matter of course: each reviewer re-running them is another identical run of the same tree, bought with " +
-	"wall time, machine load and a context full of test output. Spend the session READING instead - the diff " +
-	"against the base, and the code it touches that the diff does not show; that is where a defect the " +
-	"implementer's own gates missed is found. Run a command only as a TARGETED probe of a specific defect you " +
-	"suspect: one test file, one package, one short repro script, never the repo's gate list. Name the suspected " +
-	"defect the probe is for, and when it confirms one, the probe's output IS that finding's evidence - " +
-	"`(gate): <the command and its failing output>` for a command that fails, `(failure): <the input and the " +
-	"wrong output>` for behaviour you reproduced by hand. A probe must leave the worktree as it found it: if it " +
-	"writes a report, coverage file or snapshot, restore or delete the artifact (`git checkout -- <path>` for a tracked " +
-	"one) before you record. The panel shares this one worktree, so an artifact left behind is the next member's " +
-	"- and the fix phase's - dirty tree. "
+const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. " + reviewGateScopePhases + " So do NOT run the repo's " +
+	"full test suite, typecheck, build or long checks (a PDF validator, a whole-browser e2e sweep - anything that " +
+	"takes minutes) as a matter of course: each reviewer re-running them is another identical run of the same " +
+	"tree, bought with wall time, machine load and a context full of test output. Spend the session READING " +
+	"instead - the diff against the base, and the code it touches that the diff does not show; that is where a " +
+	"defect the implementer's own gates missed is found. Run a command only as a TARGETED probe of a specific " +
+	"defect you suspect: one test file, one package, one short repro script, never the repo's gate list. Name " +
+	"the suspected defect the probe is for, and when it confirms one, the probe's output IS that finding's " +
+	"evidence - `(gate): <the command and its failing output>` for a command that fails, `(failure): <the input " +
+	"and the wrong output>` for behaviour you reproduced by hand. A probe must leave the worktree as it found " +
+	"it: if it writes a report, coverage file or snapshot, restore or delete the artifact (`git checkout -- " +
+	"<path>` for a tracked one) before you record. The panel shares this one worktree, so an artifact left " +
+	"behind is the next member's - and the fix phase's - dirty tree. "
+
+// reviewPRExistenceScope keeps the terminal phase's actions out of the review's MUST list. A review
+// runs before the PR exists - opening it and moving to in_review are the terminal phase's step - so
+// reporting their absence as a defect spends a whole fix round on zero code defects (MAK-482).
+const reviewPRExistenceScope = "The PR is NOT this phase's job: opening it and moving the task to `in_review` " +
+	"belong to the terminal phase, so never raise a MUST that the PR does not exist or that the task is not " +
+	"in_review - at this checkpoint that is the expected state, not a defect. "
 
 // reviewOnlyBrief is the review phase's brief when a LATER phase will apply its findings (the
 // shipped [implement, review, fix] sequence). "Review only" is enforced as a scope, not a
@@ -118,6 +132,7 @@ var reviewOnlyBriefWorktreeAndGate = " Work in the worktree for branch " + Phase
 	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
 	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhaseBasePlaceholder +
 	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate." + reviewGateScope +
+	reviewPRExistenceScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
@@ -166,7 +181,7 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout " +
 	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
 	"against the PR base (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
-	"the adversarial review gate." + reviewGateScope +
+	"the adversarial review gate." + reviewGateScope + reviewPRExistenceScope +
 	"REVIEW ONLY: do not edit, create or delete a source " +
 	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +
 	"find: the phase after you is responsible for applying it, and a fix you apply here is a fix it cannot " +
@@ -351,6 +366,16 @@ const verifyDriverBounds = " The driver counts rounds: this is a hard cap of thr
 	"after two fix attempts, or an id a previous verifier marked resolved that you reopen, parks the task for " +
 	"a human."
 
+// verifyCheckScope bounds a verification round's commands: the fix delta, its regression surface and the
+// gates a prior finding named red. The fix phase ran the repo's gates at HEAD and the PR's CI carries the
+// full suite once it opens, so a second identical full run is cost without evidence.
+const verifyCheckScope = "RUN CHECKS SCOPED, NEVER THE REPO'S WHOLE GATE LIST AGAIN: verify with targeted commands " +
+	"only - the fix delta's own tests, the regression surface those fixes touch, and any check a prior finding " +
+	"said was red. Do NOT re-run the repo's full test suite, full build, or multi-minute smoke/e2e sweeps when " +
+	"the fix phase already ran them at HEAD: the PR's CI carries the full suite once it opens, and a second " +
+	"identical run buys wall time, machine load and a context full of output rather than evidence. When no new " +
+	"command is needed, say exactly that instead of running the gates again. "
+
 // verifyTerminalStep ends a verification round: the hand-over only when no MUST remains open,
 // otherwise a silent hold for the driver to spawn another fix.
 const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
@@ -361,6 +386,7 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"the released findings, or parks the task at the round cap.\n\n" +
 	"If NO MUST remains open: FIRST confirm the branch is pushed (push any fix commit that is still local) and " +
 	"open a PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for the branch." +
+	prTitleTaskRefRule +
 	worktreeReclaimStep + " THEN carry the hand-over in ONE call: submit_for_review(taskId, runId, closeRound: <the round the append " +
 	"returned>, risk: { touches: [...] }). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
 	"the task leaves in_progress this run can no longer close the round. Do NOT send an outcome in that call: " +
@@ -415,7 +441,7 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"SCOPE: the fix delta is the reviewed tip the LAST released record names (`reviewedTip`) up to HEAD " +
 	"(`git diff <reviewedTip>..HEAD`), PLUS the regression surface those fixes touch. Do not re-review the " +
 	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
-	"in the record. " +
+	"in the record. " + verifyCheckScope +
 	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, recorded through " +
 	"record_review(taskId, runId, {findingUpdates: [...]}) on the CLOSED record it belongs to: " +
 	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +

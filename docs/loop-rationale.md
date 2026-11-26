@@ -2554,8 +2554,9 @@ section note.
 > an empty string is a session quietly deciding to claim fresh work instead.
 >
 > prBase is the branch this task's repo PRs target, resolved per phase by
-> drainPhase (CLA-608), and fills {{prBase}} in EVERY phase: the other three
-> placeholders are per-run facts only a claim can carry, while the implement
+> drainPhase (CLA-608), and fills {{prBase}} in EVERY phase: the other four
+> placeholders ({{taskId}}, {{taskRef}}, {{runId}}, {{branch}}) are per-run facts
+> only a claim can carry, while the implement
 > brief — phase 1, claim-free at spawn time — is itself one of the carriers, in
 > its resumed-work rule. Empty leaves the placeholder standing, like the rest.
 >

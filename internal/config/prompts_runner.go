@@ -130,7 +130,7 @@ const runnerReviewResume = runnerResumeNoClaim + " An empty branch field on the 
 // the session starts at the reviewed tip.
 var runnerReviewWorktreeAndGate = " " + runnerWorktreeAtTip +
 	" Read the diff against the PR base (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder +
-	") and run the adversarial review gate." + reviewGateScope +
+	") and run the adversarial review gate." + reviewGateScope + reviewPRExistenceScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
@@ -205,7 +205,7 @@ var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"(verdict: pass), there is nothing to fix: commit nothing and report an empty findingUpdates." +
 	" FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes, then open a PR targeting the " +
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for this branch - push, then the PR, " +
-	"in that order." + worktreeReclaimStep + " Then end the session with the done report. The runner hands the " +
+	"in that order." + prTitleTaskRefRule + worktreeReclaimStep + " Then end the session with the done report. The runner hands the " +
 	"task over with submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) + runnerRerunGuidance +
 	runnerForbidden + handoffGuidance + runnerReportReminder
 
@@ -243,7 +243,7 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"SCOPE: the fix delta is the reviewed tip the LAST released record names (`reviewedTip`) up to HEAD " +
 	"(`git diff <reviewedTip>..HEAD`), PLUS the regression surface those fixes touch. Do not re-review the " +
 	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
-	"in the report's notes. " +
+	"in the report's notes. " + verifyCheckScope +
 	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, as an entry in the report's " +
 	"`findingUpdates`, by the id the sealed record gave it: " +
 	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +
@@ -269,6 +269,7 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"the round cap.\n\n" +
 	"If NO MUST remains open: confirm the branch is pushed (push any fix commit the fixer left local), open a " +
 	"PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for the branch." +
+	prTitleTaskRefRule +
 	worktreeReclaimStep + " Then end with the report including " + runnerRiskField + ". The runner records the " +
 	"round and hands the task to in_review. Never decide to run another round yourself." +
 	verifyStoppingRule + verifyDriverBounds + runnerDoneReport(runnerVerifyReportFields) + runnerRerunGuidance +

@@ -31,6 +31,19 @@ func diffBase(prBase, baseSHA string) string {
 	return ""
 }
 
+// claimTaskRef is the task's human-readable ref, for the PR title: the claim's own ref, then the
+// runner's task brief (a runner-claimed claim may not carry one), then the same UUID fallback
+// claimLabel uses.
+func claimTaskRef(c harness.Claim, runner *runnerBriefing) string {
+	if c.Ref != "" {
+		return c.Ref
+	}
+	if runner != nil && runner.task.Ref != "" {
+		return runner.task.Ref
+	}
+	return claimLabel(c)
+}
+
 // invocationFor builds the invocation for one PHASE: the target's invocation, carrying this phase's
 // prompt and turn cap, with the previous phase's claim substituted into the prompt's placeholders.
 // A session cannot know its own run id — it never called claim_task — so the driver, which
@@ -171,6 +184,7 @@ func (d *Driver) invocationForPhase(t Target, phaseIdx int, ph config.Phase, pre
 		}
 		repl = append(repl,
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
+			config.PhaseTaskRefPlaceholder, claimTaskRef(prev.Claim, runner),
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
 			config.PhaseBranchPlaceholder, branch,
 		)
