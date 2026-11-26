@@ -93,11 +93,11 @@ func (d *Driver) handBackClaim(ctx context.Context, t Target, res harness.Result
 		}
 		switch {
 		case ended && stalled && countUndeclared:
-			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover) (undeclared hand-offs this run: %d)",
-				labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover)%s (undeclared hand-offs this run: %d)",
+				labelOf(t), stallReason, claimLabel(res.Claim), reasonNote, d.undeclared)
 		case ended && stalled:
-			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover)",
-				labelOf(t), stallReason, claimLabel(res.Claim))
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover)%s",
+				labelOf(t), stallReason, claimLabel(res.Claim), reasonNote)
 		case ended && countUndeclared:
 			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease on %s (pushed work kept for takeover)%s (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
 				labelOf(t), res.Claim.TaskID, claimLabel(res.Claim), reasonNote, d.undeclared)
@@ -172,7 +172,7 @@ func (d *Driver) expireHeldClaim(ctx context.Context, t Target, res harness.Resu
 		// immediate takeover matters more than the budget exemption. Never fall back to
 		// ReleaseDriver - CLA-708 forbids it on pushed work.
 		d.expireReasonUnsupportedOnce.Do(func() {
-			log.Printf("%sthe backlog plane does not accept a usage-limit reason on release_task — ending the lease without one; the takeover will charge the task's reclaim budget until the plane is promoted", labelOf(t))
+			log.Printf("%streating the release_task refusal as an unrecognized reason argument — ending the lease without a usage-limit reason, so this takeover will charge the task's reclaim budget", labelOf(t))
 		})
 		err = t.Releaser.ExpireLease(rctx, res.Claim.TaskID, res.Claim.RunID, "")
 		reason = ""

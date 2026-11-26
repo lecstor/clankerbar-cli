@@ -308,8 +308,8 @@ func TestReleaseHeldClaim_RetriesWithoutTheReasonWhenThePlaneRefusesIt(t *testin
 		t.Errorf("fell back to ReleaseDriver (%+v) — that is the one call forbidden for pushed work", f.calls)
 	}
 	out := logs.String()
-	if got := strings.Count(out, "does not accept a usage-limit reason"); got != 1 {
-		t.Errorf("the unsupported-reason line appeared %d times, want once per run:\n%s", got, out)
+	if got := strings.Count(out, "treating the release_task refusal as an unrecognized reason argument"); got != 1 {
+		t.Errorf("the fallback-reason line appeared %d times, want once per run:\n%s", got, out)
 	}
 	if !strings.Contains(out, "ended the lease on t-1 (pushed work kept for takeover)") {
 		t.Errorf("the lease-ended line is missing:\n%s", out)

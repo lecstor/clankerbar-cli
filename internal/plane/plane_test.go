@@ -568,8 +568,8 @@ func TestExpireLease_RequestShape(t *testing.T) {
 	if args["driver"] != true {
 		t.Errorf("driver = %v, want true - the plane records this as a driver's call for a dead session", args["driver"])
 	}
-	if args["reason"] != ReasonUsageLimit {
-		t.Errorf("reason = %v, want %q - the plane charges the takeover to its quota ladder only when the death is named", args["reason"], ReasonUsageLimit)
+	if args["reason"] != "usage_limit" {
+		t.Errorf("reason = %v, want the literal %q the plane's CLA-1028 schema recognises - pinned here rather than compared to the constant, so a drift in either cannot silently lose the exemption", args["reason"], "usage_limit")
 	}
 	// `checkGreen` is the other attestation and belongs to a close-out release;
 	// the expiry and a green-check claim are two different assertions.
@@ -620,6 +620,76 @@ func TestExpireLease_CallRefusalIsNotReasonUnsupported(t *testing.T) {
 	err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", ReasonUsageLimit)
 	if err == nil || errors.Is(err, ErrReasonUnsupported) {
 		t.Errorf("err = %v, want a plain refusal", err)
+	}
+}
+
+// reasonArgumentRefused's two arms are pinned separately: the generic MCP validation refusal, and
+// the key-complaint shapes that must ALSO name the reason. A typo in a phrase list, or a widening
+// that swallowed a plain call refusal, is a silent loss of the retry (or a wrong retry).
+func TestReasonArgumentRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{
+			name: "generic MCP validation refusal",
+			msg:  "Input validation error: Invalid arguments for tool release_task",
+			want: true,
+		},
+		{
+			name: "unrecognized key complaint naming the reason alone",
+			msg:  "Unrecognized key(s) in object: 'reason'",
+			want: true,
+		},
+		{
+			name: "additional property complaint naming the reason",
+			msg:  "release_task: additional property 'reason' is not allowed by the schema",
+			want: true,
+		},
+		{
+			name: "unknown key variant",
+			msg:  "unknown key: reason",
+			want: true,
+		},
+		{
+			name: "plain call refusal",
+			msg:  "release_task refused: not_holding",
+			want: false,
+		},
+		{
+			name: "plain refusal that happens to mention a reason",
+			msg:  "release_task refused: the reason given is not accepted for this task",
+			want: false,
+		},
+		{
+			name: "unknown tool, not a call refusal",
+			msg:  "MCP error -32602: Tool release_task not found",
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reasonArgumentRefused(tc.msg); got != tc.want {
+				t.Errorf("reasonArgumentRefused(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+// A plane that does not serve release_task is ErrPlaneTooOld even when the call carries a reason:
+// the reason path must not mask the protocol-too-old classification (or spend a retry on it).
+func TestExpireLease_ReasonDoesNotMaskAPlaneTooOld(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, fmt.Sprintf(unknownToolBody, "release_task"))
+
+	err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1", ReasonUsageLimit)
+	if !errors.Is(err, ErrPlaneTooOld) {
+		t.Fatalf("err = %v, want ErrPlaneTooOld", err)
+	}
+	if errors.Is(err, ErrReasonUnsupported) {
+		t.Errorf("err = %v, classified as a reason-schema refusal; the plane does not serve the tool at all", err)
+	}
+	if len(got.bodies) != 1 {
+		t.Fatalf("made %d calls, want exactly 1 (the reason retry belongs to the caller, and only for a schema refusal)", len(got.bodies))
 	}
 }
 
