@@ -231,3 +231,29 @@ func TestSupervisedWait_BeaconsLimitedWithTheEarliestConcreteReset(t *testing.T)
 			refreshed.ResetAt.Format(time.RFC3339), until.Round(time.Millisecond))
 	}
 }
+
+// review 1.review-1.9: two routes reaching the SAME clear instant — one by a usage mark, one by a
+// withholding window — must read as a schedule pause, whatever order the routes came in. Before the
+// tie-break the answer depended on which route was visited first.
+func TestWaitAvailability_AnEqualInstantFromAWindowIsASchedulePause(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	windowEnd := brisbaneAt(t, 9, 14, 0)
+	d := routedDriver(t, &fakeAdapter{}, []config.Phase{{Name: "implement"}}, routeZen, routeGo)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+	// The mark and the window end at the same instant; zen is FIRST in the list, and carries no window.
+	d.markRouteLimited(routeZen, windowEnd)
+	d.markRouteLimited(routeGo, windowEnd.Add(-time.Minute))
+
+	av := d.waitAvailabilityAt(d.cfg, at, []string{routeZen, routeGo})
+	if av.open {
+		t.Fatalf("availability = %+v, want blocked: both routes carry a future instant", av)
+	}
+	if av.scheduleAt.IsZero() || !av.scheduleAt.Equal(windowEnd) {
+		t.Errorf("scheduleAt = %s, want the shared instant %s — an equal instant reached as a window end is a schedule pause",
+			av.scheduleAt.Format(time.RFC3339), windowEnd.Format(time.RFC3339))
+	}
+	if av.scheduleZone != "Australia/Brisbane" {
+		t.Errorf("scheduleZone = %q, want the withholding schedule's zone", av.scheduleZone)
+	}
+}
