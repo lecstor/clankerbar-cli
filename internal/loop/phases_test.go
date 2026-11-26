@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 
 	"strings"
@@ -452,64 +453,153 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	}
 }
 
-// Seeding made the seam's handback live for a resumed phase, which turned a
-// transient blip into a task handed back mid-sequence while the retry is given
-// the same heartbeat(runId) brief — and MaxRetries defaults to 0, "never give
-// up", so the ladder walks past the 30-minute lease and re-spawns indefinitely
-// against a run the plane has swept.
-// CLA-651: a resumed phase must not RETRY a transient failure — the backoff
-// ladder walks past the 30-minute lease nothing driver-side renews — and it
-// must not exit the DAEMON either: a single provider blip landing on the
-// review phase of every task used to take the whole fleet down, the same
-// failure CLA-631 fixed for usage limits. The sequence ends on its own, the
-// run carries on, and the claim is disposed of exactly as the usage-limit
-// arm's is: pushed work keeps its takeover hand-off, a releasable claim goes
-// back to the queue.
-func TestDrainPhases_AResumedPhaseDoesNotRetryATransientFailure(t *testing.T) {
-	t.Run("pushed work keeps its takeover hand-off", func(t *testing.T) {
-		wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
-		h := &fakeAdapter{steps: []invokeStep{
-			{res: checkpointed(1, 0)},
-			{res: held(transientResult(), wip)},
-		}}
-		d, rel := phaseDriver(t, h, twoPhases())
+// CLA-1034: a resumed phase retries a transient provider failure IN-CLAIM — the lease it already
+// holds is kept across the retry (the runner renews it again on the next attempt) instead of being
+// handed back on the first blip. Two retries, 15s then 45s, and the third attempt still succeeds.
+// CLA-651/CLA-662 still own what happens when the retries are exhausted (below).
+func TestDrainPhases_AResumedPhaseRetriesATransientFailureInClaim(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: held(transientResult(), openClaim())},
+		{res: held(transientResult(), openClaim())},
+		{res: held(okResult(1, 0), openClaim())},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+	var rungs []int
+	d.resumedTransientRetryWait = func(n int) time.Duration {
+		rungs = append(rungs, n)
+		return 0
+	}
+	// Where the one permitted end-of-sequence handback lands: after the retried attempt, never
+	// between the retries.
+	var invokesAtRelease []int
+	rel.onCall = func() { invokesAtRelease = append(invokesAtRelease, h.invokeCalls) }
 
-		_, _, stop, err := drainPhasesOnce(t, d)
-		if err != nil {
-			t.Fatalf("drainPhases: %v", err)
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("a resumed phase's in-claim retry stopped the run")
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 (implement + review and its two retries)", h.invokeCalls)
+	}
+	if len(rungs) != 2 || rungs[0] != 1 || rungs[1] != 2 {
+		t.Fatalf("in-claim retry rungs = %v, want [1 2] (15s then 45s)", rungs)
+	}
+	if len(rel.calls) != 1 {
+		t.Fatalf("handed the task back %d times, want 1 (only when the sequence ended): %+v", len(rel.calls), rel.calls)
+	}
+	if invokesAtRelease[0] != 4 {
+		t.Errorf("the handback landed after %d session(s), want 4 — the claim must stay held across the retries", invokesAtRelease[0])
+	}
+	// Every retry resumes the same run the runner holds.
+	for i := 1; i < len(h.invocations); i++ {
+		if got := h.invocations[i].ResumeClaim; got.TaskID != "t-1" || got.RunID != "r-1" {
+			t.Errorf("invocation %d ResumeClaim = %+v, want t-1/r-1 across every retry", i, got)
 		}
-		if stop {
-			t.Error("a resumed phase hit a transient failure and the run stopped; the sequence must end without the daemon exiting")
-		}
-		if h.invokeCalls != 2 {
-			t.Errorf("spawned %d sessions; a resumed phase must not be retried on a lease nothing renews", h.invokeCalls)
-		}
-		if len(rel.calls) != 0 {
-			t.Errorf("handed the task back to the queue: %+v — pushed work must keep its takeover hand-off", rel.calls)
-		}
-	})
+	}
+}
 
-	t.Run("a claim with nothing pushed is released", func(t *testing.T) {
-		h := &fakeAdapter{steps: []invokeStep{
-			{res: checkpointed(1, 0)},
-			{res: held(transientResult(), openClaim())},
-		}}
-		d, rel := phaseDriver(t, h, twoPhases())
+// CLA-1034: the two in-claim retries are the whole budget. A third transient failure hands the
+// claim back once and ends the sequence with the CLA-662 run-level backoff, so a broken provider
+// still costs no reclaim budget and the run backs off between drains.
+func TestDrainPhases_AResumedPhaseTransientRetriesExhaustThenHandBack(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		claim      harness.Claim
+		wantQueued int
+		wantEnded  int
+	}{
+		{
+			name:       "pushed work keeps its takeover hand-off",
+			claim:      harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
+			wantEnded:  1,
+			wantQueued: 0,
+		},
+		{
+			name:       "a claim with nothing pushed is released",
+			claim:      openClaim(),
+			wantQueued: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: checkpointed(1, 0)},
+				{res: held(transientResult(), tc.claim)},
+				{res: held(transientResult(), tc.claim)},
+				{res: held(transientResult(), tc.claim)},
+			}}
+			d, rel := phaseDriver(t, h, twoPhases())
+			var retryRungs, runRungs []int
+			d.resumedTransientRetryWait = func(n int) time.Duration {
+				retryRungs = append(retryRungs, n)
+				return 0
+			}
+			d.resumedTransientWait = func(n int) time.Duration {
+				runRungs = append(runRungs, n)
+				return 0
+			}
 
-		_, _, stop, err := drainPhasesOnce(t, d)
-		if err != nil {
-			t.Fatalf("drainPhases: %v", err)
+			_, _, stop, err := drainPhasesOnce(t, d)
+			if err != nil {
+				t.Fatalf("drainPhases: %v — the sequence must end without failing the run", err)
+			}
+			if stop {
+				t.Error("an exhausted in-claim retry stopped the run; the sequence must end and the run poll again")
+			}
+			if h.invokeCalls != 4 {
+				t.Fatalf("spawned %d sessions, want 4 (implement + three review attempts)", h.invokeCalls)
+			}
+			if len(retryRungs) != 2 || retryRungs[0] != 1 || retryRungs[1] != 2 {
+				t.Fatalf("in-claim retry rungs = %v, want [1 2]", retryRungs)
+			}
+			if len(rel.calls) != tc.wantQueued || len(rel.expireCalls) != tc.wantEnded {
+				t.Errorf("handback = %d queued / %d ended, want %d / %d: the third failure must hand back exactly once",
+					len(rel.calls), len(rel.expireCalls), tc.wantQueued, tc.wantEnded)
+			}
+			if len(runRungs) != 1 || runRungs[0] != 1 {
+				t.Errorf("run-level backoff rungs = %v, want [1] — the CLA-662 wait must follow the handback", runRungs)
+			}
+			if got := d.resumedTransients[resumedTransientKey{target: 0, harness: "claude"}]; got != 1 {
+				t.Errorf("resumed transient streak = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// CLA-1034: a STOP landing during the in-claim backoff abandons the retry — the claim goes back the
+// way the ordinary seam would have handed it back, and the run stops cleanly.
+func TestDrainPhases_AResumedPhaseStopDuringInClaimBackoffHandsBack(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: held(transientResult(), openClaim())},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+	d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
+	// The marker is dropped against the LIVE session, exactly as an operator's soft stop would be.
+	h.onInvoke = func(call int) {
+		if call == 1 {
+			if err := os.WriteFile(filepath.Join(d.state.Path(), "STOP"), []byte("stop after this"), 0o644); err != nil {
+				t.Errorf("planting STOP: %v", err)
+			}
 		}
-		if stop {
-			t.Error("a resumed phase hit a transient failure and the run stopped")
-		}
-		if h.invokeCalls != 2 {
-			t.Errorf("spawned %d sessions; a resumed phase must not be retried on a lease nothing renews", h.invokeCalls)
-		}
-		if len(rel.calls) != 1 {
-			t.Fatalf("handed the task back %d times, want 1: %+v — a claim with nothing pushed is releasable, exactly as on the limit arm", len(rel.calls), rel.calls)
-		}
-	})
+	}
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if !stop {
+		t.Fatal("the STOP planted during the backoff did not stop the run")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions, want 2 — the abandoned retry must not spawn", h.invokeCalls)
+	}
+	if len(rel.calls) != 1 {
+		t.Fatalf("handed the task back %d times, want 1: %+v — the abandoned retry must not leak its lease", len(rel.calls), rel.calls)
+	}
 }
 
 // The sequence-end break lands BEFORE the dead/fleet/empty arms, so a blip's
@@ -525,6 +615,8 @@ func TestDrainPhases_AResumedPhaseTransientExitDoesNotTickTheDeadCounters(t *tes
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)},
 		{res: held(blip, openClaim())},
+		{res: held(blip, openClaim())},
+		{res: held(blip, openClaim())},
 		{res: okResult(1, 0)}, // phase 3 would land here; it must not
 	}}
 	// The resumed phase is the review-only one, whose spawn reads the task's
@@ -535,6 +627,10 @@ func TestDrainPhases_AResumedPhaseTransientExitDoesNotTickTheDeadCounters(t *tes
 		return plane.TaskState{Status: "in_progress", HeldByRun: true, Outcome: "implemented: pushed clanker/x\n"}
 	}}
 	d := phaseDriverWithReleaser(t, h, three, rel)
+	// The in-claim retries and the run-level wait are real waits in production; drive both from
+	// the test seams so the three attempts run immediately.
+	d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
+	d.resumedTransientWait = func(int) time.Duration { return 0 }
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil {
@@ -543,8 +639,8 @@ func TestDrainPhases_AResumedPhaseTransientExitDoesNotTickTheDeadCounters(t *tes
 	if stop {
 		t.Error("a resumed phase hit a transient failure and the run stopped")
 	}
-	if h.invokeCalls != 2 {
-		t.Errorf("spawned %d sessions; the sequence must end at the blipped phase, not advance past it", h.invokeCalls)
+	if h.invokeCalls != 4 {
+		t.Errorf("spawned %d sessions; the sequence must end after the resumed phase's two in-claim retries, not advance past it", h.invokeCalls)
 	}
 	if got := d.fleetDead[0]; got != 0 {
 		t.Errorf("fleet dead counter = %d, want 0 — the break must land before the dead arm, or a provider blip ticks a counter that exists to catch silent deaths", got)
@@ -1118,11 +1214,16 @@ func TestRun_ResumedPhaseTransientFailureKeepsTheDaemonDraining(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)},                   // iteration 1: implement checkpoints
 		{res: held(transientResult(), openClaim())}, // iteration 1: review blips
+		{res: held(transientResult(), openClaim())}, // in-claim retry 1
+		{res: held(transientResult(), openClaim())}, // in-claim retry 2, then the sequence ends
 		{res: checkpointed(1, 0)},                   // iteration 2: implement spawns again
 		{res: okResult(1, 0)},                       // iteration 2: review runs
 	}}
 	d, rel := phaseDriver(t, h, twoPhases())
 	d.cfg.MaxIterations = 2
+	// The in-claim retries are real waits in production; drive them from the seam so the
+	// sequence reaches its end without spending the test's wall clock.
+	d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
 
 	var waitAt time.Time
 	d.resumedTransientWait = func(n int) time.Duration {
@@ -1146,10 +1247,10 @@ func TestRun_ResumedPhaseTransientFailureKeepsTheDaemonDraining(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	if h.invokeCalls != 4 {
-		t.Fatalf("spawned %d sessions, want 4 — the daemon must poll on after the blip rather than exiting with the first sequence", h.invokeCalls)
+	if h.invokeCalls != 6 {
+		t.Fatalf("spawned %d sessions, want 6 — the two in-claim retries, then the daemon must poll on after the blip rather than exiting with the first sequence", h.invokeCalls)
 	}
-	if got := h.invocations[2].Prompt; !strings.Contains(got, "PHASE 1") {
+	if got := h.invocations[4].Prompt; !strings.Contains(got, "PHASE 1") {
 		t.Errorf("the session spawned after the blip is not a fresh sequence: %q", got)
 	}
 	if h.probeCalls != 0 {
@@ -1189,16 +1290,19 @@ func TestRun_ResumedPhaseTransientBackoffGrowsAndResets(t *testing.T) {
 		{res: checkpointed(1, 0)},
 	}}
 	blip := func() invokeStep { return invokeStep{res: held(transientResult(), openClaim())} }
+	// Every blipping drain spends its two in-claim retries before the sequence ends, so each one
+	// needs three transient steps; the completing drains need one clean review step.
 	review := &fakeAdapter{steps: []invokeStep{
-		blip(),
-		blip(),
-		blip(),
-		{res: okResult(1, 0)}, // review completes: the streak resets...
-		blip(),                // ...so this blip is the first rung again
-		{res: okResult(1, 0)}, // and the run ends on a completed sequence
+		blip(), blip(), blip(), // drain 1: two in-claim retries, then the sequence ends
+		blip(), blip(), blip(), // drain 2
+		blip(), blip(), blip(), // drain 3
+		{res: okResult(1, 0)},  // drain 4: review completes, the streak resets...
+		blip(), blip(), blip(), // drain 5: ...so this blip is the first rung again
+		{res: okResult(1, 0)}, // drain 6: and the run ends on a completed sequence
 	}}
 	d := mixedDriver(t, impl, review)
 	d.cfg.MaxIterations = 6
+	d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
 
 	var rungs []int
 	type waitRec struct {
@@ -1230,8 +1334,8 @@ func TestRun_ResumedPhaseTransientBackoffGrowsAndResets(t *testing.T) {
 			t.Fatalf("waited backoff rungs %v, want %v — the ladder must grow with consecutive blips and reset when a resumed phase on the target completes", rungs, want)
 		}
 	}
-	if impl.invokeCalls != 6 || review.invokeCalls != 6 {
-		t.Fatalf("implement ran %d session(s), review %d, want 6 each — the run must keep draining while the blips persist", impl.invokeCalls, review.invokeCalls)
+	if impl.invokeCalls != 6 || review.invokeCalls != 14 {
+		t.Fatalf("implement ran %d session(s), review %d, want 6 / 14 — the run must keep draining while the blips persist", impl.invokeCalls, review.invokeCalls)
 	}
 	// The waits are real, not bookkeeping: the implement of the NEXT drain
 	// starts only after the rung's floor has elapsed (50ms a rung). A rung
@@ -1274,11 +1378,16 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: checkpointed(1, 0)},
 			{res: held(transientResult(), openClaim())},
+			{res: held(transientResult(), openClaim())},
+			{res: held(transientResult(), openClaim())},
 		}}
 		d, _ := phaseDriver(t, h, twoPhases())
 		d.cfg.MaxIterations = 10
+		// The in-claim retries are waits of their own before the sequence-end; the marker lands on
+		// the LAST attempt so the run-level wait is the one that consumes it.
+		d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
 		h.onInvoke = func(call int) {
-			if call == 1 {
+			if call == 3 {
 				writeMarker(t, d.state.Path(), "STOP", "")
 			}
 		}
@@ -1289,8 +1398,8 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		if err := d.Run(ctx); err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-		if h.invokeCalls != 2 {
-			t.Errorf("spawned %d sessions; a STOP dropped during the resumed phase must land in the wait it owes, before the next sequence", h.invokeCalls)
+		if h.invokeCalls != 4 {
+			t.Errorf("spawned %d sessions; a STOP dropped during the resumed phase's last attempt must land in the wait the sequence end owes, before the next sequence", h.invokeCalls)
 		}
 		if markerPresent(t, d.state.Path(), "STOP") {
 			t.Error("STOP must be consumed when honoured")
@@ -1304,11 +1413,14 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: checkpointed(1, 0)},
 			{res: held(transientResult(), openClaim())},
+			{res: held(transientResult(), openClaim())},
+			{res: held(transientResult(), openClaim())},
 		}}
 		d, _ := phaseDriver(t, h, twoPhases())
 		d.cfg.MaxIterations = 10
+		d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
 		h.onInvoke = func(call int) {
-			if call == 1 {
+			if call == 3 {
 				writeMarker(t, d.state.Path(), MarkerRestart, "new build installed")
 			}
 		}
@@ -1322,8 +1434,8 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		if !d.restartRequested.Load() {
 			t.Error("a RESTART dropped during the resumed-phase transient wait did not ask for the re-exec")
 		}
-		if h.invokeCalls != 2 {
-			t.Errorf("spawned %d sessions; the RESTART must stop the run at the wait", h.invokeCalls)
+		if h.invokeCalls != 4 {
+			t.Errorf("spawned %d sessions; the RESTART must stop the run at the wait the sequence end owes", h.invokeCalls)
 		}
 		if markerPresent(t, d.state.Path(), MarkerRestart) {
 			t.Error("RESTART must be consumed when honoured")
@@ -1337,11 +1449,14 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: checkpointed(1, 0)},
 			{res: held(transientResult(), openClaim())},
+			{res: held(transientResult(), openClaim())},
+			{res: held(transientResult(), openClaim())},
 			{res: checkpointed(1, 0)},
 			{res: okResult(1, 0)},
 		}}
 		d, _ := phaseDriver(t, h, twoPhases())
 		d.cfg.MaxIterations = 10
+		d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
 		reloads := 0
 		d.SetReloader(func() (*config.Config, error) {
 			reloads++
@@ -1352,7 +1467,7 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 			return &fresh, nil
 		})
 		h.onInvoke = func(call int) {
-			if call == 0 {
+			if call == 3 {
 				writeMarker(t, d.state.Path(), MarkerReload, "")
 			}
 		}
@@ -1366,8 +1481,8 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 		if reloads != 1 {
 			t.Errorf("the reloader ran %d time(s), want 1 — the wait must consume the marker and apply it", reloads)
 		}
-		if h.invokeCalls != 4 {
-			t.Errorf("spawned %d sessions, want 4 — a reload must not cut the wait's run short; it applies in place and the run keeps draining", h.invokeCalls)
+		if h.invokeCalls != 6 {
+			t.Errorf("spawned %d sessions, want 6 — a reload must not cut the wait's run short; it applies in place and the run keeps draining", h.invokeCalls)
 		}
 		if markerPresent(t, d.state.Path(), MarkerReload) {
 			t.Error("RELOAD must be consumed when honoured")

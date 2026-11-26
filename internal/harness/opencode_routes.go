@@ -184,7 +184,10 @@ func (o opencode) routeFailoverReason(res Result) string {
 	if o.ZeroUsageUnknown(res) {
 		return routeFailReasonQuiet
 	}
-	if res.ExitCode != 0 && res.ToolCalls == 0 && RecoveredErrors(res) == 0 {
+	// An adapter-caused end (our own wall-clock cap) or a signal is not a provider death: the
+	// session was stopped, and switching routes would only spend another turn on the same stop.
+	if res.ExitCode != 0 && res.ExitSignal == 0 && !o.WallClockCapped(res) &&
+		res.ToolCalls == 0 && RecoveredErrors(res) == 0 {
 		return routeFailReasonNoTool
 	}
 	return ""

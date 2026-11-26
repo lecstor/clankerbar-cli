@@ -184,10 +184,16 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	}
 	// The spawn line stamps what the session was actually spawned WITH: phase and the resolved model
 	// id inv.Model carries (ModelForPhase's output, never the tier alias).
-	if r.retries == 0 {
+	// The retry label names whichever ladder spawned this attempt: the fresh-session transient
+	// ladder (r.retries) or a resumed phase's in-claim retry.
+	retry := r.retries
+	if retry == 0 {
+		retry = r.resumedTransientRetries
+	}
+	if retry == 0 {
 		log.Printf("iteration %d %s- spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	} else {
-		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), r.retries, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
+		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), retry, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	}
 
 	at.logFile = f

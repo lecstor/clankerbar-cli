@@ -61,6 +61,9 @@ type phaseRun struct {
 	// ladder spawned is folded in here where the entry is built.
 	pass    sessionSpend
 	retries int
+	// resumedTransientRetries counts the in-claim retries this ladder has taken on a resumed
+	// phase's transient failure. Bounded by resumedTransientRetryBackoff's length.
+	resumedTransientRetries int
 }
 
 // result is the drainPhase return a verdict ends the phase with.

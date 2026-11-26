@@ -192,6 +192,42 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 	}
 }
 
+// A route abandoned for a PROVIDER death, not a usage limit, gets the shorter error cooldown —
+// ten minutes — and that mark is persisted to ROUTE_MARKS so later phases and drains skip the
+// flaky route instead of paying it again.
+func TestNoteRouteFallbacks_ProviderErrorUsesTenMinuteCooldown(t *testing.T) {
+	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	d.cfg.PollInterval = config.Duration(time.Hour)
+	logs := captureLogs(t)
+	res := harness.Result{Raw: map[string]any{
+		harness.RouteStartedKey:  routeFreeAlias,
+		harness.RouteFinishedKey: routePaidAlias,
+		harness.RouteFallbacksKey: []harness.RouteFallback{{
+			Route: routeFreeAlias, Next: routePaidAlias, Reason: "provider_error",
+		}},
+	}}
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
+
+	until, ok := d.routeMarkExpiry(routeFreeAlias)
+	if !ok {
+		t.Fatal("the provider-error failover left no mark")
+	}
+	if left := time.Until(until); left < 9*time.Minute || left > 11*time.Minute {
+		t.Errorf("mark expires in %s, want about 10 minutes — not the usage-limit probe interval", left)
+	}
+	if !strings.Contains(logs.String(), routeFreeAlias+" failed (provider_error) — resuming the session on "+routePaidAlias) {
+		t.Errorf("daemon log missing the provider-error switch line; got:\n%s", logs.String())
+	}
+
+	// Persisted: a fresh driver over the same state dir restores the mark.
+	second := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	second.state = d.state
+	second.loadRouteMarks()
+	if got, ok := second.routeMarkExpiry(routeFreeAlias); !ok || time.Until(got) < 9*time.Minute {
+		t.Errorf("the 10-minute provider-error mark did not survive a restart (mark=%v ok=%v)", got, ok)
+	}
+}
+
 // routesOf is routableRoutes without the choice: the mark tests pin the mark
 // filter, and their config carries no route schedules.
 func routesOf(d *Driver, tc *config.Config, routes []string) []string {

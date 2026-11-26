@@ -405,6 +405,26 @@ func (d *Driver) backoff(n int) time.Duration {
 	return b
 }
 
+// resumedTransientRetryBackoff is the in-claim backoff ladder for a resumed phase's transient
+// retry: short on purpose, because the claim is still held and the run-level CLA-662 backoff
+// follows if the provider keeps failing.
+var resumedTransientRetryBackoff = []time.Duration{15 * time.Second, 45 * time.Second}
+
+// inClaimTransientRetryDelay is the wait before in-claim retry n (1-based), with the test seam
+// overriding it so the ladder can be driven without sleeping.
+func (d *Driver) inClaimTransientRetryDelay(n int) time.Duration {
+	if d.resumedTransientRetryWait != nil {
+		return d.resumedTransientRetryWait(n)
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > len(resumedTransientRetryBackoff) {
+		n = len(resumedTransientRetryBackoff)
+	}
+	return resumedTransientRetryBackoff[n-1]
+}
+
 // noteResumedTransient records one more consecutive transient sequence-end on key and returns the
 // new streak — the backoff rung the run owes after the sequence's handback. The map is lazily
 // built: a run with no resumed-phase blip never allocates it.
