@@ -195,8 +195,6 @@ func (d *Driver) routeClearNowFor(tc *config.Config, routes []string) bool {
 type waitAvailability struct {
 	// open: some configured route is usable now, so the wait's next probe can lift it.
 	open bool
-	// allStopped: every configured route is Stop-blocked, so no probe can lift anything.
-	allStopped bool
 	// earliest: the soonest instant a blocked route lifts. Zero when a route is open, no route is
 	// configured, or every configured route is stopped.
 	earliest time.Time
@@ -208,17 +206,16 @@ type waitAvailability struct {
 }
 
 // waitAvailabilityAt computes the verdict for routes. holds is the per-route breakdown the beacon
-// carries (every route held now, and why).
+// carries (every route held now, and why). A Stop-blocked route has no clear instant, so it neither
+// lifts the verdict nor pulls a wake earlier.
 func (d *Driver) waitAvailabilityAt(tc *config.Config, now time.Time, routes []string) waitAvailability {
 	av := waitAvailability{holds: d.routeHoldsAt(tc, now, routes)}
 	if len(routes) == 0 {
 		return av
 	}
-	stopped := 0
 	for _, route := range routes {
 		at, window, ok := d.routeClearAt(tc, now, route)
 		if !ok {
-			stopped++
 			continue
 		}
 		if !at.After(now) {
@@ -236,7 +233,6 @@ func (d *Driver) waitAvailabilityAt(tc *config.Config, now time.Time, routes []s
 			}
 		}
 	}
-	av.allStopped = stopped == len(routes)
 	if !av.scheduleAt.IsZero() {
 		av.scheduleZone = d.routeWindowZoneAt(tc, now, routes, av.scheduleAt)
 	}

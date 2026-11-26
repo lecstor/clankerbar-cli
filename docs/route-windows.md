@@ -57,7 +57,7 @@ order wins.
 | every phase (first, next, handoff respawn, retry) | `invocationFor` -> `routeRoutesFor` |
 | a sequential review-panel member | the same, since each member is a `drainPhase` pass |
 | a parallel review-panel fan-out | `holdThroughPanelRouteWindows`: the whole panel is held over EVERY member's route list, not only the first member's |
-| the supervised-wait probe | `probeInvocation` aims at the route the next spawn would use, and refuses the probe when every route is windowed |
+| the supervised-wait probe | `probeInvocation` aims at the route the next spawn would use, refuses the probe when every route is windowed, and refuses it (writing `LIMIT_STOP` and ending the wait) when every route is Stop-blocked |
 | the supervisor's conflict-only session | `startConflictSession` -> `config.RouteChoiceAt` |
 | the deterministic close-out | not applicable: it runs no agent session |
 

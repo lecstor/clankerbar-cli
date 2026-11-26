@@ -191,10 +191,14 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 // not the one it started on.
 func (r *phaseRun) waitThroughRouteStop(at *phaseAttempt, lim harness.Limit) bool {
 	d := r.d
-	tc := r.tc
 	ph := r.ph
 	stoppedRoute := limitStopRoute(at.res, at.inv.Model)
-	routes, _ := tc.ModelRoutesForPhase(ph)
+	// The routes the phase's session was offered (escalation applied) are the set the wait will use;
+	// the configured list is the fallback for a fixture or a shape that reports none.
+	routes := at.routes
+	if len(routes) == 0 {
+		routes, _ = r.tc.ModelRoutesForPhase(ph)
+	}
 	if len(routes) < 2 || stoppedRoute == "" {
 		return false
 	}
