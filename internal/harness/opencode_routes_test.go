@@ -222,6 +222,84 @@ func TestOpencodeInvokeSwitchesRouteOnATransientProviderError(t *testing.T) {
 	}
 }
 
+// A session offered ONE route has no failover to take, however it died: a transient end runs once,
+// reports no fallback, and leaves the driver's own retry to own it.
+func TestOpencodeInvokeOneRouteTransientDoesNotSwitch(t *testing.T) {
+	script, logPath := routeStubScript(t,
+		`{"type":"error","sessionID":"ses_live","error":{"data":{"statusCode":503},"message":"Service Unavailable"}}`)
+	opencodeStub(t, script)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 1 {
+		t.Fatalf("the stub ran %d times, want 1 (a one-route list has no failover):\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if !(opencode{}).IsTransient(res) {
+		t.Error("the one-route transient end was not classified transient; the test no longer exercises the guard")
+	}
+	if started, finished, fallbacks := RouteFallbacks(res); started != "" || finished != "" || len(fallbacks) != 0 {
+		t.Errorf("a one-route transient reported a route fallback: %q -> %q %+v", started, finished, fallbacks)
+	}
+}
+
+// A usage limit that ends the session on a route the PROVIDER walk reached is reported exactly as
+// the limit walk reports one: otherwise only the route the session moved off would be marked, and
+// the next phase would walk straight back into the limited one.
+func TestOpencodeInvokeReportsALimitOnAProviderFailoverRoute(t *testing.T) {
+	const reset = "2030-02-03T04:05:06Z"
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+logPath+`"
+case "$*" in
+  *"-s ses_live"*)
+    echo '{"type":"error","sessionID":"ses_live","error":{"type":"provider.quota","message":"Usage limit reached. Resets at `+reset+`"}}'
+    exit 1
+    ;;
+  *)
+    echo '{"type":"step_finish","sessionID":"ses_live","part":{"type":"step-finish","reason":"stop","tokens":{"total":120,"input":100,"output":20,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    echo '{"type":"error","sessionID":"ses_live","error":{"data":{"statusCode":503},"message":"Service Unavailable"}}'
+    exit 1
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree, routePaid},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 2 || !strings.Contains(calls[1], "--model "+routePaid) {
+		t.Fatalf("want the session resumed on the next route; the stub ran:\n%s", strings.Join(calls, "\n"))
+	}
+	_, finished, fallbacks := RouteFallbacks(res)
+	if finished != routePaid {
+		t.Errorf("finished = %q, want %q (the route that ended the session)", finished, routePaid)
+	}
+	if len(fallbacks) != 2 {
+		t.Fatalf("fallbacks = %+v, want the provider failover and the ending route's limit", fallbacks)
+	}
+	if fb := fallbacks[0]; fb.Route != routeFree || fb.Next != routePaid || fb.Reason != routeFailReasonProvider {
+		t.Errorf("fallbacks[0] = %+v, want free -> paid (provider_error)", fb)
+	}
+	fb := fallbacks[1]
+	if fb.Route != routePaid || fb.Next != "" || fb.Reason != "usage_limit" {
+		t.Fatalf("fallbacks[1] = %+v, want the ending paid route's usage_limit", fb)
+	}
+	if got := fb.ResetAt.UTC().Format("2006-01-02T15:04:05Z"); got != reset {
+		t.Errorf("ResetAt = %s, want the last route's stated reset %s", got, reset)
+	}
+}
+
 // A quiet death the resurrection loop could not recover is a dead provider route, not a dead
 // session: the next route resumes the same session with the provider-error continuation.
 func TestOpencodeInvokeFailsOverAfterAFailedResurrection(t *testing.T) {

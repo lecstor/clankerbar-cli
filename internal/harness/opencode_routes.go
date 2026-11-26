@@ -161,6 +161,11 @@ func (o opencode) switchRoutesOnProviderError(ctx context.Context, in Invocation
 	// driver marks it rather than sending the next phase straight back into it.
 	if reason := o.routeFailoverReason(*res); reason != "" {
 		fallbacks = append(fallbacks, RouteFallback{Route: current, Reason: reason})
+	} else if lim := o.DetectLimit(*res); lim.Limited && res.Untrusted == "" && len(fallbacks) > 0 {
+		// A walk that MOVED can also end on a usage limit: report the ending route exactly as the
+		// limit walk does, or only the route it moved off would be marked. Guarded on the walk having
+		// switched, because an unchanged route's limit already went to switchRoutesOnLimit.
+		fallbacks = append(fallbacks, RouteFallback{Route: current, Reason: lim.Reason, ResetAt: lim.ResetAt})
 	}
 	setRouteReport(res, started, current, fallbacks)
 	return nil
@@ -184,9 +189,11 @@ func (o opencode) routeFailoverReason(res Result) string {
 	if o.ZeroUsageUnknown(res) {
 		return routeFailReasonQuiet
 	}
-	// An adapter-caused end (our own wall-clock cap) or a signal is not a provider death: the
-	// session was stopped, and switching routes would only spend another turn on the same stop.
-	if res.ExitCode != 0 && res.ExitSignal == 0 && !o.WallClockCapped(res) &&
+	// An adapter-caused end (our own wall-clock cap), a signal, or opencode's own exit-130
+	// interrupt shape is not a provider death: the session was stopped, and switching routes would
+	// only spend another turn on the same stop. The interrupt already has its one dedicated resume;
+	// a second one that failed says nothing about the route.
+	if res.ExitCode != 0 && res.ExitCode != opencodeInterruptExit && res.ExitSignal == 0 && !o.WallClockCapped(res) &&
 		res.ToolCalls == 0 && RecoveredErrors(res) == 0 {
 		return routeFailReasonNoTool
 	}

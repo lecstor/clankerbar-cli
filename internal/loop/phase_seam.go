@@ -211,7 +211,8 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	resumeOnly := at.res.ReportResumeFailed != "" && at.res.Claim.Held()
 	// A resumed phase's transient failure is retried IN-CLAIM by handleTransient, so the claim stays
 	// held here: the retry continues the same run, and handing it back first would spend the takeover
-	// the retry exists to avoid. Exhaustion and cancellation hand back in handleTransient instead.
+	// the retry exists to avoid. Exhaustion takes this function's ordinary handback below; only
+	// cancellation during the backoff hands back in handleTransient.
 	retryInClaim := r.resumedTransientRetry(at) && r.resumedTransientRetries < len(resumedTransientRetryBackoff)
 	// CLA-703: a retrying no-MCP attempt is not an ending — keep the claim (the retry resumes the
 	// same run) and book nothing yet.

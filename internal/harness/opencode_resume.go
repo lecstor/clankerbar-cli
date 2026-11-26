@@ -109,8 +109,10 @@ func mergeResume(base *Result, add Result) {
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
 	base.ClankerbarCalls += add.ClankerbarCalls
-	// Tool calls are a per-attempt measure of work done, so they sum like spend: a continuation's
-	// calls are the same session's calls even though only the continuation's stream carried them.
+	// Tool calls are a per-invocation measure of work done across attempts, so they sum like spend:
+	// a resumed continuation's calls are the same session's, and a FRESH-start route fallback's
+	// completed calls count toward this invocation too, even though only that attempt's stream
+	// carried them.
 	base.ToolCalls += add.ToolCalls
 	base.Usage.Add(add.Usage)
 	base.UsageReported = base.UsageReported || add.UsageReported

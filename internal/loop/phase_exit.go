@@ -331,6 +331,9 @@ func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemp
 					drainNum, at.res.ExitString(), wait, r.resumedTransientRetries, len(resumedTransientRetryBackoff), at.logPath)
 				if d.waitOrStop(ctx, wait) {
 					// The retry is abandoned before it ran: hand back exactly as the seam would have.
+					// The sequence-end signal rides along even though the stopping run judges it inert,
+					// so every abandoned in-claim retry keeps the contract the docs state.
+					r.end.sequenceEnd = &phaseSequenceEnd{}
 					r.handBackResumedClaim(ctx, at)
 					return attemptVerdict{next: attemptReturn, stop: true}
 				}

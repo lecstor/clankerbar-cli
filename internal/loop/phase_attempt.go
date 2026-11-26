@@ -143,8 +143,15 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	tag := r.tag
 	ph := r.ph
 	a := r.a
+	// The retry label names whichever ladder spawned this attempt: the fresh-session transient
+	// ladder (r.retries) or a resumed phase's in-claim retry. It labels the FILE as well as the spawn
+	// line, so a post-mortem can find the attempt the line named.
+	retry := r.retries
+	if retry == 0 {
+		retry = r.resumedTransientRetries
+	}
 	logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
-		time.Now().Format("20060102-150405"), drainNum, tag, r.retries, randomTail())
+		time.Now().Format("20060102-150405"), drainNum, tag, retry, randomTail())
 	f, ferr := d.state.Create(logName)
 	at.logPath = filepath.Join(d.state.Path(), logName)
 	// The console is where the adapter streams the session: the file, and NOT the terminal unless the
@@ -184,12 +191,6 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	}
 	// The spawn line stamps what the session was actually spawned WITH: phase and the resolved model
 	// id inv.Model carries (ModelForPhase's output, never the tier alias).
-	// The retry label names whichever ladder spawned this attempt: the fresh-session transient
-	// ladder (r.retries) or a resumed phase's in-claim retry.
-	retry := r.retries
-	if retry == 0 {
-		retry = r.resumedTransientRetries
-	}
 	if retry == 0 {
 		log.Printf("iteration %d %s- spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	} else {
