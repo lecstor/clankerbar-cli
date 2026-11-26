@@ -117,9 +117,10 @@ type phaseSequenceEnd struct {
 }
 
 type phaseLimitWait struct {
-	lim harness.Limit   // the rolling limit, for the reset and its reason
-	ph  config.Phase    // the phase whose harness was turned away
-	a   harness.Adapter // that harness, so the probes run on the account that is limited
+	lim    harness.Limit   // the rolling limit, for the reset and its reason
+	ph     config.Phase    // the phase whose harness was turned away
+	a      harness.Adapter // that harness, so the probes run on the account that is limited
+	routes []string        // the resolved phase's configured routes, for the hold breakdown
 }
 
 func deadPhase(res harness.Result) bool {

@@ -266,12 +266,17 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 // The wait blocks the whole loop, so no other project's queue is being serviced either —
 // beaconing only the target whose harness hit the limit would leave the other projects' presence
 // rows silent, and each of those reads as a dead instance for exactly the reason this state exists
-// to correct. routes is the per-route hold breakdown of the phase being waited out (CLA-1026), so
-// the console can tell a usage limit from a pricing window instead of collapsing both to one word.
-func (d *Driver) beaconLimited(resetAt time.Time, routes []fleet.RouteHold) {
-	st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt, Routes: routes}
-	d.writeLocalBeacon(st)
+// to correct. routes is the per-route hold breakdown of the phase being waited out (CLA-1026), and
+// it rides only the WAITING target's row: the sibling projects are paused by the same wait, but the
+// route names and schedules belong to the waiting project's config, and another project's row must
+// not show routes it never configured (review 1.review-1.4).
+func (d *Driver) beaconLimited(ti int, resetAt time.Time, routes []fleet.RouteHold) {
+	d.writeLocalBeacon(fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt, Routes: routes})
 	for i := range d.targets {
+		st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
+		if i == ti {
+			st.Routes = routes
+		}
 		d.sendBeacon(i, d.targets[i], st)
 	}
 }

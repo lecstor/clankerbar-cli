@@ -52,7 +52,9 @@ func (p *Planner) turn(ctx context.Context, i int, t Target, pending *backlog.Pe
 	p.mu.Unlock()
 	// TaskRef is deliberately empty: the console renders it as a task ref, and a
 	// conversation UUID is not one. The conversation id is in the local turn log.
-	p.sendBeacon(i, t, fleet.State{Kind: fleet.StateIteration, N: n, Phase: "planner"})
+	// Model is the role's resolved model — the same one the session's invocation is
+	// built with (CLA-1026), so a planner mid-turn shows its live route like a loop card.
+	p.sendBeacon(i, t, fleet.State{Kind: fleet.StateIteration, N: n, Phase: "planner", Model: role.session.Model})
 
 	// The wall clock bounds the WHOLE turn from the claim, not just the harness
 	// invocation: resolve, the claim and the history pages spend the same budget,
@@ -66,8 +68,10 @@ func (p *Planner) turn(ctx context.Context, i int, t Target, pending *backlog.Pe
 	}
 
 	// A turn can run for the whole wall-clock bound, which is the plane's stale
-	// window; refresh this instance's presence (all targets) while it runs.
-	stopPresence := p.startPresence(i, n)
+	// window; refresh this instance's presence (all targets) while it runs. The
+	// running target's row carries the role's resolved model, like the turn's first
+	// beacon (CLA-1026).
+	stopPresence := p.startPresence(i, n, role.session.Model)
 	start := p.now()
 	res, mode, err := p.runSession(turnCtx, t, role, claim)
 	stopPresence()

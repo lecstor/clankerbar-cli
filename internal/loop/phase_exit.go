@@ -137,7 +137,7 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		if panelOptional {
 			log.Printf("%siteration %d: the OPTIONAL %s seat hit a usage limit (%s) — recording it against that seat and carrying on rather than waiting out a reset on a trial reviewer (log: %s)",
 				labelOf(t), drainNum, ph.Label(phaseIdx), limitReason(lim), at.logPath)
-			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a, routes: at.routes}}
 			return attemptVerdict{next: attemptReturn}
 		}
 		// A RESUMED phase must not wait one out. The seam's handback has already ended the claim:
@@ -156,7 +156,7 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 			log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting (log: %s)",
 				drainNum, at.logPath)
 			// releaseCarriedEnd rebuilds the end, so the sequence signal goes back on afterwards.
-			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a, routes: at.routes}}
 			return attemptVerdict{next: attemptReturn}
 		}
 		// Whatever this attempt held open is not held open any more: every path below either waits or
@@ -172,7 +172,7 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		// The wait's own probe spend lands in the SAME account as the sessions' (charge, inside the
 		// wait), so it reaches the breaker at the top of this loop, the between-iterations sweep, and the
 		// iteration's cost line — rather than a separate figure nothing is measured against.
-		ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, t, spend{
+		ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, at.routes, t, spend{
 			start: prior.start,
 			ti:    r.ti,
 		})

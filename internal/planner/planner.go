@@ -437,7 +437,7 @@ func (p *Planner) resolve(ctx context.Context, i int, t Target) *projectRole {
 // loop serves one turn at a time and the others would otherwise go stale behind
 // a long turn on one project. The returned func stops the timer and waits for
 // it, so the turn's final idle beacon cannot be overtaken by a late iteration.
-func (p *Planner) startPresence(i, n int) func() {
+func (p *Planner) startPresence(i, n int, model string) func() {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -453,7 +453,7 @@ func (p *Planner) startPresence(i, n int) func() {
 				for j := range p.targets {
 					st := fleet.State{Kind: fleet.StateIdle}
 					if j == i {
-						st = fleet.State{Kind: fleet.StateIteration, N: n, Phase: "planner"}
+						st = fleet.State{Kind: fleet.StateIteration, N: n, Phase: "planner", Model: model}
 					}
 					p.sendBeacon(j, p.targets[j], st)
 				}

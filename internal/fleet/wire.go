@@ -83,9 +83,12 @@ func wireModel(st State) string {
 // wireRoutes renders a paused state's per-route hold list, or nil — which
 // `omitempty` drops — on any other kind or when nothing is held. The plane reads
 // `routes` only on `limited` and `draining`, so a list left on another state is
-// dropped here for the same reason as resetAt. The FIRST maxRouteHolds entries
-// in configured order are kept: the plane refuses the whole report beyond its
-// cap, and the first routes are the ones the phase will try first.
+// dropped here for the same reason as resetAt. Entries the plane would refuse are
+// dropped FIRST and the survivors clamped to the plane's cap: clamping first would
+// let an unrepresentable early entry cost a valid later one its slot (review
+// 1.review-1.9). The FIRST maxRouteHolds survivors in configured order are kept —
+// the plane refuses the whole report beyond its cap, and the first routes are the
+// ones the phase will try first.
 func wireRoutes(st State) []wireRouteHold {
 	if st.Kind != StateLimited && st.Kind != StateDraining {
 		return nil
@@ -93,14 +96,8 @@ func wireRoutes(st State) []wireRouteHold {
 	if len(st.Routes) == 0 {
 		return nil
 	}
-	routes := st.Routes
-	if len(routes) > maxRouteHolds {
-		log.Printf("fleet: %d route holds exceed the plane's cap of %d — reporting the first %d in configured order and dropping %d, or the plane would refuse the whole report",
-			len(routes), maxRouteHolds, maxRouteHolds, len(routes)-maxRouteHolds)
-		routes = routes[:maxRouteHolds]
-	}
-	out := make([]wireRouteHold, 0, len(routes))
-	for _, h := range routes {
+	out := make([]wireRouteHold, 0, min(len(st.Routes), maxRouteHolds))
+	for _, h := range st.Routes {
 		route := strings.TrimSpace(h.Route)
 		if route == "" || len(route) > maxRouteName {
 			log.Printf("fleet: dropping a route hold: route %q is empty or over the plane's %d-character bound", h.Route, maxRouteName)
@@ -125,6 +122,11 @@ func wireRoutes(st State) []wireRouteHold {
 			w.Until = h.Until.UTC().Format(time.RFC3339)
 		}
 		out = append(out, w)
+	}
+	if len(out) > maxRouteHolds {
+		log.Printf("fleet: %d route holds exceed the plane's cap of %d — reporting the first %d in configured order and dropping %d, or the plane would refuse the whole report",
+			len(out), maxRouteHolds, maxRouteHolds, len(out)-maxRouteHolds)
+		out = out[:maxRouteHolds]
 	}
 	if len(out) == 0 {
 		return nil

@@ -1595,6 +1595,43 @@ func TestMarshalReport_RouteHoldsAreBounded(t *testing.T) {
 	}
 }
 
+// An unrepresentable entry must not cost a valid one a cap slot: the plane's cap is applied
+// to the entries that will actually be sent, not to the raw list (review 1.review-1.9).
+func TestMarshalReport_InvalidEntriesDoNotConsumeCapSlots(t *testing.T) {
+	buf := captureLog(t)
+	holds := make([]RouteHold, 0, maxRouteHolds+1)
+	holds = append(holds, RouteHold{Route: "", Reason: RouteHoldUsageLimit}) // unrepresentable
+	for i := 0; i < maxRouteHolds; i++ {
+		holds = append(holds, RouteHold{Route: fmt.Sprintf("route/%02d", i), Reason: RouteHoldUsageLimit})
+	}
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateLimited, Routes: holds},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		State struct {
+			Routes []struct {
+				Route string `json:"route"`
+			} `json:"routes"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if len(got.State.Routes) != maxRouteHolds {
+		t.Fatalf("state.routes carried %d entries, want every valid one up to the cap %d — the dropped invalid entry must not take a slot", len(got.State.Routes), maxRouteHolds)
+	}
+	if last := got.State.Routes[len(got.State.Routes)-1].Route; last != fmt.Sprintf("route/%02d", maxRouteHolds-1) {
+		t.Errorf("last reported route = %q, want route/%02d — the invalid first entry pushed a valid last one out", last, maxRouteHolds-1)
+	}
+	if strings.Contains(buf.String(), "exceed the plane's cap") {
+		t.Errorf("the valid list was within the cap yet the clamp logged:\n%s", buf.String())
+	}
+}
+
 // Entries the plane cannot represent would 400 the whole batch, so they are
 // dropped here with a line: an unknown reason, a blank route, an over-long
 // route. The valid entries beside them still go out.

@@ -281,7 +281,7 @@ func (s *drainSeq) payOwedWaits(ctx context.Context) {
 		} else {
 			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
 				drainNum, resetSuffix(s.limitWait.lim.ResetAt))
-			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, t, spend{
+			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, s.limitWait.routes, t, spend{
 				start: prior.start,
 				ti:    s.ti,
 			})

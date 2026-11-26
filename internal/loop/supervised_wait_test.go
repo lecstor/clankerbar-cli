@@ -66,7 +66,7 @@ func TestSupervisedWait_FirstProbeLandsShortlyAfterTheStatedReset(t *testing.T) 
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: start.Add(120 * time.Millisecond)},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	elapsed := time.Since(start)
 
 	if stop {
@@ -103,7 +103,7 @@ func TestSupervisedWait_ZeroResetKeepsBlindIntervalPolling(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	elapsed := time.Since(start)
 
 	if stop {
@@ -149,7 +149,7 @@ func TestSupervisedWait_ResetPassingMidWaitFallsBackToPollingNotResuming(t *test
 	start := time.Now()
 	tokens, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: start.Add(130 * time.Millisecond)},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 
 	if stop {
 		t.Fatalf("a failed reset claim falls back to polling; it must not stop the run\n%s", logs.String())
@@ -206,7 +206,7 @@ func TestSupervisedWait_StopMarkerEndsTheWaitPromptlyWhateverTheReset(t *testing
 			defer cancel()
 			_, _, stop := d.supervisedWait(ctx,
 				harness.Limit{Limited: true, ResetAt: start.Add(tc.resetIn)},
-				h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+				h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 			elapsed := time.Since(start)
 
 			if !stop {
@@ -252,7 +252,7 @@ func TestSupervisedWait_BeaconsLimitedOnEntryWithTheStatedReset(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: reset},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	if stop {
 		t.Fatalf("the probe lifted the limit; the wait should resume, not stop")
 	}
@@ -310,7 +310,7 @@ func TestSupervisedWait_KeepsBeaconingWhileTheLimitHolds(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: reset},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	if stop {
 		t.Fatal("an unknown-or-distant reset must never stop the wait")
 	}
@@ -354,7 +354,7 @@ func TestSupervisedWait_BeaconWakesDoNotChangeTheProbeCount(t *testing.T) {
 		start := time.Now()
 		_, _, stop := d.supervisedWait(context.Background(),
 			harness.Limit{Limited: true},
-			h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+			h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 		if stop {
 			t.Fatal("the script ends with a lift; the wait must not stop")
 		}
@@ -436,7 +436,7 @@ func TestSupervisedWait_SlowProbeStillWaitsThePollIntervalBeforeTheNext(t *testi
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	if stop {
 		t.Fatalf("the script ends with a lift; the wait must not stop\n%s", logs.String())
 	}
@@ -502,7 +502,7 @@ func TestSupervisedWait_BeaconsWhileTheProbeIsInFlight(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: reset},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	if stop {
 		t.Fatalf("the probe lifted the limit; the wait should resume, not stop\n%s", logs.String())
 	}
@@ -550,7 +550,7 @@ func TestSupervisedWait_ReBeaconsDropAResetTheWaitMeasuredFalse(t *testing.T) {
 	start := time.Now()
 	_, _, stop := d.supervisedWait(context.Background(),
 		harness.Limit{Limited: true, ResetAt: reset},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	if stop {
 		t.Fatalf("a failed reset claim falls back to polling; it must not stop the run\n%s", logs.String())
 	}
@@ -597,7 +597,7 @@ func TestSupervisedWait_HaltEndsTheWaitPromptly(t *testing.T) {
 	logs := captureLogs(t)
 	_, _, stop := d.supervisedWait(ctx,
 		harness.Limit{Limited: true, ResetAt: start.Add(8 * time.Second)},
-		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+		h, d.cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: start})
 	elapsed := time.Since(start)
 
 	if !stop {
@@ -639,13 +639,17 @@ func TestSupervisedWait_LimitedBeaconCarriesThePerRouteHolds(t *testing.T) {
 	d.now = func() time.Time { return at }
 	d.limitBeaconInterval = time.Hour
 	reset := time.Now().Add(time.Hour)
+	// The mark's instant comes from the driver's own clock, not the wall clock: the fixture
+	// must hold whatever date the host is on (review 1.review-1.10).
+	markUntil := at.Add(time.Hour)
 	// routeZen is both marked and inside the window: the mark is the cause that reaches its end
 	// first and is the one the plane presents first, so it must not be reported as the window.
-	d.markRouteLimited(routeZen, reset)
+	d.markRouteLimited(routeZen, markUntil)
 
 	ph := cfg.Phases[0]
+	routes, _ := cfg.ModelRoutesForPhase(ph)
 	_, _, stop := d.supervisedWait(context.Background(),
-		harness.Limit{Limited: true, ResetAt: reset}, h, ph, d.targets[0], spend{start: time.Now()})
+		harness.Limit{Limited: true, ResetAt: reset}, h, ph, routes, d.targets[0], spend{start: time.Now()})
 	if stop {
 		t.Fatal("the open route's probe lifts the limit; the wait should resume, not stop")
 	}
@@ -664,8 +668,8 @@ func TestSupervisedWait_LimitedBeaconCarriesThePerRouteHolds(t *testing.T) {
 	if holds[0].Route != routeZen || holds[0].Reason != fleet.RouteHoldUsageLimit {
 		t.Errorf("first hold = %+v, want %q usage_limit — a mark outranks the same route's window", holds[0], routeZen)
 	}
-	if !holds[0].Until.Equal(reset) {
-		t.Errorf("usage-limit until = %s, want the mark's expiry %s", holds[0].Until, reset)
+	if !holds[0].Until.Equal(markUntil) {
+		t.Errorf("usage-limit until = %s, want the mark's expiry %s", holds[0].Until, markUntil)
 	}
 	if holds[1].Route != routeGo || holds[1].Reason != fleet.RouteHoldWindow {
 		t.Errorf("second hold = %+v, want %q window", holds[1], routeGo)
@@ -676,4 +680,155 @@ func TestSupervisedWait_LimitedBeaconCarriesThePerRouteHolds(t *testing.T) {
 	if want := brisbaneAt(t, 9, 14, 0); !holds[1].Until.Equal(want) {
 		t.Errorf("window hold until = %s, want the window's end %s", holds[1].Until, want)
 	}
+}
+
+// review 1.review-1.8: the re-beacon ticker exists so a hold that appears AFTER the entry beacon
+// still reaches the plane — a route can be marked by the wait's own probe, or a sibling phase's
+// limit can mark one while this wait holds. A later limited beacon must carry it.
+func TestSupervisedWait_ReBeaconsPickUpNewRouteHolds(t *testing.T) {
+	const (
+		beaconEvery = 2 * time.Millisecond
+		probeEvery  = 10 * time.Millisecond
+	)
+	at := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC) // outside any window: only the mark matters
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement", Model: config.ModelRoutes{routeZen, routeGo}, Prompt: "Work."}}
+	cfg.Prompt = ""
+	cfg.PollInterval = config.Duration(probeEvery)
+	// Every probe answers limited, so the wait keeps probing (and re-beaconing) until the context.
+	h := &fakeAdapter{probeLimitFor: func(int, string) harness.Limit { return harness.Limit{Limited: true} }}
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Fleet: ff}})
+	openTestStateDir(t, d)
+	d.now = func() time.Time { return at }
+	d.limitBeaconInterval = beaconEvery
+	// The first probe marks the route it probed: before it, nothing was held.
+	h.onProbe = func(call int) {
+		if call == 0 {
+			d.markRouteLimited(routeZen, at.Add(time.Hour))
+		}
+	}
+
+	routes, _ := cfg.ModelRoutesForPhase(cfg.Phases[0])
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, cfg.Phases[0], routes, d.targets[0], spend{start: time.Now()})
+	if !stop {
+		t.Fatal("the context bounded the wait; it should report stop")
+	}
+
+	sent, _ := ff.reports()
+	if len(sent) < 2 {
+		t.Fatalf("got %d limited beacon(s), want the entry one plus a re-beacon", len(sent))
+	}
+	if len(sent[0].State.Routes) != 0 {
+		t.Fatalf("entry beacon carried routes %+v before any route was held", sent[0].State.Routes)
+	}
+	for _, r := range sent[1:] {
+		if r.State.Kind != fleet.StateLimited {
+			continue
+		}
+		for _, hold := range r.State.Routes {
+			if hold.Route == routeZen && hold.Reason == fleet.RouteHoldUsageLimit {
+				return // the re-beacon picked up the mark set after the entry beacon
+			}
+		}
+	}
+	t.Errorf("no re-beacon carried the %q hold set after the entry beacon; states were %+v", routeZen, sent)
+}
+
+// review 1.review-1.3: a review phase a CLA-379 rule moved to another model RUNS on the rule's
+// route, so a limit beacon about it must describe that route — not the pinned one the phase
+// config names. The old collection resolved the phase as configured and named a route the
+// session never ran on.
+func TestSupervisedWait_HoldsDescribeTheEscalatedRouteTheSessionRan(t *testing.T) {
+	const (
+		pinnedRoute = "pinned/review-model"
+		strongRoute = "opencode-go/glm-5.3-flash"
+	)
+	at := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC) // outside any window: only the marks matter
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName, Model: config.ModelRoutes{pinnedRoute}},
+	}
+	cfg.Prompt = ""
+	cfg.Models = map[string]string{"strong": strongRoute}
+	cfg.Escalation = config.Escalation{CategoryRules: map[string]string{"bug": "strong"}}
+	bugCheckpoint := reported(held(okResult(1, 0), harness.Claim{TaskID: "t-1", RunID: "r-1", Category: "bug"}), branchReport())
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: bugCheckpoint}, // implement
+		{res: limitResult()}, // review: the rolling limit lands before it records
+	}}
+	d, _ := phaseDriver(t, h, cfg.Phases)
+	d.cfg.Models = cfg.Models
+	d.cfg.Escalation = cfg.Escalation
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+	d.now = func() time.Time { return at }
+	// Both routes are marked: the beacon must name only the one the escalated session ran on.
+	d.markRouteLimited(pinnedRoute, at.Add(time.Hour))
+	d.markRouteLimited(strongRoute, at.Add(2*time.Hour))
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(h.invocations) != 2 {
+		t.Fatalf("spawned %d sessions, want implement then review", len(h.invocations))
+	}
+	if got := h.invocations[1].Model; got != strongRoute {
+		t.Fatalf("the review ran on %q, want the escalated %q", got, strongRoute)
+	}
+
+	sent, _ := ff.reports()
+	for _, r := range sent {
+		if r.State.Kind != fleet.StateLimited {
+			continue
+		}
+		if len(r.State.Routes) != 1 || r.State.Routes[0].Route != strongRoute || r.State.Routes[0].Reason != fleet.RouteHoldUsageLimit {
+			t.Fatalf("limited beacon holds = %+v, want only %q usage_limit — the route the escalated session actually ran", r.State.Routes, strongRoute)
+		}
+		return
+	}
+	t.Fatal("the limit wait sent no limited beacon")
+}
+
+// The beacon's breakdown covers EVERY configured route, including one a usage mark already took
+// out of the adapter's fallback chain — the whole point is to show why each subscription is not
+// being used, and a marked route is the first thing the operator looks for.
+func TestDrainPhase_LimitBeaconNamesARouteAMarkAlreadyDropped(t *testing.T) {
+	at := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC) // outside any window: only the mark matters
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement", Model: config.ModelRoutes{routeZen, routeGo, routeSynthetic}, Prompt: "Work."}}
+	cfg.Prompt = ""
+	h := &fakeAdapter{steps: []invokeStep{{res: limitResult()}, {res: checkpointed(5, 0.05)}}}
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.now = func() time.Time { return at }
+	d.markRouteLimited(routeZen, at.Add(time.Hour))
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(h.invocations) == 0 {
+		t.Fatal("no session spawned")
+	}
+	if got := h.invocations[0].Routes; len(got) != 2 || got[0] != routeGo || got[1] != routeSynthetic {
+		t.Fatalf("the spawn was offered routes %v, want the unmarked two — the mark must be off the fallback chain", got)
+	}
+
+	sent, _ := ff.reports()
+	for _, r := range sent {
+		if r.State.Kind != fleet.StateLimited {
+			continue
+		}
+		if len(r.State.Routes) != 1 || r.State.Routes[0].Route != routeZen || r.State.Routes[0].Reason != fleet.RouteHoldUsageLimit {
+			t.Fatalf("limited beacon holds = %+v, want the marked %q — a route the spawn could not offer still has to be named", r.State.Routes, routeZen)
+		}
+		return
+	}
+	t.Fatal("the limit wait sent no limited beacon")
 }

@@ -62,7 +62,14 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	prBase := r.prBase
 	fixGrading := r.fixGrading
 	verifyDigest := r.verifyDigest
-	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
+	inv, resolved, ierr := d.invocationForPhase(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
+	at.inv, at.ierr = inv, ierr
+	if ierr == nil {
+		// The resolved phase's CONFIGURED routes (escalation applied, marks and windows not): the
+		// limit beacon's hold breakdown names every route the phase offers, including the ones a mark
+		// already dropped from the adapter's fallback chain (CLA-1026, review 1.review-1.3).
+		at.routes, _ = d.targetCfg(t).ModelRoutesForPhase(resolved)
+	}
 	if at.ierr != nil {
 		// CLA-947: every route is inside a pricing window. windowHeld marks it as a scheduling condition
 		// rather than a failed phase (review 1.review-1.6): the claim goes back through the ordinary
@@ -195,6 +202,11 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	drainNum := r.drainNum
 	opts := r.opts
 	a := r.a
+	// CLA-1026: the boundary beacon announced the route the phase would START on, but this
+	// attempt re-resolved its invocation — a retry after a supervised wait drops a route the
+	// wait marked, and an escalated review spawn runs the rule's tier. Report what actually
+	// starts, or the card names a route the session never runs on for its whole duration.
+	d.noteIterationModel(ti, t, at.inv.Model)
 	// CLA-358: while THIS child runs, renew whatever task-lease it holds.
 	sctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)

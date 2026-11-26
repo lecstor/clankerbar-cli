@@ -1852,15 +1852,26 @@ because the pause is the one time that poll and session cadences both stop:
   document when one is ratified, else the local file), so a ratified document
   that changes what the project runs on moves it — and
   the state — `idle`,
-  `iteration` {n, taskRef, phase} while a session runs, `waiting` {taskRef} while
+  `iteration` {n, taskRef, phase, model} while a session runs — `model` is the
+  live provider/model route the running session resolved, revised when a
+  mid-session route fallback or a retried spawn switches it — `waiting`
+  {taskRef} while
   a blocking question this instance filed is unanswered (the newest one when
   several of its own stand) — a drain of some other task does not clear it; only
   the answer (or the waited task's reclaim) does —
   the one quiet state that needs the operator rather than reporting —
-  `draining` while a pause holds spawns, `limited` {resetAt} while the run is
-  parked on a harness usage limit (with the stated reset instant when the
-  harness stated one), `stopping`
-  as the final beacon when the run ends. State changes
+  `draining` while a pause holds spawns — and, on a route pricing window,
+  carrying the per-route hold list described below — `limited` {resetAt, routes}
+  while the run is parked on a harness usage limit (with the stated reset instant
+  when the harness stated one), also carrying the per-route holds: every held
+  route in configured order as {route, reason (`usage_limit` or `window`), the
+  pricing `schedule` name, and the instant the hold ends when known}, capped at
+  the plane's 16 entries, so the console can show which routes are spent and
+  which merely have quota behind a pricing window instead of collapsing both to
+  one word — `stopping`
+  as the final beacon when the run ends. `model` and `routes` are optional and
+  omitted when there is nothing to say, so a plane that predates them reads the
+  report it already accepted. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
   to learn which phase is running; a session in progress re-beacons the same
   `iteration` state on every lease renewal (a third of the plane's 30-minute

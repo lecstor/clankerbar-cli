@@ -2143,3 +2143,81 @@ func TestDrainPhases_IterationBeaconsCarryTheStartingRoute(t *testing.T) {
 		t.Errorf("got %d iteration beacons, want one per phase boundary", iterations)
 	}
 }
+
+// review 1.review-1.1: the boundary beacon names the route the FIRST attempt starts on, but a
+// retry after a supervised wait re-resolves its invocation — the wait marked the route that hit
+// the limit, so the retried session runs the other one. The card must follow the spawn, not keep
+// claiming a route the retried session never touches.
+func TestDrainPhases_RetryReportsTheRouteItActuallyStartsOn(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement", Model: config.ModelRoutes{routeGo, routeZen}, Prompt: "Work."}}
+	cfg.Prompt = ""
+	reset := time.Now().Add(time.Hour)
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: checkpointed(5, 0.05)}},
+		limitResetAt: reset,
+		probeLimitFor: func(_ int, model string) harness.Limit {
+			if model == routeGo {
+				return harness.Limit{Limited: true, ResetAt: reset}
+			}
+			return harness.Limit{}
+		},
+	}
+	d, ff := fleetDriver(t, cfg, h)
+	var modelAtRetry string
+	h.onInvoke = func(call int) {
+		if call == 1 {
+			modelAtRetry = d.fleetState(0).Model
+		}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(h.invocations) != 2 {
+		t.Fatalf("spawned %d sessions, want the limited first attempt and its retry", len(h.invocations))
+	}
+	if got := h.invocations[0].Model; got != routeGo {
+		t.Errorf("first attempt ran on %q, want %q", got, routeGo)
+	}
+	if got := h.invocations[1].Model; got != routeZen {
+		t.Fatalf("retry ran on %q, want %q (the mark on %q must move it)", got, routeZen, routeGo)
+	}
+	if modelAtRetry != routeZen {
+		t.Errorf("state.model while the retried session runs = %q, want %q — the card must follow the spawn, not the boundary", modelAtRetry, routeZen)
+	}
+	var models []string
+	sent, _ := ff.reports()
+	for _, r := range sent {
+		if r.State.Kind == fleet.StateIteration {
+			models = append(models, r.State.Model)
+		}
+	}
+	if len(models) < 2 || models[0] != routeGo || models[len(models)-1] != routeZen {
+		t.Errorf("iteration beacons carried models %v, want the boundary's %q then the retry's %q", models, routeGo, routeZen)
+	}
+}
+
+// review 1.review-1.4: the route holds belong to the WAITING project's config. The sibling
+// projects are paused by the same wait and must say so, but their rows must not borrow route
+// names and schedules from a config they do not run.
+func TestBeaconLimited_SendsRouteHoldsOnlyToTheWaitingTarget(t *testing.T) {
+	waiting, sibling := &fakeFleet{}, &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: waiting}, {Fleet: sibling}})
+	reset := time.Now().Add(time.Hour)
+	holds := []fleet.RouteHold{{Route: routeGo, Reason: fleet.RouteHoldUsageLimit, Until: reset}}
+
+	d.beaconLimited(0, reset, holds)
+
+	sent, _ := waiting.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateLimited || len(sent[0].State.Routes) != 1 || sent[0].State.Routes[0].Route != routeGo {
+		t.Fatalf("waiting target reports = %+v, want the limited state carrying the %q hold", sent, routeGo)
+	}
+	sent, _ = sibling.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateLimited {
+		t.Fatalf("sibling reports = %+v, want its own plain limited state", sent)
+	}
+	if len(sent[0].State.Routes) != 0 {
+		t.Errorf("sibling carried route holds %+v from a project it does not serve", sent[0].State.Routes)
+	}
+}

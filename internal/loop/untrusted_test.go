@@ -246,7 +246,7 @@ func TestSupervisedWait_StopsOnAnUnreadableProbeUnderASpendCeiling(t *testing.T)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, config.Phase{}, d.targets[0], spend{start: time.Now()})
+			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, config.Phase{}, nil, d.targets[0], spend{start: time.Now()})
 
 			if stop != tc.wantStop {
 				t.Errorf("stop = %t, want %t", stop, tc.wantStop)
@@ -272,7 +272,7 @@ func TestSupervisedWait_KeepsWaitingThroughAnOrdinaryProbeError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, config.Phase{}, d.targets[0], spend{start: time.Now()})
+	_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, config.Phase{}, nil, d.targets[0], spend{start: time.Now()})
 
 	if stop {
 		t.Error("stop = true on a plain probe error under a spend ceiling; only an UNREADABLE probe ends the wait")

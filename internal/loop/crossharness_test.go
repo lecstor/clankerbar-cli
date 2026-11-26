@@ -206,7 +206,7 @@ func TestPerPhaseHarness_SupervisedWaitChargesTheWaitingPhasesHarness(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	implPhase := d.cfg.EffectivePhases()[0]
-	d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, d.targets[0], spend{start: time.Now()})
+	d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, nil, d.targets[0], spend{start: time.Now()})
 
 	byHarness := d.targetSpendAt(0).byHarness
 	if got := byHarness["opencode"].tokens; got == 0 {
@@ -254,7 +254,7 @@ func TestPerPhaseHarness_SupervisedWaitUntrustedProbeAsksThePhasesOwnHarness(t *
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			implPhase := d.cfg.EffectivePhases()[0]
-			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, d.targets[0], spend{start: time.Now()})
+			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, nil, d.targets[0], spend{start: time.Now()})
 
 			if stop != tc.wantStop {
 				t.Errorf("stop = %t, want %t — the breaker asked the wrong harness whether a ceiling is set\n%s",

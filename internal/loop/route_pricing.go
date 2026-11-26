@@ -79,17 +79,13 @@ func (s *drainSeq) routeWindowHoldState(lists [][]string) boundaryHoldState {
 		routes: d.routeHoldsAt(tc, now, mergeRouteLists(lists))}
 }
 
-// phaseRouteHolds is the per-route hold breakdown for one phase's configured routes (CLA-1026):
-// every route that cannot start right now, in configured order.
-func (d *Driver) phaseRouteHolds(tc *config.Config, ph config.Phase) []fleet.RouteHold {
-	routes, _ := tc.ModelRoutesForPhase(ph)
-	return d.routeHoldsAt(tc, d.clock(), routes)
-}
-
-// routeHoldsAt collects the active hold on each configured route: an active usage mark first, else an
-// active pricing window. The route has ONE reason on the wire, and a route held by both is denied by
-// its quota first — the same precedence the plane's summary gives usage limits over windows. A route
-// with neither is not held and contributes no entry.
+// routeHoldsAt collects the active hold on each configured route: an active usage mark first, else a
+// pricing window that actually withholds the route. The route has ONE reason on the wire, and a route
+// held by both is denied by its quota first — the same precedence the plane's summary gives usage
+// limits over windows. A route with neither is not held and contributes no entry.
+//
+// The window half asks the FILTER, not RouteWindowAt: a `when_all_blocked: run` schedule serves its
+// routes at peak price, so an in-window route it governs can start and is not held (review 1.review-1.2).
 func (d *Driver) routeHoldsAt(tc *config.Config, now time.Time, routes []string) []fleet.RouteHold {
 	if len(routes) == 0 {
 		return nil
@@ -100,12 +96,12 @@ func (d *Driver) routeHoldsAt(tc *config.Config, now time.Time, routes []string)
 			holds = append(holds, fleet.RouteHold{Route: route, Reason: fleet.RouteHoldUsageLimit, Until: until})
 			continue
 		}
-		if active, until := tc.RouteWindowAt(route, now); active {
+		if choice := tc.RouteChoiceAt(now, []string{route}); len(choice.Routes) == 0 && !choice.WaitUntil.IsZero() {
 			holds = append(holds, fleet.RouteHold{
 				Route:    route,
 				Reason:   fleet.RouteHoldWindow,
 				Schedule: strings.TrimSpace(tc.RouteWindows[route]),
-				Until:    until,
+				Until:    choice.WaitUntil,
 			})
 		}
 	}

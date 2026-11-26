@@ -668,3 +668,19 @@ func TestRouteWindowHoldState_CarriesPerRouteHolds(t *testing.T) {
 		t.Errorf("a cleared hold still reported routes: %+v", st.Routes)
 	}
 }
+
+// review 1.review-1.2: a `when_all_blocked: run` schedule serves its routes AT PEAK PRICE, so a
+// route inside its window can start and is not held. Reporting it as a window hold would replace
+// the true "usage limit" sentence with a cause that is withholding nothing.
+func TestRouteHoldsAt_RunWindowIsNotAHold(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0) // inside the 11:00-14:00 peak window
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo, routeZen)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedRun, routeGo)
+	d.now = func() time.Time { return at }
+	d.markRouteLimited(routeZen, at.Add(time.Hour))
+
+	holds := d.routeHoldsAt(d.cfg, at, []string{routeGo, routeZen})
+	if len(holds) != 1 || holds[0].Route != routeZen || holds[0].Reason != fleet.RouteHoldUsageLimit {
+		t.Fatalf("holds = %+v, want only %q usage_limit: the run-windowed %q can start at peak price", holds, routeZen, routeGo)
+	}
+}
