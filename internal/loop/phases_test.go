@@ -453,6 +453,22 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	}
 }
 
+// CLA-1034: the in-claim ladder's numbers are the design's, not a config dial — 15s then 45s —
+// and the test seam replaces the whole ladder rather than adding to it.
+func TestInClaimTransientRetryDelay(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	if got := d.inClaimTransientRetryDelay(1); got != 15*time.Second {
+		t.Errorf("retry 1 waits %s, want 15s", got)
+	}
+	if got := d.inClaimTransientRetryDelay(2); got != 45*time.Second {
+		t.Errorf("retry 2 waits %s, want 45s", got)
+	}
+	d.resumedTransientRetryWait = func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	if got := d.inClaimTransientRetryDelay(2); got != 2*time.Millisecond {
+		t.Errorf("the test seam was bypassed: %s", got)
+	}
+}
+
 // CLA-1034: a resumed phase retries a transient provider failure IN-CLAIM — the lease it already
 // holds is kept across the retry (the runner renews it again on the next attempt) instead of being
 // handed back on the first blip. Two retries, 15s then 45s, and the third attempt still succeeds.
