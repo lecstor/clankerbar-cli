@@ -106,8 +106,9 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 	a := r.a
 	panelOptional := r.shape.panelOptional
 	// A usage limit. A rolling-window subscription cap is waited out and the session re-run; a hard
-	// budget/credit exhaustion (Stop) has no reset to poll for, so the run stops cleanly and the
-	// operator resumes it once they've topped up.
+	// budget/credit exhaustion (Stop) has no reset to poll for, so a route that reports it is sat out
+	// until the operator acts — and the run stops only when NO configured route is left to wait on
+	// (CLA-1024).
 	if lim := a.DetectLimit(at.res); lim.Limited {
 		if lim.Stop {
 			// CLA-784: an OPTIONAL panel seat is a trial reviewer. A hard stop on its account is recorded
