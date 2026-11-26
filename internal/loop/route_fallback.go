@@ -19,6 +19,22 @@ import (
 // defaultRouteMarkInterval is how long a denied route with no stated reset is treated as limited.
 const defaultRouteMarkInterval = 30 * time.Minute
 
+// defaultRouteErrorCooldown is how long a route that failed with a PROVIDER death — not a usage
+// limit — is skipped: long enough to stop a flaky provider being re-paid on every phase, short
+// enough that a recovered provider is tried again inside the same run.
+const defaultRouteErrorCooldown = 10 * time.Minute
+
+// routeFallbackIsLimit reports whether a fallback reason names a usage limit, whose mark duration is
+// the supervised wait's probe interval (or the provider's stated reset). Anything else is a provider
+// death, marked for defaultRouteErrorCooldown.
+func routeFallbackIsLimit(reason string) bool {
+	switch reason {
+	case "", "usage_limit", "budget_exhausted":
+		return true
+	}
+	return false
+}
+
 // routeMarkInterval is the configured supervised-wait probe interval, or the built-in default when
 // the config names none. Read per call: a RELOAD landing mid-run applies to the next mark without a
 // restart.
@@ -195,18 +211,28 @@ func (d *Driver) noteRouteFallbacks(ti int, t Target, drainNum int, inv harness.
 	for _, fb := range fallbacks {
 		until := fb.ResetAt
 		if until.IsZero() {
-			until = now.Add(interval)
+			if routeFallbackIsLimit(fb.Reason) {
+				until = now.Add(interval)
+			} else {
+				until = now.Add(defaultRouteErrorCooldown)
+			}
 		}
 		d.markRouteLimited(fb.Route, until)
 		if fb.Next == "" {
 			continue
 		}
 		reason := fb.Reason
-		if reason == "" {
-			reason = "usage_limit"
+		var line string
+		if routeFallbackIsLimit(reason) {
+			if reason == "" {
+				reason = "usage_limit"
+			}
+			line = fmt.Sprintf("%siteration %d: %s hit a usage limit (%s) — resuming the session on %s; retrying %s after %s",
+				labelOf(t), drainNum, fb.Route, reason, fb.Next, fb.Route, routeRetryLabel(until))
+		} else {
+			line = fmt.Sprintf("%siteration %d: %s failed (%s) — resuming the session on %s; retrying %s after %s",
+				labelOf(t), drainNum, fb.Route, reason, fb.Next, fb.Route, routeRetryLabel(until))
 		}
-		line := fmt.Sprintf("%siteration %d: %s hit a usage limit (%s) — resuming the session on %s; retrying %s after %s",
-			labelOf(t), drainNum, fb.Route, reason, fb.Next, fb.Route, routeRetryLabel(until))
 		log.Printf("%s", line)
 		if inv.Console != nil {
 			fmt.Fprintf(inv.Console, "\n%s\n", line)

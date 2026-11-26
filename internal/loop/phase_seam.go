@@ -209,9 +209,14 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	// failed launch releases nothing, and reporting it as released would erase a predecessor's claim
 	// that is still live.
 	resumeOnly := at.res.ReportResumeFailed != "" && at.res.Claim.Held()
+	// A resumed phase's transient failure is retried IN-CLAIM by handleTransient, so the claim stays
+	// held here: the retry continues the same run, and handing it back first would spend the takeover
+	// the retry exists to avoid. Exhaustion takes this function's ordinary handback below; only
+	// cancellation during the backoff hands back in handleTransient.
+	retryInClaim := r.resumedTransientRetry(at) && r.resumedTransientRetries < len(resumedTransientRetryBackoff)
 	// CLA-703: a retrying no-MCP attempt is not an ending — keep the claim (the retry resumes the
 	// same run) and book nothing yet.
-	if !panelMember && !at.retryNoMCP && !resumeOnly {
+	if !panelMember && !at.retryNoMCP && !resumeOnly && !retryInClaim {
 		r.end.released = at.res.Claim.Held()
 	}
 	r.end.reportResumeFailed = at.res.ReportResumeFailed
@@ -230,7 +235,7 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	}
 	// last && a clean exit is the shape CLA-384 is about: the phase ran to completion, pushed, and
 	// simply did not declare.
-	if !panelMember && !at.retryNoMCP && !resumeOnly {
+	if !panelMember && !at.retryNoMCP && !resumeOnly && !retryInClaim {
 		// A tool-loop kill is never the undeclared hand-off CLA-384 counts, even when the process exited
 		// 0 an instant before the kill landed: it was killed failing to move the task on.
 		r.end.releasedToQueue = d.releaseHeldClaim(ctx, t, at.res, last && at.res.ExitCode == 0 && at.toolLoop == "", usageLimitEnd(r.a, at.res))

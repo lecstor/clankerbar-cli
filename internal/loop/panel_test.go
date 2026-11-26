@@ -1663,29 +1663,33 @@ func TestDrainPhases_ReviewPanelLastMemberEndsSequenceAfterRecording(t *testing.
 	for _, tc := range []struct {
 		name string
 		res  harness.Result
+		// transients is how many steps the last member's failure spends: a transient end retries
+		// in-claim twice before the sequence ends; a limit does not retry at all.
+		transients int
 	}{
-		{name: "a usage limit", res: held(limitResult(), openClaim())},
-		{name: "a transient failure", res: held(transientResult(), openClaim())},
+		{name: "a usage limit", res: held(limitResult(), openClaim()), transients: 1},
+		{name: "a transient failure", res: held(transientResult(), openClaim()), transients: 3},
 		{
 			// A session the adapter also classifies as limited can still exit
 			// cleanly: the seam runs first, matches the record and closes the
 			// round itself, and the sequence-end is read afterwards. The arm must
 			// not close a second time (CLA-639 fix pass 6).
-			name: "a usage limit on a clean exit the seam already closed",
-			res:  reported(held(harness.Result{ExitCode: 0, Tokens: 5, CostUSD: 0.05, Raw: map[string]any{"kind": "limit"}}, openClaim()), branchReport()),
+			name:       "a usage limit on a clean exit the seam already closed",
+			res:        reported(held(harness.Result{ExitCode: 0, Tokens: 5, CostUSD: 0.05, Raw: map[string]any{"kind": "limit"}}, openClaim()), branchReport()),
+			transients: 1,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
-			h := &fakeAdapter{
-				steps: []invokeStep{
-					{res: checkpointed(10, 0.10)}, // implement
-					{res: checkpointed(5, 0.50)},  // review-1 records
-					{res: tc.res},                 // review-2 records, THEN the sequence ends
-					{res: checkpointed(5, 0.05)},  // fix: must spawn on the released round
-				},
-				limitResetAt: time.Now().Add(-time.Hour),
+			steps := []invokeStep{
+				{res: checkpointed(10, 0.10)}, // implement
+				{res: checkpointed(5, 0.50)},  // review-1 records
 			}
+			for i := 0; i < tc.transients; i++ {
+				steps = append(steps, invokeStep{res: tc.res}) // review-2 records, THEN the sequence ends
+			}
+			steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // fix: must spawn on the released round
+			h := &fakeAdapter{steps: steps, limitResetAt: time.Now().Add(-time.Hour)}
 			h.onInvoke = func(i int) {
 				switch i {
 				case 1:
@@ -1698,23 +1702,25 @@ func TestDrainPhases_ReviewPanelLastMemberEndsSequenceAfterRecording(t *testing.
 						Round: 1, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
 						Findings: []plane.ReviewFindingState{mustFinding("1.review-2.1", "open", "review-2's MUST")},
 					})
-				case 3:
+				case 2 + tc.transients:
 					rel.status = "in_review"
 					rel.outcome += "\n### Fixes\n- 1.review-1.1 fixed\n- 1.review-2.1 fixed\n"
 				}
 			}
 			d := panelDriver(t, h, rel, panelMembers()[:2], panelPhases())
+			d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
 
 			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 			}
-			if h.invokeCalls != 4 {
-				t.Fatalf("spawned %d sessions, want 4 (implement, two members, fix) — the last member's record must hand over", h.invokeCalls)
+			wantInvokes := 3 + tc.transients
+			if h.invokeCalls != wantInvokes {
+				t.Fatalf("spawned %d sessions, want %d (implement, two members, any in-claim retries, fix) — the last member's record must hand over", h.invokeCalls, wantInvokes)
 			}
 			if len(rel.closes) != 1 || rel.closes[0] != 1 {
 				t.Fatalf("closed rounds = %v, want [1] — the last member's round must be released before the fix", rel.closes)
 			}
-			fix := h.invocations[3].Prompt
+			fix := h.invocations[2+tc.transients].Prompt
 			for _, want := range []string{"1.review-1.1", "1.review-2.1"} {
 				if !strings.Contains(fix, want) {
 					t.Errorf("the fix brief does not carry %q:\n%s", want, fix)

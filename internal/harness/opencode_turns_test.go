@@ -280,6 +280,57 @@ func TestOpencodeInvokeSwitchesRouteBetweenTurns(t *testing.T) {
 	}
 }
 
+// A transient provider death on a NON-FINAL turn is a route failure exactly as it is on the final
+// one: the same session is resumed on the next route, the fallback is reported (so the driver marks
+// the dead route for its error cooldown), and the next turn then runs on the route that finished it.
+func TestOpencodeInvokeSwitchesRouteOnATransientNonFinalTurn(t *testing.T) {
+	const transient503 = `    echo '{"type":"error","sessionID":"ses_live","error":{"data":{"statusCode":503},"message":"Service Unavailable"}}'
+    exit 1`
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	opencodeStub(t, turnScript(logPath,
+		turnStubTurn{"turn-one", transient503},
+		turnStubTurn{"failed with a provider error", turnAnswer("switched", 40, "0.004")},
+		turnStubTurn{"turn-two", turnAnswer("two", 20, "0.002")},
+	))
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:      "turn-one",
+		Model:       routeFree,
+		Routes:      []string{routeFree, routePaid},
+		ResumeClaim: turnClaim,
+		Turns:       []Turn{{Prompt: "turn-two"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	calls := stubCalls(t, logPath)
+	if len(calls) != 3 {
+		t.Fatalf("the stub ran %d times, want 3 (turn 1, its provider failover, turn 2); stopped=%d reason=%q:\n%s",
+			len(calls), res.TurnStopped, res.TurnStopReason, strings.Join(calls, "\n"))
+	}
+	if !strings.Contains(calls[1], "--model "+routePaid) || !strings.Contains(calls[1], "-s ses_live") {
+		t.Errorf("turn 1's transient death did not resume the session on the paid route: %s", calls[1])
+	}
+	if !strings.Contains(calls[2], "--model "+routePaid) || !strings.Contains(calls[2], "turn-two") {
+		t.Errorf("turn 2 did not continue on the route that finished turn 1: %s", calls[2])
+	}
+	if want := []string{"switched", "two"}; !reflect.DeepEqual(res.TurnMessages, want) {
+		t.Errorf("TurnMessages = %q, want %q (turn 1's message is the failover continuation's)", res.TurnMessages, want)
+	}
+	if res.TurnStopped != 0 || res.TurnStopReason != "" {
+		t.Errorf("TurnStopped = %d (%q), want 0 after a successful route failover", res.TurnStopped, res.TurnStopReason)
+	}
+	started, finished, fallbacks := RouteFallbacks(res)
+	if started != routeFree || finished != routePaid {
+		t.Errorf("route report = %q -> %q, want %q -> %q", started, finished, routeFree, routePaid)
+	}
+	if len(fallbacks) != 1 || fallbacks[0].Route != routeFree || fallbacks[0].Next != routePaid || fallbacks[0].Reason != routeFailReasonProvider {
+		t.Fatalf("fallbacks = %+v, want free -> paid (provider_error)", fallbacks)
+	}
+}
+
 // A session can exhaust more than one route across its turns. The report is
 // CUMULATIVE: the route the session STARTED on stays the start and every
 // abandoned route keeps its fallback, so the driver's run-wide marks cover both

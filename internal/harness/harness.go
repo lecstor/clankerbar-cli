@@ -329,6 +329,10 @@ type Result struct {
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
 
+	// ToolCalls is how many tool calls the stream showed COMPLETING (a terminal part with a call
+	// id). A provider death before any of them is the no-work shape the adapter can fail over on.
+	ToolCalls int
+
 	SessionRef string
 
 	// SessionMissing reports that this invocation asked to RESUME a session the harness no longer has

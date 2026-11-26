@@ -275,8 +275,32 @@ func (r *phaseRun) endOnExitKind(ctx context.Context, at *phaseAttempt) attemptV
 	return attemptVerdict{}
 }
 
+// resumedTransientRetry reports whether this attempt's transient failure can be retried while
+// KEEPING the claim: a resumed, non-optional phase whose stream was readable, whose claim the
+// session left held, and whose end is a plain provider failure rather than a cap, a kill, a usage
+// limit or a lost run. Any other end must take the ordinary handback path.
+func (r *phaseRun) resumedTransientRetry(at *phaseAttempt) bool {
+	if r.prev == nil || r.shape.panelOptional || !r.a.IsTransient(at.res) {
+		return false
+	}
+	return at.res.Untrusted == "" && at.runLost == nil && at.res.Claim.Held() &&
+		at.ierr == nil && !at.capped && !at.ceiling && !at.wallclock && at.toolLoop == "" &&
+		!at.recoveredExit && at.res.ExitCode != 0 && !usageLimitEnd(r.a, at.res)
+}
+
+// handBackResumedClaim is the handback settleWithoutCheckpoint skipped for an in-claim retry that
+// is now being abandoned (a STOP/cancel landed during the backoff). A panel member's claim belongs
+// to the panel, which hands that same lease on, so it is never released here.
+func (r *phaseRun) handBackResumedClaim(ctx context.Context, at *phaseAttempt) {
+	if r.shape.panelMember {
+		return
+	}
+	r.end.released = at.res.Claim.Held()
+	r.end.releasedToQueue = r.d.releaseHeldClaim(ctx, r.t, at.res, false, false)
+}
+
 // handleTransient backs off and retries a transient failure, or ends the phase where a retry is not
-// allowed (a resumed phase, an optional seat, a bound hit).
+// allowed (an optional seat, a bound hit).
 func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemptVerdict {
 	d := r.d
 	t := r.t
@@ -289,17 +313,33 @@ func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemp
 	// Non-zero exit, not the usage cap: a transient server/network blip backs off and retries;
 	// anything else is a genuine failure and stops.
 	if a.IsTransient(at.res) {
-		// A RESUMED phase does not retry, for the same reason it does not wait out a usage limit — and
-		// this path is the more dangerous of the two, because MaxRetries defaults to 0, meaning never
-		// give up.
 		if panelOptional {
 			log.Printf("%siteration %d: the OPTIONAL %s seat hit a transient failure (%s) — recording it against that seat and carrying on rather than retrying a task the panel is still working (log: %s)",
 				labelOf(t), drainNum, ph.Label(phaseIdx), at.res.ExitString(), at.logPath)
 			r.end.sequenceEnd = &phaseSequenceEnd{}
 			return attemptVerdict{next: attemptReturn}
 		}
+		// A RESUMED phase retries its transient failure IN-CLAIM, keeping the lease: the claim is
+		// already held and the run is ours, so a short retry costs nothing the handback would not
+		// cost anyway. Two attempts at 15s and 45s, then the ordinary handback and the run-level
+		// CLA-662 backoff so a genuinely broken provider still backs off between drains.
 		if prev != nil {
-			log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting (log: %s)",
+			if r.resumedTransientRetry(at) && r.resumedTransientRetries < len(resumedTransientRetryBackoff) {
+				r.resumedTransientRetries++
+				wait := d.inClaimTransientRetryDelay(r.resumedTransientRetries)
+				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — retrying in-claim in %s (retry %d/%d) with the claim still held; the next attempt resumes the same run (log: %s)",
+					drainNum, at.res.ExitString(), wait, r.resumedTransientRetries, len(resumedTransientRetryBackoff), at.logPath)
+				if d.waitOrStop(ctx, wait) {
+					// The retry is abandoned before it ran: hand back exactly as the seam would have.
+					// The sequence-end signal rides along even though the stopping run judges it inert,
+					// so every abandoned in-claim retry keeps the contract the docs state.
+					r.end.sequenceEnd = &phaseSequenceEnd{}
+					r.handBackResumedClaim(ctx, at)
+					return attemptVerdict{next: attemptReturn, stop: true}
+				}
+				return attemptVerdict{next: attemptRetry}
+			}
+			log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying further on a task that comes back as an immediate takeover; the run stays up to poll again instead of exiting (log: %s)",
 				drainNum, at.res.ExitString(), at.logPath)
 			r.end.sequenceEnd = &phaseSequenceEnd{}
 			return attemptVerdict{next: attemptReturn}

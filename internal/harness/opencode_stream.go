@@ -271,6 +271,10 @@ type opencodeParse struct {
 	// cannot rebuild a claim that a later call has since settled.
 	settledCalls map[string]bool
 
+	// toolCalls counts the tool parts that reached a TERMINAL state: the "completed any tool call"
+	// measure the route failover reads before abandoning a route (a running call never completed).
+	toolCalls int
+
 	// toolOutputDir is where this session's opencode saves truncated tool output: <data
 	// home>/opencode/tool-output, resolved from the session's own environment. The only directory a
 	// truncated result is read back from.
@@ -458,6 +462,7 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.settledCalls = map[string]bool{}
 	}
 	p.settledCalls[key] = true
+	p.toolCalls++
 	noteOpencodeToolEvent(p.observed.events, part.Tool, part.ID, st.Input)
 	if p.observed.toolLoop.observe(part.Tool, st.Status == "error", st.Error) && p.kill != nil {
 		fmt.Fprintf(p.diag(), "\n!! %s - killing the session here instead of letting it retry the same failing call\n", p.observed.toolLoop.tripped())

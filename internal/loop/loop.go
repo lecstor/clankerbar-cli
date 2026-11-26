@@ -154,6 +154,10 @@ type Driver struct {
 	// production (nil means backoff); a test seam so the ladder can be driven without sleeping.
 	resumedTransientWait func(n int) time.Duration
 
+	// resumedTransientRetryWait overrides the short IN-CLAIM retry ladder a resumed phase takes
+	// before handing its claim back (15s, then 45s). Nil in production; a test seam.
+	resumedTransientRetryWait func(n int) time.Duration
+
 	// The fleet dead-phase counter. Per-target because a multi-target driver runs several projects,
 	// and "the fleet" is one project's sessions: a run of dead phases on project A must not pause
 	// project B.
