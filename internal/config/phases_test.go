@@ -1871,7 +1871,7 @@ func TestReviewBriefsExemptPRExistenceFromMUSTs(t *testing.T) {
 	for _, want := range []string{
 		"belong to the terminal phase",
 		"NEVER a MUST finding during review",
-		"judge the branch against the code, docs and test clauses of `doneWhen` only",
+		"judge the change (or the plane's record, for a no-code task) against the code, docs and test clauses of `doneWhen` only",
 	} {
 		if !strings.Contains(reviewMUSTBarGrades, want) {
 			t.Errorf("the review MUST bar never says %q:\n%s", want, reviewMUSTBarGrades)
@@ -1927,6 +1927,10 @@ func TestVerifyBriefsScopeTheirChecks(t *testing.T) {
 	}
 }
 
+// CLA-635: every review-only variant — the briefs and the handoff continuations
+// that carry the record shape — states the accepted MUST bar: the seven evidence
+// kinds with their payloads, and the not-a-MUST list, whose precedence over a
+// repo hard rule about style, prose or doc wording is B6.
 func TestReviewOnlyVariantsCarryTheMUSTBar(t *testing.T) {
 	variants := map[string]string{
 		"review-only brief":             reviewOnlyBrief,

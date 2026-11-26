@@ -34,11 +34,17 @@ func taskRefPrompt(t *testing.T, claim harness.Claim, runner *runnerBriefing) st
 }
 
 // The claim's own ref is the first source: it is the identifier the session itself wrote on the
-// plane, so a ref and a UUID can never disagree about which task the PR belongs to.
+// plane, so a ref and a UUID can never disagree about which task the PR belongs to. The runner's
+// ref differs on purpose, so the test pins the ORDER, not merely that some ref was found.
 func TestInvocationForPrefersTheClaimsOwnRef(t *testing.T) {
-	got := taskRefPrompt(t, harness.Claim{TaskID: "t-1", Ref: "CLA-1032", RunID: "r-1", Branch: "clanker/x"}, nil)
+	got := taskRefPrompt(t,
+		harness.Claim{TaskID: "t-1", Ref: "CLA-1032", RunID: "r-1", Branch: "clanker/x"},
+		&runnerBriefing{task: plane.TaskBrief{ID: "t-1", Ref: "CLA-777"}, runID: "r-1"})
 	if want := "Open the PR as CLA-1032"; !strings.Contains(got, want) {
 		t.Errorf("the brief does not carry %q:\n%s", want, got)
+	}
+	if strings.Contains(got, "CLA-777") {
+		t.Errorf("the brief took the runner's ref over the claim's own:\n%s", got)
 	}
 	if strings.Contains(got, config.PhaseTaskRefPlaceholder) {
 		t.Errorf("the brief carries an unfilled %s placeholder:\n%s", config.PhaseTaskRefPlaceholder, got)

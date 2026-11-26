@@ -224,7 +224,8 @@ const reviewMUSTBarGrades = " GRADE EVERY FINDING. A severity in brackets is `[m
 // cannot grade the branch under review.
 const reviewPRExistenceExemption = "PR creation and the move to `in_review` belong to the terminal phase, so a " +
 	"`doneWhen` clause about opening a PR or submitting the task is NEVER a MUST finding during review: judge " +
-	"the branch against the code, docs and test clauses of `doneWhen` only. "
+	"the change (or the plane's record, for a no-code task) against the code, docs and test clauses of `doneWhen` " +
+	"only. "
 
 const reviewMUSTBarAttribution = "Every finding in the block is " +
 	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +

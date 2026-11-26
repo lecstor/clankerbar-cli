@@ -207,7 +207,7 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 		config.PhaseTotalPlaceholder, "2",
 	).Replace(reviewer.Prompt)
 	if h.invocations[1].Prompt != want {
-		t.Fatalf("phase 2's brief carried something other than config + the three claim-derived values:\n got: %q\nwant: %q",
+		t.Fatalf("phase 2's brief carried something other than config + the four claim-derived values:\n got: %q\nwant: %q",
 			h.invocations[1].Prompt, want)
 	}
 }

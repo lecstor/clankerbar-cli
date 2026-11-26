@@ -2503,7 +2503,8 @@ section note.
 >
 > {{prBase}} names the branch the TASK'S REPO's PRs target (CLA-608), resolved
 > per repo at phase-spawn time (config.PRBaseFor, else loop.Driver.prBaseFor).
-> Unlike the other three it is not a per-run fact and rides EVERY built-in
+> Unlike the other four ({{taskId}}, {{taskRef}}, {{runId}}, {{branch}}) it is
+> not a per-run fact and rides EVERY built-in
 > phase, the implement phase included: the implement brief's resumed-work rule
 > needs a branch to name, and that rule runs in phase 1, before any claim
 > exists for the other placeholders to come from. It replaced literal
@@ -2835,9 +2836,13 @@ section note.
 > spent the session reading and some watching builds.
 >
 > The gates belong to the phases that own them: implement self-verifies at its
-> tip, and the fix and verify phases run the gates again over what they change.
-> A reviewer's value is the reading, so a command is scoped to a PROBE of a
-> defect it already suspects - evidence for a finding, never a second gate.
+> tip, the fix phase runs the repo's gates at HEAD, and verify re-checks only
+> the fix delta, its regression surface and any gate a prior finding said was
+> red - the PR's CI carries the full suite once it is open. That ownership
+> sentence is `reviewGateScopePhases`, its own constant so the standalone review
+> command can replace exactly it (`reviewRunGateScope`). A reviewer's value is
+> the reading, so a command is scoped to a PROBE of a defect it already
+> suspects - evidence for a finding, never a second gate.
 >
 > The last sentence is the panel's: members share one worktree, so a probe that
 > writes a report, coverage file or snapshot hands the next member (and the fix
@@ -3554,12 +3559,14 @@ section note.
 ### reviewRunMUSTBarGrades
 
 > reviewRunMUSTBarGrades is reviewMUSTBarGrades for a review with no done-when
-> bar. Two clauses name the task's doneWhen as an input this review does not
-> have, so they are removed rather than left to reach a session as an
-> instruction it cannot follow; every other grading rule — the evidence kinds,
-> the seventh kind, and the not-a-MUST list — is the phase's verbatim. A test
-> pins that both replacements landed, because a silently failed Replace would
-> hand the session a bar that names a bar it was told does not exist.
+> bar. Every clause naming the task's doneWhen as an input this review does not
+> have — the quote-the-clause evidence kind, the missing-tests exception, and
+> the PR-existence exemption — is removed rather than left to reach a session as
+> an instruction it cannot follow; every other grading rule — the remaining
+> evidence kinds, the seventh kind, and the not-a-MUST list — is the phase's
+> verbatim. A test pins that all three replacements landed, because a silently
+> failed Replace would hand the session a bar that names a bar it was told does
+> not exist.
 
 ### reviewRunGateScope
 
