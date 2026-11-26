@@ -42,7 +42,7 @@ func (s *drainSeq) stopAtSeamMarker(ctx context.Context, st *seqStep, nextIdx in
 	// the takeover hand-off survives.
 	ref := claimLabel(s.carried.Claim)
 	pushed := !s.carried.Claim.Releasable()
-	handed, _ := d.handBackClaim(ctx, s.t, *s.carried, false)
+	handed, _ := d.handBackClaim(ctx, s.t, *s.carried, false, false)
 	// A FAILED handback keeps the claim: the deferred handback at the end of the drain is a free retry
 	// before the daemon exits.
 	if handed {

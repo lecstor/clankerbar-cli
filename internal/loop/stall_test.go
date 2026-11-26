@@ -43,7 +43,7 @@ func TestReleaseHeldClaim_NamesTheOutputCapStall(t *testing.T) {
 	logs := captureLogs(t)
 	d := &Driver{}
 
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), true); released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), true, false); released {
 		t.Error("a claim with pushed work must not be released to the queue")
 	}
 
@@ -62,6 +62,31 @@ func TestReleaseHeldClaim_NamesTheOutputCapStall(t *testing.T) {
 	}
 }
 
+// A result can be BOTH an output-cap stall and a usage-limit death (the adapter's limit probe
+// scans the whole diagnostic, so a limit notice can ride beside the stall marker). The lease end
+// then carries the usage-limit reason, and the stalled line must say so too — the same line the
+// non-stall branches already append it to (CLA-1029 review 1.review-1.4).
+func TestReleaseHeldClaim_NamesTheUsageLimitOnAStalledExpiry(t *testing.T) {
+	for _, countUndeclared := range []bool{false, true} {
+		logs := captureLogs(t)
+		d := &Driver{}
+		rel := &fakeReleaser{}
+
+		d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, stalledHeldResult(), countUndeclared, true)
+
+		if len(rel.expireReasons) != 1 || rel.expireReasons[0] != "usage_limit" {
+			t.Fatalf("expire reasons = %q, want exactly one usage_limit — the stall marker does not make the death something other than a limit", rel.expireReasons)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "stalled: output cap hit with no output (reasoning=32000)") {
+			t.Errorf("the daemon log must still name the stall; got: %q", out)
+		}
+		if !strings.Contains(out, "usage limit, reclaim budget not charged") {
+			t.Errorf("the stalled ended line must say the usage-limit reason was sent and accepted (countUndeclared=%v); got: %q", countUndeclared, out)
+		}
+	}
+}
+
 // The other ends keep the generic line: a held-with-work session that did NOT
 // stall must not be labelled a stall.
 func TestReleaseHeldClaim_KeepsTheGenericLineWithoutAStall(t *testing.T) {
@@ -72,7 +97,7 @@ func TestReleaseHeldClaim_KeepsTheGenericLineWithoutAStall(t *testing.T) {
 	delete(res.Raw, harness.OutputCapReasoningKey)
 
 	d := &Driver{}
-	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, res, true)
+	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, res, true, false)
 
 	out := logs.String()
 	if !strings.Contains(out, "never moved the task on") {
@@ -89,7 +114,7 @@ func TestReleaseHeldClaim_NamesTheStallWithoutTheCounter(t *testing.T) {
 	logs := captureLogs(t)
 	d := &Driver{}
 
-	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), false)
+	d.releaseHeldClaim(context.Background(), Target{Name: "makespdf"}, stalledHeldResult(), false, false)
 
 	out := logs.String()
 	if !strings.Contains(out, "stalled: output cap hit with no output (reasoning=32000)") {
@@ -113,7 +138,7 @@ func TestReleaseHeldClaim_NamesTheStallOnTheReleasePath(t *testing.T) {
 	res.Claim.HasWIP = false
 	res.Claim.Branch = ""
 
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true); !released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true, false); !released {
 		t.Error("a stalled claim with no pushed work must still be released to the queue")
 	}
 
@@ -143,7 +168,7 @@ func TestReleaseHeldClaim_KeepsTheGenericLineOnTheReleasePathWithoutAStall(t *te
 	delete(res.Raw, harness.TerminalReasonKey)
 	delete(res.Raw, harness.OutputCapReasoningKey)
 
-	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true); !released {
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true, false); !released {
 		t.Error("a releasable claim must be handed back")
 	}
 

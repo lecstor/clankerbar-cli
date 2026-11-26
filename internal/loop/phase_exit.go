@@ -84,6 +84,14 @@ func (r *phaseRun) countTrustedSpend(at *phaseAttempt) {
 	r.d.charge(r.ti, r.tc.HarnessFor(r.ph), at.res.Tokens, at.res.CostUSD)
 }
 
+// usageLimitEnd reports whether the session that just ended died on the provider's usage limit -
+// the same classification handleUsageLimit acts on, taken HERE because the handback runs first.
+// DetectLimit covers a rolling-window cap and a hard stop; the turn stop reason covers a
+// multi-turn session whose sequence a limit ended.
+func usageLimitEnd(a harness.Adapter, res harness.Result) bool {
+	return a.DetectLimit(res).Limited || res.TurnStopReason == "usage_limit"
+}
+
 // handleUsageLimit waits out a rolling usage limit and re-runs the session, or ends the phase on a
 // hard stop or a limit the phase must not wait for.
 func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attemptVerdict {
@@ -115,6 +123,13 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 			log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
 				drainNum, line, at.logPath)
 			d.writeLimitStop(line)
+			// A checkpoint held by the seam is still held: hand it back HERE with the reason, or the
+			// deferred releaseCarried at the drain boundary expires it with no cause recorded. A panel
+			// member's claim belongs to the panel - its handler hands the SAME lease to the next member
+			// or the fix - so ending it here would kill that hand-over.
+			if !r.shape.panelMember {
+				r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
+			}
 			return attemptVerdict{next: attemptReturn, stop: true}
 		}
 		log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
@@ -131,14 +146,22 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		// hours would only run against a task this sequence no longer holds, with a runId in its prompt
 		// that no longer means anything.
 		if prev != nil {
+			// The seam's handback ends a claim it did not hold open; a CHECKPOINT it did hold open is
+			// still held here, and the sequence is ending — so end that lease with the reason now. A
+			// panel member's claim belongs to the panel - its handler hands the SAME lease to the next
+			// member or the fix - so ending it here would kill that hand-over.
+			if !r.shape.panelMember {
+				r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
+			}
 			log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting (log: %s)",
 				drainNum, at.logPath)
+			// releaseCarriedEnd rebuilds the end, so the sequence signal goes back on afterwards.
 			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
 			return attemptVerdict{next: attemptReturn}
 		}
 		// Whatever this attempt held open is not held open any more: every path below either waits or
 		// retries with a FRESH session, which re-claims.
-		r.end = d.releaseCarriedEnd(ctx, t, r.end)
+		r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
 		remaining, bounded := tc.Budget.Remaining(d.budgetElapsed(r.ti, time.Since(prior.start)))
 		if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this ceiling; not waiting, so start a fresh run after the reset (log: %s)",
@@ -294,7 +317,7 @@ func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemp
 		}
 		// As in the limit branch: the retry is a fresh session that re-claims, so nothing may stay held
 		// open across it.
-		r.end = d.releaseCarriedEnd(ctx, t, r.end)
+		r.end = d.releaseCarriedEnd(ctx, t, r.end, false)
 		r.retries++
 		if d.cfg.MaxRetries > 0 && r.retries > d.cfg.MaxRetries {
 			return attemptVerdict{next: attemptReturn, err: fmt.Errorf(

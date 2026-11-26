@@ -94,7 +94,9 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 		action = "released"
 		err = rel.ReleaseDriver(ctx, claim.TaskID, claim.RunID)
 	} else {
-		err = rel.ExpireLease(ctx, claim.TaskID, claim.RunID)
+		// No harness result behind a child exit, so there is no usage-limit classification to send:
+		// the expiry names no reason.
+		err = rel.ExpireLease(ctx, claim.TaskID, claim.RunID, "")
 	}
 
 	switch {
