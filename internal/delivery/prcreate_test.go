@@ -260,6 +260,82 @@ func TestEnsurePRRefusesAnIncompleteSpec(t *testing.T) {
 	}
 }
 
+// The retry must not create blind when its re-read of the open PRs fails: the
+// first create may have landed with its answer lost, and a blind second create
+// would either duplicate the PR or be refused by GitHub, failing a hand-over
+// whose PR is in fact open.
+func TestEnsurePRFailsClosedWhenTheRetryReadFails(t *testing.T) {
+	script := `printf '=== %s %s\n' "$1" "$2" >> "$GH_RECORD"
+case "$1/$2" in
+pr/list)
+	n=$(cat "$GH_LIST_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$GH_LIST_COUNT"
+	if [ "$n" -eq 1 ]; then echo '[]'; else echo 'HTTP 502' >&2; exit 1; fi
+	;;
+pr/create)
+	echo x >> "$GH_COUNT"
+	echo 'HTTP 502' >&2
+	exit 1
+	;;
+esac
+`
+	t.Setenv("GH_LIST_COUNT", filepath.Join(t.TempDir(), "lists"))
+	v, _, count := prCreateEnvWith(t, script)
+
+	_, err := v.EnsurePR(context.Background(), prSpecFor(v))
+	if err == nil {
+		t.Fatal("EnsurePR succeeded although the retry's open-PR read failed")
+	}
+	if !strings.Contains(err.Error(), "re-reading open pull requests") {
+		t.Errorf("err = %v, want the failed re-read named", err)
+	}
+	if n := recordLines(t, count, "x"); n != 1 {
+		t.Errorf("pr create ran %d times, want the first attempt only", n)
+	}
+}
+
+// CreatePR is the one-shot form: it never reads the open PRs, so a caller that
+// asked for a create gets exactly one.
+func TestCreatePRCreatesWithoutListingOrReusing(t *testing.T) {
+	v, record, count := prCreateEnv(t, prCreateGH{list: "[]"})
+	spec := prSpecFor(v)
+	spec.Slug = "" // resolved from the worktree's origin
+
+	num, err := v.CreatePR(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("CreatePR: %v", err)
+	}
+	if num != 12 {
+		t.Errorf("num = %d, want 12", num)
+	}
+	if n := recordLines(t, count, "x"); n != 1 {
+		t.Errorf("pr create ran %d times, want once", n)
+	}
+	if n := recordLines(t, record, "=== pr list"); n != 0 {
+		t.Errorf("pr list ran %d times; CreatePR must not reuse", n)
+	}
+	got := readFileString(t, record)
+	for _, want := range []string{
+		"pr create --repo acme/widgets --base staging --head clanker/x",
+		"--title CLA-1035: runner-owned PR creation",
+		"--body Task: CLA-1035",
+		"ghtoken=" + ghFakeToken,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gh never received %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestCreatePRRefusesAnIncompleteSpec(t *testing.T) {
+	v := New(t.TempDir(), "")
+	spec := prSpecFor(v)
+	spec.Base = ""
+	_, err := v.CreatePR(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "create PR:") {
+		t.Fatalf("CreatePR(incomplete spec) = %v, want a create PR refusal", err)
+	}
+}
+
 func TestParseCreatedPR(t *testing.T) {
 	cases := []struct {
 		name string

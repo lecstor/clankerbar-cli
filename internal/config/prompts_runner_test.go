@@ -235,9 +235,9 @@ func TestRunnerFixBriefDeclaresRiskAndLeavesThePRToTheRunner(t *testing.T) {
 	}
 }
 
-// A verification round follows the fix-verify phase, so the PR and the hand-over stay that round's:
-// the fixer commits, pushes and reports.
-func TestRunnerFixVerifyBriefLeavesThePRToTheVerifier(t *testing.T) {
+// A verification round follows the fix-verify phase, so the hand-over stays that round's:
+// the fixer commits and pushes, and the runner opens the PR from the verified branch.
+func TestRunnerFixVerifyBriefLeavesThePRToTheRunner(t *testing.T) {
 	brief := RunnerFixVerifyBrief()
 	for _, want := range []string{
 		"do NOT open a PR",

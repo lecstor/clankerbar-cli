@@ -51,19 +51,21 @@ const prCreateAttempts = 2
 // It is idempotent across retries and takeovers: an existing open PR for the
 // branch is reused, and after a create that failed in a way that may still have
 // landed (a lost response, unparseable output) it re-reads the open PRs before
-// retrying, so the retry cannot open a duplicate. A second failure is returned
-// to the caller, which fails the hand-over closed.
+// retrying. If that re-read also fails it returns the error rather than
+// creating blind. GitHub's one-open-PR-per-head/base rule is what actually
+// prevents a duplicate; this loop only avoids asking for one. A second create
+// failure is returned to the caller, which fails the hand-over closed.
 func (v *Verifier) EnsurePR(ctx context.Context, spec PRSpec) (int, error) {
 	spec = normalisePRSpec(spec)
 	if err := spec.validate(); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ensure PR: %w", err)
 	}
 	if _, err := exec.LookPath(v.ghBin); err != nil {
 		return 0, fmt.Errorf("ensure PR: %s is not on PATH", v.ghBin)
 	}
 	slug, err := v.resolvePRSlug(ctx, spec)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ensure PR: %w", err)
 	}
 	// The open read runs FIRST and its failure is fatal: without it a create
 	// cannot know whether the branch already has a PR, and opening a second one
@@ -82,8 +84,15 @@ func (v *Verifier) EnsurePR(ctx context.Context, spec PRSpec) (int, error) {
 			case <-time.After(v.prCreateBackoff):
 			}
 			// The failed create may have landed with its answer lost: adopt what
-			// is now open rather than opening a second PR.
-			if num, ok, rerr := v.openPRFor(ctx, spec.Repo, slug, spec.Head, spec.Base); rerr == nil && ok {
+			// is now open rather than opening a second PR. A read that cannot
+			// answer is fatal - creating blind here would either duplicate the
+			// PR or fail on GitHub's refusal, and the caller would lose a
+			// hand-over whose PR is in fact open.
+			num, ok, rerr := v.openPRFor(ctx, spec.Repo, slug, spec.Head, spec.Base)
+			if rerr != nil {
+				return 0, fmt.Errorf("ensure PR for %s: re-reading open pull requests before the retry: %w", spec.Head, rerr)
+			}
+			if ok {
 				return num, nil
 			}
 		}
@@ -102,16 +111,20 @@ func (v *Verifier) EnsurePR(ctx context.Context, spec PRSpec) (int, error) {
 func (v *Verifier) CreatePR(ctx context.Context, spec PRSpec) (int, error) {
 	spec = normalisePRSpec(spec)
 	if err := spec.validate(); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("create PR: %w", err)
 	}
 	if _, err := exec.LookPath(v.ghBin); err != nil {
 		return 0, fmt.Errorf("create PR: %s is not on PATH", v.ghBin)
 	}
 	slug, err := v.resolvePRSlug(ctx, spec)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("create PR: %w", err)
 	}
-	return v.createPR(ctx, spec, slug)
+	num, err := v.createPR(ctx, spec, slug)
+	if err != nil {
+		return 0, fmt.Errorf("create PR for %s: %w", spec.Head, err)
+	}
+	return num, nil
 }
 
 // normalisePRSpec trims the members gh would otherwise receive with stray
@@ -127,17 +140,18 @@ func normalisePRSpec(spec PRSpec) PRSpec {
 	return spec
 }
 
-// validate refuses a spec gh cannot satisfy, before it costs a spawn.
+// validate refuses a spec gh cannot satisfy, before it costs a spawn. The
+// caller prefixes the operation that rejected it.
 func (s PRSpec) validate() error {
 	switch {
 	case s.Repo == "":
-		return errors.New("ensure PR: no working directory to run gh in")
+		return errors.New("no working directory to run gh in")
 	case s.Base == "":
-		return errors.New("ensure PR: no base branch to target")
+		return errors.New("no base branch to target")
 	case s.Head == "":
-		return errors.New("ensure PR: no head branch to open a PR from")
+		return errors.New("no head branch to open a PR from")
 	case s.Title == "":
-		return errors.New("ensure PR: no title")
+		return errors.New("no title")
 	}
 	return nil
 }
@@ -152,11 +166,11 @@ func (v *Verifier) resolvePRSlug(ctx context.Context, spec PRSpec) (string, erro
 	}
 	url, err := v.remoteURL(ctx, spec.Repo)
 	if err != nil {
-		return "", fmt.Errorf("ensure PR: read the remote of %s: %w", spec.Repo, err)
+		return "", fmt.Errorf("read the remote of %s: %w", spec.Repo, err)
 	}
 	slug, ok := githubSlugResolving(url, v.sshAliasLookup(ctx))
 	if !ok {
-		return "", fmt.Errorf("ensure PR: the remote of %s (%s) is not a github.com repository", spec.Repo, url)
+		return "", fmt.Errorf("the remote of %s (%s) is not a github.com repository", spec.Repo, url)
 	}
 	return slug, nil
 }

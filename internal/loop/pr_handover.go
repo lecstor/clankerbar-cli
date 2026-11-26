@@ -39,6 +39,10 @@ func (r *phaseRun) handOverPR(ctx context.Context, at *phaseAttempt, w plane.Rep
 		r.noteReportProblem("opening the pull request for %s failed (%v) — the task was not handed over, and its pushed branch is kept for takeover", branch, err)
 		return false
 	}
+	if number <= 0 {
+		r.noteReportProblem("the pull request opener returned no usable number (%d) for %s — the task was not handed over, and its pushed branch is kept for takeover", number, branch)
+		return false
+	}
 	pr := fmt.Sprintf("#%d", number)
 	// delivery.pr lands BEFORE submit_for_review: a later refusal of the
 	// hand-over must still leave the PR linked to the task.
@@ -136,12 +140,17 @@ func (r *phaseRun) prTitle(st plane.TaskState, branch string) string {
 
 // prBody assembles the PR body deterministically from what the task already
 // records: the task ref, the branch, the session's summary, its tests (or the
-// stored outcome's **Tests** section when the report omitted them), and the
-// round's verdict.
+// stored outcome's newest **Tests** section when the report omitted them), and
+// the round's verdict (the report's own, else the newest released record's -
+// the fix report carries no verdict field).
 func (r *phaseRun) prBody(st plane.TaskState, rep config.DoneReport, branch string) string {
 	tests := strings.TrimSpace(rep.Tests)
 	if tests == "" {
 		tests = outcomeTests(st.Outcome)
+	}
+	verdict := strings.TrimSpace(rep.Verdict)
+	if verdict == "" {
+		verdict = newestReleasedVerdict(st.Reviews)
 	}
 	ref := strings.TrimSpace(st.Ref)
 	if ref == "" && r.opts.runner != nil {
@@ -158,26 +167,46 @@ func (r *phaseRun) prBody(st plane.TaskState, rep config.DoneReport, branch stri
 	if tests != "" {
 		fmt.Fprintf(&b, "\n## Tests\n\n%s\n", tests)
 	}
-	if verdict := strings.TrimSpace(rep.Verdict); verdict != "" {
+	if verdict != "" {
 		fmt.Fprintf(&b, "\n## Review\n\n%s\n", verdict)
 	}
 	return strings.TrimSpace(b.String()) + "\n"
+}
+
+// newestReleasedVerdict is the verdict on the newest record whose round the
+// plane has released; records still sealed carry no findings and are skipped.
+func newestReleasedVerdict(records []plane.ReviewRecordState) string {
+	verdict, round := "", 0
+	for _, rec := range records {
+		if rec.State != "open" || strings.TrimSpace(rec.Verdict) == "" {
+			continue
+		}
+		if rec.Round >= round {
+			verdict, round = strings.TrimSpace(rec.Verdict), rec.Round
+		}
+	}
+	return verdict
 }
 
 // outcomeTestsHeading matches the **Tests** heading config.RenderTestsSection
 // writes, plus the markdown spellings the plane's guard accepts.
 var outcomeTestsHeading = regexp.MustCompile(`(?im)^[ \t]*(?:\*\*[ \t]*tests\b[^*\n]*\*\*|__[ \t]*tests\b[^_\n]*__|#{1,6}[ \t]+tests\b)[ \t]*$`)
 
-// outcomeTests lifts the body of an outcome's **Tests** section, so a fix
-// report that omitted its own tests still gives the PR the gates the run
-// actually executed.
-var outcomeSectionHeading = regexp.MustCompile(`(?m)^[ \t]*(?:#{1,6}[ \t]+\S|\*\*[^*\n]+\*\*[ \t]*$)`)
+// outcomeSectionHeading matches a line that ends a Tests block: a markdown
+// heading, a bold pseudo-heading, or the renderer's attribution line.
+var outcomeSectionHeading = regexp.MustCompile(`(?m)^[ \t]*(?:#{1,6}[ \t]+\S|\*\*[^*\n]+\*\*[ \t]*$|(?:fixed|implemented) by: harness[ \t])`)
 
+// outcomeTests lifts the body of an outcome's NEWEST **Tests** section, so a
+// fix report that omitted its own tests still gives the PR the gates the run
+// actually executed - and a multi-round outcome gives the newest round's. The
+// section stops at the renderer's "fixed by:" attribution line, which follows
+// every Tests block and is not a gate.
 func outcomeTests(outcome string) string {
-	loc := outcomeTestsHeading.FindStringIndex(outcome)
-	if loc == nil {
+	matches := outcomeTestsHeading.FindAllStringIndex(outcome, -1)
+	if len(matches) == 0 {
 		return ""
 	}
+	loc := matches[len(matches)-1]
 	rest := strings.TrimLeft(outcome[loc[1]:], "\n")
 	var body []string
 	for _, line := range strings.Split(rest, "\n") {

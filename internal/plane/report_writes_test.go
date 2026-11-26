@@ -93,6 +93,22 @@ func TestRecordDeliveryPR_RequestShape(t *testing.T) {
 	}
 }
 
+func TestRecordDeliveryPR_TrimsThePR(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := mustClient(t, srv).RecordDeliveryPR(context.Background(), "t-1", "r-1", "  #12  "); err != nil {
+		t.Fatalf("RecordDeliveryPR: %v", err)
+	}
+	want := map[string]any{
+		"taskId":   "t-1",
+		"runId":    "r-1",
+		"delivery": map[string]any{"pr": "#12"},
+	}
+	if args := toolArgs(t, got.body); !reflect.DeepEqual(args, want) {
+		t.Errorf("arguments = %+v, want the trimmed %+v", args, want)
+	}
+}
+
 func TestRecordDeliveryPR_RefusesLocally(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -102,6 +118,7 @@ func TestRecordDeliveryPR_RefusesLocally(t *testing.T) {
 		{name: "empty task id", runID: "r-1", pr: "#12"},
 		{name: "empty run id", taskID: "t-1", pr: "#12"},
 		{name: "empty pr", taskID: "t-1", runID: "r-1"},
+		{name: "whitespace pr", taskID: "t-1", runID: "r-1", pr: "   "},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1,8 +1,8 @@
 package loop
 
 // pr_handover_test.go — CLA-1035's runner-owned PR: the opener, the linkage it
-// records, the worktree reclaim that only runs after the hand-over, and the two
-// briefs that no longer open a PR or reclaim a tree themselves.
+// records, and the worktree reclaim that only runs after the hand-over. The
+// runner briefs' own assertions live in internal/config/prompts_runner_test.go.
 
 import (
 	"context"
@@ -79,26 +79,50 @@ func TestPRBodyIsDeterministicAndCarriesTheRecord(t *testing.T) {
 }
 
 // A fix report that omitted its own tests still gives the PR the gates the
-// stored outcome records.
+// stored outcome records: the NEWEST round's, without the renderer's
+// attribution line.
 func TestPRBodyFallsBackToTheStoredOutcomeTests(t *testing.T) {
 	r := &phaseRun{}
-	got := r.prBody(plane.TaskState{
-		Outcome: "### Fixes\n\nfixed the guard\n\n**Tests**\ngo vet ./...\n\n### Notes\n\nnone",
-	}, config.DoneReport{Summary: "fixed it"}, "clanker/x")
+	attr := config.Attribution{Harness: "opencode", Model: "deepseek"}
+	// An implement round, then the fix round: the fix is the newest Tests block.
+	outcome := config.AppendOutcome(
+		"## Delivery\n\nimplemented it\n\n"+config.RenderTestsSection("go build ./..."),
+		config.RenderFixesSection(attr, config.DoneReport{Summary: "fixed it", Tests: "go vet ./..."}))
+	got := r.prBody(plane.TaskState{Outcome: outcome}, config.DoneReport{Summary: "fixed it"}, "clanker/x")
 	if !strings.Contains(got, "## Tests\n\ngo vet ./...\n") {
-		t.Errorf("body does not carry the stored Tests section:\n%s", got)
+		t.Errorf("body does not carry the newest stored Tests section:\n%s", got)
 	}
-	if strings.Contains(got, "### Notes") {
-		t.Errorf("body leaked past the Tests section:\n%s", got)
+	if strings.Contains(got, "go build ./...") {
+		t.Errorf("body carries an older round's tests:\n%s", got)
+	}
+	if strings.Contains(got, "fixed by:") {
+		t.Errorf("body leaks the renderer's attribution into Tests:\n%s", got)
+	}
+}
+
+// The fix report schema has no verdict field, so the body falls back to the
+// newest released record's verdict there.
+func TestPRBodyFallsBackToTheReleasedRecordVerdict(t *testing.T) {
+	r := &phaseRun{}
+	st := plane.TaskState{Ref: "CLA-1035", Reviews: []plane.ReviewRecordState{
+		{Round: 1, State: "open", Verdict: "findings"},
+		{Round: 2, State: "sealed", Verdict: "pass"}, // sealed: not released yet
+	}}
+	got := r.prBody(st, config.DoneReport{Summary: "fixed it"}, "clanker/x")
+	if !strings.Contains(got, "## Review\n\nfindings\n") {
+		t.Errorf("body = %q, want the newest released verdict", got)
 	}
 }
 
 func TestOutcomeTestsReadsTheHeadingForms(t *testing.T) {
 	cases := map[string]string{
-		"**Tests**\ngo test ./...":       "go test ./...",
-		"## Tests\n\ngo vet ./...":       "go vet ./...",
-		"### Fixes\n**Tests**\nran them": "ran them",
-		"no tests here":                  "",
+		"**Tests**\ngo test ./...":                      "go test ./...",
+		"## Tests\n\ngo vet ./...":                      "go vet ./...",
+		"### Fixes\n**Tests**\nran them":                "ran them",
+		"no tests here":                                 "",
+		"**Tests**\nold\n\n### Fixes\n\n**Tests**\nnew": "new",
+		// The renderer's attribution line follows every Tests block and ends it.
+		"**Tests**\ngates\n\nfixed by: harness opencode, model deepseek": "gates",
 	}
 	for outcome, want := range cases {
 		if got := outcomeTests(outcome); got != want {
@@ -241,6 +265,79 @@ func TestHandOverVerifiedRound_ReclaimFailureDoesNotFailTheHandOver(t *testing.T
 	}
 }
 
+// preparedTaskWorktree is a real prepared task worktree whose branch is pushed
+// as a hand-over requires, with the fixture's main checkout to inspect.
+func preparedTaskWorktree(t *testing.T) (*taskWorktreeRepo, string) {
+	t.Helper()
+	f := newTaskWorktreeRepo(t)
+	f.commitOn(t, taskWorktreeBranch, "origin/staging", "work.txt", "work", "work")
+	req := f.request()
+	req.Resume, req.NoMerge = true, true
+	prep, err := f.prepare(t, req)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	gitRun(t, prep.Dir, "push", "-u", "origin", taskWorktreeBranch)
+	return f, prep.Dir
+}
+
+// The reclaim is the LAST step: only a successful submit may remove the tree.
+// A failed submit, and a failed PR step, each leave it for the takeover.
+func TestHandOverVerifiedRound_ReclaimsOnlyAfterTheSubmit(t *testing.T) {
+	handOver := func(t *testing.T, dir string, rel *reportReleaser, opener *fakePROpener) *phaseRun {
+		t.Helper()
+		r := doneRun(t, reportVerify, rel, nil)
+		if opener != nil {
+			r.d.newPROpener = func(string) prEnsurer { return opener }
+		}
+		r.opts.taskDir = dir
+		r.opts.runner = &runnerBriefing{task: plane.TaskBrief{Branch: taskWorktreeBranch}}
+		r.end.doneReport = &config.DoneReport{Tests: "go test ./..."}
+		at := doneAttempt("")
+		r.end.claim = &at.res
+		r.handOverVerifiedRound(context.Background(), at, plane.TaskState{Status: "in_progress"})
+		return r
+	}
+
+	t.Run("a failed submit leaves the tree", func(t *testing.T) {
+		f, dir := preparedTaskWorktree(t)
+		rel := &reportReleaser{
+			st:   plane.TaskState{Status: "in_progress"},
+			errs: map[string]error{callSubmit: errors.New("the plane is not answering")},
+		}
+		handOver(t, dir, rel, nil)
+
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the tree was reclaimed although the submit failed: %v", err)
+		}
+		if !taskRefExists(t, f.checkout, "refs/heads/"+taskWorktreeBranch) {
+			t.Error("the branch was deleted although the submit failed")
+		}
+	})
+
+	t.Run("a successful submit reclaims the tree", func(t *testing.T) {
+		f, dir := preparedTaskWorktree(t)
+		handOver(t, dir, &reportReleaser{st: plane.TaskState{Status: "in_progress"}}, nil)
+
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("the tree still exists after a successful hand-over (err=%v)", err)
+		}
+		if taskRefExists(t, f.checkout, "refs/heads/"+taskWorktreeBranch) {
+			t.Error("the local branch survived the successful hand-over")
+		}
+	})
+
+	t.Run("a failed PR leaves the tree", func(t *testing.T) {
+		_, dir := preparedTaskWorktree(t)
+		handOver(t, dir, &reportReleaser{st: plane.TaskState{Status: "in_progress"}},
+			&fakePROpener{err: errors.New("gh pr create: HTTP 502")})
+
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the tree was reclaimed although the PR step failed: %v", err)
+		}
+	})
+}
+
 // The runner reclaims the tree it prepared, from the main checkout: the
 // worktree is removed and the local branch deleted, without --force or -D.
 func TestReclaimTaskWorktree_RemovesTheTreeAndThePushedBranch(t *testing.T) {
@@ -276,6 +373,42 @@ func TestReclaimTaskWorktree_RemovesTheTreeAndThePushedBranch(t *testing.T) {
 	// The pushed branch is the work: it must still be on origin.
 	if !taskRefExists(t, f.origin, "refs/heads/"+taskWorktreeBranch) {
 		t.Errorf("reclaim deleted the branch from origin")
+	}
+}
+
+// The no-`-D` half of the reclaim is load-bearing: a branch standing ahead of
+// its upstream holds the only copy of an unpushed commit, so `git branch -d`
+// must refuse and the branch (and that commit) must survive in the checkout.
+func TestReclaimTaskWorktree_KeepsABranchAheadOfItsUpstream(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.commitOn(t, taskWorktreeBranch, "origin/staging", "work.txt", "work", "work")
+	req := f.request()
+	req.Resume, req.NoMerge = true, true
+	prep, err := f.prepare(t, req)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	gitRun(t, prep.Dir, "push", "-u", "origin", taskWorktreeBranch)
+	// One more commit, deliberately NOT pushed: this is the session's last
+	// local work, and the reclaim must not be able to delete it.
+	writeTestFile(t, filepath.Join(prep.Dir, "unpushed.txt"), "unpushed")
+	gitRun(t, prep.Dir, "add", "-A")
+	gitRun(t, prep.Dir, "commit", "-m", "unpushed")
+	unpushedTip := gitOut(t, prep.Dir, "rev-parse", "HEAD")
+
+	err = reclaimTaskWorktree(context.Background(), prep.Dir, taskWorktreeBranch)
+	if err == nil || !strings.Contains(err.Error(), "deleting the local branch") {
+		t.Fatalf("reclaim(branch ahead of upstream) = %v, want a refusal naming the branch deletion", err)
+	}
+	if !taskRefExists(t, f.checkout, "refs/heads/"+taskWorktreeBranch) {
+		t.Fatal("the local branch was deleted with its unpushed commit")
+	}
+	if got := gitOut(t, f.checkout, "rev-parse", "refs/heads/"+taskWorktreeBranch); got != unpushedTip {
+		t.Errorf("the surviving branch is at %s, want the unpushed tip %s", got, unpushedTip)
+	}
+	// The pushed state on origin is unchanged; only the local commit was at risk.
+	if got := gitOut(t, f.origin, "rev-parse", "refs/heads/"+taskWorktreeBranch); got == unpushedTip {
+		t.Error("the unpushed commit reached origin; the fixture no longer tests the refusal")
 	}
 }
 

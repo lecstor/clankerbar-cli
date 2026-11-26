@@ -1427,8 +1427,10 @@ section note.
 > applied to it; what follows is decided HERE from the durable records
 > the round just released:
 >
->   - no open MUST → the gate passed. The verifier carried the terminal
->     step (push check, PR, in_review) itself; the sequence is done.
+>   - no open MUST → the gate passed. In runner-claimed mode the session
+>     carries the push check and its report, and the runner carries the
+>     hand-over (PR open/link, in_review); the sequence is done only when
+>     both landed, and either failing ends it for the operator to see.
 >   - open MUST(s) → another fix is spawned, unless the round cap or the
 >     non-convergence breaker parks the task first. Never one more round
 >     on the driver's own initiative.
@@ -4493,9 +4495,9 @@ section note.
 
 ### outcomeTests
 
-> outcomeTests lifts the body of an outcome's **Tests** section, so a fix report
-> that omitted its own tests still gives the PR the gates the run actually
-> executed.
+> outcomeTests lifts the body of an outcome's newest **Tests** section, stopping
+> at the renderer's attribution line, so a fix report that omitted its own tests
+> still gives the PR the gates the run actually executed.
 
 
 ## `internal/loop/prbase.go`
