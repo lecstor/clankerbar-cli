@@ -3292,8 +3292,10 @@ section note.
 > worktreeReclaimStep is the reclaim every FINAL phase step carries: the session
 > that takes the work off the machine removes the tree it worked in, because the
 > close-out that merges may not touch a tree it did not create (CLA-534). It is
-> one constant so the shipped review and verify steps and the runner's final fix
-> and verify steps cannot drift apart.
+> one constant so the shipped review and fix steps cannot drift apart. A
+> runner-claimed session does NOT carry it: the runner prepared the tree and
+> reclaims it itself after the hand-over (CLA-1035), and two owners of one tree
+> would race.
 >
 > Order is the property: it follows the PR's confirmation, because until then
 > the tree may hold the only copy of the work, and it precedes the phase's final
@@ -3338,7 +3340,8 @@ section note.
 >
 > CLA-536: this phase's session is the last one to work in the tree, so the
 > reclaim rides the shared worktreeReclaimStep - after the PR, before the
-> hand-off that must stay the emphatic final call.
+> hand-off that must stay the emphatic final call. The runner-claimed briefs
+> leave both the PR and the reclaim to the runner (CLA-1035).
 
 ### reviewOnlyTerminalStep
 
@@ -3624,8 +3627,9 @@ section note.
 > a CI poll duplicates what the runner opens and waits for, and a fetched skill
 > page is the turn cost this design exists to remove.
 >
-> The PR clause is scoped to the brief's own terminal step because the fix and
-> verify briefs still open the PR until the runner owns the close-out (B7/B8).
+> The PR clause is unconditional: the runner opens the PR from the branch it
+> has verified on origin and records it on the task (CLA-1035), so a session
+> that opened one would race the runner and could leave a PR nobody linked.
 
 ### runnerCloseOutBrief
 

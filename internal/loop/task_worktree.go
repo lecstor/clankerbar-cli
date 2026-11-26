@@ -17,6 +17,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
@@ -53,6 +54,75 @@ type worktreePrep struct {
 	// ScratchAside is where untracked files were moved so the tree could be reused; empty when nothing
 	// was moved.
 	ScratchAside string
+}
+
+// reclaimTaskWorktree removes the runner-prepared task worktree and its local
+// branch, from the repository's main checkout, AFTER the hand-over has landed
+// (CLA-1035). It mirrors the reclaim instruction the terminal briefs used to
+// carry: `git worktree remove` without --force, then point the branch at its
+// remote and `git branch -d` without -D. A refusal is returned, never forced
+// through - the caller logs it as a warning, because the task is already in
+// in_review with its PR open and linked.
+//
+// It acts only on a REGISTERED worktree on the task's branch whose path sits
+// under a task-worktree root shape, and never on the repository's main checkout.
+// That is the runner's own tree; any other path is somebody else's and is left
+// alone.
+func reclaimTaskWorktree(ctx context.Context, taskDir, branch string) error {
+	if strings.TrimSpace(taskDir) == "" {
+		return errors.New("no task worktree to reclaim")
+	}
+	if strings.TrimSpace(branch) == "" {
+		return errors.New("the task names no branch for the worktree's branch")
+	}
+	if err := validateGitBranchRef(branch); err != nil {
+		return fmt.Errorf("task branch %q: %w", branch, err)
+	}
+	list, err := taskWorktreeWorktrees(ctx, taskDir)
+	if err != nil {
+		return fmt.Errorf("read the worktree list of %s: %w", taskDir, err)
+	}
+	if len(list) == 0 {
+		return fmt.Errorf("%s lists no worktrees", taskDir)
+	}
+	main := list[0].path
+	if taskWorktreeSamePath(main, taskDir) {
+		return fmt.Errorf("refusing to remove %s: it is the repository's main checkout", taskDir)
+	}
+	var own *registeredWorktree
+	for i := range list {
+		if taskWorktreeSamePath(list[i].path, taskDir) {
+			own = &list[i]
+			break
+		}
+	}
+	if own == nil {
+		return fmt.Errorf("%s is not a registered worktree of %s", taskDir, main)
+	}
+	if own.detached || own.branch != branch {
+		return fmt.Errorf("worktree %s is not on branch %s (detached=%v, branch %q) — leaving it alone", taskDir, branch, own.detached, own.branch)
+	}
+	if !taskWorktreeRootShaped(filepath.Dir(filepath.Clean(taskDir))) {
+		return fmt.Errorf("refusing to remove %s: it is not under a task-worktree root", taskDir)
+	}
+	if _, err := taskWorktreeGit(ctx, main, "worktree", "remove", "--", taskDir); err != nil {
+		return fmt.Errorf("remove worktree %s: %w", taskDir, err)
+	}
+	if _, err := taskWorktreeGit(ctx, main, "branch", "--set-upstream-to=origin/"+branch, "--", branch); err != nil {
+		return fmt.Errorf("worktree %s removed, but pointing %s at origin/%s failed: %w", taskDir, branch, branch, err)
+	}
+	if _, err := taskWorktreeGit(ctx, main, "branch", "-d", "--", branch); err != nil {
+		return fmt.Errorf("worktree %s removed, but deleting the local branch %s failed: %w", taskDir, branch, err)
+	}
+	return nil
+}
+
+// taskWorktreeRootShaped reports whether dir is one of the names taskWorktreeRoot
+// gives a task-worktree root: the fleet's `worktrees` area, the checkout's
+// `.worktrees`, or the older `<checkout>-wt`.
+func taskWorktreeRootShaped(dir string) bool {
+	base := filepath.Base(filepath.Clean(dir))
+	return base == config.WorktreesDirName || base == ".worktrees" || strings.HasSuffix(base, "-wt")
 }
 
 // registeredWorktree is one entry of `git worktree list --porcelain`.

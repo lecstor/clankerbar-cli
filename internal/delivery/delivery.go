@@ -237,7 +237,17 @@ type Verifier struct {
 	ghBin      string
 	prBudget   time.Duration
 	prInterval time.Duration
+
+	// prCreateBackoff is the wait before the ONE retry of `gh pr create`
+	// (prcreate.go). A field so a test can shrink it; New fills the production
+	// value.
+	prCreateBackoff time.Duration
 }
+
+// prCreateRetryBackoff is the production wait between the first create attempt
+// and the one retry: long enough for a transient GitHub/API blip, short enough
+// that a hand-over is not held up by it.
+const prCreateRetryBackoff = 5 * time.Second
 
 // New builds a Verifier rooted at a session's workdir. remote is the git remote
 // the claims are judged against; empty means "origin, or the only remote there is".
@@ -246,12 +256,13 @@ func New(workdir, remote string) *Verifier {
 		remote = "origin"
 	}
 	return &Verifier{
-		workdir:    workdir,
-		gitBin:     "git",
-		remote:     remote,
-		ghBin:      "gh",
-		prBudget:   prPollBudget,
-		prInterval: prPollInterval,
+		workdir:         workdir,
+		gitBin:          "git",
+		remote:          remote,
+		ghBin:           "gh",
+		prBudget:        prPollBudget,
+		prInterval:      prPollInterval,
+		prCreateBackoff: prCreateRetryBackoff,
 	}
 }
 
@@ -296,6 +307,15 @@ func (v *Verifier) WithPollWindow(budget, interval time.Duration) *Verifier {
 // for a merge commit it made to appear on the base — uses it as its own retry
 // window, so a test that shrinks the judgement's window shrinks that wait with it.
 func (v *Verifier) PollWindow() time.Duration { return v.prBudget }
+
+// WithPRCreateBackoff shrinks (or widens) the wait before EnsurePR's one retry,
+// for callers whose tests cannot wait out the production five seconds.
+func (v *Verifier) WithPRCreateBackoff(d time.Duration) *Verifier {
+	if d >= 0 {
+		v.prCreateBackoff = d
+	}
+	return v
+}
 
 // Verify checks a claim and returns what it found. It never returns an error:
 // everything that could go wrong is a check whose Status is Unknown, because the
