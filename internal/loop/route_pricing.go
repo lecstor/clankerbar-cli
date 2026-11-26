@@ -79,10 +79,16 @@ func (s *drainSeq) routeWindowHoldState(lists [][]string) boundaryHoldState {
 		routes: d.routeHoldsAt(tc, now, mergeRouteLists(lists))}
 }
 
-// routeHoldsAt collects the active hold on each configured route: an active usage mark first, else a
-// pricing window that actually withholds the route. The route has ONE reason on the wire, and a route
-// held by both is denied by its quota first — the same precedence the plane's summary gives usage
-// limits over windows. A route with neither is not held and contributes no entry.
+// routeHoldsAt collects the active hold on each configured route: a Stop sideline first (it has no
+// end at all), then an active usage mark, else a pricing window that actually withholds the route.
+// The route has ONE reason on the wire, and a route held by several is denied by the strongest — a
+// dead subscription outlasts its own marks and windows, and the same precedence the plane's summary
+// gives usage limits over windows applies. A route with none is not held and contributes no entry.
+//
+// A Stop sideline is reported with the wire's `usage_limit` reason and NO until: the plane's route
+// hold carries one closed reason set (usage_limit|window), and inventing a third would have it
+// refuse the whole report. Until zero is exactly "held, no stated end", which is what a spent
+// account is.
 //
 // The window half asks the FILTER, not RouteWindowAt: a `when_all_blocked: run` schedule serves its
 // routes at peak price, so an in-window route it governs can start and is not held (review 1.review-1.2).
@@ -92,6 +98,10 @@ func (d *Driver) routeHoldsAt(tc *config.Config, now time.Time, routes []string)
 	}
 	holds := make([]fleet.RouteHold, 0, len(routes))
 	for _, route := range routes {
+		if _, stopped := d.routeStopped(route); stopped {
+			holds = append(holds, fleet.RouteHold{Route: route, Reason: fleet.RouteHoldUsageLimit})
+			continue
+		}
 		if until, marked := d.routeMarkExpiry(route); marked && now.Before(until) {
 			holds = append(holds, fleet.RouteHold{Route: route, Reason: fleet.RouteHoldUsageLimit, Until: until})
 			continue

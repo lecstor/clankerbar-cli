@@ -150,6 +150,13 @@ type Driver struct {
 	routeMarks   map[string]time.Time
 	routeMarksMu sync.Mutex
 
+	// routeStops is the harder sibling of routeMarks: routes that returned a Stop-class limit — a
+	// budget, credit or plan exhaustion with no reset to wait for — are out until the operator acts,
+	// so they are neither spawned on nor probed again until a RELOAD clears them. Deliberately not
+	// persisted: a restart is the other documented way to retry them (CLA-1024).
+	routeStops   map[string]harness.Limit
+	routeStopsMu sync.Mutex
+
 	// resumedTransientWait overrides the backoff for a resumed phase's transient wait. Nil in
 	// production (nil means backoff); a test seam so the ladder can be driven without sleeping.
 	resumedTransientWait func(n int) time.Duration

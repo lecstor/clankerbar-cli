@@ -271,13 +271,22 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 // route names and schedules belong to the waiting project's config, and another project's row must
 // not show routes it never configured (review 1.review-1.4).
 func (d *Driver) beaconLimited(ti int, resetAt time.Time, routes []fleet.RouteHold) {
-	d.writeLocalBeacon(fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt, Routes: routes})
+	d.beaconWait(ti, fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt, Routes: routes})
+}
+
+// beaconWait publishes one wait state to every target this daemon serves. The supervised wait's own
+// state is derived live (waitBeaconState): `limited` with the earliest concrete instant a route
+// lifts, or `draining` with the schedule's resume time when a pause window — daemon-wide or a route
+// pricing window — is what the wait is actually waiting for (CLA-1024). The route breakdown rides
+// only ti's row, for the same reason beaconLimited documents.
+func (d *Driver) beaconWait(ti int, st fleet.State) {
+	d.writeLocalBeacon(st)
 	for i := range d.targets {
-		st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
-		if i == ti {
-			st.Routes = routes
+		s := st
+		if i != ti {
+			s.Routes = nil
 		}
-		d.sendBeacon(i, d.targets[i], st)
+		d.sendBeacon(i, d.targets[i], s)
 	}
 }
 

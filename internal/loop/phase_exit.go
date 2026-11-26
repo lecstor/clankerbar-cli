@@ -119,18 +119,14 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 				r.end.emptyWhy = "stopped on a usage limit (no reset to wait for) before recording"
 				return attemptVerdict{next: attemptReturn}
 			}
-			line := limitStopLine(lim, limitStopRoute(at.res, at.inv.Model), limitStopMessage(a, at.res))
-			log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
-				drainNum, line, at.logPath)
-			d.writeLimitStop(line)
-			// A checkpoint held by the seam is still held: hand it back HERE with the reason, or the
-			// deferred releaseCarried at the drain boundary expires it with no cause recorded. A panel
-			// member's claim belongs to the panel - its handler hands the SAME lease to the next member
-			// or the fix - so ending it here would kill that hand-over.
-			if !r.shape.panelMember {
-				r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
+			// CLA-1024: in a MULTI-route phase a Stop on one route is not the phase's verdict. Sidelining
+			// it and waiting is right whenever another configured route can still start — typically a
+			// route a pricing window filtered out of THIS spawn, which is why the session never fell back
+			// to it. The stop is only the run's ending when nothing else is left, and that path is the
+			// fall-through below.
+			if !r.waitThroughRouteStop(at, lim) {
+				return r.endOnStopLimit(ctx, at, lim)
 			}
-			return attemptVerdict{next: attemptReturn, stop: true}
 		}
 		log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
 		// CLA-784: an OPTIONAL seat never waits and never ends the sequence, resumed or not.
@@ -185,6 +181,51 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 	}
 
 	return attemptVerdict{}
+}
+
+// waitThroughRouteStop sidelines the route that reported a Stop-class limit and reports whether the
+// phase should WAIT on its remaining routes instead of ending the run. It is false for the shapes
+// that keep the old ending: a phase with no route list (the legacy single-route harness), a phase
+// with exactly one route, or one whose every configured route is now Stop-blocked. The session's
+// route is taken from the result, so a mid-session fallback is sidelined on the route it died on,
+// not the one it started on.
+func (r *phaseRun) waitThroughRouteStop(at *phaseAttempt, lim harness.Limit) bool {
+	d := r.d
+	tc := r.tc
+	ph := r.ph
+	stoppedRoute := limitStopRoute(at.res, at.inv.Model)
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) < 2 || stoppedRoute == "" {
+		return false
+	}
+	d.stopRoute(stoppedRoute, lim)
+	if refusal := d.stopRefusalFor(routes, ph.Label(r.phaseIdx)); refusal != nil {
+		log.Printf("%siteration %d hit a Stop-class limit on %s (%s) and every configured route for the phase is now Stop-blocked (%v) (log: %s)",
+			labelOf(r.t), r.drainNum, stoppedRoute, limitReason(lim), routes, at.logPath)
+		return false
+	}
+	log.Printf("%siteration %d hit a Stop-class limit on %s (%s) — sidelining that route until RELOAD or restart and waiting on the phase's other routes (%v) (log: %s)",
+		labelOf(r.t), r.drainNum, stoppedRoute, limitReason(lim), routes, at.logPath)
+	return true
+}
+
+// endOnStopLimit writes the LIMIT_STOP marker and ends the run: a budget or credit exhaustion has no
+// reset for a wait to poll, so the daemon stops cleanly for an operator to resolve the account.
+func (r *phaseRun) endOnStopLimit(ctx context.Context, at *phaseAttempt, lim harness.Limit) attemptVerdict {
+	d := r.d
+	t := r.t
+	line := limitStopLine(lim, limitStopRoute(at.res, at.inv.Model), limitStopMessage(r.a, at.res))
+	log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
+		r.drainNum, line, at.logPath)
+	d.writeLimitStop(line)
+	// A checkpoint held by the seam is still held: hand it back HERE with the reason, or the deferred
+	// releaseCarried at the drain boundary expires it with no cause recorded. A panel member's claim
+	// belongs to the panel - its handler hands the SAME lease to the next member or the fix - so
+	// ending it here would kill that hand-over.
+	if !r.shape.panelMember {
+		r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
+	}
+	return attemptVerdict{next: attemptReturn, stop: true}
 }
 
 // endOnExitKind counts a silent attempt, then ends the phase on the exits that are not a failure to

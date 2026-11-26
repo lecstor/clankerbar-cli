@@ -143,7 +143,9 @@ func (d *Driver) routableRoutes(tc *config.Config, routes []string) config.Route
 }
 
 // routableRoutesAt is routableRoutes with its clock injected, so tests can pin both sides of a
-// window. The window arithmetic itself is config's and pure.
+// window. The window arithmetic itself is config's and pure. A route carrying a Stop sideline is
+// dropped outright, like a route whose provider is gone: it cannot lift without a RELOAD, so it must
+// never be offered to a new session or a probe (CLA-1024).
 func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []string) config.RouteChoice {
 	if len(routes) == 0 {
 		return config.RouteChoice{}
@@ -153,6 +155,9 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 	var earliestMarked string
 	var earliestUntil time.Time
 	for _, route := range routes {
+		if _, stopped := d.routeStopped(route); stopped {
+			continue
+		}
 		until, limited := d.routeMarkExpiry(route)
 		if !limited || !now.Before(until) {
 			unmarked = append(unmarked, route)
@@ -294,7 +299,10 @@ func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 // aimed at probeRouteFor's route when the phase has a route list. A phase whose every route is
 // inside a "wait" pricing window has NO route a probe may start on, so it refuses the probe rather
 // than letting the phase's model through: the probe is a paid session, and paying the peak price to
-// learn whether a limit lifted is exactly what the schedule exists to prevent.
+// learn whether a limit lifted is exactly what the schedule exists to prevent. A phase whose every
+// route is Stop-blocked refuses for a harder reason — no probe can lift a dead subscription — and
+// names that state separately so the wait can stop instead of aiming at a window that will not open
+// (CLA-1024).
 func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (harness.Invocation, error) {
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), true)
 	if err != nil {
@@ -310,6 +318,8 @@ func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (
 		inv.Model = choice.Routes[0]
 	case !choice.WaitUntil.IsZero():
 		return inv, &routeWindowBlocked{phase: ph.Label(0), until: choice.WaitUntil, routes: choice.WindowBlocked}
+	case d.allRoutesStopped(routes):
+		return inv, d.stopRefusalFor(routes, ph.Label(0))
 	}
 	return inv, nil
 }

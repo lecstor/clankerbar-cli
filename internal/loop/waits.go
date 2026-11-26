@@ -56,80 +56,27 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
-// routeClearAt is when route is usable again: the later of its usage mark and a withholding pricing
-// window, or a time not after now when it is already clear.
-func (d *Driver) routeClearAt(tc *config.Config, now time.Time, route string) time.Time {
-	at := now
-	// Ask the filter rather than RouteWindowAt: a "run" schedule offers its route back at peak,
-	// so its window never withholds anything and its mark is the only real wait.
-	if choice := tc.RouteChoiceAt(now, []string{route}); len(choice.Routes) == 0 && !choice.WaitUntil.IsZero() {
-		at = choice.WaitUntil
-	}
-	if until, marked := d.routeMarkExpiry(route); marked && until.After(at) {
-		at = until
-	}
-	return at
-}
-
-// routeWakeHint is how long a still-limited wait should sleep when a route the walk left blocked
-// clears sooner than the poll interval: the soonest instant any of the phase's routes is outside
-// both its usage mark and a withholding pricing window (CLA-986). ok=false keeps the caller on the
-// interval: a phase with no route list, or one with a route already clear, has no future instant.
-func (d *Driver) routeWakeHint(tc *config.Config, ph config.Phase) (time.Duration, bool) {
-	routes, _ := tc.ModelRoutesForPhase(ph)
-	if len(routes) == 0 {
-		return 0, false
-	}
-	now := d.clock()
-	var earliest time.Time
-	for _, route := range routes {
-		at := d.routeClearAt(tc, now, route)
-		if !at.After(now) {
-			return 0, false
-		}
-		if earliest.IsZero() || at.Before(earliest) {
-			earliest = at
-		}
-	}
-	// The same grace a stated-reset wake takes: a probe that lands a hair before the edge pays a
-	// whole interval for its timing.
-	return earliest.Sub(now) + d.waitGrace, true
-}
-
-// routeClearNow reports whether one of the phase's routes is usable RIGHT NOW. routeWakeHint only
-// answers with a future instant, which is not the same as no route being clear: a mark can expire
-// while a later route's probe is still running, and the walk then stops at tried[route] without
-// re-probing it (CLA-988).
-func (d *Driver) routeClearNow(tc *config.Config, ph config.Phase) bool {
-	routes, _ := tc.ModelRoutesForPhase(ph)
-	now := d.clock()
-	for _, route := range routes {
-		if !d.routeClearAt(tc, now, route).After(now) {
-			return true
-		}
-	}
-	return false
-}
-
 // supervisedWait pauses on a usage limit, then polls for an early reset rather than sleeping
 // blindly to the stated reset. The breaker is consulted HERE and not only by the caller, because
 // this loop does not return to the caller while the limit persists: it waits, probes, and waits
 // again for as long as it takes. routes is the resolved phase's configured route list (escalation
 // applied): the per-route holds on the limited beacons describe THOSE routes, including ones a mark
 // already dropped from the adapter's fallback chain.
+//
+// Everything the wait decides from is read LIVE: the config (a RELOAD that adds a route, removes a
+// pricing window or shortens the poll interval unblocks the wait instead of sleeping out the old
+// timer), the daemon-wide pause_windows gate (no probe spawns while one holds), and the per-route
+// marks on every beacon (CLA-1024).
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, routes []string, t Target, sofar spend) (tokens int, cost float64, stop bool) {
-	tc := d.targetCfg(t)
-	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
-
 	// waitingForReset says the stated reset was still ahead of us as this wait began; it flips once
 	// the loop has slept across it.
-	waitingForReset := !lim.ResetAt.IsZero() && time.Now().Before(lim.ResetAt)
+	waitingForReset := !lim.ResetAt.IsZero() && d.clock().Before(lim.ResetAt)
 	waitedOnReset := waitingForReset
 	if waitingForReset {
-		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		firstWake := probeWait(time.Now(), lim.ResetAt, d.pollIntervalLive(), d.waitGrace)
 		log.Printf("paused%s%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
 	} else {
-		log.Printf("paused%s%s — probing every %s for an early reset", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), interval)
+		log.Printf("paused%s%s — probing every %s for an early reset", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), d.pollIntervalLive())
 	}
 
 	// CLA-728: the wait can outlast the plane's liveness window many times over, and a healthy daemon
@@ -160,16 +107,28 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		resetMu.Unlock()
 	}
 
-	// CLA-1026: every beacon re-reads the hold on each route, because a usage mark can expire and a
-	// pricing window can open while the wait holds — the card must show why each route is still off,
-	// not only the one reason the wait began with. The routes and windows come from the config this
-	// wait PROBES with (captured on entry), so the beacon cannot describe a set the wait does not use
-	// after a RELOAD (review 1.review-1.5); the marks stay live, since they are run state.
-	currentRoutes := func() []fleet.RouteHold {
-		return d.routeHoldsAt(tc, d.clock(), routes)
+	// The route list a RELOAD may replace: the beacon goroutine reads it while the wait goroutine
+	// adopts the live config's list, so it is guarded.
+	var routesMu sync.Mutex
+	entryRoutes := append([]string(nil), routes...)
+	currentRoutes := func() []string {
+		routesMu.Lock()
+		defer routesMu.Unlock()
+		return append([]string(nil), entryRoutes...)
+	}
+	setRoutes := func(next []string) {
+		routesMu.Lock()
+		entryRoutes = next
+		routesMu.Unlock()
 	}
 
-	d.beaconLimited(sofar.ti, currentReset(), currentRoutes())
+	// CLA-1026/CLA-1024: every beacon derives what it says from the LIVE verdict — each route's mark,
+	// pricing window and Stop sideline, the daemon-wide pause and the config in force now — so a
+	// RELOAD is reflected by the next beacon instead of describing a set the wait no longer uses.
+	currentState := func() fleet.State {
+		return d.waitBeaconState(d.liveCfg(t), currentRoutes(), currentReset())
+	}
+	d.beaconWait(sofar.ti, currentState())
 
 	// The re-beacon runs on its OWN goroutine, not as another wake in the probe loop below.
 	beaconStop := make(chan struct{})
@@ -183,7 +142,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			case <-beaconStop:
 				return
 			case <-tk.C:
-				d.beaconLimited(sofar.ti, currentReset(), currentRoutes())
+				d.beaconWait(sofar.ti, currentState())
 			}
 		}
 	}()
@@ -192,9 +151,21 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		<-beaconDone
 	}()
 
-	// The FIRST probe's deadline is the only one measured from the wake: it is the wait's entry, and
-	// probeWait is what aims it at a stated reset.
-	nextProbe := time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
+	// A phase whose every configured route is already Stop-blocked has nothing to wait for: a budget
+	// or credit exhaustion does not lift on its own, so the run ends for the operator instead of
+	// probing dead subscriptions (CLA-1024).
+	if refusal := d.stopRefusalFor(currentRoutes(), ph.Label(0)); refusal != nil {
+		logStopBlocked(ph, refusal)
+		d.writeStopBlocked(refusal)
+		return tokens, cost, true
+	}
+
+	// The FIRST probe's deadline is the wait's entry, and it takes the same route hint as every
+	// successor: a route window that ends before the poll interval is when the usable route comes
+	// back, so sleeping the whole interval from the entry is the same 29-minute idle CLA-986 fixed
+	// for successors (CLA-1024).
+	nextProbe := time.Now().Add(d.waitWakeDelay(d.liveCfg(t), ph, lim))
+	pauseSaid := false
 
 	for {
 		// The target's own account: charge() books this wait's probes as they land, so a stored overlay's
@@ -204,11 +175,47 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				v.dim, v.tokens, v.cost, v.elapsed.Round(time.Second))
 			return tokens, cost, true
 		}
-		// waitOrStopHalt stays the sleep, so STOP / RESTART / RELOAD - and, in this wait, HALT - keep
-		// ending it promptly however long the limit lasts.
-		if waitDur := time.Until(nextProbe); waitDur > 0 {
-			if d.waitOrStopHalt(ctx, waitDur) {
+		// CLA-1024: a daemon-wide pause_windows window spawns no probe while it holds. A probe is a
+		// paid session, and a pause scheduled to keep the machine (or the invoice) quiet would
+		// otherwise be charged for every poll interval. Sleep in bounded chunks so STOP / RESTART /
+		// HALT / RELOAD stay responsive and the window's end is never overslept.
+		if paused, pauseUntil, pw := d.pauseState(); paused {
+			if !pauseSaid {
+				pauseSaid = true
+				log.Printf("paused%s: a scheduled pause window is active until %s (%s) — spawning no probes until it ends",
+					limitWindowSuffix(lim), pauseUntil.Format("Mon 15:04 MST"), pw.Describe())
+				d.beaconWait(sofar.ti, currentState())
+			}
+			// waitOrStopHalt stays the sleep, so STOP / RESTART / RELOAD - and, in this wait, HALT - keep
+			// ending it promptly however long the limit lasts.
+			if d.waitOrStopHalt(ctx, d.pauseChunk(pauseUntil)) {
 				return tokens, cost, true
+			}
+			continue
+		}
+		if pauseSaid {
+			pauseSaid = false
+			log.Print("scheduled pause ended — resuming limit probes")
+			d.beaconWait(sofar.ti, currentState())
+		}
+		if waitDur := time.Until(nextProbe); waitDur > 0 {
+			out := d.waitOrStopHaltReload(ctx, waitDur)
+			if out.stop {
+				return tokens, cost, true
+			}
+			if out.reload {
+				// CLA-1024: the config this wait probes with has just been replaced. Re-read it and
+				// re-aim the deadline from now rather than sleeping out a timer the old config set.
+				tc := d.liveCfg(t)
+				if live, _ := tc.ModelRoutesForPhase(ph); len(live) > 0 {
+					// A RELOAD is the operator saying "use this config now", so its route list wins
+					// over the entry one when it resolves any (the entry list can be an
+					// escalation-resolved set the configured phase does not name).
+					setRoutes(live)
+				}
+				nextProbe = time.Now().Add(d.reloadWakeDelay(tc, currentRoutes()))
+				d.beaconWait(sofar.ti, currentState())
+				continue
 			}
 		}
 		// Probe time. A stated reset is the provider's claim, not a guarantee, so crossing it mid-wait
@@ -223,6 +230,8 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
+		// Every wake probes with the config in force NOW, never one captured when the wait began.
+		tc := d.liveCfg(t)
 		got, cst, verdict, end := d.probeWake(ctx, a, t, tc, ph, sofar)
 		tokens += got
 		cost += cst
@@ -239,7 +248,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// (there is no future instant): that route is probed one grace out rather than a whole
 		// interval later (CLA-988). A probe error must keep the full interval, or a failing probe
 		// that marks nothing would tight-loop.
-		delay := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		delay := probeWait(time.Now(), lim.ResetAt, d.pollIntervalLive(), d.waitGrace)
 		if verdict == wakeStillLimited && end == wakeExhausted && d.routeClearNow(tc, ph) {
 			// Never lengthen the deadline: a stated reset or a short poll interval may already be
 			// sooner than one grace. A Driver built by hand in a test carries the zero value, and a
@@ -255,6 +264,58 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		}
 		nextProbe = time.Now().Add(delay)
 	}
+}
+
+// pollIntervalLive is the configured probe interval, read fresh and under the lock a RELOAD swaps the
+// config with. Read per deadline: a shortened interval applies to the wait in progress.
+func (d *Driver) pollIntervalLive() time.Duration {
+	d.controlMu.Lock()
+	cfg := d.cfg
+	d.controlMu.Unlock()
+	if cfg == nil {
+		return defaultRouteMarkInterval
+	}
+	return cfg.PollInterval.OrDefault(defaultRouteMarkInterval)
+}
+
+// pauseChunk bounds one sleep taken inside a daemon-wide pause: the poll interval at most, so the
+// gate is re-read often enough to notice the window ending, and a floor so a fake clock sitting on
+// the window's end cannot spin.
+func (d *Driver) pauseChunk(until time.Time) time.Duration {
+	wait := d.pollIntervalLive()
+	if remaining := until.Sub(d.clock()); remaining < wait {
+		wait = remaining
+	}
+	if wait <= 0 {
+		wait = time.Millisecond
+	}
+	return wait
+}
+
+// waitWakeDelay is how long the wait sleeps from NOW before its next probe: the stated reset or the
+// poll interval, shorter when a route the wait left blocked clears sooner (CLA-986). The entry sleep
+// takes this same delay (CLA-1024), so a wait entered at 13:45 with a route windowed until 14:00
+// wakes at 14:00 rather than 14:15.
+func (d *Driver) waitWakeDelay(tc *config.Config, ph config.Phase, lim harness.Limit) time.Duration {
+	delay := probeWait(time.Now(), lim.ResetAt, d.pollIntervalLive(), d.waitGrace)
+	if hint, ok := d.routeWakeHint(tc, ph); ok && hint < delay {
+		delay = hint
+	}
+	return delay
+}
+
+// reloadWakeDelay is the deadline after a RELOAD: zero when a route is clear NOW, because the config
+// just admitted one (an added route, a removed window) and the operator's edit is what the next probe
+// should act on. A still-blocked wait takes the ordinary delay measured from now, so the reload
+// never fires an extra paid probe against an already-marked route.
+func (d *Driver) reloadWakeDelay(tc *config.Config, routes []string) time.Duration {
+	if d.routeClearNowFor(tc, routes) {
+		return 0
+	}
+	if hint, ok := d.routeWakeHintFor(tc, routes); ok {
+		return hint
+	}
+	return d.pollIntervalLive()
 }
 
 // wakeVerdict is what one wake's probes concluded.
@@ -281,12 +342,27 @@ const (
 // is marked exactly as a session limit marks it (stated reset, else the mark interval), and the next
 // unmarked routable route is probed in the same wake, so a route with no stated reset cannot mask
 // the routes behind it. The walk ends at the first unlimited probe, or when the next route is
-// already marked, tried, or window-blocked; at most one probe per route per wake. It also reports
-// whether that end was walk exhaustion or a probe failure, which decides the successor deadline.
+// already marked, tried, or window-blocked; at most one probe per route per wake. A route that
+// reports a Stop-class limit is SIDELINED for the rest of the process (CLA-1024): it has no reset
+// to poll for, so the walk moves on and never comes back to it. It also reports whether that end was
+// walk exhaustion or a probe failure, which decides the successor deadline.
 func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc *config.Config, ph config.Phase, sofar spend) (tokens int, cost float64, verdict wakeVerdict, end wakeEnd) {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	tried := map[string]bool{}
 	for {
+		// Nothing to wait for: every configured route is Stop-blocked, so no probe can lift anything.
+		// The run ends cleanly for the operator rather than polling dead subscriptions forever.
+		if refusal := d.stopRefusalFor(routes, ph.Label(0)); refusal != nil {
+			logStopBlocked(ph, refusal)
+			d.writeStopBlocked(refusal)
+			return tokens, cost, wakeStop, wakeExhausted
+		}
+		// A daemon-wide pause window that opened mid-walk stops the rest of the walk: the remaining
+		// probes are paid sessions, and the wait's own gate re-reads the window before the next wake.
+		if paused, _, _ := d.pauseState(); paused {
+			log.Print("scheduled pause active — not probing further in this wake")
+			return tokens, cost, wakeStillLimited, wakeExhausted
+		}
 		if len(tried) > 0 {
 			// Each walk probe is another paid session, so the ceiling is re-read before it, not only at the wake.
 			if v := d.budgetStop(sofar.ti, time.Since(sofar.start)); v.dim != "" {
@@ -310,6 +386,12 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 				}
 				return tokens, cost, wakeStillLimited, wakeExhausted
 			}
+			var stopped *routeStopBlocked
+			if errors.As(ierr, &stopped) {
+				logStopBlocked(ph, stopped)
+				d.writeStopBlocked(stopped)
+				return tokens, cost, wakeStop, wakeExhausted
+			}
 			// A refused probe spawn spends nothing and learns nothing about the limit, so it reads exactly
 			// like any other probe error: log the named variable (the error carries it) and poll again next
 			// interval.
@@ -317,7 +399,11 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 			return tokens, cost, wakeStillLimited, wakeProbeFailed
 		}
 		if len(tried) > 0 {
-			if until, marked := d.routeMarkExpiry(inv.Model); tried[inv.Model] || (marked && time.Now().Before(until)) {
+			if _, stopped := d.routeStopped(inv.Model); tried[inv.Model] || stopped {
+				log.Printf("still limited on every routable route — continuing to wait")
+				return tokens, cost, wakeStillLimited, wakeExhausted
+			}
+			if until, marked := d.routeMarkExpiry(inv.Model); marked && time.Now().Before(until) {
 				log.Printf("still limited on every routable route — continuing to wait")
 				return tokens, cost, wakeStillLimited, wakeExhausted
 			}
@@ -359,6 +445,22 @@ func (d *Driver) probeWake(ctx context.Context, a harness.Adapter, t Target, tc 
 				log.Print("limit lifted — resuming")
 			}
 			return tokens, cost, wakeLifted, wakeExhausted
+		}
+		// CLA-1024: a Stop-class limit has no reset to poll for. A route with other routes behind it is
+		// sidelined and the walk moves on; when it was the last route that could start, the wait stops.
+		if got.Limit.Stop {
+			d.stopRoute(inv.Model, got.Limit)
+			tried[inv.Model] = true
+			if len(routes) == 0 {
+				// The legacy single-route phase: the model just probed is the only route there is.
+				log.Printf("probe on %s hit a Stop-class limit (%s) — no reset to wait for, stopping (resume once resolved)",
+					inv.Model, limitReason(got.Limit))
+				d.writeLimitStop(limitStopLine(got.Limit, inv.Model, ""))
+				return tokens, cost, wakeStop, wakeExhausted
+			}
+			log.Printf("probe on %s hit a Stop-class limit (%s) — sidelining it until RELOAD or restart rather than re-probing a dead subscription",
+				inv.Model, limitReason(got.Limit))
+			continue
 		}
 		if len(routes) == 0 || inv.Model == "" || len(tried) >= len(routes) {
 			log.Print("still limited — continuing to wait")
@@ -464,18 +566,33 @@ func retryLabel(n, max int) string {
 // cancellation. CLA-461: the restart/reload markers get the same responsiveness, so a control
 // request is never stuck behind a multi-hour idle poll or a supervised limit wait.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
-	return d.waitResponsive(ctx, dur, false)
+	return d.waitResponsive(ctx, dur, false, false).stop
 }
 
 // waitOrStopHalt is waitOrStop with one addition: a HALT marker ends the wait too. HALT is
 // deliberately NOT consumed here — it is the operator's note, and the next run's start-up read
 // reports it again without clearing it either.
 func (d *Driver) waitOrStopHalt(ctx context.Context, dur time.Duration) bool {
-	return d.waitResponsive(ctx, dur, true)
+	return d.waitResponsive(ctx, dur, true, false).stop
+}
+
+// waitOrStopHaltReload is waitOrStopHalt for the supervised wait: a RELOAD also ends the sleep, so
+// the wait re-reads the config and re-aims its deadline instead of sleeping out a timer the config
+// no longer sets (CLA-1024).
+func (d *Driver) waitOrStopHaltReload(ctx context.Context, dur time.Duration) waitOutcome {
+	return d.waitResponsive(ctx, dur, true, true)
+}
+
+// waitOutcome says how a responsive sleep ended. reload is reported only to a caller that asked for
+// it (reloadEndsWait): the supervised wait re-reads the config and re-aims its deadline at once,
+// while every other sleep applies the reload in place and keeps sleeping.
+type waitOutcome struct {
+	stop   bool
+	reload bool
 }
 
 // waitResponsive is the shared body of waitOrStop and waitOrStopHalt.
-func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEndsWait bool) bool {
+func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEndsWait, reloadEndsWait bool) waitOutcome {
 	const chunk = 3 * time.Second
 	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed time.
 	wallStart := time.Now().Round(0)
@@ -485,10 +602,13 @@ func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEnds
 		// members all reach this loop, and two of them reading one RELOAD before either removed it would
 		// apply the reload twice, from two goroutines.
 		d.controlMu.Lock()
-		stop := d.consumeWaitControls(haltEndsWait)
+		stop, reloaded := d.consumeWaitControls(haltEndsWait)
 		d.controlMu.Unlock()
 		if stop {
-			return true
+			return waitOutcome{stop: true}
+		}
+		if reloaded && reloadEndsWait {
+			return waitOutcome{reload: true}
 		}
 		remaining := time.Until(end)
 		if remaining <= 0 {
@@ -496,7 +616,7 @@ func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEnds
 				log.Printf("wait of %s took %s of wall clock — the machine was suspended for ~%s; timers are frozen while it sleeps, so an unattended run stalls silently (macOS: `caffeinate -i clankerbar run …`, and start it on AC — plugging in later does not wake a sleeping Mac)",
 					dur, time.Now().Round(0).Sub(wallStart).Round(time.Second), lost.Round(time.Second))
 			}
-			return false
+			return waitOutcome{}
 		}
 		w := chunk
 		if remaining < w {
@@ -504,7 +624,7 @@ func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEnds
 		}
 		select {
 		case <-ctx.Done():
-			return true
+			return waitOutcome{stop: true}
 		case <-time.After(w):
 		}
 	}
@@ -513,18 +633,19 @@ func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEnds
 // consumeWaitControls reads and consumes the control markers waitOrStop honours: STOP, the restart
 // family, and RELOAD (which is APPLIED here, in place, as control.go describes). HALT is READ but
 // never consumed: it is the operator's note, so it is still there for the next run's start-up read.
-func (d *Driver) consumeWaitControls(haltEndsWait bool) bool {
+// reloaded reports a RELOAD that was applied, for the one caller that re-aims its deadline on it.
+func (d *Driver) consumeWaitControls(haltEndsWait bool) (stop, reloaded bool) {
 	if present, _ := d.readMarker("STOP"); present {
 		_ = d.state.Remove("STOP")
 		log.Print("STOP requested during wait — stopping")
-		return true
+		return true, false
 	}
 	if haltEndsWait {
 		if present, msg := d.readMarker("HALT"); present {
 			// Left in place on purpose: it is the operator's note, and the next run's start-up read is what
 			// reports it again.
 			log.Printf("HALT present during wait: %s — ending the wait; resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
-			return true
+			return true, false
 		}
 	}
 	if present, msg := d.readMarker(MarkerRestart); present {
@@ -535,7 +656,7 @@ func (d *Driver) consumeWaitControls(haltEndsWait bool) bool {
 			log.Print("RESTART requested during wait")
 		}
 		d.restartRequested.Store(true)
-		return true
+		return true, false
 	}
 	if present, msg := d.readMarker(MarkerRestartNow); present {
 		_ = d.state.Remove(MarkerRestartNow)
@@ -545,14 +666,15 @@ func (d *Driver) consumeWaitControls(haltEndsWait bool) bool {
 			log.Print("RESTART_NOW requested during wait")
 		}
 		d.restartRequested.Store(true)
-		return true
+		return true, false
 	}
 	if present, _ := d.readMarker(MarkerReload); present {
 		_ = d.state.Remove(MarkerReload)
-		log.Print("RELOAD requested during wait — reloading config; this wait keeps its schedule")
+		log.Print("RELOAD requested during wait — reloading config")
 		d.applyReload()
+		return false, true
 	}
-	return false
+	return false, false
 }
 
 // readMarker reports whether a control marker file exists, and its first line. A marker is the
