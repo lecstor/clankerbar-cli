@@ -49,6 +49,18 @@ Usage:
                                 where it came from), then verify the plane still
                                 accepts it. Exits non-zero when unauthenticated or
                                 when the key is rejected.
+  clankerbar mcp [flags]        Run a stdio-to-Streamable-HTTP MCP bridge on
+                                stdin/stdout. One harness config — command
+                                "clankerbar", args ["mcp"] — then works for every
+                                harness and shares this machine's stored login,
+                                so CLANKERBAR_API_KEY never enters a harness config
+                                or an agent session environment. stdout carries
+                                only newline-delimited JSON-RPC responses;
+                                diagnostics go to stderr. --host picks the origin,
+                                --project pins one project slug, and --multi uses
+                                the account-wide /mcp surface. Without either, a
+                                .clankerbar.json found upward from the working
+                                directory supplies the project.
   clankerbar propose-config     Import the local config's movable dials (harness,
   [flags]                       model, tiers, budget, escalation) into the plane as a
                                 PENDING proposal the operator ratifies in the console.
@@ -119,9 +131,10 @@ Usage:
 
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
 --help', 'clankerbar doctor --help', 'clankerbar login --help', 'clankerbar
-logout --help', 'clankerbar whoami --help', 'clankerbar propose-config --help',
-'clankerbar upload --help', 'clankerbar download --help', 'clankerbar deck
---help', 'clankerbar hook --help', 'clankerbar review run --help' or
-'clankerbar review map --help' for their flags.
+logout --help', 'clankerbar whoami --help', 'clankerbar mcp --help',
+'clankerbar propose-config --help', 'clankerbar upload --help', 'clankerbar
+download --help', 'clankerbar deck --help', 'clankerbar hook --help',
+'clankerbar review run --help' or 'clankerbar review map --help' for their
+flags.
 `)
 }
