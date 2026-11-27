@@ -66,6 +66,15 @@ func TestResolveTargetRefusesMultiAndProject(t *testing.T) {
 	}
 }
 
+func TestResolveTargetRefusesPathSegmentSlugs(t *testing.T) {
+	for _, slug := range []string{".", ".."} {
+		_, err := ResolveTarget(TargetOptions{Origin: testOrigin, Project: slug, CWD: t.TempDir()})
+		if err == nil || !strings.Contains(err.Error(), "not a project slug") {
+			t.Errorf("--project %q: err = %v, want a slug refusal", slug, err)
+		}
+	}
+}
+
 func TestResolveTargetSingleProjectFile(t *testing.T) {
 	root := t.TempDir()
 	writeTreeFile(t, filepath.Join(root, projectFileName), `{"project":"clankerbar-cli"}`)
@@ -157,16 +166,25 @@ func TestResolveTargetIgnoresMCPJSON(t *testing.T) {
 }
 
 func TestResolveTargetMalformedFileWarnsOnceAndFallsBack(t *testing.T) {
-	cases := []struct{ name, content string }{
+	cases := []struct{ name, content, subdir string }{
 		{name: "not JSON", content: `{"project":`},
 		{name: "typo key", content: `{"projet":"typo"}`},
 		{name: "null", content: `null`},
+		{name: "dotdot project", content: `{"project":".."}`},
+		{name: "dotdot folder", content: `{"folders":{"repo":".."}}`, subdir: "repo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			writeTreeFile(t, filepath.Join(root, projectFileName), tc.content)
-			got, warn := resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: root, Home: t.TempDir()})
+			cwd := root
+			if tc.subdir != "" {
+				cwd = filepath.Join(root, tc.subdir)
+				if err := os.MkdirAll(cwd, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, warn := resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: cwd, Home: t.TempDir()})
 			if got != testOrigin+"/mcp" {
 				t.Errorf("target = %q, want the bare surface", got)
 			}

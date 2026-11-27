@@ -99,6 +99,9 @@ func ResolveTarget(o TargetOptions) (string, error) {
 		return origin + mcpSurface, nil
 	}
 	if project != "" {
+		if !usableSlug(project) {
+			return "", fmt.Errorf("--project: %q is not a project slug", project)
+		}
 		return projectURL(origin, project), nil
 	}
 
@@ -214,6 +217,9 @@ func projectFromFile(data []byte, fileDir, cwd string) (slug string, matched boo
 		if p == "" {
 			return "", false, errors.New("`project` is empty")
 		}
+		if !usableSlug(p) {
+			return "", false, fmt.Errorf("`project` %q is not a slug", p)
+		}
 		return p, true, nil
 	}
 	rel, err := filepath.Rel(fileDir, cwd)
@@ -238,7 +244,17 @@ func projectFromFile(data []byte, fileDir, cwd string) (slug string, matched boo
 	if bestSlug == "" {
 		return "", false, fmt.Errorf("the folders entry %q names no project", bestKey)
 	}
+	if !usableSlug(bestSlug) {
+		return "", false, fmt.Errorf("the folders entry %q names %q, which is not a slug", bestKey, bestSlug)
+	}
 	return bestSlug, true, nil
+}
+
+// usableSlug rejects the two path segments that are not project names: ".." and
+// ".". url.PathEscape leaves both unchanged, so escaping alone would let a slug
+// resolve outside /mcp.
+func usableSlug(slug string) bool {
+	return slug != "" && slug != "." && slug != ".."
 }
 
 // normalizeFolderKey holds a folders key to a clean forward-slash relative

@@ -625,6 +625,54 @@ func TestLoadWithoutPromptInheritsOneTaskDefault(t *testing.T) {
 	}
 }
 
+// LoadHome is for commands launched from inside a checkout (the MCP bridge):
+// it reads the operator's own config and must neither refuse nor read a
+// `clankerbar.json` sitting in the working directory.
+func TestLoadHomeIgnoresTheWorkingDirectoryConfig(t *testing.T) {
+	home := t.TempDir()
+	cfgDir := filepath.Join(home, ".config", "clankerbar")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	homeCfg := filepath.Join(cfgDir, "config.json")
+	if err := os.WriteFile(homeCfg, []byte(`{"harness":"claude","backlog_url":"https://plane.example"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, cwdConfigName), []byte(`{"harness":"codex"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Chdir(work)
+
+	// Load("") refuses the working-directory file; LoadHome must succeed and
+	// read the home config instead.
+	if _, err := Load(""); err == nil {
+		t.Fatal("Load(\"\") accepted the working-directory config; the fixture no longer proves anything")
+	}
+	c, err := LoadHome()
+	if err != nil {
+		t.Fatalf("LoadHome: %v", err)
+	}
+	if c.Source() != homeCfg {
+		t.Errorf("LoadHome source = %q, want %q", c.Source(), homeCfg)
+	}
+	if c.BacklogURL != "https://plane.example" {
+		t.Errorf("BacklogURL = %q, want the home config's value", c.BacklogURL)
+	}
+}
+
+func TestLoadHomeWithNoFileUsesDefaults(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	c, err := LoadHome()
+	if err != nil {
+		t.Fatalf("LoadHome: %v", err)
+	}
+	if c.Source() != "" || c.BacklogURL != defaultBacklogURL {
+		t.Errorf("LoadHome = source %q, backlog %q; want the built-in defaults", c.Source(), c.BacklogURL)
+	}
+}
+
 // --- CLA-288: the zero-spend attempt bound -----------------------------------
 
 func TestZeroSpendAttemptBound(t *testing.T) {

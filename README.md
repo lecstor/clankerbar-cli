@@ -1070,6 +1070,7 @@ clankerbar upload shot.png                    # print asset:<id> (the bytes neve
 clankerbar download asset:2f9c… -o docs/      # fetch an asset; stdout is the path written
 clankerbar deck deck.html --task CLA-581      # upload a review deck, print its review URL
 clankerbar login                              # authenticate this machine once (browser device flow)
+clankerbar mcp                                # stdio MCP bridge: one config for every harness
 clankerbar whoami                             # where the credential comes from, and is it still valid?
 clankerbar logout --all                       # forget every stored origin
 ```
@@ -1110,6 +1111,48 @@ operator's ambient login.
 `CLANKERBAR_AUTH_FILE` relocates the store for tests or per-profile setups. Set
 it to `none` (or the platform's null device) to disable stored credentials
 entirely — reads then answer "not found" without touching disk.
+
+### One MCP server for every harness: `clankerbar mcp`
+
+Interactive harnesses (Claude Code, Codex, opencode, Cursor, Antigravity, T3
+Code, …) each spell their MCP config differently, expand environment variables
+differently, and often do not inherit a shell export. `clankerbar mcp` collapses
+that: it is a **stdio-to-Streamable-HTTP bridge**, so every harness configures
+the same local server and shares the one login from `clankerbar login` — no
+`CLANKERBAR_API_KEY` in a harness file, and none in the agent session's
+environment.
+
+```jsonc
+// Claude Code: .mcp.json (codex/cursor/opencode/... are the same command+args)
+{ "mcpServers": { "clankerbar": { "command": "clankerbar", "args": ["mcp"] } } }
+```
+
+```sh
+clankerbar mcp                    # project from .clankerbar.json, else the account-wide /mcp
+clankerbar mcp --project my-proj  # pin one project: <origin>/mcp/my-proj
+clankerbar mcp --multi            # force the account-wide /mcp surface
+clankerbar mcp --host https://staging.example   # a non-default plane
+```
+
+The origin is `--host`, else the config's `backlog_url`, else
+`https://clankerbar.com`; it must be HTTPS (plain HTTP only to loopback). The
+target is `<origin>/mcp` unless a project is pinned. Without `--project` or
+`--multi`, the bridge walks upward from the working directory for the nearest
+`.clankerbar.json` — `{ "project": "<slug>" }`, or a parent folder's
+`{ "folders": { "<rel-path>": "<slug>" } }` matched by longest path prefix — and
+stops at the checkout root (`.git`), home, or the filesystem root. A malformed
+file is one warning on stderr, then the account-wide surface. A repository's
+`.mcp.json` is never read: a checkout may say which project it is, never where
+the credential goes.
+
+**stdout is the protocol pipe.** It carries newline-delimited JSON-RPC 2.0
+responses and nothing else; every diagnostic goes to stderr. The bridge answers
+both `application/json` and `text/event-stream` responses, holds concurrent
+requests (bounded), relays payloads well past 64 KiB, and turns a 401/5xx/
+transport failure into a JSON-RPC error naming `clankerbar login` rather than
+leaving the client hanging. The token is resolved per request, so re-running
+`clankerbar login` takes effect without restarting the server. stdin EOF or
+SIGINT/SIGTERM exits 0.
 
 ### The fleet supervisor: bare `clankerbar`
 
