@@ -585,7 +585,7 @@ func TestDrainPhases_LongSessionBeaconsPresenceOnEveryRenewalTick(t *testing.T) 
 // and the poll that covers them all does not run while a drain is in progress.
 // The renewal tick therefore carries the poll's per-target lap: the running
 // target reports its iteration, every other target its own idle (or draining)
-// state (CLA-771 review — beaconLimited is the same precedent for a
+// state (CLA-771 review — beaconWait is the same precedent for a
 // daemon-wide state).
 func TestDrainPhases_LongSessionBeaconsEveryTargetNotOnlyTheRunningOne(t *testing.T) {
 	cfg := fastCfg()
@@ -2201,13 +2201,13 @@ func TestDrainPhases_RetryReportsTheRouteItActuallyStartsOn(t *testing.T) {
 // review 1.review-1.4: the route holds belong to the WAITING project's config. The sibling
 // projects are paused by the same wait and must say so, but their rows must not borrow route
 // names and schedules from a config they do not run.
-func TestBeaconLimited_SendsRouteHoldsOnlyToTheWaitingTarget(t *testing.T) {
+func TestBeaconWait_SendsRouteHoldsOnlyToTheWaitingTarget(t *testing.T) {
 	waiting, sibling := &fakeFleet{}, &fakeFleet{}
 	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: waiting}, {Fleet: sibling}})
 	reset := time.Now().Add(time.Hour)
 	holds := []fleet.RouteHold{{Route: routeGo, Reason: fleet.RouteHoldUsageLimit, Until: reset}}
 
-	d.beaconLimited(0, reset, holds)
+	d.beaconWait(0, fleet.State{Kind: fleet.StateLimited, ResetAt: reset, Routes: holds})
 
 	sent, _ := waiting.reports()
 	if len(sent) != 1 || sent[0].State.Kind != fleet.StateLimited || len(sent[0].State.Routes) != 1 || sent[0].State.Routes[0].Route != routeGo {

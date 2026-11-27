@@ -81,6 +81,15 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 			r.end.windowWhy = blocked.Error()
 			return attemptVerdict{next: attemptReturn, zeroSpend: true}
 		}
+		// CLA-1024: every configured route this phase may start on is Stop-blocked. No spawn can
+		// start and no reset will come, so end the run for the operator exactly as the wait's
+		// all-stopped path does.
+		var stopped *routeStopBlocked
+		if errors.As(at.ierr, &stopped) {
+			logStopBlocked(stopped)
+			d.writeStopBlocked(stopped)
+			return attemptVerdict{next: attemptReturn, zeroSpend: true, stop: true}
+		}
 		// The session env refused to resolve (a failing or empty-output fromCommand, an unreadable @path
 		// file — the error names the variable).
 		return attemptVerdict{next: attemptReturn, zeroSpend: true, err: fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), at.ierr)}

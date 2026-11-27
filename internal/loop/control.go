@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -110,6 +112,13 @@ func (d *Driver) applyReload() {
 		return
 	}
 	d.cfg = fresh
+	// A stopped route is out until the operator resolves the account; the RELOAD that follows that
+	// work is the retry, so the sidelines it carried are cleared here (CLA-1024). Marks are kept —
+	// they are the provider's own timed statement, which a config edit does not lift.
+	if stopped := d.clearStoppedRoutes(); len(stopped) > 0 {
+		sort.Strings(stopped)
+		log.Printf("RELOAD cleared the Stop sideline on %s — the next session or probe may try them again", strings.Join(stopped, ", "))
+	}
 	// A stored run-config overlay was built from the OLD base; mark it for a rebuild on the fresh one
 	// at the next poll — still this boundary, never mid-session.
 	d.invalidateRunConfigs()

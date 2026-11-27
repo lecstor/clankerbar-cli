@@ -133,6 +133,12 @@ func (d *Driver) invocationForPhase(t Target, phaseIdx int, ph config.Phase, pre
 	case !choice.WaitUntil.IsZero():
 		return inv, ph, &routeWindowBlocked{phase: ph.Label(phaseIdx), until: choice.WaitUntil, routes: choice.WindowBlocked}
 	default:
+		// An empty choice for a NON-empty list is not "no route list": every configured route is
+		// Stop-blocked, and the phase's resolved model is exactly the route that may not start
+		// (CLA-1024). Refuse the spawn instead of falling through to it.
+		if routes, _ := tc.ModelRoutesForPhase(ph); d.allRoutesStopped(routes) {
+			return inv, ph, d.stopRefusalFor(routes, ph.Label(phaseIdx))
+		}
 		inv.Model = model
 		inv.Routes = nil
 	}

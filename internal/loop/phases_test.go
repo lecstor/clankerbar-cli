@@ -987,10 +987,12 @@ func TestDrainPhases_AResumedPhaseLimitStillReleasesAClaimWithNoWork(t *testing.
 	}
 }
 
-// A hard stop is not a rolling limit and still stops the run: there is no
-// reset to wait for, so a resumed phase's sequence ends and the daemon exits
-// for the operator to resume once they have topped up (lim.Stop).
-func TestDrainPhases_AResumedPhaseHardStopStillStopsTheRun(t *testing.T) {
+// A hard stop on a resumed phase with NO configured route list (the legacy single-route shape)
+// still stops the run: there is no reset to wait for, so the sequence ends and the daemon exits for
+// the operator to resume once they have topped up (lim.Stop). The MULTI-route resumed path, where a
+// Stop sidelined one route and the run waits on another, is pinned by
+// TestDrainPhase_ResumedMultiRouteStopSidelinesTheRouteAndWaits (review 1.review-1.2).
+func TestDrainPhases_AResumedPhaseHardStopWithNoRouteListStillStopsTheRun(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)},
 		{res: held(limitStopResult(), openClaim())},

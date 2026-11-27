@@ -204,7 +204,7 @@ func TestProbeWake_WindowBlockedLogNamesOnlyWindowBlockedRoutes(t *testing.T) {
 	d.now = func() time.Time { return inside }
 
 	logs := captureLogs(t)
-	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], nil, spend{start: time.Now()})
 	if verdict != wakeStillLimited {
 		t.Fatalf("verdict = %v, want wakeStillLimited: the windowed route cannot lift inside its window", verdict)
 	}
@@ -240,7 +240,7 @@ func TestProbeWake_WindowBlockedLogNamesOnlyWindowBlockedRoutes(t *testing.T) {
 
 	// The refusal itself carries the same narrow list, so the phase-boundary evidence path ("the
 	// next drain's boundary holds until it ends") cannot name a usage-limited route either.
-	_, err := d.probeInvocation(d.targets[0], d.cfg, d.cfg.Phases[0])
+	_, err := d.probeInvocation(d.targets[0], d.cfg, d.cfg.Phases[0], nil)
 	var blocked *routeWindowBlocked
 	if !errors.As(err, &blocked) {
 		t.Fatalf("probeInvocation error = %v, want *routeWindowBlocked", err)
@@ -261,7 +261,7 @@ func TestProbeWake_AllRoutesWindowedAtWakeStartIsNotAProbeError(t *testing.T) {
 	d.now = func() time.Time { return inside }
 
 	logs := captureLogs(t)
-	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], nil, spend{start: time.Now()})
 	if verdict != wakeStillLimited {
 		t.Fatalf("verdict = %v, want wakeStillLimited", verdict)
 	}
@@ -291,7 +291,7 @@ func TestProbeWake_WindowBlockedLogDoesNotClaimEveryHeldRouteIsWindowed(t *testi
 	d.markRouteLimited(routeFreeAlias, inside.Add(5*time.Minute))
 
 	logs := captureLogs(t)
-	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	_, _, verdict, _ := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], nil, spend{start: time.Now()})
 	if verdict != wakeStillLimited {
 		t.Fatalf("verdict = %v, want wakeStillLimited", verdict)
 	}
@@ -343,7 +343,7 @@ func TestProbeWake_WindowBlockedLogAfterALimitedProbeDoesNotClaimEveryHeldRouteI
 	d.markRouteLimited(routePaidAlias, inside.Add(5*time.Minute))
 
 	logs := captureLogs(t)
-	_, _, verdict, end := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], spend{start: time.Now()})
+	_, _, verdict, end := d.probeWake(context.Background(), h, d.targets[0], d.cfg, d.cfg.Phases[0], nil, spend{start: time.Now()})
 	if verdict != wakeStillLimited || end != wakeExhausted {
 		t.Fatalf("verdict, end = %v, %v, want wakeStillLimited, wakeExhausted", verdict, end)
 	}
@@ -454,7 +454,7 @@ func TestRouteWakeHint(t *testing.T) {
 				d.markRouteLimited(route, at.Add(in))
 			}
 
-			got, ok := d.routeWakeHint(d.cfg, config.Phase{})
+			got, ok := d.routeWakeHintFor(d.cfg, tc.routes)
 			if ok != tc.ok {
 				t.Fatalf("ok = %v, want %v (hint %s)", ok, tc.ok, got)
 			}

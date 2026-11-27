@@ -57,7 +57,7 @@ order wins.
 | every phase (first, next, handoff respawn, retry) | `invocationFor` -> `routeRoutesFor` |
 | a sequential review-panel member | the same, since each member is a `drainPhase` pass |
 | a parallel review-panel fan-out | `holdThroughPanelRouteWindows`: the whole panel is held over EVERY member's route list, not only the first member's |
-| the supervised-wait probe | `probeInvocation` aims at the route the next spawn would use, and refuses the probe when every route is windowed |
+| the supervised-wait probe | `probeInvocation` aims at the route the next spawn would use, refuses the probe when every route is windowed, and refuses it (writing `LIMIT_STOP` and ending the wait) when every route is Stop-blocked |
 | the supervisor's conflict-only session | `startConflictSession` -> `config.RouteChoiceAt` |
 | the deterministic close-out | not applicable: it runs no agent session |
 
@@ -65,9 +65,8 @@ A **running** session is never interrupted; the filter decides only which route 
 new spawn may start on. A mid-session adapter route switch (CLA-782) is inside the
 session unit and is not re-filtered.
 
-The deadline for a supervised usage-limit wait's **next** probe — its first
-probe is `probeWait` alone, so the route term applies only to successors — is
-the earliest of:
+The deadline for a supervised usage-limit wait's next probe — the ENTRY sleep and
+every successor alike — is the earliest of:
 
 - the poll interval;
 - a stated reset plus a short grace, when that is sooner;
@@ -76,19 +75,57 @@ the earliest of:
 
 A window that ends mid-interval is therefore probed when it opens, instead of a
 usable route sitting idle until the next interval tick (CLA-986: a wake at 13:59
-held the probe to 14:29 when the window ended at 14:00). If the walk itself ends
-with a route already clear — its usage mark expired while a later route was
-being probed — the next probe is one grace away rather than the whole interval.
-A wake that ended on a probe error takes no one-grace shortcut: it keeps the
-ordinary deadline above — the poll interval, a nearer stated reset plus grace, or
-a route's clear instant plus grace — so a failing probe cannot be re-spawned at
-once (CLA-988).
+held the probe to 14:29 when the window ended at 14:00; CLA-1024: a wait ENTERED
+at 13:45 with another route windowed until 14:00 slept to 14:15, because the
+entry sleep took the interval alone). If the walk itself ends with a route
+already clear — its usage mark expired while a later route was being probed — the
+next probe is one grace away rather than the whole interval. A wake that ended on
+a probe error takes no one-grace shortcut: it keeps the ordinary deadline above —
+the poll interval, a nearer stated reset plus grace, or a route's clear instant
+plus grace — so a failing probe cannot be re-spawned at once (CLA-988).
+
+The wait re-reads the config at every wake and on `RELOAD`: a config edit that
+adds a route, removes a window or shortens `poll_interval` re-aims the deadline at
+once instead of sleeping out the timer the old config set. It also re-reads the
+daemon-wide `pause_windows` gate — no probe (a probe is a paid session) spawns
+while such a window holds, and probing resumes when it ends.
+
+The wait's beacon says what it is actually waiting for. When a daemon-wide
+`pause_windows` window is in force, or when every route is limited/windowed and
+the earliest thing that can change is a route WINDOW's end, it reports `draining`
+with `pauseReason: "schedule"` and that instant as `pauseUntil` (plus the
+schedule's zone), so the console shows the resume time instead of "usage limit -
+probing for a reset". Otherwise it reports `limited` with the earliest concrete
+mark/reset instant, or no instant at all when there is genuinely nothing stated
+(CLA-1024).
 
 A usage MARK and a window are different answers to different questions, so both
 apply: a mark only ORDERs the candidates (a phase still starts, on the route whose
 mark lifts first), while a window removes them. When every route is marked the
 first-unlifting marked route is still used, but never one that is also inside its
 window under `"wait"` — the phase then holds until the window ends.
+
+## Stop-class routes
+
+A route that answers with a limit the loop cannot wait out — a budget or credit
+exhaustion, a 402, a monthly/spend cap, `budget_exhausted` — is **sidelined**
+until a `RELOAD` or a restart, and is never offered to a new session or a probe
+again in the meantime. It has no reset to poll for, so re-probing it every
+`poll_interval` only pays a dead subscription a visit (CLA-1024). A free-tier cap
+("Free usage limit reached") is deliberately NOT in this class: it is a rolling
+`usage_limit` and stays waitable.
+
+In a multi-route phase one route's Stop is not the phase's verdict: the phase
+waits on its other routes — typically a route a pricing window filtered out of
+that spawn, which is why the session never fell back to it — and only a phase
+with no route left stops. "No route left" means a single-route phase (which keeps
+the immediate `LIMIT_STOP`), or every configured route for the phase Stop-blocked
+(whether discovered in a session or by a wait probe). The daemon then stops
+cleanly for operator intervention instead of probing dead subscriptions forever.
+
+`RELOAD` clears the Stop sidelines: it is the operator saying the account — and
+with it the reason for the stop — changed. Usage marks survive it, because a
+config edit does not lift the provider's own timed statement.
 
 ## All routes blocked
 
