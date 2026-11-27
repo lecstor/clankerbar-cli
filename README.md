@@ -1069,7 +1069,47 @@ clankerbar propose-config                     # import this file into the plane 
 clankerbar upload shot.png                    # print asset:<id> (the bytes never leave the shell)
 clankerbar download asset:2f9c… -o docs/      # fetch an asset; stdout is the path written
 clankerbar deck deck.html --task CLA-581      # upload a review deck, print its review URL
+clankerbar login                              # authenticate this machine once (browser device flow)
+clankerbar whoami                             # where the credential comes from, and is it still valid?
+clankerbar logout --all                       # forget every stored origin
 ```
+
+### Once per machine: `clankerbar login`
+
+Every command authenticates with `CLANKERBAR_API_KEY` when it is in the
+environment. When it is not — the common case for a GUI or TUI harness that
+never inherits a shell export — `clankerbar login` writes the key once to an
+owner-only local credential store instead:
+
+```sh
+clankerbar login                    # browser device flow; --host picks a non-default plane
+clankerbar login --project-scope    # a project-bound key instead of the account-wide one
+clankerbar whoami                   # origin, source, scope, and a live list_projects call
+clankerbar logout                   # forget this origin; --all forgets every origin
+```
+
+`login` prints the approval URL and code on stderr, polls the plane, and saves
+the minted key. It never prints the key itself, and neither does any later
+command. The store is `$XDG_STATE_HOME/clankerbar/auth.json`
+(`~/.local/state/clankerbar/auth.json` by default): one entry per canonical
+origin, directory `0700`, file `0600`, written atomically with a same-directory
+rename. A credential file that exists but is a symlink, or sits under a
+symlinked directory, is **refused** (delete the link and log in again); one
+owned by another user is **refused** (re-own it or remove it); one readable by
+group or other is **refused** with the `chmod 600` that fixes it.
+
+Resolution is per origin and in one order everywhere: `CLANKERBAR_API_KEY`
+first (an explicit export still wins), then the stored entry for exactly that
+origin. A key stored for one origin is never sent to another. `run` and
+`supervise` export a file-resolved key into the processes they spawn, so the
+harness sessions they start carry the same credential. `clankerbar review run`
+does the opposite on purpose: it starts its review session with
+`CLANKERBAR_AUTH_FILE=/dev/null`, so an isolated review cannot reach the
+operator's ambient login.
+
+`CLANKERBAR_AUTH_FILE` relocates the store for tests or per-profile setups. Set
+it to `none` (or the platform's null device) to disable stored credentials
+entirely — reads then answer "not found" without touching disk.
 
 ### The fleet supervisor: bare `clankerbar`
 

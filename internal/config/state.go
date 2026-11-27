@@ -29,7 +29,7 @@ func (c *Config) ResolveStateDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	home, err := stateHome()
+	home, err := StateHome()
 	if err != nil {
 		return "", err
 	}
@@ -99,24 +99,28 @@ func (c *Config) SessionWorkDirs() []string {
 // StateRoot is the loop state root: the directory holding one per-workdir state directory (each
 // named `<basename>-<hash>`, see stateSlug), which in turn holds that workdir's iteration logs.
 func StateRoot() (string, error) {
-	home, err := stateHome()
+	home, err := StateHome()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, "clankerbar", "loop"), nil
 }
 
-// stateHome is $XDG_STATE_HOME, or ~/.local/state. A relative XDG_STATE_HOME is ignored rather than
+// StateHome is $XDG_STATE_HOME, or ~/.local/state. A relative XDG_STATE_HOME is ignored rather than
 // honoured: the spec says the variable must hold an absolute path, and a relative one would resolve
 // against whatever cwd the daemon happens to have been started in — the exact ambiguity
 // underWorkDir exists to stamp out.
-func stateHome() (string, error) {
+//
+// Exported because internal/auth keeps the credential store beside the loop's state
+// (<state home>/clankerbar/auth.json) and must resolve the same home, not a second
+// spelling of it.
+func StateHome() (string, error) {
 	if v := os.Getenv("XDG_STATE_HOME"); filepath.IsAbs(v) {
 		return filepath.Clean(v), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("cannot locate a home directory for the loop's state dir (set state_dir, or XDG_STATE_HOME): %w", err)
+		return "", fmt.Errorf("cannot locate the state home (set XDG_STATE_HOME, or HOME): %w", err)
 	}
 	return filepath.Join(home, ".local", "state"), nil
 }

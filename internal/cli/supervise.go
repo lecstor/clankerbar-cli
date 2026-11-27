@@ -96,9 +96,13 @@ func Supervise(ctx context.Context, args []string) error {
 	// calls. A supervisor without it has no desired state to reconcile
 	// against, which is a wiring error to say loudly, not a degraded mode to
 	// invent.
-	key := os.Getenv("CLANKERBAR_API_KEY")
-	if key == "" {
-		return errors.New("supervise: CLANKERBAR_API_KEY is required - the supervisor reconciles against the account-scoped roster, and the account key is the irreducible credential (a supervisor spans projects, so a project key will not do)")
+	//
+	// The key comes from the environment first, then the local credential store
+	// (CLA-1038). A file-resolved key is exported into this process's environment
+	// so every child — and every session that child spawns — inherits it.
+	key, err := accountKeyFor(base, "supervise", "the supervisor reconciles against the account-scoped roster, and the account key is the irreducible credential (a supervisor spans projects, so a project key will not do)")
+	if err != nil {
+		return err
 	}
 
 	o := supervisor.Options{
@@ -162,9 +166,9 @@ func Roll(ctx context.Context, args []string) error {
 
 	// Same irreducible credential as the supervisor: the roll reads the
 	// account-scoped roster, so the account key is the whole wiring.
-	key := os.Getenv("CLANKERBAR_API_KEY")
-	if key == "" {
-		return errors.New("supervise roll: CLANKERBAR_API_KEY is required - the roll reads the same account-scoped roster the supervisor reconciles against")
+	key, err := accountKeyFor(base, "supervise roll", "the roll reads the same account-scoped roster the supervisor reconciles against")
+	if err != nil {
+		return err
 	}
 
 	o := supervisor.Options{

@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
@@ -201,6 +202,28 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 	}
 
 	failed := 0
+	// The key normally arrives in the environment (defaultDoctorEnv). When it
+	// does not, fall back to the local credential store (CLA-1038), so `doctor`
+	// answers about the same credential `run` would use rather than reporting a
+	// keyless machine. A store that exists but is insecure is a FAIL of its own:
+	// silently treating it as "no key" would send the operator to mint a second
+	// one instead of fixing the mode.
+	if e.apiKey == "" {
+		res, rerr := credentialFor(cfg)
+		switch {
+		case rerr != nil:
+			printCheck(w, check{
+				name:   "credential",
+				status: fail,
+				detail: rerr.Error(),
+				remedy: "the credential store could not be used: follow the fix in the detail above, then re-run `clankerbar doctor`",
+			})
+			failed++
+		case res.Source == auth.SourceFile:
+			e.apiKey = res.Token
+			printCheck(w, check{name: "credential", status: pass, detail: "using the stored credential for " + cfg.CredentialOrigin()})
+		}
+	}
 	for _, c := range doctorChecks(ctx, cfg, e) {
 		printCheck(w, c)
 		if c.status == fail {
