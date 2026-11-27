@@ -78,6 +78,17 @@ func Run(ctx context.Context, cfg Config) error {
 	if strings.TrimSpace(cfg.Origin) == "" {
 		return errors.New("mcpbridge: no credential origin")
 	}
+	origin, err := secureurl.Origin(strings.TrimSpace(cfg.Origin))
+	if err != nil {
+		return fmt.Errorf("mcpbridge: credential origin: %w", err)
+	}
+	cfg.Origin = origin
+	// The token may only ever go to the origin it was resolved for. The CLI
+	// builds both from one origin, so this is the guard that keeps a future
+	// caller from pairing a target with a credential it does not belong to.
+	if !secureurl.SameOrigin(cfg.Origin, strings.TrimSpace(cfg.Target)) {
+		return fmt.Errorf("mcpbridge: target %q is not on the credential origin %s", cfg.Target, cfg.Origin)
+	}
 	if cfg.In == nil || cfg.Out == nil {
 		return errors.New("mcpbridge: stdin and stdout are both required")
 	}
@@ -391,10 +402,17 @@ func (b *bridge) emit(line []byte) {
 }
 
 // warnf writes one diagnostic line to stderr. It never touches stdout.
+// A message that already names the binary ("clankerbar: ...") is not prefixed
+// again; the synthesized JSON-RPC errors carry that prefix for the client's own
+// display.
 func (b *bridge) warnf(format string, args ...any) {
+	text := fmt.Sprintf(format, args...)
+	if !strings.HasPrefix(text, "clankerbar: ") {
+		text = "clankerbar mcp: " + text
+	}
 	b.errMu.Lock()
 	defer b.errMu.Unlock()
-	fmt.Fprintf(b.cfg.Err, "clankerbar mcp: "+format+"\n", args...)
+	fmt.Fprintln(b.cfg.Err, text)
 }
 
 // warnAuthHint says the login hint once for the whole run, so a keyless

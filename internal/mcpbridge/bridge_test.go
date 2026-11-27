@@ -394,6 +394,9 @@ func TestBridgeMissingAuth(t *testing.T) {
 	if !strings.Contains(errOut, "clankerbar login") {
 		t.Errorf("stderr does not carry the login hint:\n%s", errOut)
 	}
+	if strings.Contains(errOut, "clankerbar mcp: clankerbar:") {
+		t.Errorf("stderr double-prefixes the hint:\n%s", errOut)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(methods) != 2 {
@@ -492,6 +495,31 @@ func TestBridgeRefusesCrossOriginRedirect(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&leaked); got != 0 {
 		t.Errorf("the redirect target received %d request(s); the credential followed a cross-origin hop", got)
+	}
+}
+
+// Run refuses a target that is not on the credential origin, so a future caller
+// cannot hand the account key to another host by pairing the two fields wrong.
+func TestRunRefusesTargetOffCredentialOrigin(t *testing.T) {
+	var hits int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	err := Run(context.Background(), Config{
+		Target: other.URL + "/mcp",
+		Origin: "http://127.0.0.1:1",
+		In:     strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}` + "\n"),
+		Out:    io.Discard,
+		Err:    io.Discard,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not on the credential origin") {
+		t.Fatalf("err = %v, want an off-origin refusal", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Errorf("the off-origin target received %d request(s)", got)
 	}
 }
 
