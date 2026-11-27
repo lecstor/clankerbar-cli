@@ -22,17 +22,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
+	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
 const (
-	// maxLineBytes bounds one stdin line. A tools/call can carry a whole file
-	// or a long prompt as an argument, so the scanner gets room well past a
-	// dense tool definition; 4 MiB is the floor the design names.
-	maxLineBytes = 4 << 20
-
 	// maxResponseBytes bounds one JSON body or one SSE event payload. It is a
 	// runaway guard, not a protocol limit: the plane's largest tool results are
 	// well under it.
@@ -45,6 +42,11 @@ const (
 	// clients pipeline; the cap keeps a misbehaving one from opening unbounded
 	// connections while still allowing real concurrency.
 	DefaultMaxInflight = 16
+
+	// responseHeaderTimeout bounds how long the plane may take to start
+	// answering. The body gets no deadline of its own: a tools/call may
+	// legitimately run long, and the harness can still cancel by closing stdin.
+	responseHeaderTimeout = 60 * time.Second
 )
 
 // Config is one bridge run.
@@ -100,7 +102,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	b := &bridge{
 		cfg:      cfg,
-		client:   &http.Client{CheckRedirect: sameOriginRedirect(cfg.Origin)},
+		client:   newHTTPClient(cfg.Origin),
 		inflight: make(chan struct{}, cfg.MaxInflight),
 	}
 
@@ -143,35 +145,47 @@ type bridge struct {
 	warnOnce sync.Once // the no-credential hint is said once, not once per request
 }
 
-// readLoop scans stdin for messages and hands each to a worker.
+// newHTTPClient builds the one client a run uses. A plane that accepts the
+// connection and then never answers is bounded by ResponseHeaderTimeout; an
+// overall deadline is deliberately absent because a legitimately long tool call
+// would trip it.
+func newHTTPClient(origin string) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: tr, CheckRedirect: sameOriginRedirect(origin)}
+}
+
+// readLoop reads stdin for messages and hands each to a worker. It reads whole
+// lines with no size cap rather than a Scanner: one tools/call bigger than a
+// scanner's buffer must not end the session, and the input is a local client's
+// own pipe.
 func (b *bridge) readLoop(ctx context.Context) error {
-	sc := bufio.NewScanner(b.cfg.In)
-	sc.Buffer(make([]byte, 64*1024), maxLineBytes)
-	for sc.Scan() {
-		raw := bytes.TrimSpace(sc.Bytes())
-		if len(raw) == 0 {
-			continue
+	br := bufio.NewReaderSize(b.cfg.In, 64*1024)
+	for {
+		line, readErr := br.ReadBytes('\n')
+		if raw := bytes.TrimSpace(line); len(raw) > 0 {
+			msg, err := parseRPCMessage(raw)
+			if err != nil {
+				b.emit(rpcError(nil, codeParse, "clankerbar: "+err.Error()))
+			} else {
+				// The version is recorded before the worker starts, so an
+				// initialize and the requests a client sends straight after it
+				// agree on it even while the initialize response is in flight.
+				if msg.method == "initialize" && msg.protocol != "" {
+					b.setProtocolVersion(msg.protocol)
+				}
+				if !b.dispatch(ctx, append([]byte(nil), raw...), msg) {
+					return ctx.Err()
+				}
+			}
 		}
-		msg, err := parseRPCMessage(raw)
-		if err != nil {
-			b.emit(rpcError(nil, codeParse, "clankerbar: "+err.Error()))
-			continue
-		}
-		// The version is recorded before the worker starts, so an initialize
-		// and the requests a client sends straight after it agree on it even
-		// while the initialize response is still in flight.
-		if msg.method == "initialize" && msg.protocol != "" {
-			b.setProtocolVersion(msg.protocol)
-		}
-		line := append([]byte(nil), raw...)
-		if !b.dispatch(ctx, line, msg) {
-			return nil
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("read stdin: %w", readErr)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read stdin: %w", err)
-	}
-	return nil
 }
 
 // dispatch starts one worker, blocking while the in-flight cap is reached.
@@ -222,6 +236,9 @@ func (b *bridge) post(ctx context.Context, raw []byte, msg rpcMessage, token str
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	// A named UA, not Go's default: Cloudflare refuses some non-browser
+	// signatures outright (error 1010), and the plane sits behind it.
+	req.Header.Set("User-Agent", "clankerbar-cli/"+version.Current+" (mcp bridge)")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -289,7 +306,7 @@ func (b *bridge) forwardPayload(msg rpcMessage, payload []byte) {
 // stream closes without one, the client gets an error instead of hanging.
 func (b *bridge) forwardSSE(ctx context.Context, msg rpcMessage, body io.Reader) {
 	emitted := 0
-	err := forEachSSEData(body, func(payload []byte) error {
+	err := forEachSSEData(body, maxResponseBytes, func(payload []byte) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

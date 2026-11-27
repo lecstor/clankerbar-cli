@@ -9,7 +9,7 @@ import (
 func collectSSE(t *testing.T, input string) []string {
 	t.Helper()
 	var got []string
-	if err := forEachSSEData(strings.NewReader(input), func(payload []byte) error {
+	if err := forEachSSEData(strings.NewReader(input), maxResponseBytes, func(payload []byte) error {
 		got = append(got, string(payload))
 		return nil
 	}); err != nil {
@@ -76,10 +76,38 @@ func TestForEachSSEDataStripsOneLeadingSpace(t *testing.T) {
 
 func TestForEachSSEDataPropagatesErrors(t *testing.T) {
 	sentinel := errors.New("stop")
-	err := forEachSSEData(strings.NewReader("data: one\n\n"), func([]byte) error {
+	err := forEachSSEData(strings.NewReader("data: one\n\n"), maxResponseBytes, func([]byte) error {
 		return sentinel
 	})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the callback's error", err)
 	}
+}
+
+// A hostile stream cannot make the relay buffer without limit: both one long
+// line and a multi-line event are bounded, with the same wording as the JSON
+// path's runaway guard.
+func TestForEachSSEDataBoundsEventSize(t *testing.T) {
+	t.Run("one long line", func(t *testing.T) {
+		input := "data: " + strings.Repeat("x", 64) + "\n\n"
+		err := forEachSSEData(strings.NewReader(input), 32, func([]byte) error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "exceeded 32 bytes") {
+			t.Fatalf("err = %v, want a size refusal", err)
+		}
+	})
+
+	t.Run("multi-line event", func(t *testing.T) {
+		input := "data: " + strings.Repeat("x", 60) + "\ndata: " + strings.Repeat("y", 60) + "\n\n"
+		err := forEachSSEData(strings.NewReader(input), 100, func([]byte) error { return nil })
+		if err == nil || !strings.Contains(err.Error(), "exceeded 100 bytes") {
+			t.Fatalf("err = %v, want a size refusal", err)
+		}
+	})
+
+	t.Run("under the bound still dispatches", func(t *testing.T) {
+		got := collectSSE(t, "data: two\n\ndata: lines\n\n")
+		if len(got) != 2 || got[0] != "two" || got[1] != "lines" {
+			t.Errorf("events = %#v", got)
+		}
+	})
 }

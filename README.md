@@ -1117,15 +1117,23 @@ entirely — reads then answer "not found" without touching disk.
 Interactive harnesses (Claude Code, Codex, opencode, Cursor, Antigravity, T3
 Code, …) each spell their MCP config differently, expand environment variables
 differently, and often do not inherit a shell export. `clankerbar mcp` collapses
-that: it is a **stdio-to-Streamable-HTTP bridge**, so every harness configures
-the same local server and shares the one login from `clankerbar login` — no
-`CLANKERBAR_API_KEY` in a harness file, and none in the agent session's
-environment.
+that: it is a **stdio-to-Streamable-HTTP bridge**, so every interactive harness
+configures the same local server and shares the one login from
+`clankerbar login` — the key stays in the CLI's own store, so the harness needs
+no key in its config or in the shell environment it was launched from.
 
 ```jsonc
-// Claude Code: .mcp.json (codex/cursor/opencode/... are the same command+args)
+// The harness's own (user-level) config, not a checkout's .mcp.json.
+// Claude Code: ~/.claude.json; codex/cursor/opencode/... take the same command+args.
 { "mcpServers": { "clankerbar": { "command": "clankerbar", "args": ["mcp"] } } }
 ```
+
+This entry belongs to the **interactive** harness's config, not the driver's:
+`clankerbar run` and `doctor` refuse a server named `clankerbar` that has no URL
+(a spawned process would be handed the account key), and a discovered
+`<workdir>/.mcp.json` also refuses any local-process entry unless
+`allow_local_mcp_servers` names it. The driver's own MCP config keeps the HTTP
+`/mcp` entry; do not replace it with this one.
 
 ```sh
 clankerbar mcp                    # project from .clankerbar.json, else the account-wide /mcp
@@ -1139,7 +1147,8 @@ The origin is `--host`, else the config's `backlog_url`, else
 target is `<origin>/mcp` unless a project is pinned. Without `--project` or
 `--multi`, the bridge walks upward from the working directory for the nearest
 `.clankerbar.json` — `{ "project": "<slug>" }`, or a parent folder's
-`{ "folders": { "<rel-path>": "<slug>" } }` matched by longest path prefix — and
+`{ "folders": { "<rel-path>": "<slug>" } }` matched by longest path prefix (a
+`"."` key maps the file's own directory) — and
 stops at the checkout root (`.git`), home, or the filesystem root. A malformed
 file is one warning on stderr, then the account-wide surface. A repository's
 `.mcp.json` is never read: a checkout may say which project it is, never where
@@ -1148,11 +1157,11 @@ the credential goes.
 **stdout is the protocol pipe.** It carries newline-delimited JSON-RPC 2.0
 responses and nothing else; every diagnostic goes to stderr. The bridge answers
 both `application/json` and `text/event-stream` responses, holds concurrent
-requests (bounded), relays payloads well past 64 KiB, and turns a 401/5xx/
-transport failure into a JSON-RPC error naming `clankerbar login` rather than
-leaving the client hanging. The token is resolved per request, so re-running
-`clankerbar login` takes effect without restarting the server. stdin EOF or
-SIGINT/SIGTERM exits 0.
+requests (bounded), relays payloads well past 64 KiB, and turns a 401/403 into a
+JSON-RPC error naming `clankerbar login` (a 5xx or transport failure becomes one
+naming the failure) rather than leaving the client hanging. The token is
+resolved per request, so re-running `clankerbar login` takes effect without
+restarting the server. stdin EOF or SIGINT/SIGTERM exits 0.
 
 ### The fleet supervisor: bare `clankerbar`
 

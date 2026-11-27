@@ -2,8 +2,8 @@ package cli
 
 // mcp.go — `clankerbar mcp`, the stdio-to-Streamable-HTTP bridge every local
 // harness can configure identically. The credential stays in the CLI's own
-// store (internal/auth), so a harness config carries no key and the agent
-// session never sees one in its environment.
+// store (internal/auth), so an interactive harness config carries no key and
+// needs none in its environment.
 
 import (
 	"context"

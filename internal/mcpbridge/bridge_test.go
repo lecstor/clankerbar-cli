@@ -100,7 +100,7 @@ func TestBridgeRelaysJSONAndSendsHeaders(t *testing.T) {
 	t.Setenv(auth.EnvAPIKey, "test-key")
 
 	type captured struct {
-		method, auth, accept, contentType, version string
+		method, auth, accept, contentType, version, userAgent string
 	}
 	var mu sync.Mutex
 	var seen []captured
@@ -120,6 +120,7 @@ func TestBridgeRelaysJSONAndSendsHeaders(t *testing.T) {
 			accept:      r.Header.Get("Accept"),
 			contentType: r.Header.Get("Content-Type"),
 			version:     r.Header.Get("MCP-Protocol-Version"),
+			userAgent:   r.Header.Get("User-Agent"),
 		})
 		mu.Unlock()
 		if probe.Method == "notifications/initialized" {
@@ -170,6 +171,9 @@ func TestBridgeRelaysJSONAndSendsHeaders(t *testing.T) {
 		}
 		if got.contentType != "application/json" {
 			t.Errorf("%s Content-Type = %q", got.method, got.contentType)
+		}
+		if !strings.HasPrefix(got.userAgent, "clankerbar-cli/") {
+			t.Errorf("%s User-Agent = %q, want a named clankerbar UA", got.method, got.userAgent)
 		}
 		if got.method == "initialize" && got.version != "" {
 			t.Errorf("initialize carried MCP-Protocol-Version %q; the version belongs in the body", got.version)
@@ -626,6 +630,107 @@ func TestBridgeCancellationReturnsCleanly(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+// A plane that accepts the connection and then never answers must not hang the
+// harness forever; the client bounds the wait for response headers.
+func TestHTTPClientBoundsResponseHeaders(t *testing.T) {
+	tr, ok := newHTTPClient("https://clankerbar.com").Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", newHTTPClient("https://clankerbar.com").Transport)
+	}
+	if tr.ResponseHeaderTimeout != responseHeaderTimeout || tr.ResponseHeaderTimeout <= 0 {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, responseHeaderTimeout)
+	}
+}
+
+// A stdin line above the old 4 MiB scanner cap is a message, not a fatal read
+// error: the request reaches the plane and the bridge keeps serving the pipe.
+func TestBridgeHandlesLineAboveScannerCap(t *testing.T) {
+	t.Setenv(auth.EnvAPIKey, "test-key")
+	const blobLen = 5 << 20
+	var requestBytes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requestBytes = len(body)
+		var probe struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.Unmarshal(body, &probe)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}`, probe.ID)
+	}))
+	defer srv.Close()
+
+	blobJSON, _ := json.Marshal(strings.Repeat("x", blobLen))
+	input := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"blob":%s}}}`, blobJSON) + "\n"
+	out, errOut, err := runBridge(t, input, srv.URL+"/mcp", srv.URL)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if errOut != "" {
+		t.Errorf("unexpected stderr:\n%s", errOut)
+	}
+	if requestBytes < blobLen {
+		t.Errorf("server received %d bytes, want at least the %d-byte argument", requestBytes, blobLen)
+	}
+	lines := outputLines(t, out)
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1:\n%s", len(lines), out)
+	}
+	lineByID(t, lines, "1")
+}
+
+// The concurrency cap is a ceiling, not just a suggestion: with MaxInflight 2
+// the plane never sees a third request at once.
+func TestBridgeEnforcesMaxInflight(t *testing.T) {
+	t.Setenv(auth.EnvAPIKey, "test-key")
+	const n, limit = 8, 2
+	var inFlight, maxInFlight int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var probe struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.Unmarshal(body, &probe)
+		cur := atomic.AddInt32(&inFlight, 1)
+		for {
+			max := atomic.LoadInt32(&maxInFlight)
+			if cur <= max || atomic.CompareAndSwapInt32(&maxInFlight, max, cur) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		atomic.AddInt32(&inFlight, -1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{}}`, probe.ID)
+	}))
+	defer srv.Close()
+
+	var input strings.Builder
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&input, `{"jsonrpc":"2.0","id":%d,"method":"tools/list","params":{}}`+"\n", i)
+	}
+	var out strings.Builder
+	err := Run(context.Background(), Config{
+		Target:      srv.URL + "/mcp",
+		Origin:      srv.URL,
+		In:          strings.NewReader(input.String()),
+		Out:         &out,
+		Err:         io.Discard,
+		MaxInflight: limit,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lines := outputLines(t, out.String()); len(lines) != n {
+		t.Fatalf("got %d lines, want %d", len(lines), n)
+	}
+	if got := atomic.LoadInt32(&maxInFlight); got > limit {
+		t.Errorf("max concurrent plane requests = %d, want no more than %d", got, limit)
+	} else if got < limit {
+		t.Errorf("max concurrent plane requests = %d; the cap never filled", got)
 	}
 }
 

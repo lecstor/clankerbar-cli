@@ -6,6 +6,7 @@ package mcpbridge
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -256,6 +257,101 @@ func TestResolveTargetStopsAtHome(t *testing.T) {
 	got, _ := resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: cwd, Home: home})
 	if got != testOrigin+"/mcp" {
 		t.Errorf("target = %q: the walk continued above home", got)
+	}
+}
+
+// A harness launched from a GUI has no usable PWD: os.Getwd answers the
+// symlink-resolved path while $HOME is the symlink's own name. The walk must
+// still stop at home rather than read a mapping above it.
+func TestResolveTargetStopsAtSymlinkedHome(t *testing.T) {
+	root := t.TempDir()
+	realHome := filepath.Join(root, "real-home")
+	cwd := filepath.Join(realHome, "work")
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkHome := filepath.Join(root, "home-link")
+	if err := os.Symlink(realHome, linkHome); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	writeTreeFile(t, filepath.Join(root, projectFileName), `{"project":"above-home"}`)
+
+	got, _ := resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: cwd, Home: linkHome})
+	if got != testOrigin+"/mcp" {
+		t.Errorf("target = %q: the walk passed the symlinked home", got)
+	}
+}
+
+func TestResolveTargetFoldersDotKey(t *testing.T) {
+	root := t.TempDir()
+	writeTreeFile(t, filepath.Join(root, projectFileName), `{"folders":{".":"root-project","sub":"sub-project"}}`)
+
+	got, _ := resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: root, Home: t.TempDir()})
+	if got != testOrigin+"/mcp/root-project" {
+		t.Errorf("target at the mapping root = %q, want the \".\" entry", got)
+	}
+
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: sub, Home: t.TempDir()})
+	if got != testOrigin+"/mcp/sub-project" {
+		t.Errorf("target in a subfolder = %q, want the longer key", got)
+	}
+}
+
+func TestResolveTargetFoldersKeyGuards(t *testing.T) {
+	cases := []struct {
+		name, key, cwdRel, slug string // slug "" means the bare surface
+	}{
+		{name: "parent escape", key: "../repo", cwdRel: "repo"},
+		{name: "absolute", key: "/etc", cwdRel: "repo"},
+		{name: "backslash separator", key: `repo\sub`, cwdRel: "repo/sub", slug: "backslash"},
+		{name: "leading dot slash", key: "./repo", cwdRel: "repo", slug: "dotted"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			body, err := json.Marshal(map[string]any{"folders": map[string]string{tc.key: tc.slug}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTreeFile(t, filepath.Join(root, projectFileName), string(body))
+			cwd := filepath.Join(root, tc.cwdRel)
+			if err := os.MkdirAll(cwd, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			want := testOrigin + "/mcp"
+			if tc.slug != "" {
+				want += "/" + tc.slug
+			}
+			got, _ := resolveForTest(t, TargetOptions{Origin: testOrigin, CWD: cwd, Home: t.TempDir()})
+			if got != want {
+				t.Errorf("target = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestNormalizeFolderKey(t *testing.T) {
+	cases := []struct{ key, want string }{
+		{key: ".", want: "."},
+		{key: "./", want: "."},
+		{key: "repo", want: "repo"},
+		{key: "./repo", want: "repo"},
+		{key: `repo\sub`, want: "repo/sub"},
+		{key: "repo//sub", want: "repo/sub"},
+		{key: "", want: ""},
+		{key: "..", want: ""},
+		{key: "../repo", want: ""},
+		{key: "/etc", want: ""},
+		{key: "a/../../b", want: ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeFolderKey(tc.key); got != tc.want {
+			t.Errorf("normalizeFolderKey(%q) = %q, want %q", tc.key, got, tc.want)
+		}
 	}
 }
 

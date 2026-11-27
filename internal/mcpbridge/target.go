@@ -18,7 +18,6 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/config"
-	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 const (
@@ -56,28 +55,11 @@ type TargetOptions struct {
 // ResolveOrigin applies the bridge's origin precedence: --host if set, else the
 // operator's own config (~/.config/clankerbar/config.json), else the built-in
 // plane. The result is always canonical and credential-safe: https anywhere, or
-// http to loopback only.
+// http to loopback only. LoadHome, not Load, because the bridge is launched by a
+// harness from inside a checkout and must neither read nor refuse a driver's
+// clankerbar.json there.
 func ResolveOrigin(host string) (string, error) {
-	if h := strings.TrimSpace(host); h != "" {
-		origin, err := secureurl.Origin(h)
-		if err != nil {
-			return "", fmt.Errorf("--host: %w", err)
-		}
-		return origin, nil
-	}
-	cfg, err := config.LoadHome()
-	if err != nil {
-		return "", fmt.Errorf("load the config: %w (pass --host <origin> to skip it)", err)
-	}
-	raw := strings.TrimSpace(cfg.BacklogURL)
-	if raw == "" {
-		return DefaultOrigin, nil
-	}
-	origin, err := secureurl.Origin(raw)
-	if err != nil {
-		return "", fmt.Errorf("the config's backlog_url cannot carry a credential (%w) - pass --host <origin>", err)
-	}
-	return origin, nil
+	return config.ResolveOrigin(host, config.LoadHome)
 }
 
 // ResolveTarget turns the flags (and, when neither pins a project, the nearest
@@ -143,11 +125,14 @@ func discoverProject(dir, home string, warn io.Writer) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	// Resolve symlinks on both ends of the stop-at-home comparison. A
+	// GUI-launched harness has no usable PWD, and os.Getwd then answers the
+	// resolved path while $HOME is whatever the environment says; a symlinked
+	// home would otherwise never match and the walk would read above it.
+	abs = resolvePath(abs)
 	dir = abs
 	if home != "" {
-		if h, err := filepath.Abs(home); err == nil {
-			home = h
-		}
+		home = resolvePath(home)
 	}
 
 	var warned bool
@@ -188,6 +173,19 @@ func discoverProject(dir, home string, warn io.Writer) (string, bool) {
 		}
 		dir = parent
 	}
+}
+
+// resolvePath canonicalizes a path for comparison: symlinks resolved when the
+// path exists, absolute otherwise. Two spellings of the same directory (a
+// symlinked $HOME and os.Getwd's resolved answer) must compare equal.
+func resolvePath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 // clankerbarJSON is the CLA-1021 mapping. The two shapes share one filename: a
@@ -258,13 +256,18 @@ func usableSlug(slug string) bool {
 }
 
 // normalizeFolderKey holds a folders key to a clean forward-slash relative
-// path. A key that escapes its own directory is not a mapping this file can
+// path. "." is the mapping file's own directory (CLA-1021's single-project
+// shape names it with `project`, but an explicit "." entry means the same
+// thing); a key that escapes its own directory is not a mapping this file can
 // make, and is skipped rather than matched.
 func normalizeFolderKey(key string) string {
 	k := strings.TrimSpace(strings.ReplaceAll(key, `\`, "/"))
+	if k == "" {
+		return ""
+	}
 	k = strings.TrimPrefix(k, "./")
 	k = path.Clean(k)
-	if k == "." || k == ".." || strings.HasPrefix(k, "../") || strings.HasPrefix(k, "/") {
+	if k == ".." || strings.HasPrefix(k, "../") || strings.HasPrefix(k, "/") {
 		return ""
 	}
 	return k

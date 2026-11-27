@@ -25,7 +25,6 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
-	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 type loginFlags struct {
@@ -266,29 +265,13 @@ func whoamiRun(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 // resolveAuthHost applies the login/logout/whoami --host default: the config's
-// own credential origin, else the built-in plane. The result is always a
-// credential-safe canonical origin, never the raw flag.
+// own credential origin, else the built-in plane. It shares one ladder with the
+// MCP bridge (config.ResolveOrigin); the difference is only which file is the
+// caller's: these commands use Load(""), which refuses an implicit workdir
+// clankerbar.json, while the bridge is launched inside a checkout and uses
+// LoadHome.
 func resolveAuthHost(flag string) (string, error) {
-	if host := strings.TrimSpace(flag); host != "" {
-		origin, err := secureurl.Origin(host)
-		if err != nil {
-			return "", fmt.Errorf("--host: %w", err)
-		}
-		return origin, nil
-	}
-	cfg, err := config.Load("")
-	if err != nil {
-		return "", fmt.Errorf("load config: %w (pass --host <origin> to skip the config)", err)
-	}
-	raw := strings.TrimSpace(cfg.BacklogURL)
-	if raw == "" {
-		return auth.DefaultOrigin, nil
-	}
-	origin, err := secureurl.Origin(raw)
-	if err != nil {
-		return "", fmt.Errorf("the config's backlog_url cannot carry a credential (%w) - pass --host <origin>", err)
-	}
-	return origin, nil
+	return config.ResolveOrigin(flag, func() (*config.Config, error) { return config.Load("") })
 }
 
 // credentialFor resolves the credential for cfg's trusted origin. It is the one
