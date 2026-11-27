@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -167,6 +168,51 @@ func TestLoginProjectScope(t *testing.T) {
 	}
 	if res.Scope != auth.ScopeProject || res.ProjectSlug != "acme" {
 		t.Errorf("stored credential = %s, want project/acme", res)
+	}
+}
+
+func TestLoginDefaultsToTheConfigOrigin(t *testing.T) {
+	isolateStore(t)
+	p := newLoginPlane(t, map[string]any{"access_token": loginToken, "scope": "user"})
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgDir := filepath.Join(home, ".config", "clankerbar")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(`{"backlog_url":"`+p.srv.URL+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := loginRunWith(context.Background(), nil, &stdout, &stderr, noWait); err != nil {
+		t.Fatalf("login with the config's origin: %v\n%s", err, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want login to keep it empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Logged in to "+p.srv.URL) {
+		t.Errorf("login did not use the config's backlog_url:\n%s", stderr.String())
+	}
+	res, err := auth.Resolve(p.srv.URL)
+	if err != nil || res.Token != loginToken {
+		t.Errorf("stored under the config origin? res=%s err=%v", res, err)
+	}
+}
+
+func TestLoginRefusesWhenTheStoreIsDisabled(t *testing.T) {
+	t.Setenv(auth.EnvAuthFile, os.DevNull)
+	t.Setenv(auth.EnvAPIKey, "")
+	p := newLoginPlane(t, map[string]any{"access_token": loginToken, "scope": "user"})
+
+	var stdout, stderr bytes.Buffer
+	err := loginRunWith(context.Background(), []string{"--host", p.srv.URL}, &stdout, &stderr, noWait)
+	if !errors.Is(err, auth.ErrStoreDisabled) {
+		t.Fatalf("login with the store disabled = %v, want ErrStoreDisabled", err)
+	}
+	// No browser round-trip for a key this process may not save.
+	if p.request() != nil || len(p.pollRequests()) != 0 {
+		t.Errorf("login started the device flow with the store disabled")
 	}
 }
 
@@ -369,6 +415,51 @@ func TestWhoamiProjectScopeUsesTheProjectEndpoint(t *testing.T) {
 	}
 	if len(*calls) != 2 || (*calls)[0] != "list_projects" || (*calls)[1] != "get_backlog_summary" {
 		t.Errorf("calls = %v", *calls)
+	}
+}
+
+func TestWhoamiRefusesAnUnsafeHost(t *testing.T) {
+	isolateStore(t)
+	var stdout, stderr bytes.Buffer
+	err := whoamiRun(context.Background(), []string{"--host", "http://attacker.example"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("whoami accepted plain http to a non-loopback host")
+	}
+	if !strings.Contains(err.Error(), "--host") {
+		t.Errorf("the refusal does not name the flag: %v", err)
+	}
+}
+
+func TestAccountKeyForTheSupervisor(t *testing.T) {
+	isolateStore(t)
+	cfg := validCfg(t)
+	const reason = "the roster is account-scoped"
+
+	if _, err := accountKeyFor(cfg, "supervise", reason); err == nil || !strings.Contains(err.Error(), "clankerbar login") {
+		t.Fatalf("accountKeyFor with no credential = %v, want a login hint", err)
+	}
+
+	if err := auth.Save("https://clankerbar.com", auth.Credential{Token: "project-key", Scope: auth.ScopeProject, ProjectSlug: "acme"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	_, err := accountKeyFor(cfg, "supervise", reason)
+	if err == nil || !strings.Contains(err.Error(), "project-scoped") || !strings.Contains(err.Error(), "--project-scope") {
+		t.Fatalf("accountKeyFor with a project credential = %v, want the project-scope refusal", err)
+	}
+
+	if err := auth.Save("https://clankerbar.com", auth.Credential{Token: "user-key", Scope: auth.ScopeUser}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	t.Setenv(auth.EnvAPIKey, "")
+	key, err := accountKeyFor(cfg, "supervise", reason)
+	if err != nil {
+		t.Fatalf("accountKeyFor with a user credential: %v", err)
+	}
+	if key != "user-key" {
+		t.Errorf("accountKeyFor = %q, want the stored user key", key)
+	}
+	if got := os.Getenv(auth.EnvAPIKey); got != "user-key" {
+		t.Errorf("%s after accountKeyFor = %q, want the exported key", auth.EnvAPIKey, got)
 	}
 }
 

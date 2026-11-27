@@ -257,6 +257,44 @@ func TestLoadRefusesUnknownVersion(t *testing.T) {
 	}
 }
 
+func TestDisabledStoreIgnoresAnExistingFile(t *testing.T) {
+	path := isolate(t)
+	mustSave(t, "https://clankerbar.com", auth.Credential{Token: testToken, Scope: auth.ScopeUser})
+
+	t.Setenv(auth.EnvAuthFile, "none")
+	res, err := auth.Resolve("https://clankerbar.com")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if res.Token != "" {
+		t.Errorf("a disabled store still returned a credential: %s", res)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("disabling the store touched the file: %v", err)
+	}
+}
+
+func TestSaveReplacesTheSameOrigin(t *testing.T) {
+	isolate(t)
+	mustSave(t, "https://clankerbar.com", auth.Credential{Token: "first", Scope: auth.ScopeUser})
+	mustSave(t, "https://clankerbar.com", auth.Credential{Token: "second", Scope: auth.ScopeProject, ProjectSlug: "acme"})
+
+	st, err := auth.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(st.Hosts) != 1 {
+		t.Errorf("hosts = %v, want one entry after a replace", st.Hosts)
+	}
+	res, err := auth.Resolve("https://clankerbar.com")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if res.Token != "second" || res.Scope != auth.ScopeProject {
+		t.Errorf("Resolve = %s, want the replacement credential", res)
+	}
+}
+
 func TestResolveEnvWinsOverStore(t *testing.T) {
 	isolate(t)
 	mustSave(t, "https://clankerbar.com", auth.Credential{Token: testToken, Scope: auth.ScopeUser})

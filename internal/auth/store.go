@@ -233,12 +233,14 @@ func RemoveAll() (int, error) {
 	if before.Mode()&os.ModeSymlink != 0 {
 		return 0, fmt.Errorf("%s is a symlink - refusing to remove anything through one", path)
 	}
-	n := 0
-	if before.Mode().IsRegular() {
-		if st, err := loadFile(path); err == nil {
-			n = len(st.Hosts)
-		}
+	if !before.Mode().IsRegular() {
+		return 0, fmt.Errorf("%s is not a regular file - refusing to remove it", path)
 	}
+	st, err := loadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	n := len(st.Hosts)
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return n, fmt.Errorf("%s: %w", path, err)
 	}
@@ -260,6 +262,9 @@ func removeFile(path string) error {
 func writeFile(path string, st Store) error {
 	dir := filepath.Dir(path)
 	if err := ensureDir(dir); err != nil {
+		return err
+	}
+	if err := checkParent(path); err != nil {
 		return err
 	}
 	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {

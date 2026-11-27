@@ -12,8 +12,8 @@
 //
 //   - the file is owner-only. An existing file readable by group or other, or
 //     owned by another user, is REFUSED with the chmod that fixes it.
-//   - the directory is created 0700, and a symlink at the file or any directory
-//     component below the deepest existing ancestor is refused.
+//   - the directory is created 0700 and every missing component is checked as it
+//     is created; a symlink at the file or at its parent directory is refused.
 //   - writes are atomic (a same-directory temp file renamed over the target), so
 //     a concurrent reader never sees half a JSON document.
 //   - a token is never put into an error string or any output: errors name paths,
@@ -122,17 +122,6 @@ func expandHome(p string) string {
 	}
 	return p
 }
-
-// CanonicalOrigin normalises and validates origin with the same rule every
-// credentialed request uses: https anywhere, http only to loopback.
-func CanonicalOrigin(origin string) (string, error) {
-	return canonicalOrigin(origin)
-}
-
-// ErrNotAuthenticated is returned by Resolve when neither the environment nor
-// the store has a credential for the origin. Callers turn it into a message
-// naming `clankerbar login`.
-var ErrNotAuthenticated = errors.New("no credential for this origin")
 
 // ErrStoreDisabled is returned when a WRITE is attempted while
 // CLANKERBAR_AUTH_FILE disables the store.

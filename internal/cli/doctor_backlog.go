@@ -55,7 +55,7 @@ func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
 	if e.apiKey == "" {
 		c.status = warn
 		c.detail = "fleet activity reporting is off: no creds — CLANKERBAR_API_KEY is unset"
-		c.remedy = "export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
+		c.remedy = "run `clankerbar login` on this machine, or export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
 		return c
 	}
 	if endpoint == "" {
@@ -185,7 +185,7 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 	if e.apiKey == "" {
 		c.status = warn
 		c.detail = "loop would run blind: no creds — CLANKERBAR_API_KEY is unset"
-		c.remedy = "export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
+		c.remedy = "run `clankerbar login` on this machine, or export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
 		return c
 	}
 	if summaryURL == "" {

@@ -67,6 +67,9 @@ func Login(ctx context.Context, args []string) error {
 	return loginRun(ctx, args, os.Stdout, os.Stderr)
 }
 
+// loginRun is Login with its writers injected. It writes only to stderr: the
+// verification URL and the confirmation are for the human, and stdout is left
+// empty so a wrapper can capture it without filtering instructions out.
 func loginRun(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return loginRunWith(ctx, args, stdout, stderr, nil)
 }
@@ -85,6 +88,13 @@ func loginRunWith(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	origin, err := resolveAuthHost(f.host)
 	if err != nil {
 		return err
+	}
+	// Refuse before the browser round-trip when the store is disabled: the flow
+	// would mint a key this process is forbidden to save.
+	if _, enabled, err := auth.Path(); err != nil {
+		return err
+	} else if !enabled {
+		return fmt.Errorf("%w - unset %s (or point it at a real path) and run `clankerbar login` again", auth.ErrStoreDisabled, auth.EnvAuthFile)
 	}
 	scope := auth.ScopeUser
 	if f.projectScope {
@@ -117,7 +127,7 @@ func loginRunWith(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stderr, "Logged in to %s (%s).\n", origin, describeScope(cred.Scope, cred.ProjectSlug))
+	fmt.Fprintf(stderr, "Logged in to %s — %s.\n", origin, describeScope(cred.Scope, cred.ProjectSlug))
 	fmt.Fprintf(stderr, "Credential saved to %s (owner-only).\n", path)
 	return nil
 }
@@ -142,6 +152,8 @@ func Logout(ctx context.Context, args []string) error {
 	return logoutRun(ctx, args, os.Stdout, os.Stderr)
 }
 
+// logoutRun is Logout with its writers injected. Human lines go to stderr and
+// stdout stays empty, the same split login uses.
 func logoutRun(_ context.Context, args []string, stdout, stderr io.Writer) error {
 	var f logoutFlags
 	fs := newLogoutFlagSet(&f)
@@ -189,6 +201,9 @@ func Whoami(ctx context.Context, args []string) error {
 	return whoamiRun(ctx, args, os.Stdout, os.Stderr)
 }
 
+// whoamiRun is Whoami with its writers injected. The report is stdout; a
+// failure comes back as an error (main prints it on stderr) so the exit code is
+// the contract.
 func whoamiRun(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	var f whoamiFlags
 	fs := newWhoamiFlagSet(&f)
@@ -286,6 +301,28 @@ func requireCredential(cfg *config.Config) (auth.Resolution, error) {
 		return res, fmt.Errorf("not authenticated for %s: set %s, or run `clankerbar login`", cfg.CredentialOrigin(), auth.EnvAPIKey)
 	}
 	return res, nil
+}
+
+// accountKeyFor resolves the ACCOUNT-wide key the supervisor and the roll need:
+// the roster spans projects, so a project-scoped stored credential is refused
+// before it can fail as an opaque 401. A file-resolved key is exported so every
+// child inherits it. command prefixes the refusal ("supervise", "supervise
+// roll"); reason says what the key is for.
+func accountKeyFor(cfg *config.Config, command, reason string) (string, error) {
+	res, err := credentialFor(cfg)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", command, err)
+	}
+	if res.Token == "" {
+		return "", fmt.Errorf("%s: no credential for %s - %s: set %s or run `clankerbar login`", command, cfg.CredentialOrigin(), reason, auth.EnvAPIKey)
+	}
+	if res.Source == auth.SourceFile && res.Scope == auth.ScopeProject {
+		return "", fmt.Errorf("%s: the stored credential for %s is project-scoped, and %s - run `clankerbar login` without --project-scope", command, cfg.CredentialOrigin(), reason)
+	}
+	if err := exportStoredCredential(res); err != nil {
+		return "", fmt.Errorf("%s: %w", command, err)
+	}
+	return res.Token, nil
 }
 
 // exportStoredCredential puts a file-resolved key into this process's
