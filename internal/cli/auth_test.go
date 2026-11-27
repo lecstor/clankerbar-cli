@@ -547,8 +547,9 @@ func TestDoctorFallsBackToTheStoredCredential(t *testing.T) {
 		return fakePoller{}
 	}
 	var out strings.Builder
-	// Warnings are allowed; a FAIL is what this test would catch as a regression.
-	_ = doctorRun(context.Background(), &out, cfgPath, config.Overrides{}, e)
+	if err := doctorRun(context.Background(), &out, cfgPath, config.Overrides{}, e); err != nil {
+		t.Fatalf("doctor with a stored credential failed: %v\n%s", err, out.String())
+	}
 	if !strings.Contains(out.String(), "using the stored credential for https://clankerbar.com") {
 		t.Errorf("doctor did not report the stored credential:\n%s", out.String())
 	}
