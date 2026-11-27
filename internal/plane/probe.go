@@ -54,8 +54,16 @@ func Unauthorized(err error) bool {
 // toolNotServed reports whether err says the endpoint does not register tool,
 // rather than that the tool refused the call. It is the plane package's own
 // unknownTool rule applied to a wrapped call error.
+//
+// An HTTP-level error is never an unknown-tool refusal: its body is arbitrary
+// (a 404 page can contain "tool <name> not found") and the endpoint did answer,
+// so retrying another tool would report a healthy key for a failing endpoint.
 func toolNotServed(tool string, err error) bool {
 	if err == nil {
+		return false
+	}
+	var status *httpStatusError
+	if errors.As(err, &status) {
 		return false
 	}
 	msg := err.Error()

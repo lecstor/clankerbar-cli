@@ -21,6 +21,8 @@ type devicePlane struct {
 
 	mu         sync.Mutex
 	codeBody   map[string]any
+	codeStatus int
+	codeRaw    string
 	tokenPolls []map[string]any
 	token      []deviceTokenResponse
 	codeReqs   []map[string]any
@@ -29,6 +31,7 @@ type devicePlane struct {
 type deviceTokenResponse struct {
 	status int
 	body   map[string]any
+	raw    string
 }
 
 func newDevicePlane(t *testing.T) *devicePlane {
@@ -54,6 +57,13 @@ func newDevicePlane(t *testing.T) *devicePlane {
 		case "/api/device/code":
 			p.codeReqs = append(p.codeReqs, req)
 			w.Header().Set("Content-Type", "application/json")
+			if p.codeRaw != "" {
+				if p.codeStatus != 0 {
+					w.WriteHeader(p.codeStatus)
+				}
+				_, _ = io.WriteString(w, p.codeRaw)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(p.codeBody)
 		case "/api/device/token":
 			p.tokenPolls = append(p.tokenPolls, req)
@@ -67,6 +77,10 @@ func newDevicePlane(t *testing.T) *devicePlane {
 			p.token = p.token[1:]
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(next.status)
+			if next.raw != "" {
+				_, _ = io.WriteString(w, next.raw)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(next.body)
 		default:
 			http.NotFound(w, r)
@@ -253,5 +267,92 @@ func TestPollDeviceTokenRefusesAnEmptyAccessToken(t *testing.T) {
 func TestRequestDeviceCodeRefusesAnUnsafeOrigin(t *testing.T) {
 	if _, err := auth.RequestDeviceCode(context.Background(), "http://attacker.example", auth.ScopeUser); err == nil {
 		t.Fatal("RequestDeviceCode accepted plain http to a non-loopback host")
+	}
+}
+
+// A /api/device/code response body carries the grant's device_code, so a failure
+// that echoes it hands the polling secret to whoever reads the error.
+func TestRequestDeviceCodeNeverEchoesTheResponseBody(t *testing.T) {
+	const secret = "device-code-secret"
+	cases := []struct {
+		name   string
+		status int
+		raw    string
+		want   string
+	}{
+		{
+			name:   "unexpected status",
+			status: http.StatusCreated,
+			raw:    `{"device_code":"` + secret + `","user_code":"WDJB-MJHT","expires_in":600}`,
+			want:   "HTTP 201",
+		},
+		{
+			name:   "malformed body",
+			status: http.StatusOK,
+			raw:    `{"device_code":"` + secret,
+			want:   "not valid JSON",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newDevicePlane(t)
+			p.mu.Lock()
+			p.codeStatus = tc.status
+			p.codeRaw = tc.raw
+			p.mu.Unlock()
+
+			_, err := auth.RequestDeviceCode(context.Background(), p.srv.URL, auth.ScopeUser)
+			if err == nil {
+				t.Fatal("RequestDeviceCode accepted a bad device-code response")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("the error echoed the device_code: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// A /api/device/token body carries the freshly minted access_token: echoing it on
+// an unexpected status or a truncated body would print the key the operator just
+// approved.
+func TestPollDeviceTokenNeverEchoesTheTokenBody(t *testing.T) {
+	const secret = "clk_minted_secret_do_not_print"
+	cases := []struct {
+		name     string
+		response deviceTokenResponse
+		want     string
+	}{
+		{
+			name:     "unexpected 201 status",
+			response: deviceTokenResponse{status: http.StatusCreated, body: map[string]any{"access_token": secret}},
+			want:     "HTTP 201",
+		},
+		{
+			name:     "malformed 200 body",
+			response: deviceTokenResponse{status: http.StatusOK, raw: `{"access_token":"` + secret},
+			want:     "not valid JSON",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newDevicePlane(t)
+			p.queue(tc.response)
+
+			_, err := auth.PollDeviceToken(context.Background(), p.srv.URL,
+				auth.DeviceAuthorization{DeviceCode: "device-code-123", Interval: 1},
+				auth.PollOptions{Sleep: noSleep})
+			if err == nil {
+				t.Fatal("PollDeviceToken accepted a bad token response")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("the error echoed the access token: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
 	}
 }

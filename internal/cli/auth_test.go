@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -216,6 +217,37 @@ func TestLoginRefusesWhenTheStoreIsDisabled(t *testing.T) {
 	}
 }
 
+// An insecure store is refused before the browser round-trip: otherwise the
+// operator approves a grant, the save fails, and the minted key is lost.
+func TestLoginRefusesAnInsecureStoreBeforeTheDeviceFlow(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the mode check is meaningful on unix only")
+	}
+	path := isolateStore(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"hosts":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := newLoginPlane(t, map[string]any{"access_token": loginToken, "scope": "user"})
+
+	var stdout, stderr bytes.Buffer
+	err := loginRunWith(context.Background(), []string{"--host", p.srv.URL}, &stdout, &stderr, noWait)
+	if err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("login with an insecure store = %v, want a chmod 600 refusal", err)
+	}
+	if p.request() != nil || len(p.pollRequests()) != 0 {
+		t.Errorf("login started the device flow before finding the store unusable")
+	}
+	if strings.Contains(err.Error(), loginToken) {
+		t.Errorf("the refusal leaked the token: %v", err)
+	}
+}
+
 func TestLoginDeniedSavesNothing(t *testing.T) {
 	path := isolateStore(t)
 	p := newLoginPlane(t, map[string]any{"error": "access_denied", "error_description": "The operator denied this request."})
@@ -282,12 +314,21 @@ func TestLogoutAllAndHostAreExclusive(t *testing.T) {
 	}
 }
 
+// probeCall is one tools/call the probe server saw: which tool, the endpoint it
+// went to, and the bearer it carried. Recording all three is what lets a test
+// pin the routing rather than only the tool name.
+type probeCall struct {
+	tool string
+	path string
+	auth string
+}
+
 // probeMCP is a minimal MCP server: it records every tools/call and answers with
 // respond(tool).
-func probeMCP(t *testing.T, respond func(tool string) (int, string)) (*httptest.Server, *[]string) {
+func probeMCP(t *testing.T, respond func(tool string) (int, string)) (*httptest.Server, *[]probeCall) {
 	t.Helper()
 	var mu sync.Mutex
-	var calls []string
+	var calls []probeCall
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var req struct {
@@ -297,7 +338,7 @@ func probeMCP(t *testing.T, respond func(tool string) (int, string)) (*httptest.
 		}
 		_ = json.Unmarshal(raw, &req)
 		mu.Lock()
-		calls = append(calls, req.Params.Name)
+		calls = append(calls, probeCall{tool: req.Params.Name, path: r.URL.Path, auth: r.Header.Get("Authorization")})
 		mu.Unlock()
 		status, body := respond(req.Params.Name)
 		w.Header().Set("Content-Type", "application/json")
@@ -326,6 +367,7 @@ func TestWhoamiReportsTheStoredCredential(t *testing.T) {
 		"origin: " + srv.URL,
 		"source: credential file " + path,
 		"scope: user",
+		"saved: ",
 		"status: OK (list_projects succeeded)",
 	} {
 		if !strings.Contains(out, want) {
@@ -335,8 +377,14 @@ func TestWhoamiReportsTheStoredCredential(t *testing.T) {
 	if strings.Contains(out, loginToken) || strings.Contains(stderr.String(), loginToken) {
 		t.Error("whoami printed the token")
 	}
-	if len(*calls) != 1 || (*calls)[0] != "list_projects" {
+	if len(*calls) != 1 || (*calls)[0].tool != "list_projects" {
 		t.Errorf("calls = %v, want one list_projects", *calls)
+	}
+	if (*calls)[0].path != "/mcp" {
+		t.Errorf("probe path = %q, want /mcp", (*calls)[0].path)
+	}
+	if (*calls)[0].auth != "Bearer "+loginToken {
+		t.Errorf("probe Authorization = %q, want the stored token", (*calls)[0].auth)
 	}
 }
 
@@ -388,6 +436,23 @@ func TestWhoamiReportsARejectedCredential(t *testing.T) {
 	}
 }
 
+// A rejected env key cannot be replaced by logging in (env precedence always
+// wins), so the remedy must name the export instead.
+func TestWhoamiRejectedEnvKeyNamesTheExport(t *testing.T) {
+	isolateStore(t)
+	t.Setenv(auth.EnvAPIKey, "env-key")
+	srv, _ := probeMCP(t, func(string) (int, string) { return http.StatusUnauthorized, `{"error":"unauthorized"}` })
+
+	var stdout, stderr bytes.Buffer
+	err := whoamiRun(context.Background(), []string{"--host", srv.URL}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), auth.EnvAPIKey) {
+		t.Fatalf("whoami on a rejected env key = %v, want the export named", err)
+	}
+	if strings.Contains(err.Error(), "run `clankerbar login`") {
+		t.Errorf("the remedy tells an env-key user to log in, which cannot help: %v", err)
+	}
+}
+
 // A project-scoped credential probes its project's endpoint, where the project
 // tool set has no list_projects: the probe must fall back rather than report a
 // healthy credential as broken.
@@ -413,8 +478,18 @@ func TestWhoamiProjectScopeUsesTheProjectEndpoint(t *testing.T) {
 	if !strings.Contains(stdout.String(), "status: OK (get_backlog_summary succeeded)") {
 		t.Errorf("whoami did not record the fallback tool:\n%s", stdout.String())
 	}
-	if len(*calls) != 2 || (*calls)[0] != "list_projects" || (*calls)[1] != "get_backlog_summary" {
+	if len(*calls) != 2 || (*calls)[0].tool != "list_projects" || (*calls)[1].tool != "get_backlog_summary" {
 		t.Errorf("calls = %v", *calls)
+	}
+	// A project-scoped key is only valid on its project's endpoint; probing the
+	// account surface would answer 401 against a real plane.
+	for i, call := range *calls {
+		if call.path != "/mcp/acme" {
+			t.Errorf("call %d path = %q, want /mcp/acme", i, call.path)
+		}
+		if call.auth != "Bearer "+loginToken {
+			t.Errorf("call %d Authorization = %q, want the stored token", i, call.auth)
+		}
 	}
 }
 

@@ -451,3 +451,137 @@ func TestCredentialAndStoreRedactTokens(t *testing.T) {
 		t.Errorf("Resolution.String leaked the token: %s", s)
 	}
 }
+
+// A directory another user can write lets them replace the 0600 file, so the
+// store is refused before anything is written into it.
+func TestSaveRefusesGroupWritableParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the mode check is meaningful on unix only")
+	}
+	base := t.TempDir()
+	dir := filepath.Join(base, "store")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "auth.json")
+	t.Setenv(auth.EnvAuthFile, path)
+	t.Setenv(auth.EnvAPIKey, "")
+
+	err := auth.Save("https://clankerbar.com", auth.Credential{Token: testToken, Scope: auth.ScopeUser})
+	if err == nil || !strings.Contains(err.Error(), "writable by group or other") {
+		t.Fatalf("Save under a group-writable directory = %v, want a mode refusal", err)
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Errorf("the refusal leaked the token: %v", err)
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("Save wrote the credential file despite the refusal: %v", statErr)
+	}
+	if _, loadErr := auth.Load(); loadErr == nil {
+		t.Error("Load accepted a group-writable store directory")
+	}
+}
+
+// A file another user owns can be rewritten by them whatever its mode says, so
+// it is refused. Assigning a foreign owner needs root.
+func TestLoadRefusesForeignOwnedFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the ownership check is meaningful on unix only")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to assign a foreign owner")
+	}
+	path := isolate(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"version":1,"hosts":{"https://clankerbar.com":{"token":"` + testToken + `","scope":"user"}}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(path, 65534, 65534); err != nil {
+		t.Skipf("cannot assign a foreign owner: %v", err)
+	}
+
+	_, err := auth.Load()
+	if err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Fatalf("Load of a foreign-owned file = %v, want an owner refusal", err)
+	}
+	if strings.Contains(err.Error(), testToken) {
+		t.Errorf("the refusal leaked the token: %v", err)
+	}
+}
+
+// Logging out of the last origin deletes the store rather than leaving an empty
+// document behind.
+func TestRemoveDropsTheFileWithTheLastOrigin(t *testing.T) {
+	path := isolate(t)
+	mustSave(t, "https://one.example", auth.Credential{Token: "one", Scope: auth.ScopeUser})
+
+	removed, err := auth.Remove("https://one.example")
+	if err != nil || !removed {
+		t.Fatalf("Remove = (%v, %v), want (true, nil)", removed, err)
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("Remove left the last origin's file behind: %v", statErr)
+	}
+}
+
+// Remove and RemoveAll refuse a symlink or a directory at the store path: either
+// would make "forget my key" mean something other than the file it names.
+func TestRemovePathsRefuseSymlinkAndDirectoryStores(t *testing.T) {
+	for _, removeAll := range []bool{false, true} {
+		name := "Remove"
+		if removeAll {
+			name = "RemoveAll"
+		}
+		t.Run(name+"/symlink", func(t *testing.T) {
+			path := isolate(t)
+			target := filepath.Join(t.TempDir(), "elsewhere.json")
+			if err := os.WriteFile(target, []byte(`{"version":1,"hosts":{}}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+
+			err := removeOne(t, removeAll)
+			if err == nil || !strings.Contains(err.Error(), "symlink") {
+				t.Fatalf("%s through a symlink = %v, want a symlink refusal", name, err)
+			}
+			if _, statErr := os.Lstat(target); statErr != nil {
+				t.Errorf("the symlink's target was removed: %v", statErr)
+			}
+		})
+		t.Run(name+"/directory", func(t *testing.T) {
+			path := isolate(t)
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			err := removeOne(t, removeAll)
+			if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("%s of a directory = %v, want a regular-file refusal", name, err)
+			}
+			if _, statErr := os.Lstat(path); statErr != nil {
+				t.Errorf("the directory was removed: %v", statErr)
+			}
+		})
+	}
+}
+
+func removeOne(t *testing.T, removeAll bool) error {
+	t.Helper()
+	if removeAll {
+		_, err := auth.RemoveAll()
+		return err
+	}
+	_, err := auth.Remove("https://clankerbar.com")
+	return err
+}

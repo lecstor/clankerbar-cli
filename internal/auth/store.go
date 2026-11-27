@@ -48,10 +48,20 @@ func emptyStore() Store {
 // loadFile reads and vets one credential file. It refuses a symlink, a
 // non-regular file, a file another user owns, and a file group or other can
 // read — each with the reason and, where relevant, the chmod that fixes it.
+//
+// A missing file is an empty store, but an EXISTING unsafe parent directory is
+// still refused: whoever can write the directory could plant or replace the
+// credential, and refusing only at save time would lose a key `login` had just
+// been granted.
 func loadFile(path string) (Store, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if _, derr := os.Lstat(filepath.Dir(path)); derr == nil {
+				if perr := checkParent(path); perr != nil {
+					return Store{}, perr
+				}
+			}
 			return emptyStore(), nil
 		}
 		return Store{}, fmt.Errorf("%s: %w", path, err)

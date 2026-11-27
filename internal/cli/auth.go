@@ -89,12 +89,19 @@ func loginRunWith(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	if err != nil {
 		return err
 	}
-	// Refuse before the browser round-trip when the store is disabled: the flow
-	// would mint a key this process is forbidden to save.
-	if _, enabled, err := auth.Path(); err != nil {
+	// Refuse before the browser round-trip when the store cannot take a key: a
+	// disabled store, an unreadable/insecure file, or an unresolvable state home
+	// would otherwise only surface after the operator approved a grant, losing
+	// the freshly minted key.
+	path, enabled, err := auth.Path()
+	if err != nil {
 		return err
-	} else if !enabled {
+	}
+	if !enabled {
 		return fmt.Errorf("%w - unset %s (or point it at a real path) and run `clankerbar login` again", auth.ErrStoreDisabled, auth.EnvAuthFile)
+	}
+	if _, err := auth.Load(); err != nil {
+		return fmt.Errorf("the credential store at %s cannot be used: %w", path, err)
 	}
 	scope := auth.ScopeUser
 	if f.projectScope {
@@ -122,10 +129,6 @@ func loginRunWith(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	}
 	if err := auth.Save(origin, cred); err != nil {
 		return fmt.Errorf("save the credential: %w", err)
-	}
-	path, _, err := auth.Path()
-	if err != nil {
-		return err
 	}
 	fmt.Fprintf(stderr, "Logged in to %s — %s.\n", origin, describeScope(cred.Scope, cred.ProjectSlug))
 	fmt.Fprintf(stderr, "Credential saved to %s (owner-only).\n", path)
@@ -237,6 +240,9 @@ func whoamiRun(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	} else {
 		fmt.Fprintln(stdout, "scope: unknown")
 	}
+	if !res.SavedAt.IsZero() {
+		fmt.Fprintf(stdout, "saved: %s\n", res.SavedAt.UTC().Format(time.RFC3339))
+	}
 
 	endpoint := origin + "/mcp"
 	if res.Scope == auth.ScopeProject && res.ProjectSlug != "" {
@@ -245,7 +251,13 @@ func whoamiRun(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	tool, probeErr := plane.Probe(ctx, endpoint, res.Token)
 	if probeErr != nil {
 		if plane.Unauthorized(probeErr) {
-			return fmt.Errorf("the credential for %s was rejected by the plane (401/403) - it may be revoked: run `clankerbar login` again: %w", origin, probeErr)
+			remedy := "it may be revoked: run `clankerbar login` again"
+			if res.Source == auth.SourceEnv {
+				// Env precedence means a stored key could never replace this one:
+				// the fix is to correct or unset the export itself.
+				remedy = "replace or unset the " + auth.EnvAPIKey + " export"
+			}
+			return fmt.Errorf("the credential for %s was rejected by the plane (401/403) - %s: %w", origin, remedy, probeErr)
 		}
 		return fmt.Errorf("could not verify the credential at %s: %w", endpoint, probeErr)
 	}
@@ -266,7 +278,7 @@ func resolveAuthHost(flag string) (string, error) {
 	}
 	cfg, err := config.Load("")
 	if err != nil {
-		return "", fmt.Errorf("load config: %w", err)
+		return "", fmt.Errorf("load config: %w (pass --host <origin> to skip the config)", err)
 	}
 	raw := strings.TrimSpace(cfg.BacklogURL)
 	if raw == "" {

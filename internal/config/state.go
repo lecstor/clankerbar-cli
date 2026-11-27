@@ -120,7 +120,7 @@ func StateHome() (string, error) {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("cannot locate a home directory for the loop's state dir (set state_dir, or XDG_STATE_HOME): %w", err)
+		return "", fmt.Errorf("cannot locate the state home (set XDG_STATE_HOME, or HOME): %w", err)
 	}
 	return filepath.Join(home, ".local", "state"), nil
 }

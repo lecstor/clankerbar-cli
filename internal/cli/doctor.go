@@ -216,7 +216,7 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 				name:   "credential",
 				status: fail,
 				detail: rerr.Error(),
-				remedy: "fix the credential file (chmod 600 it, or remove it and run `clankerbar login` again)",
+				remedy: "the credential store could not be used: follow the fix in the detail above, then re-run `clankerbar doctor`",
 			})
 			failed++
 		case res.Source == auth.SourceFile:

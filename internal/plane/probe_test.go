@@ -106,6 +106,20 @@ func TestProbeNotWired(t *testing.T) {
 	}
 }
 
+// An HTTP error body can contain the tool name and an unknown-tool phrase (a 404
+// page, a proxy error). It is not a tool-level refusal, so it must not fall
+// through: the endpoint answered, and it did not serve the tool.
+func TestProbeDoesNotFallThroughOnAnHTTPErrorNamingTheTool(t *testing.T) {
+	srv, got := serve(t, http.StatusNotFound, `Tool list_projects not found`)
+	_, err := Probe(context.Background(), srv.URL+"/mcp", "k-1")
+	if err == nil {
+		t.Fatal("Probe accepted a 404")
+	}
+	if len(got.bodies) != 1 {
+		t.Errorf("calls = %d, want exactly one (no fallback on an HTTP error)", len(got.bodies))
+	}
+}
+
 func TestUnauthorizedOnlyFor401And403(t *testing.T) {
 	for status, want := range map[int]bool{
 		http.StatusUnauthorized:        true,

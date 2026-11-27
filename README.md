@@ -1065,9 +1065,10 @@ the minted key. It never prints the key itself, and neither does any later
 command. The store is `$XDG_STATE_HOME/clankerbar/auth.json`
 (`~/.local/state/clankerbar/auth.json` by default): one entry per canonical
 origin, directory `0700`, file `0600`, written atomically with a same-directory
-rename. A credential file that exists but is group/other-readable, owned by
-another user, a symlink, or under a symlinked directory is **refused** with the
-`chmod 600` that fixes it.
+rename. A credential file that exists but is a symlink, or sits under a
+symlinked directory, is **refused** (delete the link and log in again); one
+owned by another user is **refused** (re-own it or remove it); one readable by
+group or other is **refused** with the `chmod 600` that fixes it.
 
 Resolution is per origin and in one order everywhere: `CLANKERBAR_API_KEY`
 first (an explicit export still wins), then the stored entry for exactly that

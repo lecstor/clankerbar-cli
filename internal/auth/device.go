@@ -28,6 +28,10 @@ const (
 	slowDownIncrement   = 5 * time.Second
 	maxTransientPolls   = 5
 	maxDeviceBodyBytes  = 1 << 20
+
+	// defaultGrantLifetime bounds a poll whose grant omitted expires_in, so a
+	// plane that never answers cannot keep `login` waiting forever.
+	defaultGrantLifetime = 10 * time.Minute
 )
 
 // deviceHTTPClient bounds one request. Login is interactive: a hung plane
@@ -107,13 +111,13 @@ func RequestDeviceCode(ctx context.Context, origin, scope string) (DeviceAuthori
 		ErrorDescription string `json:"error_description"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return DeviceAuthorization{}, fmt.Errorf("request a device code from %s: HTTP %d: %s", norm, status, bodySnippet(raw))
+		return DeviceAuthorization{}, fmt.Errorf("request a device code from %s: HTTP %d: the response was not valid JSON", norm, status)
 	}
 	if payload.Error != "" {
 		return DeviceAuthorization{}, &DeviceFlowError{Code: payload.Error, Description: payload.ErrorDescription}
 	}
 	if status != http.StatusOK {
-		return DeviceAuthorization{}, fmt.Errorf("request a device code from %s: HTTP %d: %s", norm, status, bodySnippet(raw))
+		return DeviceAuthorization{}, fmt.Errorf("request a device code from %s: HTTP %d", norm, status)
 	}
 	if payload.DeviceCode == "" || payload.UserCode == "" {
 		return DeviceAuthorization{}, fmt.Errorf("request a device code from %s: the response carried no device_code/user_code", norm)
@@ -129,8 +133,10 @@ type PollOptions struct {
 
 // PollDeviceToken polls the token endpoint until the grant is approved, denied
 // or expired. It respects the grant's interval, backs off by 5s on slow_down
-// (RFC 8628 §3.5), and gives up when ctx is done or the grant's expires_in has
-// passed.
+// (RFC 8628 §3.5), and gives up when ctx is done, the grant's expires_in has
+// passed, or a bounded default lifetime passes when the grant omitted expires_in.
+// A response body is never echoed in an error: the token endpoint's body carries
+// the freshly minted access_token.
 func PollDeviceToken(ctx context.Context, origin string, grant DeviceAuthorization, opts PollOptions) (DeviceToken, error) {
 	norm, err := canonicalOrigin(origin)
 	if err != nil {
@@ -147,7 +153,7 @@ func PollDeviceToken(ctx context.Context, origin string, grant DeviceAuthorizati
 	if interval <= 0 {
 		interval = defaultPollInterval
 	}
-	var deadline time.Time
+	deadline := time.Now().Add(defaultGrantLifetime)
 	if grant.ExpiresIn > 0 {
 		deadline = time.Now().Add(time.Duration(grant.ExpiresIn) * time.Second)
 	}
@@ -157,7 +163,7 @@ func PollDeviceToken(ctx context.Context, origin string, grant DeviceAuthorizati
 		if err := ctx.Err(); err != nil {
 			return DeviceToken{}, err
 		}
-		if !deadline.IsZero() && time.Now().After(deadline) {
+		if time.Now().After(deadline) {
 			return DeviceToken{}, &DeviceFlowError{Code: "expired_token"}
 		}
 		if err := sleep(ctx, interval); err != nil {
@@ -183,11 +189,11 @@ func PollDeviceToken(ctx context.Context, origin string, grant DeviceAuthorizati
 			if transientStatus(status) {
 				transient++
 				if transient >= maxTransientPolls {
-					return DeviceToken{}, fmt.Errorf("poll %s: HTTP %d: %s", norm, status, bodySnippet(raw))
+					return DeviceToken{}, fmt.Errorf("poll %s: HTTP %d: the response was not valid JSON", norm, status)
 				}
 				continue
 			}
-			return DeviceToken{}, fmt.Errorf("poll %s: HTTP %d: %s", norm, status, bodySnippet(raw))
+			return DeviceToken{}, fmt.Errorf("poll %s: HTTP %d: the response was not valid JSON", norm, status)
 		}
 		switch payload.Error {
 		case "":
@@ -198,7 +204,7 @@ func PollDeviceToken(ctx context.Context, origin string, grant DeviceAuthorizati
 						continue
 					}
 				}
-				return DeviceToken{}, fmt.Errorf("poll %s: HTTP %d: %s", norm, status, bodySnippet(raw))
+				return DeviceToken{}, fmt.Errorf("poll %s: HTTP %d", norm, status)
 			}
 			if payload.AccessToken == "" {
 				return DeviceToken{}, fmt.Errorf("poll %s: the plane approved the request but returned no access_token", norm)
@@ -260,17 +266,4 @@ func postJSON(ctx context.Context, endpoint string, body any) (int, []byte, erro
 		return resp.StatusCode, nil, err
 	}
 	return resp.StatusCode, raw, nil
-}
-
-// bodySnippet renders a response body for an error without letting it run to
-// pages or put a newline into an error line.
-func bodySnippet(raw []byte) string {
-	s := strings.Join(strings.Fields(string(raw)), " ")
-	if len(s) > 300 {
-		s = s[:300] + "…"
-	}
-	if s == "" {
-		return "(empty body)"
-	}
-	return s
 }

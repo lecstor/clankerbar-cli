@@ -12,8 +12,10 @@
 // TestMain; it points XDG_STATE_HOME at a fresh temporary directory for every
 // test in the binary (stateHome honours it, spawned subprocesses inherit it,
 // and a per-test t.Setenv still overrides it where a test wants its own), and
-// afterwards compares the REAL root - and its parent clankerbar dir - against
-// snapshots taken before the run, failing the binary if the run added anything
+// disables the credential store through CLANKERBAR_AUTH_FILE so a test can never
+// resolve the operator's real login. Afterwards it compares the REAL root - and
+// its parent clankerbar dir - against snapshots taken before the run, failing
+// the binary if the run added anything
 // there. A leak therefore cannot return quietly: it turns into a red suite
 // naming the directories created. TestEnforcedEverywhereConfigIsImported pins
 // the other half: every package whose tests can reach this derivation MUST
@@ -75,6 +77,13 @@ func Isolate(m *testing.M) int {
 	defer os.RemoveAll(iso)
 	if err := os.Setenv("XDG_STATE_HOME", iso); err != nil {
 		fmt.Fprintln(os.Stderr, "teststate: cannot point XDG_STATE_HOME at the isolated home:", err)
+		return 1
+	}
+	// The credential store honours CLANKERBAR_AUTH_FILE before the state home, so
+	// an exported value would let a test resolve the operator's real login and
+	// reach a real plane. Disable stored credentials unless a test sets its own.
+	if err := os.Setenv("CLANKERBAR_AUTH_FILE", os.DevNull); err != nil {
+		fmt.Fprintln(os.Stderr, "teststate: cannot disable the credential store:", err)
 		return 1
 	}
 
