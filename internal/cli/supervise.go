@@ -25,6 +25,7 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/supervisor"
 )
@@ -96,10 +97,24 @@ func Supervise(ctx context.Context, args []string) error {
 	// calls. A supervisor without it has no desired state to reconcile
 	// against, which is a wiring error to say loudly, not a degraded mode to
 	// invent.
-	key := os.Getenv("CLANKERBAR_API_KEY")
-	if key == "" {
-		return errors.New("supervise: CLANKERBAR_API_KEY is required - the supervisor reconciles against the account-scoped roster, and the account key is the irreducible credential (a supervisor spans projects, so a project key will not do)")
+	//
+	// The key comes from the environment first, then the local credential store
+	// (CLA-1038). A file-resolved key is exported into this process's environment
+	// so every child — and every session that child spawns — inherits it.
+	res, err := credentialFor(base)
+	if err != nil {
+		return fmt.Errorf("supervise: %w", err)
 	}
+	if res.Token == "" {
+		return fmt.Errorf("supervise: no credential for %s - the supervisor reconciles against the account-scoped roster, and the account key is the irreducible credential (a supervisor spans projects, so a project key will not do): set %s or run `clankerbar login`", base.CredentialOrigin(), auth.EnvAPIKey)
+	}
+	if res.Source == auth.SourceFile && res.Scope == auth.ScopeProject {
+		return fmt.Errorf("supervise: the stored credential for %s is project-scoped, and the supervisor reconciles an account-wide roster - run `clankerbar login` without --project-scope", base.CredentialOrigin())
+	}
+	if err := exportStoredCredential(res); err != nil {
+		return fmt.Errorf("supervise: %w", err)
+	}
+	key := res.Token
 
 	o := supervisor.Options{
 		Binary:    bin,
@@ -162,10 +177,20 @@ func Roll(ctx context.Context, args []string) error {
 
 	// Same irreducible credential as the supervisor: the roll reads the
 	// account-scoped roster, so the account key is the whole wiring.
-	key := os.Getenv("CLANKERBAR_API_KEY")
-	if key == "" {
-		return errors.New("supervise roll: CLANKERBAR_API_KEY is required - the roll reads the same account-scoped roster the supervisor reconciles against")
+	res, err := credentialFor(base)
+	if err != nil {
+		return fmt.Errorf("supervise roll: %w", err)
 	}
+	if res.Token == "" {
+		return fmt.Errorf("supervise roll: no credential for %s - the roll reads the same account-scoped roster the supervisor reconciles against: set %s or run `clankerbar login`", base.CredentialOrigin(), auth.EnvAPIKey)
+	}
+	if res.Source == auth.SourceFile && res.Scope == auth.ScopeProject {
+		return fmt.Errorf("supervise roll: the stored credential for %s is project-scoped, and the roll reads an account-wide roster - run `clankerbar login` without --project-scope", base.CredentialOrigin())
+	}
+	if err := exportStoredCredential(res); err != nil {
+		return fmt.Errorf("supervise roll: %w", err)
+	}
+	key := res.Token
 
 	o := supervisor.Options{
 		Binary:    bin,

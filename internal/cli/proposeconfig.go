@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -86,7 +85,11 @@ func ProposeConfig(ctx context.Context, args []string) error {
 	if endpoint == "" {
 		return errors.New("cannot resolve a project-scoped MCP endpoint - set backlog_url in the config")
 	}
-	apiKey := os.Getenv("CLANKERBAR_API_KEY")
+	res, err := requireCredential(cfg)
+	if err != nil {
+		return err
+	}
+	apiKey := res.Token
 	rc := plane.NewRunConfigAPI(endpoint, apiKey)
 
 	// `roles` is the stored document's alone (studio-chat.md §1/§2): the local
