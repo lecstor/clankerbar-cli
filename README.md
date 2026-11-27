@@ -16,6 +16,95 @@ trust it with an overnight run.
 > hardened. It is a supported surface rather than an internal tool - see
 > [Versioning](#versioning) for what the `v0.x` line does and does not promise.
 
+## Install
+
+**One-line install.** Detects your OS and architecture, downloads the matching
+release archive, verifies its SHA-256 against the release's `checksums.txt`, and
+installs `clankerbar` to `~/.local/bin/clankerbar`:
+
+```sh
+curl -fsSL https://clankerbar.com/install.sh | sh
+```
+
+It is a plain `sh` script over `curl` rather than a browser download, so macOS
+never sets the Gatekeeper quarantine attribute. Override the destination with
+`CLANKERBAR_INSTALL_DIR`, and pin a release by setting `CLANKERBAR_VERSION` to a
+tag on the `sh` side of the pipe (a variable before `curl` would apply to `curl`,
+not to the script reading the pipe):
+
+```sh
+curl -fsSL https://clankerbar.com/install.sh | CLANKERBAR_INSTALL_DIR="$HOME/bin" sh
+```
+
+The script finishes by running `clankerbar version`; if the install directory is
+not on your `PATH`, it prints the export line to add to your shell profile.
+
+### Download a release tarball by hand
+
+Each release ships cross-platform binaries on the [releases page][releases] -
+macOS and Linux, amd64 and arm64, as
+`clankerbar_<version>_<os>_<arch>.tar.gz`. Extract it and put `clankerbar` on
+your `PATH`. No Go toolchain required.
+
+```sh
+# macOS arm64; swap the os/arch for yours.
+VERSION=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/lecstor/clankerbar-cli/releases/latest | sed 's#.*/v##')
+OSARCH=darwin_arm64
+curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/clankerbar_${VERSION}_${OSARCH}.tar.gz"
+curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/checksums.txt"
+shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum --ignore-missing -c checksums.txt
+tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
+./clankerbar version
+```
+
+### Verify where it came from
+
+The checksum above catches a corrupt or truncated download, and that is all it
+catches: it is served from the same release page as the archive, so anyone able
+to replace one could replace both. Every release is also signed with
+[build provenance][slsa] - a Sigstore attestation held by GitHub, not by the
+release, recording that these exact bytes came out of this repo's `release.yml`
+at a specific commit:
+
+```sh
+gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" \
+  --repo lecstor/clankerbar-cli \
+  --signer-workflow lecstor/clankerbar-cli/.github/workflows/release.yml
+```
+
+`--signer-workflow` is the half that makes the sentence above true: `--repo`
+alone accepts an attestation signed by *any* workflow in this repo, while naming
+the workflow pins it to the one that publishes releases. That is worth the extra
+line - this binary holds your credentials and runs shell commands on your
+machine, and provenance is the part that would notice if the archive were not
+ours. Needs the [GitHub CLI][gh-cli] and a `gh auth login`; run
+`gh attestation verify --help` for the offline and JSON-output variants.
+
+Downloading in a browser instead of with `curl` gets the archive quarantined by
+macOS, and the binaries are not notarized, so the first run is refused with
+"cannot be opened because the developer cannot be verified". Clear it with
+`xattr -d com.apple.quarantine clankerbar`, or use `curl` as above, which never
+sets the attribute.
+
+### Build from source
+
+Requires Go 1.26+:
+
+```sh
+go install github.com/lecstor/clankerbar-cli/cmd/clankerbar@latest
+# or, from a checkout:
+go build -o clankerbar ./cmd/clankerbar
+```
+
+A source build reports the version it was stamped with - `go install` leaves it
+at the `0.0.0-dev` default, so `clankerbar version` naming a real `vX.Y.Z` means
+you are on a release archive.
+
+[slsa]: https://slsa.dev/spec/v1.0/provenance
+[gh-cli]: https://cli.github.com
+[releases]: https://github.com/lecstor/clankerbar-cli/releases
+
 ## How it works
 
 Each iteration is a *fresh* harness session told to work **one** task, landing a PR
@@ -949,67 +1038,6 @@ and permission policy.
 
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
-
-## Install
-
-**Download a prebuilt binary.** Each release ships cross-platform binaries on the
-[releases page][releases] - macOS and Linux, amd64 and arm64, as
-`clankerbar_<version>_<os>_<arch>.tar.gz`. Extract it and put `clankerbar` on your
-`PATH`. No Go toolchain required.
-
-```sh
-# macOS arm64; swap the os/arch for yours.
-VERSION=0.1.0 OSARCH=darwin_arm64
-curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/clankerbar_${VERSION}_${OSARCH}.tar.gz"
-curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/checksums.txt"
-shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum --ignore-missing -c checksums.txt
-tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
-./clankerbar version
-```
-
-**Then verify where it came from, not just that it arrived intact.** The checksum
-above catches a corrupt or truncated download, and that is all it catches: it is
-served from the same release page as the archive, so anyone able to replace one
-could replace both. Every release is also signed with [build provenance][slsa] -
-a Sigstore attestation held by GitHub, not by the release, recording that these
-exact bytes came out of this repo's `release.yml` at a specific commit:
-
-```sh
-gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" \
-  --repo lecstor/clankerbar-cli \
-  --signer-workflow lecstor/clankerbar-cli/.github/workflows/release.yml
-```
-
-`--signer-workflow` is the half that makes the sentence above true: `--repo`
-alone accepts an attestation signed by *any* workflow in this repo, while naming
-the workflow pins it to the one that publishes releases. That is worth the extra
-line - this binary holds your credentials and runs shell commands on your
-machine, and provenance is the part that would notice if the archive were not
-ours. Needs the [GitHub CLI][gh-cli] and a `gh auth login`; run
-`gh attestation verify --help` for the offline and JSON-output variants.
-
-[slsa]: https://slsa.dev/spec/v1.0/provenance
-[gh-cli]: https://cli.github.com
-
-Downloading in a browser instead of with `curl` gets the archive quarantined by
-macOS, and the binaries are not notarized, so the first run is refused with
-"cannot be opened because the developer cannot be verified". Clear it with
-`xattr -d com.apple.quarantine clankerbar`, or use the `curl` route above, which
-never sets the attribute.
-
-**Or build from source** (requires Go 1.26+):
-
-```sh
-go install github.com/lecstor/clankerbar-cli/cmd/clankerbar@latest
-# or, from a checkout:
-go build -o clankerbar ./cmd/clankerbar
-```
-
-A source build reports the version it was stamped with - `go install` leaves it at
-the `0.0.0-dev` default, so `clankerbar version` naming a real `vX.Y.Z` means you
-are on a release archive.
-
-[releases]: https://github.com/lecstor/clankerbar-cli/releases
 
 ## Versioning
 
