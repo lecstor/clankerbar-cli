@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -180,7 +181,7 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 			Route: routeFreeAlias, Next: routePaidAlias, Reason: "usage_limit",
 		}},
 	}}
-	d.noteRouteFallbacks(d.targets[0], 1, harness.Invocation{}, res)
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
 
 	until, ok := d.routeMarkExpiry(routeFreeAlias)
 	if !ok {
@@ -188,6 +189,88 @@ func TestRouteMarks_UnstatedResetDefaultsToThirtyMinutes(t *testing.T) {
 	}
 	if left := time.Until(until); left < 29*time.Minute || left > 31*time.Minute {
 		t.Errorf("mark expires in %s, want about 30 minutes", left)
+	}
+}
+
+// A route abandoned for a PROVIDER death, not a usage limit, gets the shorter error cooldown —
+// ten minutes — and that mark is persisted to ROUTE_MARKS so later phases and drains skip the
+// flaky route instead of paying it again.
+func TestNoteRouteFallbacks_ProviderErrorUsesTenMinuteCooldown(t *testing.T) {
+	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	d.cfg.PollInterval = config.Duration(time.Hour)
+	logs := captureLogs(t)
+	res := harness.Result{Raw: map[string]any{
+		harness.RouteStartedKey:  routeFreeAlias,
+		harness.RouteFinishedKey: routePaidAlias,
+		harness.RouteFallbacksKey: []harness.RouteFallback{{
+			Route: routeFreeAlias, Next: routePaidAlias, Reason: "provider_error",
+		}},
+	}}
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
+
+	until, ok := d.routeMarkExpiry(routeFreeAlias)
+	if !ok {
+		t.Fatal("the provider-error failover left no mark")
+	}
+	if left := time.Until(until); left < 9*time.Minute || left > 11*time.Minute {
+		t.Errorf("mark expires in %s, want about 10 minutes — not the usage-limit probe interval", left)
+	}
+	if !strings.Contains(logs.String(), routeFreeAlias+" failed (provider_error) — resuming the session on "+routePaidAlias) {
+		t.Errorf("daemon log missing the provider-error switch line; got:\n%s", logs.String())
+	}
+
+	// Persisted: a fresh driver over the same state dir restores the mark.
+	second := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	second.state = d.state
+	second.loadRouteMarks()
+	if got, ok := second.routeMarkExpiry(routeFreeAlias); !ok || time.Until(got) < 9*time.Minute {
+		t.Errorf("the 10-minute provider-error mark did not survive a restart (mark=%v ok=%v)", got, ok)
+	}
+}
+
+// A budget_exhausted stop is a LIMIT reason, not a provider death: its unstated reset takes the
+// supervised wait's probe interval, not the shorter provider-error cooldown, and it is logged as a
+// usage limit.
+func TestNoteRouteFallbacks_BudgetExhaustedUsesTheProbeInterval(t *testing.T) {
+	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	d.cfg.PollInterval = config.Duration(time.Hour)
+	logs := captureLogs(t)
+	res := harness.Result{Raw: map[string]any{
+		harness.RouteStartedKey:  routeFreeAlias,
+		harness.RouteFinishedKey: routePaidAlias,
+		harness.RouteFallbacksKey: []harness.RouteFallback{{
+			Route: routeFreeAlias, Next: routePaidAlias, Reason: "budget_exhausted",
+		}},
+	}}
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
+
+	until, ok := d.routeMarkExpiry(routeFreeAlias)
+	if !ok {
+		t.Fatal("the budget_exhausted stop left no mark")
+	}
+	if left := time.Until(until); left < 59*time.Minute || left > 61*time.Minute {
+		t.Errorf("mark expires in %s, want about the configured one-hour probe interval", left)
+	}
+	if !strings.Contains(logs.String(), routeFreeAlias+" hit a usage limit (budget_exhausted)") {
+		t.Errorf("the budget_exhausted stop was not logged as a usage limit; got:\n%s", logs.String())
+	}
+}
+
+// routeFallbackIsLimit alone, so every reason branch is pinned: the empty reason is a limit (the
+// historical fallback shape states none), the two limit reasons are limits, and every provider
+// death takes the shorter error cooldown.
+func TestRouteFallbackIsLimit(t *testing.T) {
+	for reason, want := range map[string]bool{
+		"":                 true,
+		"usage_limit":      true,
+		"budget_exhausted": true,
+		"provider_error":   false,
+		"quiet_death":      false,
+		"no_tool_exit":     false,
+	} {
+		if got := routeFallbackIsLimit(reason); got != want {
+			t.Errorf("routeFallbackIsLimit(%q) = %v, want %v", reason, got, want)
+		}
 	}
 }
 
@@ -249,7 +332,7 @@ func TestNoteRouteFallbacks_DeniedLastRouteIsMarkedButNotLoggedAsASwitch(t *test
 			{Route: routePaidAlias, Reason: "usage_limit"},
 		},
 	}}
-	d.noteRouteFallbacks(d.targets[0], 1, harness.Invocation{}, res)
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, res)
 
 	if _, ok := d.routeMarkExpiry(routePaidAlias); !ok {
 		t.Error("the denied last route was not marked; the next phase would retry it for nothing")
@@ -311,7 +394,7 @@ func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias, routePaidAlias)
 	d.markRouteLimited(routeFreeAlias, time.Now().Add(2*time.Hour))
 	d.markRouteLimited(routePaidAlias, time.Now().Add(time.Hour))
-	inv, err := d.probeInvocation(Target{}, d.cfg, d.cfg.Phases[0])
+	inv, err := d.probeInvocation(Target{}, d.cfg, d.cfg.Phases[0], nil)
 	if err != nil {
 		t.Fatalf("probeInvocation: %v", err)
 	}
@@ -321,11 +404,66 @@ func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
 
 	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias)
 	single.markRouteLimited(routeFreeAlias, time.Now().Add(time.Hour))
-	inv, err = single.probeInvocation(Target{}, single.cfg, single.cfg.Phases[0])
+	inv, err = single.probeInvocation(Target{}, single.cfg, single.cfg.Phases[0], nil)
 	if err != nil {
 		t.Fatalf("probeInvocation (single): %v", err)
 	}
 	if inv.Model != routeFreeAlias {
 		t.Errorf("single route: probe model = %q, want the harness block's %q", inv.Model, routeFreeAlias)
+	}
+}
+
+// CLA-1026: the fallback is the live route change. A session that started on the
+// free route and finished on the paid one revises the fleet card on the switch.
+func TestNoteRouteFallbacks_RevisesTheLiveRoute(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	ff := &fakeFleet{}
+	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
+	d.targets[0].Fleet = ff
+	d.iter = []iterState{{on: true, n: 1, ref: "CLA-1", phase: "implement", model: routeFreeAlias}}
+
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{},
+		switchedResult(harness.Result{}, routeFreeAlias, routePaidAlias, reset))
+
+	if got := d.fleetState(0).Model; got != routePaidAlias {
+		t.Errorf("state.model = %q, want the route that finished the session %q", got, routePaidAlias)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateIteration || sent[0].State.Model != routePaidAlias {
+		t.Fatalf("switch beacon = %+v, want exactly one iteration beacon on %q", sent, routePaidAlias)
+	}
+	if _, ok := d.routeMarkExpiry(routeFreeAlias); !ok {
+		t.Error("the denied route lost its mark; the card update must not disturb the fallback bookkeeping")
+	}
+
+	// A session that reported no switch leaves the card alone.
+	d.noteRouteFallbacks(0, d.targets[0], 1, harness.Invocation{}, harness.Result{})
+	if got, _ := ff.reports(); len(got) != 1 {
+		t.Errorf("a no-switch result beaconed; want the one switch beacon, got %d", len(got))
+	}
+}
+
+// phaseStartModel is the route state.model reports and the spawn will use: marks
+// and pricing windows applied, "" when the phase resolves no route at all.
+func TestPhaseStartModel_AppliesMarksAndWindows(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	d := routedDriver(t, &fakeAdapter{}, nil, routeGo, routeZen)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+	ph := d.cfg.EffectivePhases()[0]
+
+	if got := d.phaseStartModel(d.cfg, ph); got != routeZen {
+		t.Errorf("windowed start = %q, want %q", got, routeZen)
+	}
+	// With the only open route marked too, every route is withheld (one by its mark, one by its
+	// window) and no session will start: the spawn is refused, so there is no live route to name.
+	d.markRouteLimited(routeZen, time.Now().Add(time.Hour))
+	if got := d.phaseStartModel(d.cfg, ph); got != "" {
+		t.Errorf("all-blocked start = %q, want empty — a refused spawn has no live route", got)
+	}
+
+	empty := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller()}})
+	if got := empty.phaseStartModel(empty.cfg, empty.cfg.EffectivePhases()[0]); got != "" {
+		t.Errorf("start model = %q, want empty for a config with no route", got)
 	}
 }

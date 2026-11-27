@@ -13,8 +13,9 @@ import (
 
 // The walk stages that judge how a phase ended: dead, handed off, or verified.
 
-// judgeDeadPhase retries a dead first phase up to the per-task bound, then parks the task; a
-// fleet-wide run of deaths pauses the target instead.
+// judgeDeadPhase retries a dead phase at the walk's start phase, and a resume-only failure in ANY
+// position — the last phase included (CLA-1033) — each up to the per-task bound, then parks the
+// task; a fleet-wide run of deaths pauses the target instead.
 func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 	d := s.d
 	t := s.t
@@ -28,9 +29,10 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 			taskID = st.end.claim.Claim.TaskID
 		}
 		// CLA-877: a resume-only failure KEPT its claim on purpose (see settleWithoutCheckpoint), so the
-		// retry resumes that same run without a re-claim.
+		// retry resumes that same run without a re-claim. CLA-1033: that retry is allowed on the LAST phase
+		// too — a verify round routinely pushes and opens the PR before its report resume stalls.
 		resumeOnly := st.end.reportResumeFailed != "" && st.end.claim != nil && st.end.claim.Claim.Held()
-		retryable := !st.last && (s.i == s.start || resumeOnly)
+		retryable := (!st.last && s.i == s.start) || resumeOnly
 
 		if retryable && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 			how := "died producing nothing"
@@ -191,8 +193,15 @@ func (s *drainSeq) judgeVerifyGate(ctx context.Context, st *seqStep) seqNext {
 		}
 		if len(st.end.verifyOpenMusts) == 0 {
 			if st.end.verifyStatus == "in_progress" || st.end.verifyStatus == "ready" {
-				log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — it recorded a pass but did not carry the terminal step (push check, PR, in_review); the sequence ends without a hand-over for the operator to see",
-					labelOf(t), drainNum, st.ph.Label(s.i), st.end.verifyRound, st.end.verifyStatus)
+				// Since CLA-1035 the session's terminal step is the push check and the report; the
+				// PR/link/in_review hand-over is the runner's, so name whichever failed.
+				if st.end.reportProblem != "" {
+					log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — the runner-owned hand-over did not complete: %s; the sequence ends for the operator to see",
+						labelOf(t), drainNum, st.ph.Label(s.i), st.end.verifyRound, st.end.verifyStatus, st.end.reportProblem)
+				} else {
+					log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — it recorded a pass but neither its push check nor the runner's hand-over (PR open/link, in_review) carried it; the sequence ends without a hand-over for the operator to see",
+						labelOf(t), drainNum, st.ph.Label(s.i), st.end.verifyRound, st.end.verifyStatus)
+				}
 			}
 			if st.end.verifyRound == 0 {
 				// CLA-638 × CLA-670: a BRANCHLESS round. Its record is the legacy `## Review` block, so there
@@ -281,7 +290,7 @@ func (s *drainSeq) payOwedWaits(ctx context.Context) {
 		} else {
 			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
 				drainNum, resetSuffix(s.limitWait.lim.ResetAt))
-			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, t, spend{
+			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, s.limitWait.routes, t, spend{
 				start: prior.start,
 				ti:    s.ti,
 			})

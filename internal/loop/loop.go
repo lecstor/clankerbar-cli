@@ -150,9 +150,20 @@ type Driver struct {
 	routeMarks   map[string]time.Time
 	routeMarksMu sync.Mutex
 
+	// routeStops is the harder sibling of routeMarks: routes that returned a Stop-class limit — a
+	// budget, credit or plan exhaustion with no reset to wait for — are out until the operator acts,
+	// so they are neither spawned on nor probed again until a RELOAD clears them. Deliberately not
+	// persisted: a restart is the other documented way to retry them (CLA-1024).
+	routeStops   map[string]harness.Limit
+	routeStopsMu sync.Mutex
+
 	// resumedTransientWait overrides the backoff for a resumed phase's transient wait. Nil in
 	// production (nil means backoff); a test seam so the ladder can be driven without sleeping.
 	resumedTransientWait func(n int) time.Duration
+
+	// resumedTransientRetryWait overrides the short IN-CLAIM retry ladder a resumed phase takes
+	// before handing its claim back (15s, then 45s). Nil in production; a test seam.
+	resumedTransientRetryWait func(n int) time.Duration
 
 	// The fleet dead-phase counter. Per-target because a multi-target driver runs several projects,
 	// and "the fleet" is one project's sessions: a run of dead phases on project A must not pause
@@ -182,6 +193,11 @@ type Driver struct {
 
 	waitGrace time.Duration
 
+	// waitChunk is how long a responsive sleep runs before re-reading the control markers (STOP, the
+	// restart family, HALT, RELOAD). Zero means the production 3s — the seam lets a test assert that
+	// a RELOAD or STOP ends a multi-hour sleep promptly without spending three seconds per case.
+	waitChunk time.Duration
+
 	limitBeaconInterval time.Duration
 
 	leaseRenewalInterval time.Duration
@@ -192,6 +208,10 @@ type Driver struct {
 	shutdownBudget time.Duration
 
 	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
+
+	// newPROpener resolves the surface a runner-owned hand-over opens its PR
+	// with (CLA-1035), rooted at the session's worktree.
+	newPROpener func(workdir string) prEnsurer
 
 	newSalvager func(workdir string) workSalvager
 
@@ -302,6 +322,13 @@ type deliveryVerifier interface {
 	Verify(ctx context.Context, c delivery.Claim) delivery.Report
 }
 
+// prEnsurer opens (or reuses) the pull request a runner-owned hand-over carries
+// (CLA-1035). A separate interface from deliveryVerifier so the seam's fakes can
+// keep implementing only the checks they drive.
+type prEnsurer interface {
+	EnsurePR(ctx context.Context, spec delivery.PRSpec) (int, error)
+}
+
 type workSalvager interface {
 	Salvage(ctx context.Context, taskID, label string, recorded ...string) salvage.Outcome
 }
@@ -354,6 +381,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 			}
 			return v
 		},
+		newPROpener: func(workdir string) prEnsurer { return delivery.New(workdir, "") },
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 		probePRBase: ProbeOriginPRBase,

@@ -1509,6 +1509,20 @@ section note.
 > (Capabilities.TracksClaims); on any other adapter it stays zero and the
 > driver must not read a zero as "the MCP server was missing".
 
+### ToolCalls
+
+> ToolCalls is how many tool calls the stream showed COMPLETING — a part whose
+> state reached completed or error, counted once per call id (CLA-1034). The
+> opencode route failover reads it to tell a provider death before the session
+> did any work from one that died mid-task: switching routes after a completed
+> tool call risks replaying side effects the transcript already caused.
+>
+> A call still running when the stream died is not counted: it never completed,
+> and the route failover may still treat the death as work-free. Only adapters
+> with a structured tool stream populate it; on any other adapter it stays zero,
+> so it must never be read as "the session made no tool calls" outside the
+> adapter that writes it.
+
 ### CheckpointUnverified
 
 > CheckpointUnverified marks this Result as the hand-off for a phase that
@@ -3187,6 +3201,9 @@ section note.
 >     result untrusted (the CLA-262 gates read this); dropped-output counts add.
 >   - Tokens/CostUSD SUM: the budget must see every request the fleet made,
 >     including the ones around the hole;
+>   - ToolCalls SUM: a continuation's tool calls are the same session's calls;
+>     the count is a per-attempt measure of work done, like spend. The route
+>     failover's no-tool death test reads it (CLA-1034);
 >   - UsageReported ORs: either run reporting is enough to count spend;
 >   - FinalMessage takes the continuation's (the latest text wins, matching
 >     the parser's own last-text-wins rule);
@@ -3287,9 +3304,13 @@ section note.
 > recalled a codeword from the first turn.
 >
 > The rules:
->   - only a LIMIT switches (DetectLimit): a transient 429 stays on the existing
->     retry ladder, because a blip is worth retrying on the route that already
->     has the context and the budget for it;
+>   - a LIMIT switches (DetectLimit): a rolling window or a hard stop on one
+>     route says nothing about the next route's account;
+>   - a route that dies a PROVIDER death also switches (CLA-1034): a transient
+>     error, a quiet death the resurrection loop could not recover, or a non-zero
+>     exit before the session completed any tool call. Retrying a dead provider
+>     on the route that has the context is not cheaper when the provider itself
+>     is what died, so the next route is tried;
 >   - a Stop on a route that is NOT the last one is just a switch: a hard budget
 >     exhaustion on the free route says nothing about the paid route's account;
 >   - a limit on the LAST route is left on the Result unchanged, for the driver's
@@ -3300,6 +3321,27 @@ section note.
 > mergeRouteSwitch (mergeResume sums its tokens and cost), and a failed one
 > explicitly before the error is returned. A resume re-sends the transcript, so
 > it is real money even when the answer is a limit again.
+
+### switchRoutesOnProviderError
+
+> switchRoutesOnProviderError walks the remaining routes after a provider death,
+> and reports each abandoned route with a distinct reason (provider_error,
+> quiet_death, no_tool_exit) so the driver can mark it for the shorter
+> 10-minute error cooldown instead of the usage-limit interval. A route that
+> named a session is resumed with a terse provider-error continuation; one that
+> died before emitting a session id is started FRESH with the same invocation
+> prompt, because there is no transcript a resume could preserve.
+>
+> Deliberately after the resurrection loop: a quiet death is only a dead
+> PROVIDER after the adapter's own probe-and-continue recovery has failed (or
+> when there was no coherent session to probe). An untrusted stream, a tool-loop
+> kill, an idle kill, a usage limit, our own wall-clock cap and a signal are all
+> excluded: each has an owner elsewhere, and switching would either act on an
+> unreadable capture or spend another turn on a stop this adapter caused.
+>
+> A no-tool death is measured on Result.ToolCalls — the parser's count of tool
+> parts that reached a terminal state. A call still running when the stream died
+> is not "completed", so it does not mask a death that did no work.
 
 ### switchRoutesOnLimit
 

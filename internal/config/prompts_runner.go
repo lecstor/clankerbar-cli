@@ -27,14 +27,14 @@ var runnerRerunGuidance = strings.Replace(rerunGuidance,
 		"discipline while keeping hold of this task.",
 	runnerWaitRule, 1)
 
-// runnerForbidden is the shared prohibition every runner-claimed brief carries. The PR clause is
-// scoped to the brief's own terminal step because the fix and verify briefs still open the PR until
-// the runner owns the close-out (B7/B8).
-const runnerForbidden = " NEVER in this session: do NOT open a PR (unless this brief's own terminal step tells " +
-	"you to), do NOT poll or sleep-wait on CI, do NOT call next_task or claim_task, do NOT call heartbeat (the " +
-	"lease is the runner's), do NOT create or switch worktrees, and do NOT fetch clankerbar skill documents (curl " +
-	"or webfetch of any page under clankerbar.com) - the runner owns all of that, and this brief plus the context " +
-	"block carry everything the task needs." + runnerNoWrites
+// runnerForbidden is the shared prohibition every runner-claimed brief carries. Opening a PR is
+// forbidden unconditionally: the runner opens it from the branch it has verified on origin
+// (CLA-1035), so a session that opens one would race the runner and could leave a PR nobody linked.
+const runnerForbidden = " NEVER in this session: do NOT open a PR, do NOT poll or sleep-wait on CI, do NOT call " +
+	"next_task or claim_task, do NOT call heartbeat (the lease is the runner's), do NOT create or switch " +
+	"worktrees, and do NOT fetch clankerbar skill documents (curl or webfetch of any page under " +
+	"clankerbar.com) - the runner owns all of that, and this brief plus the context block carry everything " +
+	"the task needs." + runnerNoWrites
 
 // runnerCloseOutForbidden is runnerForbidden for the close-out brief, and keeps its own write
 // rules: the close-out still repairs a red check and hands the task back itself, so it must not
@@ -130,7 +130,7 @@ const runnerReviewResume = runnerResumeNoClaim + " An empty branch field on the 
 // the session starts at the reviewed tip.
 var runnerReviewWorktreeAndGate = " " + runnerWorktreeAtTip +
 	" Read the diff against the PR base (git diff " + PhaseBasePlaceholder + "..." + PhaseBranchPlaceholder +
-	") and run the adversarial review gate." + reviewGateScope +
+	") and run the adversarial review gate." + reviewGateScope + reviewPRExistenceScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
@@ -192,8 +192,8 @@ const runnerFixUpdates = " THE FINDING UPDATES GO IN THE SAME REPORT, never with
 const runnerFixCreateTask = " The ONE write that is yours in this session is create_task, for a follow-up a " +
 	"finding deserves (with a real doneWhen): send the new task's ref back as that finding's `filed` update."
 
-// runnerFixBrief is fixBrief for a runner-claimed session: the fix phase that still opens the PR,
-// with the hand-over and the record writes owned by the runner.
+// runnerFixBrief is fixBrief for a runner-claimed session: the final fix phase, with the PR, the
+// hand-over and the record writes owned by the runner.
 var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the runner has now " +
@@ -203,35 +203,35 @@ var runnerFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	" " + runnerFixCore + runnerFixUpdates + runnerFixCreateTask +
 	" If the review found nothing " +
 	"(verdict: pass), there is nothing to fix: commit nothing and report an empty findingUpdates." +
-	" FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes, then open a PR targeting the " +
-	"repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for this branch - push, then the PR, " +
-	"in that order." + worktreeReclaimStep + " Then end the session with the done report. The runner hands the " +
-	"task over with submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) + runnerRerunGuidance +
-	runnerForbidden + handoffGuidance + runnerReportReminder
+	" FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes, then end the session with " +
+	"the done report. The runner opens the PR targeting the repo's PR base branch, records it on the task and " +
+	"hands the task over with submit_for_review itself." + runnerDoneReport(runnerFixLastReportFields) +
+	runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerFixVerifyBrief is fixVerifyBrief for a runner-claimed session: a verification round
-// follows, so the PR and the hand-over stay the verifier's.
+// follows, so the hand-over stays that round's; the runner opens the PR once the round verifies.
 var runnerFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder +
 	" on task " + PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the runner has now " +
 	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
 	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
 	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. A VERIFICATION round " +
-	"runs after you: it re-reviews your fix delta and adjudicates the prior open MUSTs, and IT opens the PR " +
-	"and hands the task to in_review once no MUST remains open." + runnerResumeNoClaim + " " + runnerFixCore +
+	"runs after you: it re-reviews your fix delta and adjudicates the prior open MUSTs, and IT carries the " +
+	"terminal step that hands the task to in_review once no MUST remains open; the runner opens the PR " +
+	"itself." + runnerResumeNoClaim + " " + runnerFixCore +
 	runnerFixUpdates + runnerFixCreateTask +
 	" If the review found nothing (verdict: pass), there is nothing to fix: commit nothing, leave the branch " +
 	"as it is, and report an empty findingUpdates - the verification round still runs and carries the terminal " +
 	"step." +
 	" FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes you made, then end the session " +
-	"with the done report. Do NOT open a PR and do NOT move the task to in_review: the VERIFICATION round after " +
-	"you carries that terminal step once it finds no open MUST, and a PR opened here would ship fixes the " +
-	"verifier never saw. Ending this session holding the task is the checkpoint the verification round resumes " +
+	"with the done report. Do NOT move the task to in_review: the VERIFICATION round after " +
+	"you carries that terminal step once it finds no open MUST, and the runner opens the PR from the " +
+	"verified branch. Ending this session holding the task is the checkpoint the verification round resumes " +
 	"from." + runnerDoneReport(runnerFixReportFields) + runnerRerunGuidance + runnerForbidden + handoffGuidance + runnerReportReminder
 
 // runnerVerifyBrief is verifyBrief for a runner-claimed session: the review scope, the adjudication
-// and the stopping rule are the shipped substance; the resume, the worktree, the polling rule and
-// the record - a done report the runner writes from - differ.
+// and the stopping rule are the shipped substance; the resume, the worktree, the polling rule, the
+// PR and the record - a done report the runner writes from - differ.
 var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the VERIFICATION round. A review round found issues and a fix round applied " +
 	"them; your job is to verify the FIXES, not to review the whole diff again. The driver has closed the " +
@@ -243,7 +243,7 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"SCOPE: the fix delta is the reviewed tip the LAST released record names (`reviewedTip`) up to HEAD " +
 	"(`git diff <reviewedTip>..HEAD`), PLUS the regression surface those fixes touch. Do not re-review the " +
 	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
-	"in the report's notes. " +
+	"in the report's notes. " + verifyCheckScope +
 	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, as an entry in the report's " +
 	"`findingUpdates`, by the id the sealed record gave it: " +
 	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +
@@ -261,16 +261,16 @@ var runnerVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"the existing id. " +
 	"REVIEW ONLY: you do not change code — do not edit, create or delete a source file, do not commit, and do " +
 	"not apply a fix yourself. The phase after you applies what you find, and a fix applied here is a fix it " +
-	"cannot attribute. The one exception is the hand-over below: when no MUST remains open, opening the PR " +
-	"(and pushing a fix commit that the fixer left local) is the terminal step, not a review change. " +
+	"cannot attribute. The one exception is the hand-over below: when no MUST remains open, pushing a fix " +
+	"commit that the fixer left local is the terminal step, not a review change. " +
 	" FINALLY, and this is the step that ENDS the phase. If ANY MUST is still open after your adjudication: " +
-	"just end the session with the done report - do NOT open a PR, do NOT move the task to in_review and do NOT " +
+	"just end the session with the done report - do NOT move the task to in_review and do NOT " +
 	"change its status. The runner records the round, releases it, and spawns another fix or parks the task at " +
 	"the round cap.\n\n" +
-	"If NO MUST remains open: confirm the branch is pushed (push any fix commit the fixer left local), open a " +
-	"PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder + ") if none exists for the branch." +
-	worktreeReclaimStep + " Then end with the report including " + runnerRiskField + ". The runner records the " +
-	"round and hands the task to in_review. Never decide to run another round yourself." +
+	"If NO MUST remains open: confirm the branch is pushed (push any fix commit the fixer left local), then end " +
+	"with the report including " + runnerRiskField + ". The runner opens the PR targeting the repo's PR base " +
+	"branch (" + PhasePRBasePlaceholder + "), records it on the task and hands the task to in_review. " +
+	"Never decide to run another round yourself." +
 	verifyStoppingRule + verifyDriverBounds + runnerDoneReport(runnerVerifyReportFields) + runnerRerunGuidance +
 	runnerForbidden + handoffGuidance + runnerReportReminder
 

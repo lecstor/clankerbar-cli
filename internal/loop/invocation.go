@@ -31,15 +31,37 @@ func diffBase(prBase, baseSHA string) string {
 	return ""
 }
 
+// claimTaskRef is the task's human-readable ref, for the PR title: the claim's own ref, then the
+// runner's task brief (a runner-claimed claim may not carry one), then the same UUID fallback
+// claimLabel uses.
+func claimTaskRef(c harness.Claim, runner *runnerBriefing) string {
+	if c.Ref != "" {
+		return c.Ref
+	}
+	if runner != nil && runner.task.Ref != "" {
+		return runner.task.Ref
+	}
+	return claimLabel(c)
+}
+
 // invocationFor builds the invocation for one PHASE: the target's invocation, carrying this phase's
 // prompt and turn cap, with the previous phase's claim substituted into the prompt's placeholders.
 // A session cannot know its own run id — it never called claim_task — so the driver, which
 // watched the earlier phase's stream go by, is the only thing that can tell it.
 func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing, baseSHA string) (harness.Invocation, error) {
+	inv, _, err := d.invocationForPhase(t, phaseIdx, ph, prev, spawnDir, prBase, phases, runner, baseSHA)
+	return inv, err
+}
+
+// invocationForPhase is invocationFor plus the phase as it was RESOLVED: a review-tier escalation
+// rewrites the phase's tier and drops its pinned model, so a caller that reports the session's
+// configured route set (the limit beacon's hold breakdown) must read the rule's routes, not the
+// configured pin (review 1.review-1.3).
+func (d *Driver) invocationForPhase(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing, baseSHA string) (harness.Invocation, config.Phase, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
-		return inv, err
+		return inv, ph, err
 	}
 	if spawnDir != "" {
 		inv.WorkDir = spawnDir
@@ -109,8 +131,14 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		inv.Model = choice.Routes[0]
 		inv.Routes = choice.Routes
 	case !choice.WaitUntil.IsZero():
-		return inv, &routeWindowBlocked{phase: ph.Label(phaseIdx), until: choice.WaitUntil, routes: choice.WindowBlocked}
+		return inv, ph, &routeWindowBlocked{phase: ph.Label(phaseIdx), until: choice.WaitUntil, routes: choice.WindowBlocked}
 	default:
+		// An empty choice for a NON-empty list is not "no route list": every configured route is
+		// Stop-blocked, and the phase's resolved model is exactly the route that may not start
+		// (CLA-1024). Refuse the spawn instead of falling through to it.
+		if routes, _ := tc.ModelRoutesForPhase(ph); d.allRoutesStopped(routes) {
+			return inv, ph, d.stopRefusalFor(routes, ph.Label(phaseIdx))
+		}
 		inv.Model = model
 		inv.Routes = nil
 	}
@@ -162,6 +190,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		}
 		repl = append(repl,
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
+			config.PhaseTaskRefPlaceholder, claimTaskRef(prev.Claim, runner),
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
 			config.PhaseBranchPlaceholder, branch,
 		)
@@ -176,7 +205,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		}
 	}
 	inv.Prompt = strings.NewReplacer(repl...).Replace(inv.Prompt)
-	return inv, nil
+	return inv, ph, nil
 }
 
 // invocationOn builds the invocation for one target ON A NAMED HARNESS: the project's workdir and

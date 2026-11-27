@@ -1334,7 +1334,8 @@ section note.
 > operator decision's "retry the implement phase N times, then park" is
 > exactly `i == start` in the shipped [implement, review] sequence. A
 > resume-only failure is the exception (see below): it KEEPS the claim, so
-> `prev` re-seeds it and it may retry at any non-last position.
+> `prev` re-seeds it and it may retry in any phase position, the last
+> included (CLA-1033).
 >
 > CLA-396: a dead phase feeds BOTH counters, but the per-task park is
 > checked and taken FIRST — before the fleet counter's trip is even
@@ -1363,6 +1364,27 @@ section note.
 > seeds the retry's brief exactly as it seeded the failed attempt's. Only
 > the start phase carries the prep facts (s.prep), and those it keeps —
 > minus the stale tip, dropped below.
+
+### CLA-1033
+
+> CLA-1033: the resume-only retry was originally scoped to non-last
+> positions, which left the LAST phase with no recovery: `classifyExit`
+> never set `at.dead` there, so judgeDeadPhase never saw the failure, the
+> verification gate judged the round unverifiable, and the drain's
+> deferred handback called expireHeldClaim. A verify round routinely
+> pushes the branch and opens the PR before its report resume stalls, so
+> that sequence burned a reclaim slot on a task whose work was already
+> finished (MAK-482 Run 3).
+>
+> The widening is one conjunct in classifyExit and one parenthesisation in
+> `retryable`: a resume-only failure is dead on the last phase too, while
+> the genuine-death signatures (a dead phase, a tool-loop kill) keep their
+> `!last` guard — there is no claim-staying retry to offer them, and the
+> ordinary handback remains their whole recovery. Everything else about
+> the retry is unchanged: it keeps the held claim, so `prev` still seeds
+> the verify brief with the branch it named, and the per-task bound still
+> parks the task on the fourth consecutive failure rather than spinning
+> sessions on a phase that cannot re-emit its report.
 
 ### CLA-900
 
@@ -1405,8 +1427,10 @@ section note.
 > applied to it; what follows is decided HERE from the durable records
 > the round just released:
 >
->   - no open MUST → the gate passed. The verifier carried the terminal
->     step (push check, PR, in_review) itself; the sequence is done.
+>   - no open MUST → the gate passed. In runner-claimed mode the session
+>     carries the push check and its report, and the runner carries the
+>     hand-over (PR open/link, in_review); the sequence is done only when
+>     both landed, and either failing ends it for the operator to see.
 >   - open MUST(s) → another fix is spawned, unless the round cap or the
 >     non-convergence breaker parks the task first. Never one more round
 >     on the driver's own initiative.
@@ -1850,8 +1874,8 @@ section note.
 > CLA-631/CLA-651/CLA-662: a RESUMED phase ended the sequence without
 > completing it — a rolling usage limit (CLA-631) or a transient failure
 > (CLA-651) — and the RUN must not end with it. The sequence stops
-> exactly like the pstop above — the claim is not handed back to the
-> queue, so the lease lapses into a takeover with its branch recorded —
+> exactly like the pstop above — the claim has been handed back by the
+> seam (released, or expired into a takeover with its branch recorded) —
 > but the run carries on: the wait the signal owes is taken below,
 > after the sequence's deferred handback, holding no lease. Broken here
 > rather than flowing into the checks below because those read a session
@@ -1861,9 +1885,9 @@ section note.
 >
 > The transient arm ALSO extends its target's streak here (CLA-662):
 > nothing else bounds a provider that keeps blipping the resumed phase
-> while the implementing harness stays healthy — the drain is over, so
-> drainPhase's retry ladder was never entered, and the re-drain would
-> otherwise land the very next instant. A rolling limit extends no
+> while the implementing harness stays healthy — the two in-claim retries
+> are spent by now (CLA-1034), and the re-drain would otherwise land the
+> very next instant. A rolling limit extends no
 > streak: its wait is a reset, not a rung, and the next drain is
 > scheduled after it anyway.
 > CLA-639: a PANEL member's sequence-end is judged by the panel handler
@@ -2554,8 +2578,9 @@ section note.
 > an empty string is a session quietly deciding to claim fresh work instead.
 >
 > prBase is the branch this task's repo PRs target, resolved per phase by
-> drainPhase (CLA-608), and fills {{prBase}} in EVERY phase: the other three
-> placeholders are per-run facts only a claim can carry, while the implement
+> drainPhase (CLA-608), and fills {{prBase}} in EVERY phase: the other four
+> placeholders ({{taskId}}, {{taskRef}}, {{runId}}, {{branch}}) are per-run facts
+> only a claim can carry, while the implement
 > brief — phase 1, claim-free at spawn time — is itself one of the carriers, in
 > its resumed-work rule. Empty leaves the placeholder standing, like the rest.
 >
@@ -3105,12 +3130,13 @@ section note.
 ### resumedTransients
 
 > The resumed-phase transient streak (CLA-662), keyed by the target that
-> failed. A resumed phase's transient failure ends its sequence, and every
-> counter the dead/fleet machinery keeps is deliberately skipped on that
-> path — so without this the run re-drains AT ONCE, and when the failing
-> phase runs on a different harness from the one the queue drains on
-> (implement on opencode, review on claude — the README's own example),
-> the first-phase transient arm never sees the failure at all. The streak
+> failed. A resumed phase's transient failure ends its sequence once its two
+> in-claim retries are spent (CLA-1034), and every counter the dead/fleet
+> machinery keeps is deliberately skipped on that path — so without this the run
+> re-drains AT ONCE, and when the failing phase runs on a different harness from
+> the one the queue drains on (implement on opencode, review on claude — the
+> README's own example), the first-phase transient arm never sees the failure at
+> all. The streak
 > is the rung of the backoff the run owes after the sequence's handback,
 > before polling again. Per target AND per phase harness: the failure is
 > the provider's, so a claude streak must climb while opencode stays
@@ -4110,27 +4136,33 @@ section note.
 > again; it is kept defensive, not descriptive of the present. The claim-held
 > wording was earned by CLA-365, not reserved for a future adapter.
 
-### A RESUMED phase does not retry, for the same reason it does not wait
+### A RESUMED phase retries IN-CLAIM, then ends the sequence
 
-> A RESUMED phase does not retry, for the same reason it does not wait
-> out a usage limit — and this path is the more dangerous of the two,
-> because MaxRetries defaults to 0, meaning never give up. Seeding the
-> resumed claim made the seam's handback live for phase 2, so a blip
-> here hands the task back mid-sequence at once: `release` for a claim
-> with nothing pushed, `expireLease` for pushed work, which ends that
-> claim's lease immediately and leaves the task an immediate takeover.
-> A retry would then be handed the very same heartbeat(runId) brief
-> against a run that no longer holds anything. End the sequence. The
-> RUN, though, must not end with it (CLA-651) — exiting the daemon on
-> one provider blip left the fleet idle until an operator noticed, the
-> same failure CLA-631 fixed for limits — so the sequence-end signal
-> goes to drainPhases, which owes it a wait (CLA-662): there is no
-> reset for a blip, so the run waits the target's growing backoff rung
-> after the handback and then polls again. The rung matters precisely
-> when this phase's harness is NOT the one the queue drains on: an
-> opencode implement start can never see the claude blip, so without
-> the run-level wait the same implement-and-lose loop would repeat with
-> nothing bounding it.
+> A RESUMED phase retries a transient failure IN-CLAIM (CLA-1034): the lease is
+> already held and the run is ours, so the first blip must not cost a reclaim
+> slot. Two retries at 15s and 45s, then the ordinary handback and the run-level
+> CLA-662 wait. Before this, the seam handed the task back on the first blip —
+> `release` for a claim with nothing pushed, `expireLease` for pushed work —
+> and the retry was handed the same heartbeat(runId) brief against a run that no
+> longer held anything, so no retry was allowed at all.
+>
+> The retry keeps the claim only when it is SAFE to: a resumed, non-optional
+> phase whose stream was readable (not untrusted), whose run is still its own
+> (runLost nil), whose claim the session left held, and whose end is a plain
+> provider failure rather than a cap, a kill, a usage limit or a lost run. Any
+> other end takes the ordinary handback. The lease renewer restarts on each
+> attempt from the same seeded claim, so CURRENT_CLAIM survives the retries.
+>
+> The RUN, though, must not end with the phase (CLA-651) — exiting the daemon on
+> one provider blip left the fleet idle until an operator noticed, the same
+> failure CLA-631 fixed for limits — so once the retries are exhausted (or a
+> STOP/cancel lands in one of their backoffs) the sequence-end signal goes to
+> drainPhases, which owes it a wait (CLA-662): there is no reset for a blip, so
+> the run waits the target's growing backoff rung after the handback and then
+> polls again. The rung matters precisely when this phase's harness is NOT the
+> one the queue drains on: an opencode implement start can never see the claude
+> blip, so without the run-level wait the same implement-and-lose loop would
+> repeat with nothing bounding it.
 > CLA-784: like a usage limit, an OPTIONAL seat's transient end is
 > its own result — never the sequence's, resumed or not.
 
@@ -4437,6 +4469,35 @@ section note.
 > the panel's only record and the "no member recorded → no fix" rule must
 > apply to it — so the position test alone (`no review-shaped phase follows`)
 > is not enough here.
+
+
+## `internal/loop/pr_handover.go`
+
+### pr_handover.go
+
+> pr_handover.go — the runner owns the pull request a runner-claimed task is
+> reviewed through (CLA-1035). A session used to open it and reclaim its tree in
+> the gap before its done report; a session that died there (MAK-482 Run 3) left
+> a PR the task never named, delivery.pr null, and a worktree nobody removed.
+>
+> The runner now runs the whole sequence after a terminal done report: open (or
+> reuse) the PR, record delivery.pr, submit_for_review, then reclaim the tree.
+> The order is the property. A PR that cannot be opened or linked fails the
+> hand-over closed - no submit, no reclaim, the claim stays live and the pushed
+> branch survives for takeover - because an in_review task with no PR is the
+> state this replaces. A reclaim failure is only a warning: by then the task is
+> safely in review with its PR open and linked.
+>
+> The title is `<ref>: <task title>`, so the PR is always matched back to its
+> task; the body is assembled deterministically from the task's record (ref,
+> branch, the session's summary and tests, the round's verdict), so a retried
+> hand-over does not churn the PR.
+
+### outcomeTests
+
+> outcomeTests lifts the body of an outcome's newest **Tests** section, stopping
+> at the renderer's attribution line, so a fix report that omitted its own tests
+> still gives the PR the gates the run actually executed.
 
 
 ## `internal/loop/prbase.go`
@@ -4907,8 +4968,13 @@ section note.
 >
 > The mark's length is the provider's stated reset when it gave one, else the
 > same default interval the supervised wait probes at (config `poll_interval`,
-> 30 minutes). Nothing here waits: a marked route is simply not offered at the
-> next phase's spawn, so the clanker keeps working on the route that worked.
+> 30 minutes) for a usage limit, or 10 minutes for a route that died a
+> PROVIDER death instead (a transient error, a quiet death the resurrection
+> loop could not recover, a non-zero exit before any tool call). A flaky
+> provider should be skipped long enough to stop paying it every phase, but not
+> for the half hour a real quota reset may need. Nothing here waits: a marked
+> route is simply not offered at the next phase's spawn, so the clanker keeps
+> working on the route that worked.
 
 ### routableRoutes
 
@@ -4949,6 +5015,11 @@ section note.
 >
 > A denied LAST route is marked but not logged here: there was no switch, and the
 > existing limit branch already says what happened to the session.
+>
+> A non-limit reason (provider_error, quiet_death, no_tool_exit) takes the
+> 10-minute error cooldown and logs "failed (<reason>)" rather than "hit a usage
+> limit": the failure is not a quota, and saying so would send the operator
+> looking for a reset that does not exist.
 
 ### routeRoutesFor
 
@@ -5541,7 +5612,22 @@ section note.
 >     are returned, and the session starts clean at the pre-merge tip with the
 >     conflict to resolve itself.
 >
-> Nothing here pushes or opens a PR; that is the close-out's job (B7).
+> Nothing here pushes or opens a PR; that is the close-out's job (B7). It DOES
+> reclaim the task's own tree after a successful hand-over (CLA-1035): the
+> runner prepared it, so the runner removes it, never the session.
+
+### reclaimTaskWorktree
+
+> reclaimTaskWorktree removes the runner-prepared task worktree and its local
+> branch, from the repository's main checkout, AFTER the hand-over landed
+> (CLA-1035). It mirrors the reclaim instruction the terminal briefs used to
+> carry: `git worktree remove` without --force, then point the branch at its
+> remote and `git branch -d` without -D. It acts only on a registered worktree
+> on the task's branch whose path sits under a task-worktree root shape, and
+> never on the main checkout: that is the runner's own tree, and any other path
+> is somebody else's. A refusal is returned, never forced through, because the
+> task is already in in_review with its PR open and linked - the caller logs a
+> warning and leaves the tree for the operator.
 
 ### adoptBranchWorktree
 
@@ -5741,6 +5827,16 @@ section note.
 
 
 ## `internal/loop/waits.go`
+
+### resumedTransientRetryBackoff
+
+> The in-claim backoff ladder for a resumed phase's transient retry (CLA-1034):
+> 15s, then 45s. Short on purpose — the claim is still held, so the retry costs
+> no reclaim slot, and the run-level CLA-662 backoff (backoff(n), growing per
+> consecutive blip) takes over once the ladder is spent. Deliberately not a
+> config dial: two attempts is the bound, and an operator cannot make a broken
+> provider cheaper by lowering it. The test seam overrides the whole ladder so a
+> drain test never sleeps a real 60 seconds.
 
 ### sleepStall
 

@@ -19,6 +19,22 @@ import (
 // defaultRouteMarkInterval is how long a denied route with no stated reset is treated as limited.
 const defaultRouteMarkInterval = 30 * time.Minute
 
+// defaultRouteErrorCooldown is how long a route that failed with a PROVIDER death — not a usage
+// limit — is skipped: long enough to stop a flaky provider being re-paid on every phase, short
+// enough that a recovered provider is tried again inside the same run.
+const defaultRouteErrorCooldown = 10 * time.Minute
+
+// routeFallbackIsLimit reports whether a fallback reason names a usage limit, whose mark duration is
+// the supervised wait's probe interval (or the provider's stated reset). Anything else is a provider
+// death, marked for defaultRouteErrorCooldown.
+func routeFallbackIsLimit(reason string) bool {
+	switch reason {
+	case "", "usage_limit", "budget_exhausted":
+		return true
+	}
+	return false
+}
+
 // routeMarkInterval is the configured supervised-wait probe interval, or the built-in default when
 // the config names none. Read per call: a RELOAD landing mid-run applies to the next mark without a
 // restart.
@@ -127,7 +143,9 @@ func (d *Driver) routableRoutes(tc *config.Config, routes []string) config.Route
 }
 
 // routableRoutesAt is routableRoutes with its clock injected, so tests can pin both sides of a
-// window. The window arithmetic itself is config's and pure.
+// window. The window arithmetic itself is config's and pure. A route carrying a Stop sideline is
+// dropped outright, like a route whose provider is gone: it cannot lift without a RELOAD, so it must
+// never be offered to a new session or a probe (CLA-1024).
 func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []string) config.RouteChoice {
 	if len(routes) == 0 {
 		return config.RouteChoice{}
@@ -137,6 +155,9 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 	var earliestMarked string
 	var earliestUntil time.Time
 	for _, route := range routes {
+		if _, stopped := d.routeStopped(route); stopped {
+			continue
+		}
 		until, limited := d.routeMarkExpiry(route)
 		if !limited || !now.Before(until) {
 			unmarked = append(unmarked, route)
@@ -180,29 +201,43 @@ func (d *Driver) routableRoutesAt(tc *config.Config, now time.Time, routes []str
 }
 
 // noteRouteFallbacks records the marks an adapter reported and writes each SWITCH to the daemon log
-// and the iteration log.
-func (d *Driver) noteRouteFallbacks(t Target, drainNum int, inv harness.Invocation, res harness.Result) {
-	_, _, fallbacks := harness.RouteFallbacks(res)
+// and the iteration log. It also revises the live route on the fleet card (CLA-1026): a session
+// that fell back from one route to another is running on the LAST route the adapter named.
+func (d *Driver) noteRouteFallbacks(ti int, t Target, drainNum int, inv harness.Invocation, res harness.Result) {
+	_, finished, fallbacks := harness.RouteFallbacks(res)
 	if len(fallbacks) == 0 {
 		return
+	}
+	if finished != "" {
+		d.noteIterationModel(ti, t, finished)
 	}
 	now := time.Now()
 	interval := d.routeMarkInterval()
 	for _, fb := range fallbacks {
 		until := fb.ResetAt
 		if until.IsZero() {
-			until = now.Add(interval)
+			if routeFallbackIsLimit(fb.Reason) {
+				until = now.Add(interval)
+			} else {
+				until = now.Add(defaultRouteErrorCooldown)
+			}
 		}
 		d.markRouteLimited(fb.Route, until)
 		if fb.Next == "" {
 			continue
 		}
 		reason := fb.Reason
-		if reason == "" {
-			reason = "usage_limit"
+		var line string
+		if routeFallbackIsLimit(reason) {
+			if reason == "" {
+				reason = "usage_limit"
+			}
+			line = fmt.Sprintf("%siteration %d: %s hit a usage limit (%s) — resuming the session on %s; retrying %s after %s",
+				labelOf(t), drainNum, fb.Route, reason, fb.Next, fb.Route, routeRetryLabel(until))
+		} else {
+			line = fmt.Sprintf("%siteration %d: %s failed (%s) — resuming the session on %s; retrying %s after %s",
+				labelOf(t), drainNum, fb.Route, reason, fb.Next, fb.Route, routeRetryLabel(until))
 		}
-		line := fmt.Sprintf("%siteration %d: %s hit a usage limit (%s) — resuming the session on %s; retrying %s after %s",
-			labelOf(t), drainNum, fb.Route, reason, fb.Next, fb.Route, routeRetryLabel(until))
 		log.Printf("%s", line)
 		if inv.Console != nil {
 			fmt.Fprintf(inv.Console, "\n%s\n", line)
@@ -232,6 +267,17 @@ func (d *Driver) routeRoutesFor(tc *config.Config, ph config.Phase) config.Route
 	return d.routableRoutes(tc, routes)
 }
 
+// phaseStartModel is the route a phase's next session will start on, marks and pricing windows
+// applied. It is what `state.model` reports while the iteration runs (CLA-1026); "" when the phase
+// resolves no routable route, which the wire omits rather than guessing a name.
+func (d *Driver) phaseStartModel(tc *config.Config, ph config.Phase) string {
+	choice := d.routeRoutesFor(tc, ph)
+	if len(choice.Routes) == 0 {
+		return ""
+	}
+	return choice.Routes[0]
+}
+
 // probeRouteFor is the route a supervised-wait probe should test for a phase with a route list
 // (review finding 1.review-1.3): the route its next session would start on, marks and pricing
 // windows applied. A wait is entered only once every route is spent, so that is the route whose
@@ -250,16 +296,22 @@ func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 }
 
 // probeInvocation is the supervised-wait probe's Invocation: the phase harness's probe invocation,
-// aimed at probeRouteFor's route when the phase has a route list. A phase whose every route is
-// inside a "wait" pricing window has NO route a probe may start on, so it refuses the probe rather
-// than letting the phase's model through: the probe is a paid session, and paying the peak price to
-// learn whether a limit lifted is exactly what the schedule exists to prevent.
-func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (harness.Invocation, error) {
+// aimed at the wait's own route list. A phase whose every route is inside a "wait" pricing window
+// has NO route a probe may start on, so it refuses the probe rather than letting the phase's model
+// through: the probe is a paid session, and paying the peak price to learn whether a limit lifted is
+// exactly what the schedule exists to prevent. A phase whose every route is Stop-blocked refuses for
+// a harder reason — no probe can lift a dead subscription — and names that state separately so the
+// wait can stop instead of aiming at a window that will not open (CLA-1024). routes is the wait's
+// resolved list (the same one probeWake walks), so the entry deadline and the probe cannot disagree
+// about the route set (review 1.review-1.12).
+func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase, routes []string) (harness.Invocation, error) {
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), true)
 	if err != nil {
 		return inv, err
 	}
-	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		routes, _ = tc.ModelRoutesForPhase(ph)
+	}
 	if len(routes) == 0 {
 		return inv, nil
 	}
@@ -269,6 +321,8 @@ func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (
 		inv.Model = choice.Routes[0]
 	case !choice.WaitUntil.IsZero():
 		return inv, &routeWindowBlocked{phase: ph.Label(0), until: choice.WaitUntil, routes: choice.WindowBlocked}
+	case d.allRoutesStopped(routes):
+		return inv, d.stopRefusalFor(routes, ph.Label(0))
 	}
 	return inv, nil
 }

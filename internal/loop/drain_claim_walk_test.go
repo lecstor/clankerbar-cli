@@ -203,6 +203,54 @@ func TestRunnerClaim_ReportResumeStallRetriesInTheSameClaim(t *testing.T) {
 	}
 }
 
+// CLA-1034: the in-claim transient retry applies in runner-claimed mode too, where `prev` is the
+// claim the RUNNER holds for every phase. A transient phase 0 keeps that claim across both
+// retries — no re-claim, no handback — and the third failure hands the lease back exactly once.
+func TestRunnerClaim_PhaseTransientRetriesInTheHeldClaim(t *testing.T) {
+	b := walkClaimBrief("CLA-1001")
+	f := &claimingReleaser{
+		offers: []plane.Offer{{Next: &b}},
+		claimFn: func(string, bool) (plane.ClaimedTask, error) {
+			return plane.ClaimedTask{Task: b, RunID: walkClaimRunID}, nil
+		},
+	}
+	walkClaim := harness.Claim{
+		TaskID: walkClaimTaskID, Ref: "CLA-1001", RunID: walkClaimRunID,
+		HasWIP: true, Branch: "clanker/walk",
+	}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(transientResult(), walkClaim)},
+		{res: held(transientResult(), walkClaim)},
+		{res: held(transientResult(), walkClaim)},
+	}}
+	d := phaseDriverWithReleaser(t, h, twoPhases(), f)
+	d.resumedTransientRetryWait = func(int) time.Duration { return 0 }
+	d.resumedTransientWait = func(int) time.Duration { return 0 }
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (the runner-claimed phase and its two in-claim retries)", h.invokeCalls)
+	}
+	if len(f.claimCalls) != 1 {
+		t.Errorf("claim calls = %v, want only the runner's initial fresh claim — an in-claim retry must not re-claim", f.claimCalls)
+	}
+	for i, in := range h.invocations {
+		if got := in.ResumeClaim; got.TaskID != walkClaimTaskID || got.RunID != walkClaimRunID {
+			t.Errorf("invocation %d ResumeClaim = %+v, want the SAME %s/%s the runner holds across every retry",
+				i, got, walkClaimTaskID, walkClaimRunID)
+		}
+	}
+	if got := handbacks(f, walkClaimTaskID); got != 1 {
+		t.Errorf("handed the task back %d time(s), want exactly 1 — only when the retries are exhausted: %+v / %+v",
+			got, f.calls, f.expireCalls)
+	}
+	if n := d.resumedTransients[resumedTransientKey{target: 0, harness: "claude"}]; n != 1 {
+		t.Errorf("resumed transient streak = %d, want 1 after the sequence-end", n)
+	}
+}
+
 // CLA-877 review 1.review-1.2: the same-claim retry is not limited to the phase
 // the walk started at. A resume-only failure keeps the claim, so `prev` is still
 // set and a later phase's retry is seeded exactly as its failed attempt was — so

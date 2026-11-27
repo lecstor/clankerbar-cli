@@ -300,7 +300,7 @@ func TestSupervisedWait_UnreadableProbeFollowsThePerHarnessBreaker(t *testing.T)
 			// this table describes is unchanged; the two
 			// TestPerPhaseHarness_SupervisedWait* tests in crossharness_test.go are
 			// where they differ.
-			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, cfg.EffectivePhases()[0], d.targets[0], spend{start: time.Now()})
+			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, cfg.EffectivePhases()[0], nil, d.targets[0], spend{start: time.Now()})
 
 			if stop != tc.wantStop {
 				t.Errorf("stop = %t, want %t", stop, tc.wantStop)

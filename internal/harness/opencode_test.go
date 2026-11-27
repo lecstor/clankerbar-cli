@@ -242,6 +242,17 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		{"RATE_LIMITED body with no window and no plan wording", Result{Stdout: `{"type":"error","error":{"message":"Rate limit exceeded","status":429,"response":{"body":"{\"error\":{\"code\":\"RATE_LIMITED\"}}"}}}`}, false, false, "", ""},
 		// The hard stop keeps winning over a structured window (settled 3).
 		{"structured window never outranks a hard budget stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You have reached your monthly usage limit","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, true, "", ""},
+		// CLA-1024: a FREE-TIER cap is a rolling limit even when it is not typed
+		// provider.quota and states no reset. Reading it as a Stop (the generic
+		// "usage limit reached" arm) ends the daemon on a cap that lifts, and
+		// marks the account as depleted when only the free tier is spent.
+		{"free usage limit, untyped with no reset", Result{Stdout: `{"type":"error","error":{"message":"Free usage limit reached"}}`}, true, false, "", ""},
+		{"free usage limit on stderr", Result{Stderr: "Error: Free usage limit reached"}, true, false, "", ""},
+		{"free tier usage limit with a stated reset", Result{Stdout: `{"type":"error","error":{"message":"Free usage limit reached. Your limit resets at 2026-11-20T03:00:00Z."}}`}, true, false, "2026-11-20T03:00:00Z", ""},
+		// The paid-account stops stay Stop beside it: a free-tier cap lifting says
+		// nothing about an exhausted balance, a 402 or a monthly cap.
+		{"insufficient account funds stays a Stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Upstream request failed: Insufficient account funds","status":402}}`}, true, true, "", ""},
+		{"free and monthly cap together is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Free usage limit reached; you have reached your monthly usage limit"}}`}, true, true, "", ""},
 		// Synthetic's spent subscription, verbatim: typed provider.rate-limit like a
 		// burst, no window, no reset. Its wording names the subscription, so it is a
 		// usage limit (route marked, session moved on), not a retry of the refusal.

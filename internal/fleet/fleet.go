@@ -21,7 +21,6 @@ package fleet
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -115,12 +114,45 @@ const (
 	PauseReasonBudget = "budget"
 )
 
+// The per-route hold reasons a paused multi-route daemon reports (CLA-1026), the
+// plane's vocabulary (ROUTE_HOLD_REASONS) verbatim: a usage limit is quota the
+// provider reported, a window is the CLI's own pricing schedule. The console
+// keeps them distinct so "why isn't it using the other subscriptions?" has an
+// answer.
+const (
+	// RouteHoldUsageLimit: the route carries an active usage-limit mark.
+	RouteHoldUsageLimit = "usage_limit"
+	// RouteHoldWindow: the route is inside its pricing/availability window.
+	RouteHoldWindow = "window"
+)
+
+// RouteHold is one configured route a paused daemon cannot start a session on,
+// and why (CLA-1026). It mirrors the plane's RouteHold: the route's own
+// `provider/model` name, one closed reason, and — for a window — the schedule
+// that holds it. Until is zero when the hold has no stated end.
+type RouteHold struct {
+	Route    string
+	Reason   string    // one of RouteHoldUsageLimit / RouteHoldWindow
+	Schedule string    // the pricing schedule's name, only with Reason == RouteHoldWindow
+	Until    time.Time // when the hold is expected to lift; zero means unstated
+}
+
 // State is the presence half of a report: what the daemon is doing right now.
 type State struct {
 	Kind    string // one of the State* constants
 	N       int    // iteration number, when Kind is iteration
 	TaskRef string // task being worked ("CLA-466"), when known; the task whose answer is outstanding on waiting; the HELD task on a schedule pause
 	Phase   string // phase label, when Kind is iteration, or the held phase on a schedule pause
+	// Model is the route the running iteration's session is actually on
+	// (`provider/model`), only meaningful on Kind == iteration (CLA-1026). It is
+	// the phase's resolved starting route, updated when a mid-session route
+	// fallback switches. Empty when no route was resolved; the plane then shows
+	// nothing rather than a guessed name.
+	Model string
+	// Routes is the per-route hold breakdown of a paused multi-route daemon
+	// (CLA-1026), only meaningful on Kind == limited or a route-window draining.
+	// Every configured route held right now appears once, in configured order.
+	Routes []RouteHold
 	// ResetAt is the harness's stated limit-reset instant, only meaningful on
 	// Kind == limited (CLA-728). The zero value means the harness stated no
 	// reset — the console then says "probing for a reset" rather than guessing
@@ -367,7 +399,7 @@ func New(endpoint, apiKey string) Reporter {
 	return &httpReporter{
 		endpoint: endpoint,
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: reportTimeout, CheckRedirect: noDowngradeRedirect},
+		client:   &http.Client{Timeout: reportTimeout, CheckRedirect: secureurl.NoDowngradeRedirect},
 		queue:    make(chan Report, queueCap),
 		done:     make(chan struct{}),
 		postMu:   newCtxMutex(),
@@ -627,240 +659,6 @@ func (r *httpReporter) sendOnce(ctx context.Context, rep Report) error {
 	return nil
 }
 
-// wireResetAt renders a `limited` state's stated reset instant in the one shape
-// the plane accepts (an ISO-8601 instant with an explicit zone), or "" — which
-// `omitempty` drops — when the harness stated none (CLA-728). UTC so the bytes
-// never depend on the sending machine's zone; second precision because a
-// stated reset is a boundary, not a sub-second deadline.
-//
-// Restricted to StateLimited on purpose: the plane reads resetAt only there, so
-// a reset left on some other state is dropped here rather than shipped as a
-// field the plane would ignore — one representation of "no reset", not two.
-func wireResetAt(st State) string {
-	if st.Kind != StateLimited || st.ResetAt.IsZero() {
-		return ""
-	}
-	return st.ResetAt.UTC().Format(time.RFC3339)
-}
-
-// wirePauseReason and wirePauseUntil render a draining state's pause payload
-// (CLA-908), or the empty string — which `omitempty` drops — on any other kind.
-// The plane reads the pair only on `draining`, and `pauseUntil` only beside the
-// schedule reason, so a value left on another state is dropped here rather than
-// shipped as a key the plane would ignore.
-func wirePauseReason(st State) string {
-	if st.Kind != StateDraining {
-		return ""
-	}
-	return st.PauseReason
-}
-
-func wirePauseUntil(st State) string {
-	if wirePauseReason(st) != PauseReasonSchedule || st.PauseUntil.IsZero() {
-		return ""
-	}
-	return st.PauseUntil.UTC().Format(time.RFC3339)
-}
-
-// ── Wire shape ────────────────────────────────────────────────────────────────
-// Exactly what apps/web/src/server/fleet-report.ts parseFleetReport reads
-// (CLA-465). Kept as a separate marshalling step with its own tags so the Go
-// field names can say what they mean without leaking into the JSON.
-
-type wireState struct {
-	Kind    string `json:"kind"`
-	N       int    `json:"n,omitempty"`
-	TaskRef string `json:"taskRef,omitempty"`
-	Phase   string `json:"phase,omitempty"`
-	// ResetAt is the `limited` state's payload (CLA-728), RFC 3339 with an
-	// explicit zone — the only shape the plane's parser accepts. Omitted when
-	// the harness stated no reset, so the plane reads "probing", never a
-	// guessed instant. A string rather than a time.Time so `omitempty` can
-	// actually omit it: time.Time is a struct, and the encoder never treats
-	// its zero value as empty.
-	ResetAt string `json:"resetAt,omitempty"`
-	// PauseReason/PauseUntil are the `draining` state's payload (CLA-908), in the
-	// shape the plane's parseFleetReport accepts: a bounded reason token
-	// (PauseReason*) and, for the schedule alone, the window's end as RFC 3339
-	// with an explicit zone. Both are omitted on every other kind, exactly like
-	// resetAt, so an old plane sees the bytes it always did.
-	PauseReason string `json:"pauseReason,omitempty"`
-	PauseUntil  string `json:"pauseUntil,omitempty"`
-}
-
-// wireUsage is the normalised breakdown on the wire. Each key is omitted when
-// zero, so a session that reported usage with an empty bucket stays a compact
-// object rather than five zeroes.
-type wireUsage struct {
-	Input      int `json:"input,omitempty"`
-	Output     int `json:"output,omitempty"`
-	Reasoning  int `json:"reasoning,omitempty"`
-	CacheRead  int `json:"cacheRead,omitempty"`
-	CacheWrite int `json:"cacheWrite,omitempty"`
-}
-
-type wireSession struct {
-	Phase   string `json:"phase"`
-	Harness string `json:"harness"`
-	// Model is deliberately not omitempty: the plane stores the empty string as
-	// null ("not resolved"), and sending it explicitly is CLA-630's contract.
-	Model string `json:"model"`
-	// UsageReported, Usage and CostUSD are the CLA-691 additions, and each is
-	// omitted when there is nothing to say: an older CLI's entry — and a session
-	// that died before its harness reported anything — stays the pre-CLA-691
-	// shape byte for byte, so the plane's "no usage" case is representable.
-	UsageReported bool       `json:"usageReported,omitempty"`
-	Usage         *wireUsage `json:"usage,omitempty"`
-	// CostUSD is a pointer so a reported ZERO survives marshalling
-	// (omitempty drops a nil pointer, never a pointer to 0).
-	CostUSD *float64 `json:"costUsd,omitempty"`
-	// RunID omits itself when the session held no claim, like the rest.
-	RunID string `json:"runId,omitempty"`
-	// Cause is omitted for an ordinary session, so an older plane sees the same
-	// bytes it always did. The current plane ignores unknown session keys; the
-	// classification is carried for the durable phase_session record to read
-	// once its parser stores it (CLA-703 follow-up).
-	Cause string `json:"cause,omitempty"`
-}
-
-type wireIteration struct {
-	TaskID          string        `json:"taskId,omitempty"`
-	TaskRef         string        `json:"taskRef,omitempty"`
-	Phases          []string      `json:"phases,omitempty"`
-	Sessions        []wireSession `json:"sessions,omitempty"`
-	Outcome         string        `json:"outcome"`
-	DurationSeconds float64       `json:"durationSeconds,omitempty"`
-	Tokens          int           `json:"tokens,omitempty"`
-	// CostUSD is the iteration's dollar spend; always present — UNLIKE Tokens
-	// (omitempty) — so a zero (nothing reported) stays distinguishable from a
-	// missing key (an older CLI). CLA-677.
-	CostUSD float64 `json:"costUsd"`
-}
-
-type wireReport struct {
-	Instance       string          `json:"instance"`
-	Host           string          `json:"host,omitempty"`
-	Version        string          `json:"version,omitempty"`
-	ConfigIdentity string          `json:"configIdentity,omitempty"`
-	Role           string          `json:"role,omitempty"`
-	State          *wireState      `json:"state,omitempty"`
-	Iterations     []wireIteration `json:"iterations,omitempty"`
-}
-
-func marshalReport(rep Report) ([]byte, error) {
-	// An unnamed instance would upsert a garbage row keyed on "" — refuse here,
-	// once, rather than teach the plane to defend against it.
-	if rep.Instance == "" {
-		return nil, errors.New("fleet report has no instance name")
-	}
-	w := wireReport{
-		Instance:       rep.Instance,
-		Host:           rep.Host,
-		Version:        rep.Version,
-		ConfigIdentity: rep.ConfigIdentity,
-		Role:           rep.Role,
-		State: &wireState{
-			Kind:        rep.State.Kind,
-			N:           rep.State.N,
-			TaskRef:     rep.State.TaskRef,
-			Phase:       rep.State.Phase,
-			ResetAt:     wireResetAt(rep.State),
-			PauseReason: wirePauseReason(rep.State),
-			PauseUntil:  wirePauseUntil(rep.State),
-		},
-	}
-	if w.State.Kind == "" {
-		w.State.Kind = StateIdle
-	}
-	for _, it := range rep.Iterations {
-		switch it.Outcome {
-		case OutcomeCheckpoint, OutcomeReleased, OutcomeParked, OutcomeDead:
-		default:
-			// A typo'd outcome would 400 the WHOLE report plane-side
-			// (all-or-nothing batch), losing the presence refresh too. Drop the
-			// row here and log it directly: returning an error would lose the
-			// presence half locally, and deliver's failStreak could silence it.
-			log.Printf("fleet: dropping iteration %q: outcome %q is not one of the four the plane knows", it.TaskRef, it.Outcome)
-			continue
-		}
-		w.Iterations = append(w.Iterations, wireIteration{
-			TaskID:          it.TaskID,
-			TaskRef:         it.TaskRef,
-			Phases:          it.Phases,
-			Sessions:        wireSessions(it.Sessions),
-			Outcome:         it.Outcome,
-			DurationSeconds: it.DurationSeconds,
-			Tokens:          it.Tokens,
-			CostUSD:         it.CostUSD,
-		})
-	}
-	return json.Marshal(w)
-}
-
-// maxSessionsPerIteration mirrors the plane's MAX_SESSIONS_PER_ITERATION
-// (apps/web/src/server/fleet-report.ts). The plane refuses the WHOLE report —
-// all-or-nothing, presence refresh included — when an iteration carries more,
-// so the cap is an interface this side has to honour rather than a bound the
-// plane silently sheds. The shipped phase sequences cannot reach it (handoff
-// respawns are capped per phase and dead retries per task), but a many-phase
-// config plus respawns on each could; clamping the tail keeps the report — and
-// with it the iteration record and presence — valid, at the cost of the
-// least-important entries.
-const maxSessionsPerIteration = 20
-
-// wireSessions converts one iteration's sessions to the wire shape, clamping at
-// the plane's per-iteration cap. The FIRST entries in spawn order are kept: the
-// configured phases lead the list, and it is the tail of respawns that a run
-// long enough to cross the cap has accumulated. The clamp is logged because it
-// means the reporter overran a contract the plane will not forgive — a loop bug
-// to see, not a normal path.
-func wireSessions(sessions []Session) []wireSession {
-	if len(sessions) == 0 {
-		return nil // no key on the wire: the pre-CLA-630 shape, which stays valid
-	}
-	if len(sessions) > maxSessionsPerIteration {
-		log.Printf("fleet: iteration spawned %d sessions, over the plane's per-iteration cap of %d — reporting the first %d in spawn order and dropping %d, or the plane would refuse the whole report",
-			len(sessions), maxSessionsPerIteration, maxSessionsPerIteration, len(sessions)-maxSessionsPerIteration)
-		sessions = sessions[:maxSessionsPerIteration]
-	}
-	out := make([]wireSession, 0, len(sessions))
-	for _, s := range sessions {
-		w := wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model, RunID: s.RunID, Cause: s.Cause}
-		if s.UsageReported {
-			w.UsageReported = true
-			w.Usage = &wireUsage{
-				Input:      s.Usage.Input,
-				Output:     s.Usage.Output,
-				Reasoning:  s.Usage.Reasoning,
-				CacheRead:  s.Usage.CacheRead,
-				CacheWrite: s.Usage.CacheWrite,
-			}
-		}
-		// CLA-737: the plane refuses a session carrying costUsd without
-		// usageReported: true ("session.costUsd requires session.usageReported"),
-		// and it refuses the WHOLE report with it. sessionSpend already withholds
-		// the figure at the aggregated source, but Session is constructible by any
-		// caller and the wire is where the contract lives — so the guarantee is
-		// made here too, rather than trusting every future producer to remember a
-		// rule whose violation costs unrelated iterations and presence as well.
-		if s.UsageReported && s.CostUSD != nil {
-			w.CostUSD = s.CostUSD
-		}
-		// Dropping a figure the caller DID report is a producer bug, and a silent
-		// one would let the session sums stop tying up to the iteration-level
-		// costUsd with nothing to explain the gap. Every other contract stumble on
-		// this wire is logged (the clamp above, endIteration's BUG line,
-		// marshalReport's refusal); the guard's job is protecting the batch, not
-		// hiding the case it was written to catch (review 1.review-2.3).
-		if s.CostUSD != nil && !s.UsageReported {
-			log.Printf("fleet: session %q (%s/%s) reported costUsd %v with no usage report — dropping the figure (BUG: the producer bypassed sessionSpend, whose contract is that a cost is known only when the attempt reported usage)",
-				s.Phase, s.Harness, s.Model, *s.CostUSD)
-		}
-		out = append(out, w)
-	}
-	return out
-}
-
 // ── Probe ─────────────────────────────────────────────────────────────────────
 
 // ProbeError carries the HTTP status of a probe that got an answer the doctor
@@ -902,7 +700,7 @@ func Probe(ctx context.Context, endpoint, apiKey string) error {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: reportTimeout, CheckRedirect: noDowngradeRedirect}
+	client := &http.Client{Timeout: reportTimeout, CheckRedirect: secureurl.NoDowngradeRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -924,16 +722,4 @@ func firstLine(s string) string {
 		}
 	}
 	return s
-}
-
-// noDowngradeRedirect refuses a redirect that would put the bearer token on the
-// wire in cleartext — the same guard the backlog poller and the plane client
-// carry (CLA-257): Go forwards Authorization on an https -> http hop to the SAME
-// host, which is exactly the exposure the credential-origin rule exists to
-// prevent.
-func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
-	if _, err := secureurl.Origin(req.URL.String()); err != nil {
-		return fmt.Errorf("refusing redirect: %w", err)
-	}
-	return nil
 }

@@ -19,11 +19,18 @@ const worktreeReclaimStep = " AFTER the PR is confirmed open - and before this s
 	"work. Expect gitignored local state to go with the tree: collateral, not work. Reclaim only this run's own " +
 	"tree, never another task's worktree."
 
+// prTitleTaskRefRule is the shared PR-title requirement for every brief that opens a PR. The title
+// carries the task's ref, so a PR opened by a terminal phase is matched back to its Clankerbar task -
+// the promotion deck's task mapping depends on it.
+const prTitleTaskRefRule = " Its title MUST carry the task ref " + PhaseTaskRefPlaceholder + " - as a suffix, " +
+	"e.g. `feat(...): ... (MAK-482)`, or as a prefix, e.g. `MAK-482: ...` - so the PR is matched back to " +
+	"this task."
+
 // reviewTerminalStep is the review phase's LAST instruction, kept as a constant so its position can
 // be pinned by a test and not only its wording. Position is the property that failed.
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
 	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
-	"hand-off below." + worktreeReclaimStep +
+	"hand-off below." + prTitleTaskRefRule + worktreeReclaimStep +
 	" FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"submit_for_review(taskId, runId, outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
@@ -210,7 +217,15 @@ const reviewMUSTBarGrades = " GRADE EVERY FINDING. A severity in brackets is `[m
 	"and the missing test). NEVER a MUST, however confident you are: style, naming, a design you would prefer, a " +
 	"performance concern without a measurement, missing tests the doneWhen does not require (except untested), or " +
 	"documentation wording - and where a repo hard rule concerns style, prose or documentation wording, this " +
-	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. "
+	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. " + reviewPRExistenceExemption
+
+// reviewPRExistenceExemption carries the terminal-phase carve-out into the grading bar: a doneWhen
+// clause about opening the PR or submitting the task describes the terminal phase's step, so it
+// cannot grade the branch under review.
+const reviewPRExistenceExemption = "PR creation and the move to `in_review` belong to the terminal phase, so a " +
+	"`doneWhen` clause about opening a PR or submitting the task is NEVER a MUST finding during review: judge " +
+	"the change (or the plane's record, for a no-code task) against the code, docs and test clauses of `doneWhen` " +
+	"only. "
 
 const reviewMUSTBarAttribution = "Every finding in the block is " +
 	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +

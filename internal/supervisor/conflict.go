@@ -456,7 +456,7 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 // silently inheriting a session it cannot complete. Today:
 //
 //   - opencode gains read/edit/external_directory scope on every extra dir
-//     (harness/opencode.go, scopeExtraDirs);
+//     (harness/opencode_permission.go, scopeExtraDirs);
 //   - claude maps them to --add-dir (and is refused earlier by the operator's
 //     no-Claude-for-daemon-sessions rule, listed for completeness);
 //   - copilot maps them to --add-dir too, which the CLI's path verification

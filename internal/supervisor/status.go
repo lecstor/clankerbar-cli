@@ -39,6 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
@@ -138,7 +139,7 @@ func newStatusReporter(endpoint, apiKey string) StatusReporter {
 	return &httpStatusReporter{
 		endpoint: endpoint,
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: statusReportTimeout, CheckRedirect: noDowngradeRedirect},
+		client:   &http.Client{Timeout: statusReportTimeout, CheckRedirect: secureurl.NoDowngradeRedirect},
 		queue:    make(chan StatusReport, statusQueueCap),
 		done:     make(chan struct{}),
 	}

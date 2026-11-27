@@ -92,8 +92,10 @@ func usageLimitEnd(a harness.Adapter, res harness.Result) bool {
 	return a.DetectLimit(res).Limited || res.TurnStopReason == "usage_limit"
 }
 
-// handleUsageLimit waits out a rolling usage limit and re-runs the session, or ends the phase on a
-// hard stop or a limit the phase must not wait for.
+// handleUsageLimit waits out a rolling usage limit and re-runs the session. A hard stop SIDELINES
+// the route that reported it and waits on the phase's remaining routes when one can still start
+// (CLA-1024); it ends the phase — with LIMIT_STOP stopping the run — only when no configured route
+// is left to wait on.
 func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attemptVerdict {
 	d := r.d
 	t := r.t
@@ -106,8 +108,9 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 	a := r.a
 	panelOptional := r.shape.panelOptional
 	// A usage limit. A rolling-window subscription cap is waited out and the session re-run; a hard
-	// budget/credit exhaustion (Stop) has no reset to poll for, so the run stops cleanly and the
-	// operator resumes it once they've topped up.
+	// budget/credit exhaustion (Stop) has no reset to poll for, so a route that reports it is sat out
+	// until the operator acts — and the run stops only when NO configured route is left to wait on
+	// (CLA-1024).
 	if lim := a.DetectLimit(at.res); lim.Limited {
 		if lim.Stop {
 			// CLA-784: an OPTIONAL panel seat is a trial reviewer. A hard stop on its account is recorded
@@ -119,25 +122,21 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 				r.end.emptyWhy = "stopped on a usage limit (no reset to wait for) before recording"
 				return attemptVerdict{next: attemptReturn}
 			}
-			line := limitStopLine(lim, limitStopRoute(at.res, at.inv.Model), limitStopMessage(a, at.res))
-			log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
-				drainNum, line, at.logPath)
-			d.writeLimitStop(line)
-			// A checkpoint held by the seam is still held: hand it back HERE with the reason, or the
-			// deferred releaseCarried at the drain boundary expires it with no cause recorded. A panel
-			// member's claim belongs to the panel - its handler hands the SAME lease to the next member
-			// or the fix - so ending it here would kill that hand-over.
-			if !r.shape.panelMember {
-				r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
+			// CLA-1024: in a MULTI-route phase a Stop on one route is not the phase's verdict. Sidelining
+			// it and waiting is right whenever another configured route can still start — typically a
+			// route a pricing window filtered out of THIS spawn, which is why the session never fell back
+			// to it. The stop is only the run's ending when nothing else is left, and that path is the
+			// fall-through below.
+			if !r.waitThroughRouteStop(at, lim) {
+				return r.endOnStopLimit(ctx, at, lim)
 			}
-			return attemptVerdict{next: attemptReturn, stop: true}
 		}
 		log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
 		// CLA-784: an OPTIONAL seat never waits and never ends the sequence, resumed or not.
 		if panelOptional {
 			log.Printf("%siteration %d: the OPTIONAL %s seat hit a usage limit (%s) — recording it against that seat and carrying on rather than waiting out a reset on a trial reviewer (log: %s)",
 				labelOf(t), drainNum, ph.Label(phaseIdx), limitReason(lim), at.logPath)
-			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a, routes: at.routes}}
 			return attemptVerdict{next: attemptReturn}
 		}
 		// A RESUMED phase must not wait one out. The seam's handback has already ended the claim:
@@ -156,7 +155,7 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 			log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting (log: %s)",
 				drainNum, at.logPath)
 			// releaseCarriedEnd rebuilds the end, so the sequence signal goes back on afterwards.
-			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a, routes: at.routes}}
 			return attemptVerdict{next: attemptReturn}
 		}
 		// Whatever this attempt held open is not held open any more: every path below either waits or
@@ -172,7 +171,7 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 		// The wait's own probe spend lands in the SAME account as the sessions' (charge, inside the
 		// wait), so it reaches the breaker at the top of this loop, the between-iterations sweep, and the
 		// iteration's cost line — rather than a separate figure nothing is measured against.
-		ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, t, spend{
+		ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, at.routes, t, spend{
 			start: prior.start,
 			ti:    r.ti,
 		})
@@ -185,6 +184,55 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 	}
 
 	return attemptVerdict{}
+}
+
+// waitThroughRouteStop sidelines the route that reported a Stop-class limit and reports whether the
+// phase should WAIT on its remaining routes instead of ending the run. It is false for the shapes
+// that keep the old ending: a phase with no route list (the legacy single-route harness), a phase
+// with exactly one route, or one whose every configured route is now Stop-blocked. The session's
+// route is taken from the result, so a mid-session fallback is sidelined on the route it died on,
+// not the one it started on.
+func (r *phaseRun) waitThroughRouteStop(at *phaseAttempt, lim harness.Limit) bool {
+	d := r.d
+	ph := r.ph
+	stoppedRoute := limitStopRoute(at.res, at.inv.Model)
+	// The routes the phase's session was offered (escalation applied) are the set the wait will use;
+	// the configured list is the fallback for a fixture or a shape that reports none.
+	routes := at.routes
+	if len(routes) == 0 {
+		routes, _ = r.tc.ModelRoutesForPhase(ph)
+	}
+	if len(routes) < 2 || stoppedRoute == "" {
+		return false
+	}
+	d.stopRoute(stoppedRoute, lim)
+	if refusal := d.stopRefusalFor(routes, ph.Label(r.phaseIdx)); refusal != nil {
+		log.Printf("%siteration %d hit a Stop-class limit on %s (%s) and every configured route for the phase is now Stop-blocked (%v) (log: %s)",
+			labelOf(r.t), r.drainNum, stoppedRoute, limitReason(lim), routes, at.logPath)
+		return false
+	}
+	log.Printf("%siteration %d hit a Stop-class limit on %s (%s) — sidelining that route until RELOAD or restart and waiting on the phase's other routes (%v) (log: %s)",
+		labelOf(r.t), r.drainNum, stoppedRoute, limitReason(lim), routes, at.logPath)
+	return true
+}
+
+// endOnStopLimit writes the LIMIT_STOP marker and ends the run: a budget or credit exhaustion has no
+// reset for a wait to poll, so the daemon stops cleanly for an operator to resolve the account.
+func (r *phaseRun) endOnStopLimit(ctx context.Context, at *phaseAttempt, lim harness.Limit) attemptVerdict {
+	d := r.d
+	t := r.t
+	line := limitStopLine(lim, limitStopRoute(at.res, at.inv.Model), limitStopMessage(r.a, at.res))
+	log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
+		r.drainNum, line, at.logPath)
+	d.writeLimitStop(line)
+	// A checkpoint held by the seam is still held: hand it back HERE with the reason, or the deferred
+	// releaseCarried at the drain boundary expires it with no cause recorded. A panel member's claim
+	// belongs to the panel - its handler hands the SAME lease to the next member or the fix - so
+	// ending it here would kill that hand-over.
+	if !r.shape.panelMember {
+		r.end = d.releaseCarriedEnd(ctx, t, r.end, true)
+	}
+	return attemptVerdict{next: attemptReturn, stop: true}
 }
 
 // endOnExitKind counts a silent attempt, then ends the phase on the exits that are not a failure to
@@ -275,8 +323,32 @@ func (r *phaseRun) endOnExitKind(ctx context.Context, at *phaseAttempt) attemptV
 	return attemptVerdict{}
 }
 
+// resumedTransientRetry reports whether this attempt's transient failure can be retried while
+// KEEPING the claim: a resumed, non-optional phase whose stream was readable, whose claim the
+// session left held, and whose end is a plain provider failure rather than a cap, a kill, a usage
+// limit or a lost run. Any other end must take the ordinary handback path.
+func (r *phaseRun) resumedTransientRetry(at *phaseAttempt) bool {
+	if r.prev == nil || r.shape.panelOptional || !r.a.IsTransient(at.res) {
+		return false
+	}
+	return at.res.Untrusted == "" && at.runLost == nil && at.res.Claim.Held() &&
+		at.ierr == nil && !at.capped && !at.ceiling && !at.wallclock && at.toolLoop == "" &&
+		!at.recoveredExit && at.res.ExitCode != 0 && !usageLimitEnd(r.a, at.res)
+}
+
+// handBackResumedClaim is the handback settleWithoutCheckpoint skipped for an in-claim retry that
+// is now being abandoned (a STOP/cancel landed during the backoff). A panel member's claim belongs
+// to the panel, which hands that same lease on, so it is never released here.
+func (r *phaseRun) handBackResumedClaim(ctx context.Context, at *phaseAttempt) {
+	if r.shape.panelMember {
+		return
+	}
+	r.end.released = at.res.Claim.Held()
+	r.end.releasedToQueue = r.d.releaseHeldClaim(ctx, r.t, at.res, false, false)
+}
+
 // handleTransient backs off and retries a transient failure, or ends the phase where a retry is not
-// allowed (a resumed phase, an optional seat, a bound hit).
+// allowed (an optional seat, a bound hit).
 func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemptVerdict {
 	d := r.d
 	t := r.t
@@ -289,17 +361,33 @@ func (r *phaseRun) handleTransient(ctx context.Context, at *phaseAttempt) attemp
 	// Non-zero exit, not the usage cap: a transient server/network blip backs off and retries;
 	// anything else is a genuine failure and stops.
 	if a.IsTransient(at.res) {
-		// A RESUMED phase does not retry, for the same reason it does not wait out a usage limit — and
-		// this path is the more dangerous of the two, because MaxRetries defaults to 0, meaning never
-		// give up.
 		if panelOptional {
 			log.Printf("%siteration %d: the OPTIONAL %s seat hit a transient failure (%s) — recording it against that seat and carrying on rather than retrying a task the panel is still working (log: %s)",
 				labelOf(t), drainNum, ph.Label(phaseIdx), at.res.ExitString(), at.logPath)
 			r.end.sequenceEnd = &phaseSequenceEnd{}
 			return attemptVerdict{next: attemptReturn}
 		}
+		// A RESUMED phase retries its transient failure IN-CLAIM, keeping the lease: the claim is
+		// already held and the run is ours, so a short retry costs nothing the handback would not
+		// cost anyway. Two attempts at 15s and 45s, then the ordinary handback and the run-level
+		// CLA-662 backoff so a genuinely broken provider still backs off between drains.
 		if prev != nil {
-			log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting (log: %s)",
+			if r.resumedTransientRetry(at) && r.resumedTransientRetries < len(resumedTransientRetryBackoff) {
+				r.resumedTransientRetries++
+				wait := d.inClaimTransientRetryDelay(r.resumedTransientRetries)
+				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — retrying in-claim in %s (retry %d/%d) with the claim still held; the next attempt resumes the same run (log: %s)",
+					drainNum, at.res.ExitString(), wait, r.resumedTransientRetries, len(resumedTransientRetryBackoff), at.logPath)
+				if d.waitOrStop(ctx, wait) {
+					// The retry is abandoned before it ran: hand back exactly as the seam would have.
+					// The sequence-end signal rides along even though the stopping run judges it inert,
+					// so every abandoned in-claim retry keeps the contract the docs state.
+					r.end.sequenceEnd = &phaseSequenceEnd{}
+					r.handBackResumedClaim(ctx, at)
+					return attemptVerdict{next: attemptReturn, stop: true}
+				}
+				return attemptVerdict{next: attemptRetry}
+			}
+			log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying further on a task that comes back as an immediate takeover; the run stays up to poll again instead of exiting (log: %s)",
 				drainNum, at.res.ExitString(), at.logPath)
 			r.end.sequenceEnd = &phaseSequenceEnd{}
 			return attemptVerdict{next: attemptReturn}

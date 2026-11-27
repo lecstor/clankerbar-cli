@@ -585,7 +585,7 @@ func TestDrainPhases_LongSessionBeaconsPresenceOnEveryRenewalTick(t *testing.T) 
 // and the poll that covers them all does not run while a drain is in progress.
 // The renewal tick therefore carries the poll's per-target lap: the running
 // target reports its iteration, every other target its own idle (or draining)
-// state (CLA-771 review — beaconLimited is the same precedent for a
+// state (CLA-771 review — beaconWait is the same precedent for a
 // daemon-wide state).
 func TestDrainPhases_LongSessionBeaconsEveryTargetNotOnlyTheRunningOne(t *testing.T) {
 	cfg := fastCfg()
@@ -2026,5 +2026,198 @@ func TestFleetShutdownAbandonsAReporterThatIgnoresTheDeadline(t *testing.T) {
 	case <-b.entered:
 	case <-time.After(100 * time.Millisecond):
 		t.Error("target 1's Close was never entered")
+	}
+}
+
+// --- CLA-1026: the live route on the card ------------------------------------
+
+// beginIteration announces the phase AND the route its session will start on — the
+// first route that may start at that moment, not the config's first: a windowed
+// route is never what the spawn uses.
+func TestBeginIteration_CarriesThePhaseStartingRoute(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0) // inside the 11:00-14:00 peak window
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement", Model: config.ModelRoutes{routeGo, routeZen}, Prompt: "Work."}}
+	cfg.Prompt = ""
+	d, ff := fleetDriver(t, cfg, &fakeAdapter{})
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+
+	ph := d.cfg.Phases[0]
+	d.beginIteration(0, d.targets[0], 3, "CLA-1", ph.Label(0), d.phaseStartModel(d.cfg, ph))
+
+	got := d.fleetState(0)
+	if got.Kind != fleet.StateIteration || got.Model != routeZen {
+		t.Fatalf("state = %+v, want iteration on %q (the windowed %q cannot start)", got, routeZen, routeGo)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 1 || sent[0].State.Model != routeZen {
+		t.Fatalf("begin beacon = %+v, want exactly one carrying the starting route %q", sent, routeZen)
+	}
+}
+
+// A phase that resolves no route leaves the field empty rather than naming a
+// model the session did not run on.
+func TestBeginIteration_NoResolvedRouteLeavesModelEmpty(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d, ff := fleetDriver(t, cfg, &fakeAdapter{})
+
+	ph := d.cfg.Phases[0]
+	d.beginIteration(0, d.targets[0], 1, "CLA-1", ph.Label(0), d.phaseStartModel(d.cfg, ph))
+	if got := d.fleetState(0).Model; got != "" {
+		t.Errorf("state.model = %q, want empty for a phase with no route", got)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 1 || sent[0].State.Model != "" {
+		t.Errorf("begin beacon carried a model the phase did not resolve: %+v", sent)
+	}
+}
+
+// noteIterationModel is the mid-session update: a route CHANGE beacons once, a
+// repeated route is silent, and nothing is written outside a live iteration.
+func TestNoteIterationModel_BeaconsOnlyOnAChange(t *testing.T) {
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: ff}})
+	d.iter = []iterState{{on: true, n: 2, ref: "CLA-1", phase: "implement", model: routeZen}}
+
+	d.noteIterationModel(0, d.targets[0], routeGo)
+	if got := d.fleetState(0).Model; got != routeGo {
+		t.Fatalf("state.model = %q, want %q after the switch", got, routeGo)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateIteration || sent[0].State.Model != routeGo {
+		t.Fatalf("switch beacon = %+v, want exactly one iteration beacon on %q", sent, routeGo)
+	}
+
+	d.noteIterationModel(0, d.targets[0], routeGo)
+	if sent, _ = ff.reports(); len(sent) != 1 {
+		t.Fatalf("a repeated route beaconed again; want the single change, got %d", len(sent))
+	}
+
+	d.iter[0] = iterState{}
+	d.noteIterationModel(0, d.targets[0], routeZen)
+	if sent, _ = ff.reports(); len(sent) != 1 {
+		t.Fatalf("a route outside a live iteration beaconed; want no change, got %d", len(sent))
+	}
+}
+
+// The whole drain, not the one call: every phase boundary announces its own
+// phase's route, and the closing idle beacon carries none.
+func TestDrainPhases_IterationBeaconsCarryTheStartingRoute(t *testing.T) {
+	at := brisbaneAt(t, 9, 12, 0)
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{
+		{Name: "implement", Model: config.ModelRoutes{routeGo, routeZen}},
+		{Name: "review", Model: config.ModelRoutes{routeGo, routeZen}},
+	}
+	cfg.Prompt = ""
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: held(okResult(5, 0.05), harness.Claim{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Settled: true})},
+	}}
+	d, ff := fleetDriver(t, cfg, h)
+	d.cfg.RouteSchedules, d.cfg.RouteWindows = peakRoutes(t, config.RouteWhenAllBlockedWait, routeGo)
+	d.now = func() time.Time { return at }
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	sent, _ := ff.reports()
+	iterations := 0
+	for _, r := range sent {
+		switch r.State.Kind {
+		case fleet.StateIteration:
+			iterations++
+			if r.State.Model != routeZen {
+				t.Errorf("iteration beacon for phase %q carried model %q, want the starting route %q", r.State.Phase, r.State.Model, routeZen)
+			}
+		case fleet.StateIdle:
+			if r.State.Model != "" {
+				t.Errorf("the idle beacon carried model %q; the route belongs to a running iteration", r.State.Model)
+			}
+		}
+	}
+	if iterations != 2 {
+		t.Errorf("got %d iteration beacons, want one per phase boundary", iterations)
+	}
+}
+
+// review 1.review-1.1: the boundary beacon names the route the FIRST attempt starts on, but a
+// retry after a supervised wait re-resolves its invocation — the wait marked the route that hit
+// the limit, so the retried session runs the other one. The card must follow the spawn, not keep
+// claiming a route the retried session never touches.
+func TestDrainPhases_RetryReportsTheRouteItActuallyStartsOn(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement", Model: config.ModelRoutes{routeGo, routeZen}, Prompt: "Work."}}
+	cfg.Prompt = ""
+	reset := time.Now().Add(time.Hour)
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: checkpointed(5, 0.05)}},
+		limitResetAt: reset,
+		probeLimitFor: func(_ int, model string) harness.Limit {
+			if model == routeGo {
+				return harness.Limit{Limited: true, ResetAt: reset}
+			}
+			return harness.Limit{}
+		},
+	}
+	d, ff := fleetDriver(t, cfg, h)
+	var modelAtRetry string
+	h.onInvoke = func(call int) {
+		if call == 1 {
+			modelAtRetry = d.fleetState(0).Model
+		}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(h.invocations) != 2 {
+		t.Fatalf("spawned %d sessions, want the limited first attempt and its retry", len(h.invocations))
+	}
+	if got := h.invocations[0].Model; got != routeGo {
+		t.Errorf("first attempt ran on %q, want %q", got, routeGo)
+	}
+	if got := h.invocations[1].Model; got != routeZen {
+		t.Fatalf("retry ran on %q, want %q (the mark on %q must move it)", got, routeZen, routeGo)
+	}
+	if modelAtRetry != routeZen {
+		t.Errorf("state.model while the retried session runs = %q, want %q — the card must follow the spawn, not the boundary", modelAtRetry, routeZen)
+	}
+	var models []string
+	sent, _ := ff.reports()
+	for _, r := range sent {
+		if r.State.Kind == fleet.StateIteration {
+			models = append(models, r.State.Model)
+		}
+	}
+	if len(models) < 2 || models[0] != routeGo || models[len(models)-1] != routeZen {
+		t.Errorf("iteration beacons carried models %v, want the boundary's %q then the retry's %q", models, routeGo, routeZen)
+	}
+}
+
+// review 1.review-1.4: the route holds belong to the WAITING project's config. The sibling
+// projects are paused by the same wait and must say so, but their rows must not borrow route
+// names and schedules from a config they do not run.
+func TestBeaconWait_SendsRouteHoldsOnlyToTheWaitingTarget(t *testing.T) {
+	waiting, sibling := &fakeFleet{}, &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: waiting}, {Fleet: sibling}})
+	reset := time.Now().Add(time.Hour)
+	holds := []fleet.RouteHold{{Route: routeGo, Reason: fleet.RouteHoldUsageLimit, Until: reset}}
+
+	d.beaconWait(0, fleet.State{Kind: fleet.StateLimited, ResetAt: reset, Routes: holds})
+
+	sent, _ := waiting.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateLimited || len(sent[0].State.Routes) != 1 || sent[0].State.Routes[0].Route != routeGo {
+		t.Fatalf("waiting target reports = %+v, want the limited state carrying the %q hold", sent, routeGo)
+	}
+	sent, _ = sibling.reports()
+	if len(sent) != 1 || sent[0].State.Kind != fleet.StateLimited {
+		t.Fatalf("sibling reports = %+v, want its own plain limited state", sent)
+	}
+	if len(sent[0].State.Routes) != 0 {
+		t.Errorf("sibling carried route holds %+v from a project it does not serve", sent[0].State.Routes)
 	}
 }

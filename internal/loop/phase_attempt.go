@@ -62,7 +62,14 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 	prBase := r.prBase
 	fixGrading := r.fixGrading
 	verifyDigest := r.verifyDigest
-	at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
+	inv, resolved, ierr := d.invocationForPhase(t, phaseIdx, ph, prev, spawnDir, prBase, phases, opts.runner, opts.baseSHA)
+	at.inv, at.ierr = inv, ierr
+	if ierr == nil {
+		// The resolved phase's CONFIGURED routes (escalation applied, marks and windows not): the
+		// limit beacon's hold breakdown names every route the phase offers, including the ones a mark
+		// already dropped from the adapter's fallback chain (CLA-1026, review 1.review-1.3).
+		at.routes, _ = d.targetCfg(t).ModelRoutesForPhase(resolved)
+	}
 	if at.ierr != nil {
 		// CLA-947: every route is inside a pricing window. windowHeld marks it as a scheduling condition
 		// rather than a failed phase (review 1.review-1.6): the claim goes back through the ordinary
@@ -73,6 +80,15 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 			r.end.windowHeld = true
 			r.end.windowWhy = blocked.Error()
 			return attemptVerdict{next: attemptReturn, zeroSpend: true}
+		}
+		// CLA-1024: every configured route this phase may start on is Stop-blocked. No spawn can
+		// start and no reset will come, so end the run for the operator exactly as the wait's
+		// all-stopped path does.
+		var stopped *routeStopBlocked
+		if errors.As(at.ierr, &stopped) {
+			logStopBlocked(stopped)
+			d.writeStopBlocked(stopped)
+			return attemptVerdict{next: attemptReturn, zeroSpend: true, stop: true}
 		}
 		// The session env refused to resolve (a failing or empty-output fromCommand, an unreadable @path
 		// file — the error names the variable).
@@ -136,8 +152,15 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	tag := r.tag
 	ph := r.ph
 	a := r.a
+	// The retry label names whichever ladder spawned this attempt: the fresh-session transient
+	// ladder (r.retries) or a resumed phase's in-claim retry. It labels the FILE as well as the spawn
+	// line, so a post-mortem can find the attempt the line named.
+	retry := r.retries
+	if retry == 0 {
+		retry = r.resumedTransientRetries
+	}
 	logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
-		time.Now().Format("20060102-150405"), drainNum, tag, r.retries, randomTail())
+		time.Now().Format("20060102-150405"), drainNum, tag, retry, randomTail())
 	f, ferr := d.state.Create(logName)
 	at.logPath = filepath.Join(d.state.Path(), logName)
 	// The console is where the adapter streams the session: the file, and NOT the terminal unless the
@@ -177,10 +200,10 @@ func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
 	}
 	// The spawn line stamps what the session was actually spawned WITH: phase and the resolved model
 	// id inv.Model carries (ModelForPhase's output, never the tier alias).
-	if r.retries == 0 {
+	if retry == 0 {
 		log.Printf("iteration %d %s- spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	} else {
-		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), r.retries, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
+		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), retry, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
 	}
 
 	at.logFile = f
@@ -195,6 +218,11 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	drainNum := r.drainNum
 	opts := r.opts
 	a := r.a
+	// CLA-1026: the boundary beacon announced the route the phase would START on, but this
+	// attempt re-resolved its invocation — a retry after a supervised wait drops a route the
+	// wait marked, and an escalated review spawn runs the rule's tier. Report what actually
+	// starts, or the card names a route the session never runs on for its whole duration.
+	d.noteIterationModel(ti, t, at.inv.Model)
 	// CLA-358: while THIS child runs, renew whatever task-lease it holds.
 	sctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -214,7 +242,7 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	if ctx.Err() == nil {
 		at.runLost = renewalCause(sctx, joined, loss.cause())
 	}
-	d.noteRouteFallbacks(t, drainNum, at.inv, at.res)
+	d.noteRouteFallbacks(r.ti, t, drainNum, at.inv, at.res)
 	if at.logFile != nil {
 		_ = at.logFile.Close()
 	}
@@ -247,8 +275,11 @@ func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	at.orderlyExit = at.toolLoop == "" && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock)
 	at.recoveredExit = !at.orderlyExit && at.toolLoop == "" && at.res.Untrusted == "" && harness.RecoveredErrors(at.res) > 0
 	at.checkpointable = at.toolLoop == "" && (at.res.ExitCode == 0 || ((at.capped || at.ceiling || at.wallclock) && at.res.Claim.HasWIP) || at.recoveredExit)
-	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
-		(deadPhase(at.res) || at.toolLoop != "" || at.res.ReportResumeFailed != "")
+	// CLA-1033: a resume-only failure is retryable on the LAST phase too — the work was delivered and only
+	// the report was lost, and the claim was kept for exactly this retry. The genuine-death signatures stay
+	// non-retryable there, where there is no claim-staying retry to offer.
+	at.dead = at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock &&
+		((!last && (deadPhase(at.res) || at.toolLoop != "")) || at.res.ReportResumeFailed != "")
 }
 
 // openPhaseEnd books the exit into the dead-phase tally and starts the attempt's phaseEnd: its

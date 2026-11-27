@@ -541,6 +541,25 @@ func TestValidate_RefusesAResumeBriefInFirstPosition(t *testing.T) {
 	}
 }
 
+// {{taskRef}} is filled from the previous phase's claim exactly as {{taskId}} is, so a first phase
+// carrying it would tell its session to open a PR titled "{{taskRef}}".
+func TestValidate_RefusesTheTaskRefInTheFirstPhase(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{
+		{Name: "custom", Prompt: "Open the PR titled " + PhaseTaskRefPlaceholder},
+		{Name: ReviewPhaseName},
+	}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted {{taskRef}} in phase 0, which has no previous claim to fill it from")
+	}
+	if !strings.Contains(err.Error(), PhaseTaskRefPlaceholder) {
+		t.Errorf("the rejection does not name the placeholder that cannot be filled: %v", err)
+	}
+}
+
 // The name becomes part of an iteration log's filename, and statedir refuses one
 // it does not like — costing the phase the single artifact an operator has to
 // debug the sequence with.
@@ -1719,9 +1738,12 @@ func TestReviewOnlyBriefsDoNotRerunTheGates(t *testing.T) {
 	}
 	for name, brief := range reviewOnly {
 		for _, want := range []string{
-			// The claim: the gates are another phase's job, at THIS tip.
+			// The claim: the gates are another phase's job, at THIS tip - and the verify phase
+			// re-checks only the fix delta, so a reviewer cannot read the gate sentence as
+			// "verify re-runs everything, so I should too".
 			"THE GATES ARE NOT YOURS TO RE-RUN",
-			"the fix and verify phases run the gates again over what they change",
+			"the fix phase runs the gates again over what it changes",
+			"the verify phase re-checks only the fix delta",
 			// The prohibition names what was actually re-run, so "do not run
 			// the suite" cannot be read as "do not run a test".
 			"do NOT run the repo's full test suite, typecheck, build or long checks",
@@ -1789,10 +1811,126 @@ func TestReviewOnlyBriefsDoNotRerunTheGates(t *testing.T) {
 	}
 }
 
-// CLA-635: every review-only variant — the three briefs and the two handoff
-// continuations that carry the record shape — states the accepted MUST bar: the
-// seven evidence kinds with their payloads, and the not-a-MUST list, whose
-// precedence over a repo hard rule about style, prose or doc wording is B6.
+// CLA-1032: a PR opened by a terminal phase has to name the task's ref in its title, or the PR is an
+// orphan nobody can match back to the Clankerbar task (MAK-482, PR #646). Every shipped text that
+// opens a PR carries the {{taskRef}} placeholder and the shared rule requiring it.
+func TestPRBriefsRequireTheTaskRefInTheTitle(t *testing.T) {
+	briefs := map[string]string{
+		"review terminal step": reviewTerminalStep,
+		"verify terminal step": verifyTerminalStep,
+		"fix brief":            fixBrief,
+		"final review brief":   builtinPhasePrompts[ReviewPhaseName],
+	}
+	for name, brief := range briefs {
+		if !strings.Contains(brief, prTitleTaskRefRule) {
+			t.Errorf("the %s does not carry the shared PR-title rule:\n%s", name, brief)
+		}
+		if !strings.Contains(brief, PhaseTaskRefPlaceholder) {
+			t.Errorf("the %s never carries %s, so its PR title cannot name the task:\n%s", name, PhaseTaskRefPlaceholder, brief)
+		}
+	}
+	// The text that never opens a PR must not claim a title rule for one.
+	for name, brief := range map[string]string{
+		"implement brief":   builtinPhasePrompts[ImplementPhaseName],
+		"no-code fix brief": noCodeFixBrief,
+		"no-code verify":    noCodeVerifyBrief,
+	} {
+		if strings.Contains(brief, prTitleTaskRefRule) {
+			t.Errorf("the %s carries a PR-title rule but opens no PR:\n%s", name, brief)
+		}
+	}
+}
+
+// CLA-1032: the PR's existence and the move to in_review are the TERMINAL phase's actions. A review
+// that runs before them must not grade their absence: MAK-482's two review rounds raised exactly
+// that as a must, spending a fix round when no code defect remained.
+func TestReviewBriefsExemptPRExistenceFromMUSTs(t *testing.T) {
+	gate := map[string]string{
+		"review-only gate":        reviewOnlyBriefWorktreeAndGate,
+		"runner review-only gate": runnerReviewWorktreeAndGate,
+	}
+	for name, text := range gate {
+		if !strings.Contains(text, reviewPRExistenceScope) {
+			t.Errorf("the %s does not carry the PR-existence exemption:\n%s", name, text)
+		}
+		for _, want := range []string{
+			"belong to the terminal phase",
+			"never raise a MUST that the PR does not exist",
+			"the expected state, not a defect",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the %s never says %q:\n%s", name, want, text)
+			}
+		}
+	}
+	// The grading bar carries the same carve-out into the doneWhen evidence kind: the bar is where a
+	// reviewer is told what a doneWhen MUST is, so the exemption has to live there too.
+	if !strings.Contains(reviewMUSTBarGrades, reviewPRExistenceExemption) {
+		t.Errorf("the review MUST bar does not carry the PR-existence exemption:\n%s", reviewMUSTBarGrades)
+	}
+	for _, want := range []string{
+		"belong to the terminal phase",
+		"NEVER a MUST finding during review",
+		"judge the change (or the plane's record, for a no-code task) against the code, docs and test clauses of `doneWhen` only",
+	} {
+		if !strings.Contains(reviewMUSTBarGrades, want) {
+			t.Errorf("the review MUST bar never says %q:\n%s", want, reviewMUSTBarGrades)
+		}
+	}
+}
+
+// CLA-1032: a verification round checks the fix, not the whole repo. The fix phase already ran the
+// repo's gates at HEAD and CI carries the full suite once the PR opens, so verify's commands are the
+// fix delta's own tests, the regression surface they touch, and any gate a prior finding named red.
+func TestVerifyBriefsScopeTheirChecks(t *testing.T) {
+	for name, brief := range map[string]string{
+		"verify":        verifyBrief,
+		"runner verify": runnerVerifyBrief,
+	} {
+		if !strings.Contains(brief, verifyCheckScope) {
+			t.Errorf("the %s does not carry the scoped-check rule:\n%s", name, brief)
+		}
+		for _, want := range []string{
+			"RUN CHECKS SCOPED, NEVER THE REPO'S WHOLE GATE LIST AGAIN",
+			"the fix delta's own tests",
+			"regression surface",
+			"a prior finding said was red",
+			"full test suite",
+			"full build",
+			"smoke/e2e",
+			"at HEAD",
+			"CI carries the full suite",
+			"say exactly that instead of running the gates again",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("the %s never says %q:\n%s", name, want, brief)
+			}
+		}
+	}
+	// The review gate's phase sentence must not imply verify re-runs the whole tree either - a
+	// reviewer reading "the fix and verify phases run the gates again" repeats the full run.
+	if !strings.Contains(reviewGateScope, "the verify phase re-checks only the fix delta") {
+		t.Errorf("reviewGateScope still implies verify re-runs the full gates:\n%s", reviewGateScope)
+	}
+	if strings.Contains(reviewGateScope, "the fix and verify phases run the gates again") {
+		t.Errorf("reviewGateScope still names verify as a full-gate runner:\n%s", reviewGateScope)
+	}
+	// The report asks for the checks that were ACTUALLY run, and accepts the fix phase's full-gate run
+	// at HEAD as the answer when the delta needed no new command.
+	for _, want := range []string{
+		"the targeted checks you actually ran and saw",
+		"the fix phase already ran the full gates at HEAD",
+	} {
+		if !strings.Contains(runnerVerifyReportFields, want) {
+			t.Errorf("the runner verify report never says %q:\n%s", want, runnerVerifyReportFields)
+		}
+	}
+}
+
+// CLA-635: every review-only variant — the briefs and the handoff continuations
+// that carry the record shape — states the accepted MUST bar: the seven evidence
+// kinds with their payloads, and the not-a-MUST list, whose precedence over a
+// repo hard rule about style, prose or doc wording is B6.
 func TestReviewOnlyVariantsCarryTheMUSTBar(t *testing.T) {
 	variants := map[string]string{
 		"review-only brief":             reviewOnlyBrief,

@@ -55,6 +55,7 @@ func builtinBriefs() map[string]string {
 func renderBriefForDiffScan(brief string) string {
 	return strings.NewReplacer(
 		PhaseTaskPlaceholder, "11111111-1111-1111-1111-111111111111",
+		PhaseTaskRefPlaceholder, "CLA-1",
 		PhaseRunPlaceholder, "22222222-2222-2222-2222-222222222222.opaque",
 		PhaseBranchPlaceholder, "clanker/11111111-a-title",
 		PhasePRBasePlaceholder, "staging",

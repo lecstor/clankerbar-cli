@@ -61,6 +61,9 @@ type phaseRun struct {
 	// ladder spawned is folded in here where the entry is built.
 	pass    sessionSpend
 	retries int
+	// resumedTransientRetries counts the in-claim retries this ladder has taken on a resumed
+	// phase's transient failure. Bounded by resumedTransientRetryBackoff's length.
+	resumedTransientRetries int
 }
 
 // result is the drainPhase return a verdict ends the phase with.
@@ -100,10 +103,13 @@ type attemptVerdict struct {
 // the seam's verdict on it. runLost is non-nil when the renewer ended the session because the plane
 // says the run no longer holds the task.
 type phaseAttempt struct {
-	inv                harness.Invocation
-	res                harness.Result
-	ierr               error
-	runLost            error
+	inv     harness.Invocation
+	res     harness.Result
+	ierr    error
+	runLost error
+	// routes is the resolved phase's configured route list (escalation applied, marks and windows
+	// not): what the limit beacon's per-route hold breakdown is computed over (CLA-1026).
+	routes             []string
 	logPath            string
 	logFile            *os.File
 	capped             bool

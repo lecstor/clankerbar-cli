@@ -83,12 +83,28 @@ func (o opencode) runTurns(ctx context.Context, in Invocation, res *Result, dead
 // with its own model carries no list (Invocation.OnTurn), so its limit stands and stops the
 // sequence - the stage's model is never silently swapped.
 func (o opencode) afterNonFinalTurn(ctx context.Context, turnIn, base Invocation, res *Result, deadline time.Time, delivery *opencodeInbox) (Invocation, string, error) {
+	walkIn := turnIn
 	if o.DetectLimit(*res).Limited && res.Untrusted == "" {
 		if err := o.switchRoutesOnLimit(ctx, turnIn, turnIn.RouteList(), res, deadline, delivery); err != nil {
 			return base, "run_error", err
 		}
 		if o.DetectLimit(*res).Limited {
 			return base, "usage_limit", nil
+		}
+		if finished := RouteFinished(*res); finished != "" {
+			base = base.OnFinishedRoute(finished)
+			walkIn = walkIn.OnFinishedRoute(finished)
+		}
+	}
+	// A provider death on a NON-FINAL turn is a route failure exactly as it is on the final one:
+	// walk the turn's remaining routes here too, or the sequence stops above Invoke's provider walk
+	// and the dead route is never marked (the driver's in-claim retry would re-buy it). The walk
+	// resumes the same session, and the next turn then runs on the route that finished it. A turn
+	// with its own model carries no route list (OnTurn), so its death still stands and stops the
+	// sequence - the stage's model is never silently swapped.
+	if o.routeFailoverReason(*res) != "" {
+		if err := o.switchRoutesOnProviderError(ctx, walkIn, walkIn.RouteList(), res, deadline, delivery); err != nil {
+			return base, "run_error", err
 		}
 		if finished := RouteFinished(*res); finished != "" {
 			base = base.OnFinishedRoute(finished)

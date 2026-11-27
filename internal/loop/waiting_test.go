@@ -254,7 +254,7 @@ func TestWaiting_ReclaimingOneOfTwoOwnAsksKeepsTheOther(t *testing.T) {
 	if got := d.fleetState(0); got.Kind != fleet.StateWaiting || got.TaskRef != "CLA-2" {
 		t.Fatalf("after the newest answer landed = %+v, want waiting on CLA-2 until the reclaim", got)
 	}
-	d.beginIteration(0, d.targets[0], 2, "CLA-2", "implement")
+	d.beginIteration(0, d.targets[0], 2, "CLA-2", "implement", "")
 	if got := d.fleetState(0); got.Kind != fleet.StateIteration {
 		t.Fatalf("state while the reclaimed task runs = %+v, want iteration over waiting", got)
 	}
@@ -312,7 +312,7 @@ func TestBeginIteration_ClearsOnlyForTheWaitedTask(t *testing.T) {
 	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Fleet: ff}})
 	d.noteWaiting(0, "CLA-535")
 
-	d.beginIteration(0, d.targets[0], 1, "CLA-999", "implement")
+	d.beginIteration(0, d.targets[0], 1, "CLA-999", "implement", "")
 	if !d.waitingAt(0).on {
 		t.Fatal("a drain of another task cleared the waiting marker")
 	}
@@ -321,7 +321,7 @@ func TestBeginIteration_ClearsOnlyForTheWaitedTask(t *testing.T) {
 		t.Fatalf("after a foreign drain state = %+v, want waiting on CLA-535", got)
 	}
 
-	d.beginIteration(0, d.targets[0], 2, "CLA-535", "implement")
+	d.beginIteration(0, d.targets[0], 2, "CLA-535", "implement", "")
 	if d.waitingAt(0).on {
 		t.Fatal("the waited task's reclaim left the waiting marker on")
 	}

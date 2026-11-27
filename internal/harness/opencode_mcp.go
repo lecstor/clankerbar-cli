@@ -353,7 +353,7 @@ func opencodeBacklogMCPDeclarations(in Invocation, env []string, allLayers bool)
 		}
 	}
 	// 2. OPENCODE_CONFIG, the layer opencode reads after the global dir. The
-	// adapter pins the named MCP config there (opencode.go), so it is read at
+	// adapter pins the named MCP config there (opencode_permission.go), so it is read at
 	// this position rather than first; a caller-declared value in in.Env wins
 	// at exec, so it is read after it.
 	if in.MCPConfigPath != "" {

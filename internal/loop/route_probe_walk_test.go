@@ -58,7 +58,7 @@ func TestSupervisedWait_ALimitedFirstRouteIsMarkedAndTheNextRouteProbedInTheSame
 			logs := captureLogs(t)
 			start := time.Now()
 			tokens, _, stop := d.supervisedWait(context.Background(), harness.Limit{Limited: true},
-				h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+				h, d.cfg.Phases[0], nil, d.targets[0], spend{start: start})
 			elapsed := time.Since(start)
 
 			if stop {
@@ -82,9 +82,12 @@ func TestSupervisedWait_ALimitedFirstRouteIsMarkedAndTheNextRouteProbedInTheSame
 				t.Errorf("ROUTE_MARKS = %v, the route that probed open must not be marked", marks)
 			}
 			if tc.resetAt.IsZero() {
-				// Marked at probe time, one poll interval into the wait, for one poll interval.
-				if until.Before(start.Add(2*interval)) || until.After(start.Add(elapsed+interval)) {
-					t.Errorf("mark lifts %s after the wait began, want one poll interval (%s) past the probe", until.Sub(start), interval)
+				// Marked at probe time for one poll interval. The ENTRY probe can run at once — a route
+				// that is clear at entry is worth testing without sleeping first (CLA-1024) — so measure
+				// from the probe, not from a fixed offset into the wait.
+				probeAt := h.probeStarts[0]
+				if until.Before(probeAt.Add(interval)) || until.After(probeAt.Add(interval+100*time.Millisecond)) {
+					t.Errorf("mark lifts %s after its probe, want one poll interval (%s) past it", until.Sub(probeAt).Round(time.Millisecond), interval)
 				}
 			} else if !until.Equal(tc.resetAt) {
 				t.Errorf("mark = %s, want the stated reset %s", until, tc.resetAt)
@@ -108,7 +111,7 @@ func TestSupervisedWait_EveryRouteLimitedStillSleepsThePollIntervalAndChargesEve
 	logs := captureLogs(t)
 	start := time.Now()
 	tokens, _, stop := d.supervisedWait(context.Background(), harness.Limit{Limited: true},
-		h, d.cfg.Phases[0], d.targets[0], spend{start: start})
+		h, d.cfg.Phases[0], nil, d.targets[0], spend{start: start})
 	if stop {
 		t.Fatalf("the limit lifted on probe %d; the wait should resume\n%s", limitedProbes+1, logs.String())
 	}
@@ -165,7 +168,7 @@ func TestSupervisedWait_ABudgetCrossedMidWalkStopsBeforeTheNextRoute(t *testing.
 
 	logs := captureLogs(t)
 	_, _, stop := d.supervisedWait(context.Background(), harness.Limit{Limited: true},
-		h, d.cfg.Phases[0], d.targets[0], spend{start: time.Now()})
+		h, d.cfg.Phases[0], nil, d.targets[0], spend{start: time.Now()})
 	if !stop {
 		t.Fatalf("the probe crossed the ceiling; the wait should stop\n%s", logs.String())
 	}
@@ -229,7 +232,7 @@ func TestOneRouteOpencodeSessionMarksItsRouteOnALimit(t *testing.T) {
 			if !oc.DetectLimit(res).Limited {
 				t.Fatalf("the stub's session did not classify as limited: %+v", oc.DetectLimit(res))
 			}
-			d.noteRouteFallbacks(d.targets[0], 1, inv, res)
+			d.noteRouteFallbacks(0, d.targets[0], 1, inv, res)
 
 			until, ok := persistedRouteMarks(t, d)[routeFreeAlias]
 			if !ok {

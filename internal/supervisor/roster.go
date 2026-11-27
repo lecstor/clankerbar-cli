@@ -166,7 +166,7 @@ func NewRosterClient(endpoint, apiKey string) *RosterClient {
 	return &RosterClient{
 		endpoint: strings.TrimRight(endpoint, "/"),
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: 15 * time.Second, CheckRedirect: noDowngradeRedirect},
+		client:   &http.Client{Timeout: 15 * time.Second, CheckRedirect: secureurl.NoDowngradeRedirect},
 	}
 }
 
@@ -209,17 +209,6 @@ func (c *RosterClient) Fetch(ctx context.Context) ([]RosterEntry, error) {
 		return nil, fmt.Errorf("roster: decode %s: %w", c.endpoint, err)
 	}
 	return payload.Entries, nil
-}
-
-// noDowngradeRedirect refuses a redirect that would put the bearer token on the
-// wire in cleartext — the same rule every other authenticated client here
-// follows (CLA-257): Go strips Authorization on a host change but forwards it
-// on an https -> http hop to the SAME host.
-func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
-	if _, err := secureurl.Origin(req.URL.String()); err != nil {
-		return fmt.Errorf("refusing redirect: %w", err)
-	}
-	return nil
 }
 
 // rosterCacheName is the last-known-good roster file the supervisor writes

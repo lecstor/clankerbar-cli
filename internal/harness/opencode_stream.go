@@ -271,6 +271,10 @@ type opencodeParse struct {
 	// cannot rebuild a claim that a later call has since settled.
 	settledCalls map[string]bool
 
+	// toolCalls counts the tool parts that reached a TERMINAL state: the "completed any tool call"
+	// measure the route failover reads before abandoning a route (a running call never completed).
+	toolCalls int
+
 	// toolOutputDir is where this session's opencode saves truncated tool output: <data
 	// home>/opencode/tool-output, resolved from the session's own environment. The only directory a
 	// truncated result is read back from.
@@ -458,6 +462,7 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.settledCalls = map[string]bool{}
 	}
 	p.settledCalls[key] = true
+	p.toolCalls++
 	noteOpencodeToolEvent(p.observed.events, part.Tool, part.ID, st.Input)
 	if p.observed.toolLoop.observe(part.Tool, st.Status == "error", st.Error) && p.kill != nil {
 		fmt.Fprintf(p.diag(), "\n!! %s - killing the session here instead of letting it retry the same failing call\n", p.observed.toolLoop.tripped())
@@ -498,4 +503,76 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	}
 	content, _ := json.Marshal(output)
 	noteToolResult(&p.observed, part.ID, st.Status == "error", content, p.diag())
+}
+
+// finish writes what the stream added up to onto res.
+func (p *opencodeParse) finish(res *Result) {
+	res.FinalMessage = p.lastText
+	// What the session did with the backlog. Copied rather than accumulated in place because res does
+	// not exist until the process has exited; see the `observed` field.
+	res.Claim = p.observed.Claim
+	res.BlockingAsk = p.observed.BlockingAsk
+	res.Reports = p.observed.Reports
+	res.ClankerbarCalls = p.observed.ClankerbarCalls
+	res.ToolCalls = p.toolCalls
+	res.UsageReported = p.sawUsage
+	// The cost figure is its own question: a stream whose steps carried tokens but no cost reported no
+	// money, and the durable record must say so rather than reporting 0.
+	res.CostReported = p.sawCost
+	if p.sawUsage {
+		res.Tokens = p.total
+		res.CostUSD = p.cost
+		res.Usage = TokenUsage{
+			Input:      p.in,
+			Output:     p.out,
+			Reasoning:  p.reason,
+			CacheRead:  p.cRead,
+			CacheWrite: p.cWrite,
+		}
+		res.Raw = map[string]any{
+			"input_tokens": p.in, "output_tokens": p.out, "reasoning_tokens": p.reason,
+			"cache_write_tokens": p.cWrite, "cache_read_tokens": p.cRead,
+		}
+	}
+	// The finish reason is recorded even when the step carried no usage: a dead session's final step
+	// can report zero tokens, and that reason is exactly the CLA-386 signal the driver needs to refuse
+	// to hand the phase on.
+	if p.lastReason != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[FinishReasonKey] = p.lastReason
+		// The CLA-398 quiet-death signature: a FINAL "unknown" step whose OWN usage was all-zero.
+		if p.lastReason == FinishReasonUnknown && p.lastStepZeroUsage {
+			res.Raw[TerminalReasonKey] = ZeroUsageReason
+		}
+		// CLA-584: the output-cap stall — a FINAL step that hit the output token limit with ZERO
+		// output.
+		if p.lastReason == FinishReasonLength && p.lastStepOut == 0 {
+			res.Raw[TerminalReasonKey] = OutputCapReason
+			res.Raw[OutputCapReasoningKey] = p.lastStepReason
+		}
+	}
+	// The opencode session id, when the stream named one: the CLA-406 resurrection path resumes INTO
+	// this session via `opencode run --session`, and needs the handle to survive onto the Result.
+	if p.sessionID != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[opencodeSessionIDKey] = p.sessionID
+		res.SessionRef = p.sessionID
+	}
+	if p.errorType != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[OpencodeErrorTypeKey] = p.errorType
+	}
+	// CLA-700: the events this session RECOVERED from, with no error event ending the stream.
+	if p.recoveredErrors > 0 && !p.lastEventWasError {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[RecoveredErrorsKey] = p.recoveredErrors
+	}
 }
