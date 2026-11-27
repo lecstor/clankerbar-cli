@@ -68,19 +68,28 @@ func parseRPCMessage(raw []byte) (rpcMessage, error) {
 	var probe struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
-		Params struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		} `json:"params"`
+		Params json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal(trimmed, &probe); err != nil {
 		return rpcMessage{}, errInvalidJSON
 	}
-	return rpcMessage{
-		id:       probe.ID,
-		method:   probe.Method,
-		keyless:  keylessMethods[probe.Method],
-		protocol: probe.Params.ProtocolVersion,
-	}, nil
+	msg := rpcMessage{
+		id:      probe.ID,
+		method:  probe.Method,
+		keyless: keylessMethods[probe.Method],
+	}
+	// params may be an object or (per JSON-RPC) an array; only an object can
+	// carry initialize's protocolVersion, and an array must not make an
+	// otherwise valid request unparseable here.
+	if len(probe.Params) > 0 && probe.Params[0] == '{' {
+		var params struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		if err := json.Unmarshal(probe.Params, &params); err == nil {
+			msg.protocol = params.ProtocolVersion
+		}
+	}
+	return msg, nil
 }
 
 // rpcError builds one JSON-RPC error response, preserving the client's id

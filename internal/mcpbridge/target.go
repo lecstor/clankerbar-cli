@@ -203,6 +203,12 @@ func projectFromFile(data []byte, fileDir, cwd string) (slug string, matched boo
 	if err := json.Unmarshal(data, &m); err != nil {
 		return "", false, fmt.Errorf("not valid JSON: %w", err)
 	}
+	// A mapping that names neither shape is malformed even though it parses:
+	// `null`, `{}` and a misspelled key ("projet") would otherwise fall back
+	// silently, which is the one outcome a mapping file must not produce.
+	if m.Project == "" && m.Folders == nil {
+		return "", false, errors.New("names neither `project` nor `folders`")
+	}
 	if raw := m.Project; raw != "" {
 		p := strings.TrimSpace(raw)
 		if p == "" {

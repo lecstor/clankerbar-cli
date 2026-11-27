@@ -124,6 +124,7 @@ type bridge struct {
 	wg       sync.WaitGroup
 
 	outMu sync.Mutex // one whole line at a time on stdout
+	errMu sync.Mutex // one whole diagnostic line at a time on stderr
 
 	protoMu      sync.Mutex
 	protoVersion string
@@ -391,6 +392,8 @@ func (b *bridge) emit(line []byte) {
 
 // warnf writes one diagnostic line to stderr. It never touches stdout.
 func (b *bridge) warnf(format string, args ...any) {
+	b.errMu.Lock()
+	defer b.errMu.Unlock()
 	fmt.Fprintf(b.cfg.Err, "clankerbar mcp: "+format+"\n", args...)
 }
 
