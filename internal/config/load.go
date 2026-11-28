@@ -82,6 +82,20 @@ func discover() string {
 	return ""
 }
 
+// LoadHome reads the operator's own config file (~/.config/clankerbar/config.json)
+// layered over defaults, and nothing else.
+//
+// It is Load without the working-directory refusal, for commands that run INSIDE
+// a checkout and never read a `clankerbar.json` there: `clankerbar mcp` is
+// launched by a harness from the project directory, and a driver config sitting
+// in that directory is not its config. Such a file is neither read nor refused.
+func LoadHome() (*Config, error) {
+	if p := discover(); p != "" {
+		return Load(p)
+	}
+	return defaults(), nil
+}
+
 // refuseImplicitWorkDirConfig refuses to run when a `clankerbar.json` is sitting in the process
 // working directory and no --config was given. REFUSED, NOT IGNORED.
 func refuseImplicitWorkDirConfig() error {

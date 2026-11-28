@@ -69,6 +69,10 @@ func TestHelpAndVersionExitZero(t *testing.T) {
 		{"clankerbar", "upload", "--help"},
 		{"clankerbar", "download", "--help"},
 		{"clankerbar", "deck", "--help"},
+		{"clankerbar", "login", "--help"},
+		{"clankerbar", "logout", "--help"},
+		{"clankerbar", "whoami", "--help"},
+		{"clankerbar", "mcp", "--help"},
 		{"clankerbar", "hook", "--help"},
 		{"clankerbar", "hook", "emit", "--help"},
 	} {

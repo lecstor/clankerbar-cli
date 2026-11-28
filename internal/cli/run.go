@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
@@ -130,10 +131,24 @@ func Run(ctx context.Context, args []string) error {
 	// The driver reads backlog state directly (cheap, no tokens) to gate each
 	// iteration, to keep polling while idle, and to honour the console pause flag —
 	// one GET per project of the plane's backlog-summary surface (counts +
-	// loopPaused in one read). The API key comes from the env: the operator's
+	// loopPaused in one read). The API key comes from the env first, then the
+	// local credential store `clankerbar login` wrote (CLA-1038): the operator's
 	// ACCOUNT key covers every configured project (CLA-142); a project-scoped key
 	// still works for single-project / CI setups.
-	apiKey := os.Getenv("CLANKERBAR_API_KEY")
+	res, err := credentialFor(cfg)
+	if err != nil {
+		return err
+	}
+	apiKey := res.Token
+	if res.Source == auth.SourceFile {
+		// Sessions inherit CLANKERBAR_API_KEY and hand it to the plane's MCP
+		// server; a driver authenticated from the store must export the same key
+		// or every session it spawns would start keyless.
+		if err := exportStoredCredential(res); err != nil {
+			return fmt.Errorf("export the stored credential for spawned sessions: %w", err)
+		}
+		log.Printf("using the stored credential for %s from %s", cfg.CredentialOrigin(), res.Path)
+	}
 
 	// Say where the key is going, once, before the first request carries it
 	// (CLA-257). A redirected credential used to be invisible: the origin was

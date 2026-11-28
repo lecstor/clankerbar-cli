@@ -16,6 +16,95 @@ trust it with an overnight run.
 > hardened. It is a supported surface rather than an internal tool - see
 > [Versioning](#versioning) for what the `v0.x` line does and does not promise.
 
+## Install
+
+**One-line install.** Detects your OS and architecture, downloads the matching
+release archive, verifies its SHA-256 against the release's `checksums.txt`, and
+installs `clankerbar` to `~/.local/bin/clankerbar`:
+
+```sh
+curl -fsSL https://clankerbar.com/install.sh | sh
+```
+
+It is a plain `sh` script over `curl` rather than a browser download, so macOS
+never sets the Gatekeeper quarantine attribute. Override the destination with
+`CLANKERBAR_INSTALL_DIR`, and pin a release by setting `CLANKERBAR_VERSION` to a
+tag on the `sh` side of the pipe (a variable before `curl` would apply to `curl`,
+not to the script reading the pipe):
+
+```sh
+curl -fsSL https://clankerbar.com/install.sh | CLANKERBAR_INSTALL_DIR="$HOME/bin" sh
+```
+
+The script finishes by running `clankerbar version`; if the install directory is
+not on your `PATH`, it prints the export line to add to your shell profile.
+
+### Download a release tarball by hand
+
+Each release ships cross-platform binaries on the [releases page][releases] -
+macOS and Linux, amd64 and arm64, as
+`clankerbar_<version>_<os>_<arch>.tar.gz`. Extract it and put `clankerbar` on
+your `PATH`. No Go toolchain required.
+
+```sh
+# macOS arm64; swap the os/arch for yours.
+VERSION=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  https://github.com/lecstor/clankerbar-cli/releases/latest | sed 's#.*/v##')
+OSARCH=darwin_arm64
+curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/clankerbar_${VERSION}_${OSARCH}.tar.gz"
+curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/checksums.txt"
+shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum --ignore-missing -c checksums.txt
+tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
+./clankerbar version
+```
+
+### Verify where it came from
+
+The checksum above catches a corrupt or truncated download, and that is all it
+catches: it is served from the same release page as the archive, so anyone able
+to replace one could replace both. Every release is also signed with
+[build provenance][slsa] - a Sigstore attestation held by GitHub, not by the
+release, recording that these exact bytes came out of this repo's `release.yml`
+at a specific commit:
+
+```sh
+gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" \
+  --repo lecstor/clankerbar-cli \
+  --signer-workflow lecstor/clankerbar-cli/.github/workflows/release.yml
+```
+
+`--signer-workflow` is the half that makes the sentence above true: `--repo`
+alone accepts an attestation signed by *any* workflow in this repo, while naming
+the workflow pins it to the one that publishes releases. That is worth the extra
+line - this binary holds your credentials and runs shell commands on your
+machine, and provenance is the part that would notice if the archive were not
+ours. Needs the [GitHub CLI][gh-cli] and a `gh auth login`; run
+`gh attestation verify --help` for the offline and JSON-output variants.
+
+Downloading in a browser instead of with `curl` gets the archive quarantined by
+macOS, and the binaries are not notarized, so the first run is refused with
+"cannot be opened because the developer cannot be verified". Clear it with
+`xattr -d com.apple.quarantine clankerbar`, or use `curl` as above, which never
+sets the attribute.
+
+### Build from source
+
+Requires Go 1.26+:
+
+```sh
+go install github.com/lecstor/clankerbar-cli/cmd/clankerbar@latest
+# or, from a checkout:
+go build -o clankerbar ./cmd/clankerbar
+```
+
+A source build reports the version it was stamped with - `go install` leaves it
+at the `0.0.0-dev` default, so `clankerbar version` naming a real `vX.Y.Z` means
+you are on a release archive.
+
+[slsa]: https://slsa.dev/spec/v1.0/provenance
+[gh-cli]: https://cli.github.com
+[releases]: https://github.com/lecstor/clankerbar-cli/releases
+
 ## How it works
 
 Each iteration is a *fresh* harness session told to work **one** task, landing a PR
@@ -950,67 +1039,6 @@ and permission policy.
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
 
-## Install
-
-**Download a prebuilt binary.** Each release ships cross-platform binaries on the
-[releases page][releases] - macOS and Linux, amd64 and arm64, as
-`clankerbar_<version>_<os>_<arch>.tar.gz`. Extract it and put `clankerbar` on your
-`PATH`. No Go toolchain required.
-
-```sh
-# macOS arm64; swap the os/arch for yours.
-VERSION=0.1.0 OSARCH=darwin_arm64
-curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/clankerbar_${VERSION}_${OSARCH}.tar.gz"
-curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/checksums.txt"
-shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum --ignore-missing -c checksums.txt
-tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
-./clankerbar version
-```
-
-**Then verify where it came from, not just that it arrived intact.** The checksum
-above catches a corrupt or truncated download, and that is all it catches: it is
-served from the same release page as the archive, so anyone able to replace one
-could replace both. Every release is also signed with [build provenance][slsa] -
-a Sigstore attestation held by GitHub, not by the release, recording that these
-exact bytes came out of this repo's `release.yml` at a specific commit:
-
-```sh
-gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" \
-  --repo lecstor/clankerbar-cli \
-  --signer-workflow lecstor/clankerbar-cli/.github/workflows/release.yml
-```
-
-`--signer-workflow` is the half that makes the sentence above true: `--repo`
-alone accepts an attestation signed by *any* workflow in this repo, while naming
-the workflow pins it to the one that publishes releases. That is worth the extra
-line - this binary holds your credentials and runs shell commands on your
-machine, and provenance is the part that would notice if the archive were not
-ours. Needs the [GitHub CLI][gh-cli] and a `gh auth login`; run
-`gh attestation verify --help` for the offline and JSON-output variants.
-
-[slsa]: https://slsa.dev/spec/v1.0/provenance
-[gh-cli]: https://cli.github.com
-
-Downloading in a browser instead of with `curl` gets the archive quarantined by
-macOS, and the binaries are not notarized, so the first run is refused with
-"cannot be opened because the developer cannot be verified". Clear it with
-`xattr -d com.apple.quarantine clankerbar`, or use the `curl` route above, which
-never sets the attribute.
-
-**Or build from source** (requires Go 1.26+):
-
-```sh
-go install github.com/lecstor/clankerbar-cli/cmd/clankerbar@latest
-# or, from a checkout:
-go build -o clankerbar ./cmd/clankerbar
-```
-
-A source build reports the version it was stamped with - `go install` leaves it at
-the `0.0.0-dev` default, so `clankerbar version` naming a real `vX.Y.Z` means you
-are on a release archive.
-
-[releases]: https://github.com/lecstor/clankerbar-cli/releases
-
 ## Versioning
 
 Releases are semver tags (`vX.Y.Z`) and the tool is pre-1.0, so expect the `v0.x`
@@ -1041,7 +1069,99 @@ clankerbar propose-config                     # import this file into the plane 
 clankerbar upload shot.png                    # print asset:<id> (the bytes never leave the shell)
 clankerbar download asset:2f9c… -o docs/      # fetch an asset; stdout is the path written
 clankerbar deck deck.html --task CLA-581      # upload a review deck, print its review URL
+clankerbar login                              # authenticate this machine once (browser device flow)
+clankerbar mcp                                # stdio MCP bridge: one config for every harness
+clankerbar whoami                             # where the credential comes from, and is it still valid?
+clankerbar logout --all                       # forget every stored origin
 ```
+
+### Once per machine: `clankerbar login`
+
+Every command authenticates with `CLANKERBAR_API_KEY` when it is in the
+environment. When it is not — the common case for a GUI or TUI harness that
+never inherits a shell export — `clankerbar login` writes the key once to an
+owner-only local credential store instead:
+
+```sh
+clankerbar login                    # browser device flow; --host picks a non-default plane
+clankerbar login --project-scope    # a project-bound key instead of the account-wide one
+clankerbar whoami                   # origin, source, scope, and a live list_projects call
+clankerbar logout                   # forget this origin; --all forgets every origin
+```
+
+`login` prints the approval URL and code on stderr, polls the plane, and saves
+the minted key. It never prints the key itself, and neither does any later
+command. The store is `$XDG_STATE_HOME/clankerbar/auth.json`
+(`~/.local/state/clankerbar/auth.json` by default): one entry per canonical
+origin, directory `0700`, file `0600`, written atomically with a same-directory
+rename. A credential file that exists but is a symlink, or sits under a
+symlinked directory, is **refused** (delete the link and log in again); one
+owned by another user is **refused** (re-own it or remove it); one readable by
+group or other is **refused** with the `chmod 600` that fixes it.
+
+Resolution is per origin and in one order everywhere: `CLANKERBAR_API_KEY`
+first (an explicit export still wins), then the stored entry for exactly that
+origin. A key stored for one origin is never sent to another. `run` and
+`supervise` export a file-resolved key into the processes they spawn, so the
+harness sessions they start carry the same credential. `clankerbar review run`
+does the opposite on purpose: it starts its review session with
+`CLANKERBAR_AUTH_FILE=/dev/null`, so an isolated review cannot reach the
+operator's ambient login.
+
+`CLANKERBAR_AUTH_FILE` relocates the store for tests or per-profile setups. Set
+it to `none` (or the platform's null device) to disable stored credentials
+entirely — reads then answer "not found" without touching disk.
+
+### One MCP server for every harness: `clankerbar mcp`
+
+Interactive harnesses (Claude Code, Codex, opencode, Cursor, Antigravity, T3
+Code, …) each spell their MCP config differently, expand environment variables
+differently, and often do not inherit a shell export. `clankerbar mcp` collapses
+that: it is a **stdio-to-Streamable-HTTP bridge**, so every interactive harness
+configures the same local server and shares the one login from
+`clankerbar login` — the key stays in the CLI's own store, so the harness needs
+no key in its config or in the shell environment it was launched from.
+
+```jsonc
+// The harness's own (user-level) config, not a checkout's .mcp.json.
+// Claude Code: ~/.claude.json; codex/cursor/opencode/... take the same command+args.
+{ "mcpServers": { "clankerbar": { "command": "clankerbar", "args": ["mcp"] } } }
+```
+
+This entry belongs to the **interactive** harness's config, not the driver's:
+`clankerbar run` and `doctor` refuse a server named `clankerbar` that has no URL
+(a spawned process would be handed the account key), and a discovered
+`<workdir>/.mcp.json` also refuses any local-process entry unless
+`allow_local_mcp_servers` names it. The driver's own MCP config keeps the HTTP
+`/mcp` entry; do not replace it with this one.
+
+```sh
+clankerbar mcp                    # project from .clankerbar.json, else the account-wide /mcp
+clankerbar mcp --project my-proj  # pin one project: <origin>/mcp/my-proj
+clankerbar mcp --multi            # force the account-wide /mcp surface
+clankerbar mcp --host https://staging.example   # a non-default plane
+```
+
+The origin is `--host`, else the config's `backlog_url`, else
+`https://clankerbar.com`; it must be HTTPS (plain HTTP only to loopback). The
+target is `<origin>/mcp` unless a project is pinned. Without `--project` or
+`--multi`, the bridge walks upward from the working directory for the nearest
+`.clankerbar.json` — `{ "project": "<slug>" }`, or a parent folder's
+`{ "folders": { "<rel-path>": "<slug>" } }` matched by longest path prefix (a
+`"."` key maps the file's own directory) — and
+stops at the checkout root (`.git`), home, or the filesystem root. A malformed
+file is one warning on stderr, then the account-wide surface. A repository's
+`.mcp.json` is never read: a checkout may say which project it is, never where
+the credential goes.
+
+**stdout is the protocol pipe.** It carries newline-delimited JSON-RPC 2.0
+responses and nothing else; every diagnostic goes to stderr. The bridge answers
+both `application/json` and `text/event-stream` responses, holds concurrent
+requests (bounded), relays payloads well past 64 KiB, and turns a 401/403 into a
+JSON-RPC error naming `clankerbar login` (a 5xx or transport failure becomes one
+naming the failure) rather than leaving the client hanging. The token is
+resolved per request, so re-running `clankerbar login` takes effect without
+restarting the server. stdin EOF or SIGINT/SIGTERM exits 0.
 
 ### The fleet supervisor: bare `clankerbar`
 

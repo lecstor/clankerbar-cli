@@ -99,6 +99,11 @@ func hookEmit(args []string, stdin io.Reader) error {
 	if apiKey == "" {
 		// Quiet like the run-id case: a session without the key sends nothing, and
 		// a line per tool call would be noise the operator cannot act on from here.
+		//
+		// Deliberately env-only: the hook runs INSIDE a spawned session, and a
+		// standalone review sets CLANKERBAR_AUTH_FILE to the null device so that
+		// an isolated session cannot reach the operator's stored login
+		// (CLA-1038). Reading the store here would defeat exactly that.
 		return nil
 	}
 

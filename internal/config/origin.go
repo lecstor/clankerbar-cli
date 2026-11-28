@@ -28,6 +28,34 @@ func (c *Config) CredentialOrigin() string {
 	return origin
 }
 
+// ResolveOrigin is the --host / config backlog_url / built-in plane ladder shared by the auth
+// commands and the MCP bridge, so the credential-origin precedence exists once. load reads the
+// config file the caller owns: Load("") refuses an implicit workdir config, while LoadHome is for
+// a command (the bridge) launched inside a checkout. The result is canonical and credential-safe:
+// https anywhere, or http to loopback only.
+func ResolveOrigin(host string, load func() (*Config, error)) (string, error) {
+	if h := strings.TrimSpace(host); h != "" {
+		origin, err := secureurl.Origin(h)
+		if err != nil {
+			return "", fmt.Errorf("--host: %w", err)
+		}
+		return origin, nil
+	}
+	cfg, err := load()
+	if err != nil {
+		return "", fmt.Errorf("load config: %w (pass --host <origin> to skip it)", err)
+	}
+	raw := strings.TrimSpace(cfg.BacklogURL)
+	if raw == "" {
+		return defaultBacklogURL, nil
+	}
+	origin, err := secureurl.Origin(raw)
+	if err != nil {
+		return "", fmt.Errorf("the config's backlog_url cannot carry a credential (%w) - pass --host <origin>", err)
+	}
+	return origin, nil
+}
+
 // mcpServer is one server entry of a harness MCP config, reduced to what deciding "may the key go
 // there" needs. A URL-less entry is a locally spawned process; it has no origin, but it can still
 // be handed the key through its environment.

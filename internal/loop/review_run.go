@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/reviewmap"
@@ -232,6 +233,13 @@ func reviewRunInvocation(opts ReviewRunOptions, cfg *config.Config, method, wt, 
 	if err != nil {
 		return harness.Invocation{}, stage, fmt.Errorf("review session env: %w", err)
 	}
+	// CLA-1038 isolation, the sibling of CLA-927's no-backlog switch: a
+	// standalone review must not inherit the operator's ambient login. The null
+	// device is the store's documented disable value, so even a CLI command run
+	// inside the session finds no stored credential. Appended LAST because exec
+	// keeps the last value of a duplicate key — a config-declared
+	// CLANKERBAR_AUTH_FILE cannot outrank it.
+	env = append(env, auth.EnvAuthFile+"="+os.DevNull)
 	hc := cfg.SessionFor(opts.Harness)
 	idle, toolCall := cfg.SessionIdleFor(opts.Harness)
 	// A standalone review has no phase of its own, so it takes the run-wide cap and then the built-in

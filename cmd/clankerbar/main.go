@@ -57,6 +57,14 @@ func run(args []string) int {
 			err = cli.Ctl(ctx, args[2:])
 		case "doctor":
 			err = cli.Doctor(ctx, args[2:])
+		case "login":
+			err = cli.Login(ctx, args[2:])
+		case "logout":
+			err = cli.Logout(ctx, args[2:])
+		case "whoami":
+			err = cli.Whoami(ctx, args[2:])
+		case "mcp":
+			err = cli.Mcp(ctx, args[2:])
 		case "propose-config":
 			err = cli.ProposeConfig(ctx, args[2:])
 		case "dead-rate":

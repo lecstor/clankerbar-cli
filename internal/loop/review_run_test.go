@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lecstor/clankerbar-cli/internal/auth"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
@@ -74,6 +75,35 @@ func reviewRunDone(tip string, findings string) string {
 }
 
 const reviewRunMustFinding = `{"severity":"must","summary":"The guard is missing","evidenceKind":"gate","evidence":"go test ./... fails","file":"main.go","line":3,"kind":"bug","requiredFix":"Restore the guard"}`
+
+// CLA-1038: a standalone review must not inherit an ambient login from the CLI's
+// credential store. The session env carries the store's documented disable value,
+// appended AFTER any config-declared value so exec's last-wins rule makes it win.
+func TestReviewRunDisablesStoredAuthInTheSessionEnv(t *testing.T) {
+	cfg := &config.Config{
+		Env: config.EnvMap{
+			auth.EnvAuthFile: config.EnvValue{Literal: "/tmp/ambient-auth.json"},
+		},
+	}
+	inv, _, err := reviewRunInvocation(ReviewRunOptions{}, cfg, config.ReviewMethodSinglePass, "/tmp/wt", "base", "head")
+	if err != nil {
+		t.Fatalf("reviewRunInvocation: %v", err)
+	}
+	want := auth.EnvAuthFile + "=" + os.DevNull
+	found, last := false, ""
+	for _, kv := range inv.Env {
+		if strings.HasPrefix(kv, auth.EnvAuthFile+"=") {
+			found = true
+			last = kv
+		}
+	}
+	if !found {
+		t.Fatalf("the review session env does not disable stored auth: %v", inv.Env)
+	}
+	if last != want {
+		t.Errorf("the LAST %s = %q, want %q (exec keeps the last duplicate key)", auth.EnvAuthFile, last, want)
+	}
+}
 
 // TestRunReviewSinglePassReport drives one standalone review: the JSON shape,
 // the resolved SHAs, the temp worktree (outside the repository, removed after),

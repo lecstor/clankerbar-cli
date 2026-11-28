@@ -183,15 +183,17 @@ func parseOnePositional(fs *pflag.FlagSet, args []string, want string) (string, 
 // CredentialOrigin (never the workdir file's host), exactly like every other
 // credentialed call.
 func commandTarget(cfgPath, project, flag string) (string, *config.Config, string, error) {
-	key := os.Getenv("CLANKERBAR_API_KEY")
-	if key == "" {
-		return "", nil, "", errors.New("CLANKERBAR_API_KEY is not set - export the account key the daemon runs with")
-	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("load config: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
+		return "", nil, "", err
+	}
+	// The key is resolved AFTER the config, because the store is per-origin and
+	// the origin is the config's own statement. Env still wins inside Resolve.
+	res, err := requireCredential(cfg)
+	if err != nil {
 		return "", nil, "", err
 	}
 
@@ -205,7 +207,7 @@ func commandTarget(cfgPath, project, flag string) (string, *config.Config, strin
 			return "", nil, "", err
 		}
 	}
-	return key, cfg, slug, nil
+	return res.Token, cfg, slug, nil
 }
 
 // uploadAPI resolves the config, the target project and the account key, and
