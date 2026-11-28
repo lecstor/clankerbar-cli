@@ -321,3 +321,83 @@ func TestDrainPhases_MCPPreflightFailureTwiceFailsTheDrain(t *testing.T) {
 		t.Fatalf("spawned %d sessions, want 2 — the retry is bounded at ONE", h.invokeCalls)
 	}
 }
+
+// 2026-11-28 incident (MAK-531): a review session holding a claim with pushed
+// work failed its MCP preflight. The seam ended the lease (the pushed-work
+// handback) BEFORE the invoke error was read as a retry, so the retry and the
+// fix phase ran under a run the plane had already released. The seam must keep
+// the claim for the retry, and the retry and the next phase must run on the
+// same run.
+func TestDrainPhases_MCPPreflightFailureMidSequenceKeepsTheLeaseForTheRetry(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	wip := openClaim()
+	wip.HasWIP = true
+	wip.Branch = "clanker/t-1-feature"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		// It reached the backlog on an earlier turn, so the no_mcp backstop does not cover it.
+		{res: mcpReached(held(okResult(1, 0.01), wip)), err: fmt.Errorf("%w: MCP server \"clankerbar\" reports \"failed\"", harness.ErrMCPNotConnected)},
+		{res: mcpReached(checkpointed(5, 0.50))}, // review retry records
+		{res: checkpointed(5, 0.05)},             // fix
+	}}
+	handbacksBeforeFix := -1
+	h.onInvoke = func(i int) {
+		switch i {
+		case 2:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+		case 3:
+			handbacksBeforeFix = len(rel.calls) + len(rel.expireCalls)
+			rel.status = "in_review"
+			rel.outcome += "\n### Fixes\n- 1.review-1.1 fixed\n"
+		}
+	}
+	d, _ := panelDriverWithFleet(t, h, rel, nil, panelPhases())
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — implement, the failed review, its retry, fix", h.invokeCalls)
+	}
+	if handbacksBeforeFix != 0 {
+		t.Fatalf("%d handback call(s) before the fix phase (release %v, expire %v), want 0 — the preflight retry must keep the lease",
+			handbacksBeforeFix, rel.calls, rel.expireCalls)
+	}
+	for _, i := range []int{2, 3} {
+		if got := h.invocations[i].ResumeClaim.RunID; got != "r-1" {
+			t.Errorf("session %d resumed run %q, want r-1 — the retry and the phase after it continue the same run", i, got)
+		}
+	}
+	if out := logs.String(); !strings.Contains(out, "MCP preflight failure") {
+		t.Errorf("the driver did not log the preflight retry:\n%s", out)
+	}
+}
+
+// If the preflight-failed session settled its own claim, there is no lease to
+// keep: the retry would run with no claim, so the drain ends instead.
+func TestDrainPhases_MCPPreflightFailureOnASettledClaimEndsTheDrain(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	settled := openClaim()
+	settled.Settled = true
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: held(okResult(1, 0.01), settled), err: fmt.Errorf("%w: late", harness.ErrMCPNotConnected)},
+		{res: checkpointed(5, 0.50)},
+	}}
+	d, _ := panelDriverWithFleet(t, h, rel, nil, panelPhases())
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — no retry once the claim is no longer held", h.invokeCalls)
+	}
+	if out := logs.String(); !strings.Contains(out, "no longer held by this run") {
+		t.Errorf("the driver did not say why it ended:\n%s", out)
+	}
+}

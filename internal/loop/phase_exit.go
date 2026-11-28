@@ -31,8 +31,16 @@ func (r *phaseRun) endOnInvokeError(ctx context.Context, at *phaseAttempt) attem
 		}
 		// CLA-703: an MCP preflight failure is infrastructure, not a verdict on the phase.
 		if errors.Is(at.ierr, harness.ErrMCPNotConnected) {
-			if !r.mcpRetried {
+			if at.retryPreflight {
 				r.mcpRetried = true
+				// The seam kept the claim for this retry; if the task still is not held (the session settled
+				// it, or a handback ended it anyway), a retry would run under a run the plane has released.
+				if at.res.Claim.TaskID != "" && (!at.res.Claim.Held() || r.end.released) {
+					log.Printf("%siteration %d: %s could not start its first turn: %v — not retrying the %s phase: %s is no longer held by this run, ending the drain",
+						labelOf(t), drainNum, a.Name(), at.ierr, ph.Label(phaseIdx), claimLabel(at.res.Claim))
+					r.end.checkpoint = false
+					return attemptVerdict{next: attemptReturn}
+				}
 				log.Printf("%siteration %d: %s could not start its first turn: %v — retrying the %s phase once (MCP preflight failure, not a phase verdict)",
 					labelOf(t), drainNum, a.Name(), at.ierr, ph.Label(phaseIdx))
 				return attemptVerdict{next: attemptRetry}

@@ -231,6 +231,15 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 		loss.record(err)
 		cancel(err)
 	})
+	// The last claim the session was seen holding, kept for the run-lost salvage: an adapter killed
+	// mid-stream may return a Result that never carries it.
+	seen := &observedClaim{}
+	if obs := at.inv.OnClaim; obs != nil {
+		at.inv.OnClaim = func(c harness.Claim) {
+			seen.set(c)
+			obs(c)
+		}
+	}
 	if opts.onSessionLaunch != nil {
 		opts.onSessionLaunch()
 	}
@@ -241,6 +250,9 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 	// whole run.
 	if ctx.Err() == nil {
 		at.runLost = renewalCause(sctx, joined, loss.cause())
+	}
+	if at.runLost != nil {
+		at.lostClaim = lostRunClaimOf(at.res.Claim, seen.get(), at.inv.ResumeClaim)
 	}
 	d.noteRouteFallbacks(r.ti, t, drainNum, at.inv, at.res)
 	if at.logFile != nil {
