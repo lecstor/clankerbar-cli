@@ -136,7 +136,14 @@ type phaseAttempt struct {
 	empty              bool
 	noMCPNow           bool
 	retryNoMCP         bool
-	verifyNeedsHold    bool
+	// retryPreflight: the adapter's MCP preflight failed and the phase's one infrastructure retry is
+	// still unspent. Decided before the seam, because the retry continues the SAME run: the seam must
+	// not hand the claim back (or end its lease) first.
+	retryPreflight bool
+	// lostClaim is the claim the session held when the renewer ended it for a lost run, for the
+	// run-lost salvage. Set only when runLost is.
+	lostClaim       harness.Claim
+	verifyNeedsHold bool
 	// mapsNotes is how many NOTES turns a maps-session invocation planned (turn 1 included). The
 	// replies before that index go to the iteration log; the turn after them is the findings turn
 	// whose report the runner reads.

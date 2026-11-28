@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
@@ -87,12 +88,19 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		}
 		r.openAttemptLog(at)
 		r.spawnSession(ctx, at)
+		at.retryPreflight = at.ierr != nil && ctx.Err() == nil && at.runLost == nil &&
+			errors.Is(at.ierr, harness.ErrMCPNotConnected) && !r.mcpRetried
 		r.classifyEnd(at)
 		// Rescue whatever the session left uncommitted, FIRST — before the handback, because a
 		// successful salvage changes what the handback should do: a task with a branch recorded on it is
 		// no longer safe to release.
 		if !requireReviewRecord && at.runLost == nil {
 			d.salvageStrandedWork(ctx, t, &at.res, at.producedNothing && at.toolLoop == "", at.inv.WorkDir)
+		}
+		// A lost run's work is still saved to the task branch, so the next claim finds a clean tree; only
+		// the plane side (recording the branch, handing back) is skipped, since the claim is not ours.
+		if !requireReviewRecord && at.runLost != nil {
+			d.salvageLostRunWork(ctx, t, at.lostClaim, at.inv.WorkDir)
 		}
 		r.classifyExit(at)
 		r.openPhaseEnd(at)

@@ -3611,6 +3611,12 @@ section note.
 > itself stays on the parent context: it still has its log line to write,
 > and a cancelled parent is the operator stopping the whole run, not a lost
 > claim.
+>
+> A run-lost session's uncommitted work is still committed and pushed to the
+> task branch (`salvageLostRunWork`): the branch belongs to the task, not the
+> run, and a dirty tree makes the next claim refuse the worktree and park the
+> task (MAK-531, 2026-11-28). Only the plane side is skipped: the branch is not
+> recorded and the claim is not handed back, because the run is no longer ours.
 
 ### The orderly-cap classifications, computed here (before the salvage) so
 
@@ -3981,6 +3987,13 @@ section note.
 > retried. One retry — the same bound the no-record backstop uses —
 > then the run fails loudly with the reason rather than producing a
 > silent empty phase.
+>
+> The retry is decided right after the spawn (`phaseAttempt.retryPreflight`),
+> before the seam, so the seam skips its handback for that attempt. Deciding
+> it after the seam let a claim with pushed work have its lease ended first,
+> and the retry and every later phase then ran under a run the plane had
+> released (MAK-531, 2026-11-28). If the claim is no longer held anyway (the
+> session settled it), the drain ends instead of retrying.
 
 ### held is nil here by construction
 

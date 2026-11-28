@@ -214,14 +214,15 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	// the retry exists to avoid. Exhaustion takes this function's ordinary handback below; only
 	// cancellation during the backoff hands back in handleTransient.
 	retryInClaim := r.resumedTransientRetry(at) && r.resumedTransientRetries < len(resumedTransientRetryBackoff)
-	// CLA-703: a retrying no-MCP attempt is not an ending — keep the claim (the retry resumes the
-	// same run) and book nothing yet.
-	if !panelMember && !at.retryNoMCP && !resumeOnly && !retryInClaim {
+	// CLA-703: a retrying no-MCP attempt (or MCP preflight failure) is not an ending — keep the claim
+	// (the retry resumes the same run) and book nothing yet.
+	retryMCP := at.retryNoMCP || at.retryPreflight
+	if !panelMember && !retryMCP && !resumeOnly && !retryInClaim {
 		r.end.released = at.res.Claim.Held()
 	}
 	r.end.reportResumeFailed = at.res.ReportResumeFailed
 	r.end.dead = at.dead
-	if r.end.empty && !r.end.noMCP && !at.retryNoMCP {
+	if r.end.empty && !r.end.noMCP && !retryMCP {
 		log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",
 			labelOf(t), drainNum, ph.Label(phaseIdx), claimLabel(at.res.Claim), at.evidenceWhy)
 		// Book it into the dead-phase tally: this is the "produced nothing" class the rate exists to
@@ -235,7 +236,7 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	}
 	// last && a clean exit is the shape CLA-384 is about: the phase ran to completion, pushed, and
 	// simply did not declare.
-	if !panelMember && !at.retryNoMCP && !resumeOnly && !retryInClaim {
+	if !panelMember && !retryMCP && !resumeOnly && !retryInClaim {
 		// A tool-loop kill is never the undeclared hand-off CLA-384 counts, even when the process exited
 		// 0 an instant before the kill landed: it was killed failing to move the task on.
 		r.end.releasedToQueue = d.releaseHeldClaim(ctx, t, at.res, last && at.res.ExitCode == 0 && at.toolLoop == "", usageLimitEnd(r.a, at.res))
